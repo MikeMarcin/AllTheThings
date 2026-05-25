@@ -22,9 +22,9 @@ This repository currently contains the first AppKit MVP:
 ## Build
 
 ```sh
-cmake -S . -B build/cmake
-cmake --build build/cmake --target check
-cmake --build build/cmake --target app
+cmake --preset default
+cmake --build --preset check
+cmake --build --preset app
 ```
 
 The app bundle is written to:
@@ -36,8 +36,24 @@ build/AllTheThings.app
 Run it with:
 
 ```sh
-cmake --build build/cmake --target run
+cmake --build --preset run
 ```
+
+## VSCode
+
+The repository includes VSCode workspace tasks:
+
+- `CMake: Build App`
+- `CMake: Run App`
+- `CMake: Test`
+- `CMake: Build Debug App`
+- `CMake: Clean App Bundles`
+
+The default build task is `CMake: Build App`. The Run and Debug panel has `Run AllTheThings` and `Debug AllTheThings` configurations. Both build `build/AllTheThings-Debug.app` first, then launch the app executable with CodeLLDB.
+
+Use the VSCode Run and Debug panel configuration named `Debug AllTheThings` for direct app debugging. The CMake Tools status-bar debug button can also work if you select the `DebugAllTheThings` launch target first; workspace settings force it to use CodeLLDB instead of the unsupported `lldb --interpreter=mi` path.
+
+`CMake: Run App` opens a visible terminal and waits until the app exits. The CMake Tools status-bar run button uses the `LaunchAllTheThings` executable target, which builds `build/AllTheThings.app` first and then launches it with `open -W`. If prompted to select a launch target for running, choose `LaunchAllTheThings`.
 
 ## Current Architecture
 
