@@ -22,8 +22,9 @@ This repository currently contains the first AppKit MVP:
 ## Build
 
 ```sh
-swift test
-make app
+cmake -S . -B build/cmake
+cmake --build build/cmake --target check
+cmake --build build/cmake --target app
 ```
 
 The app bundle is written to:
@@ -35,7 +36,7 @@ build/AllTheThings.app
 Run it with:
 
 ```sh
-make run
+cmake --build build/cmake --target run
 ```
 
 ## Current Architecture
