@@ -4,13 +4,13 @@ import Foundation
 final class FileSystemWatcher {
     private let queue = DispatchQueue(label: "att.fsevents", qos: .utility)
     private var stream: FSEventStreamRef?
-    private var eventHandler: (([String]) -> Void)?
+    private var eventHandler: (@MainActor @Sendable ([String]) -> Void)?
 
     deinit {
         stop()
     }
 
-    func start(roots: [URL], eventHandler: @escaping ([String]) -> Void) {
+    func start(roots: [URL], eventHandler: @escaping @MainActor @Sendable ([String]) -> Void) {
         stop()
 
         let paths = roots.map { $0.standardizedFileURL.path }
@@ -62,6 +62,10 @@ final class FileSystemWatcher {
 
     private func handle(paths: [String]) {
         guard !paths.isEmpty else { return }
-        eventHandler?(paths)
+        guard let eventHandler else { return }
+
+        Task { @MainActor in
+            eventHandler(paths)
+        }
     }
 }

@@ -390,10 +390,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func startWatching() {
-        watcher.start(roots: indexedRoots) { [weak self] paths in
-            DispatchQueue.main.async {
-                self?.coalesceFSEvents(paths)
-            }
+        watcher.start(roots: indexedRoots) { @MainActor @Sendable [weak self] paths in
+            self?.coalesceFSEvents(paths)
         }
     }
 
