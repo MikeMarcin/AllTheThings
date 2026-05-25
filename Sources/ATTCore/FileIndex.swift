@@ -149,29 +149,52 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     public func search(_ request: SearchRequest, maxResults: Int = 20_000) -> SearchResponse {
+        search(request, maxResults: maxResults, shouldCancel: { false }) ?? SearchResponse(results: [], totalMatches: 0, elapsed: 0)
+    }
+
+    public func search(
+        _ request: SearchRequest,
+        maxResults: Int = 20_000,
+        shouldCancel: @Sendable () -> Bool
+    ) -> SearchResponse? {
         let started = Date()
         let records = lock.withLock {
             Array(recordsByPath.values)
         }
 
+        guard !shouldCancel() else { return nil }
+
         let trimmedQuery = request.query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parsedQuery = FuzzyMatcher.parse(trimmedQuery)
         var matches: [SearchResult] = []
         matches.reserveCapacity(min(records.count, maxResults))
 
-        if trimmedQuery.isEmpty {
-            matches = records.map { SearchResult(record: $0, score: 0) }
+        if parsedQuery.isEmpty {
+            for (offset, record) in records.enumerated() {
+                if offset.isMultiple(of: 512), shouldCancel() {
+                    return nil
+                }
+                matches.append(SearchResult(record: record, score: 0))
+            }
         } else {
-            for record in records {
-                if let score = FuzzyMatcher.score(record: record, query: trimmedQuery) {
+            for (offset, record) in records.enumerated() {
+                if offset.isMultiple(of: 512), shouldCancel() {
+                    return nil
+                }
+                if let score = FuzzyMatcher.score(record: record, parsedQuery: parsedQuery) {
                     matches.append(SearchResult(record: record, score: score))
                 }
             }
         }
 
         let total = matches.count
+        guard !shouldCancel() else { return nil }
+
         matches.sort { lhs, rhs in
-            Self.compare(lhs, rhs, sort: request.sort, queryIsEmpty: trimmedQuery.isEmpty)
+            Self.compare(lhs, rhs, sort: request.sort, queryIsEmpty: parsedQuery.isEmpty)
         }
+
+        guard !shouldCancel() else { return nil }
 
         if matches.count > maxResults {
             matches.removeSubrange(maxResults..<matches.count)

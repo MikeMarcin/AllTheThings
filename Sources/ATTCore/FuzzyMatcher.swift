@@ -1,20 +1,45 @@
 import Foundation
+import Ifrit
 
 public enum FuzzyMatcher {
     public struct ParsedQuery: Sendable {
-        let positive: [QueryPart]
-        let negative: [String]
+        let positive: [QueryClause]
+        let negative: [QueryClause]
 
         var isEmpty: Bool {
             positive.isEmpty && negative.isEmpty
         }
     }
 
-    enum QueryPart: Sendable {
-        case fuzzy(String)
-        case exact(String)
-        case fileExtension(String)
+    struct QueryClause: Sendable {
+        let alternatives: [QueryPart]
     }
+
+    struct SearchPattern: Sendable {
+        let token: String
+        let ifritPattern: Fuse.Pattern?
+    }
+
+    enum QueryPart: Sendable {
+        case text(field: QueryField, pattern: SearchPattern, mode: MatchMode)
+        case fileExtension(SearchPattern, mode: MatchMode)
+        case kind(String)
+    }
+
+    enum QueryField: Sendable {
+        case any
+        case name
+        case path
+    }
+
+    enum MatchMode: Sendable {
+        case fuzzy
+        case exact
+        case wildcard
+    }
+
+    private static let fuse = Fuse(location: 0, distance: 1_000, threshold: 0.35, isCaseSensitive: false, tokenize: false)
+    private static let maximumIfritPatternLength = MemoryLayout<Int>.size * 8 - 1
 
     public static func normalize(_ value: String) -> String {
         value
@@ -24,23 +49,19 @@ public enum FuzzyMatcher {
 
     public static func parse(_ query: String) -> ParsedQuery {
         let rawParts = splitQuery(query)
-        var positives: [QueryPart] = []
-        var negatives: [String] = []
+        var positives: [QueryClause] = []
+        var negatives: [QueryClause] = []
 
         for raw in rawParts {
-            let isNegative = raw.hasPrefix("!") && raw.count > 1
-            let value = isNegative ? String(raw.dropFirst()) : raw
-            let normalized = normalize(value.trimmingCharacters(in: .whitespacesAndNewlines))
-            guard !normalized.isEmpty else { continue }
+            let parsed = parseClause(raw)
+            guard !parsed.clause.alternatives.isEmpty else {
+                continue
+            }
 
-            if isNegative {
-                negatives.append(normalized)
-            } else if normalized.hasPrefix(".") && normalized.count > 1 {
-                positives.append(.fileExtension(String(normalized.dropFirst())))
-            } else if value.hasPrefix("\"") && value.hasSuffix("\"") && value.count > 1 {
-                positives.append(.exact(String(normalized.dropFirst().dropLast())))
+            if parsed.isNegative {
+                negatives.append(parsed.clause)
             } else {
-                positives.append(.fuzzy(normalized))
+                positives.append(parsed.clause)
             }
         }
 
@@ -49,17 +70,21 @@ public enum FuzzyMatcher {
 
     public static func score(record: FileRecord, query: String) -> Int? {
         let parsed = parse(query)
-        guard !parsed.isEmpty else { return 0 }
+        return score(record: record, parsedQuery: parsed)
+    }
 
-        for negative in parsed.negative {
-            if record.normalizedName.contains(negative) || record.normalizedPath.contains(negative) {
+    public static func score(record: FileRecord, parsedQuery: ParsedQuery) -> Int? {
+        guard !parsedQuery.isEmpty else { return 0 }
+
+        for negative in parsedQuery.negative {
+            if score(clause: negative, record: record) != nil {
                 return nil
             }
         }
 
         var total = 0
-        for part in parsed.positive {
-            guard let partScore = score(part: part, record: record) else {
+        for clause in parsedQuery.positive {
+            guard let partScore = score(clause: clause, record: record) else {
                 return nil
             }
             total += partScore
@@ -71,42 +96,282 @@ public enum FuzzyMatcher {
     }
 
     public static func primaryHighlightToken(for query: String) -> String? {
-        for part in parse(query).positive {
-            switch part {
-            case .fuzzy(let token), .exact(let token), .fileExtension(let token):
-                return token
+        for clause in parse(query).positive {
+            for part in clause.alternatives {
+                switch part {
+                case .text(_, let pattern, _):
+                    return pattern.token.removingWildcardSyntax
+                case .fileExtension(let pattern, _):
+                    return pattern.token.removingWildcardSyntax
+                case .kind:
+                    continue
+                }
             }
         }
         return nil
     }
 
+    private static func score(clause: QueryClause, record: FileRecord) -> Int? {
+        clause.alternatives.compactMap { score(part: $0, record: record) }.max()
+    }
+
     private static func score(part: QueryPart, record: FileRecord) -> Int? {
         switch part {
-        case .fileExtension(let ext):
-            if record.fileExtension == ext {
-                return 4_800
-            }
-            if record.fileExtension.hasPrefix(ext) {
-                return 3_600
-            }
-            return nil
-        case .exact(let token):
-            if record.normalizedName.contains(token) {
-                return 5_200
-            }
-            if record.normalizedPath.contains(token) {
-                return 3_700
-            }
-            return nil
-        case .fuzzy(let token):
-            let nameScore = scoreString(record.normalizedName, token: token, basenameBias: true)
-            let pathScore = scoreString(record.normalizedPath, token: token, basenameBias: false).map { $0 - 400 }
-            let typoScore = typoScore(record: record, token: token)
-            return [nameScore, pathScore, typoScore].compactMap { $0 }.max()
+        case .fileExtension(let pattern, let mode):
+            return extensionScore(record.fileExtension, pattern: pattern, mode: mode)
+        case .kind(let token):
+            return kindScore(record: record, token: token)
+        case .text(let field, let pattern, let mode):
+            return textScore(record: record, field: field, pattern: pattern, mode: mode)
         }
     }
 
-    private static func scoreString(_ text: String, token: String, basenameBias: Bool) -> Int? {
+    private static func textScore(record: FileRecord, field: QueryField, pattern: SearchPattern, mode: MatchMode) -> Int? {
+        let token = pattern.token
+        guard !token.isEmpty else { return nil }
+
+        switch mode {
+        case .exact:
+            return exactScore(record: record, field: field, token: token)
+        case .wildcard:
+            return wildcardScore(record: record, field: field, pattern: token)
+        case .fuzzy:
+            switch field {
+            case .any:
+                let nameScore = scoreString(record.normalizedName, pattern: pattern, basenameBias: true)
+                let pathScore = scoreString(record.normalizedPath, pattern: pattern, basenameBias: false).map { $0 - 400 }
+                let typoScore = typoScore(record: record, token: token)
+                return [nameScore, pathScore, typoScore].compactMap { $0 }.max()
+            case .name:
+                let nameScore = scoreString(record.normalizedName, pattern: pattern, basenameBias: true)
+                let typoScore = typoScore(record: record, token: token)
+                return [nameScore, typoScore].compactMap { $0 }.max()
+            case .path:
+                return scoreString(record.normalizedPath, pattern: pattern, basenameBias: false)
+            }
+        }
+    }
+
+    private static func extensionScore(_ extensionValue: String, pattern: SearchPattern, mode: MatchMode) -> Int? {
+        let token = pattern.token
+        guard !token.isEmpty else { return nil }
+
+        switch mode {
+        case .exact:
+            return extensionValue == token ? 4_900 : nil
+        case .wildcard:
+            return wildcardMatches(extensionValue, pattern: token) ? 4_700 : nil
+        case .fuzzy:
+            if extensionValue == token {
+                return 4_800
+            }
+            if extensionValue.hasPrefix(token) {
+                return 3_600
+            }
+            return nil
+        }
+    }
+
+    private static func kindScore(record: FileRecord, token: String) -> Int? {
+        let values = record.isDirectory ? ["folder", "directory", "dir"] : ["file"]
+        return values.contains { $0.hasPrefix(token) } ? 4_400 : nil
+    }
+
+    private static func exactScore(record: FileRecord, field: QueryField, token: String) -> Int? {
+        func scoreCandidate(_ text: String, base: Int) -> Int? {
+            guard let range = text.range(of: token) else { return nil }
+            let offset = text.distance(from: text.startIndex, to: range.lowerBound)
+            let boundaryBonus = isBoundary(in: text, at: range.lowerBound) ? 500 : 0
+            return base + boundaryBonus - min(offset * 10, 900)
+        }
+
+        switch field {
+        case .any:
+            let nameScore = scoreCandidate(record.normalizedName, base: 5_200)
+            let pathScore = scoreCandidate(record.normalizedPath, base: 3_700)
+            return [nameScore, pathScore].compactMap { $0 }.max()
+        case .name:
+            return scoreCandidate(record.normalizedName, base: 5_200)
+        case .path:
+            return scoreCandidate(record.normalizedPath, base: 4_000)
+        }
+    }
+
+    private static func wildcardScore(record: FileRecord, field: QueryField, pattern: String) -> Int? {
+        func scoreCandidate(_ text: String, base: Int) -> Int? {
+            wildcardMatches(text, pattern: pattern) ? base - min(text.count, 300) : nil
+        }
+
+        switch field {
+        case .any:
+            let nameScore = scoreCandidate(record.normalizedName, base: 5_100)
+            let pathScore = scoreCandidate(record.normalizedPath, base: 3_900)
+            return [nameScore, pathScore].compactMap { $0 }.max()
+        case .name:
+            return scoreCandidate(record.normalizedName, base: 5_100)
+        case .path:
+            return scoreCandidate(record.normalizedPath, base: 4_100)
+        }
+    }
+
+    private static func parseClause(_ raw: String) -> (isNegative: Bool, clause: QueryClause) {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return (false, QueryClause(alternatives: []))
+        }
+
+        let isNegative = (trimmed.hasPrefix("!") || trimmed.hasPrefix("-")) && trimmed.count > 1
+        let body = isNegative ? String(trimmed.dropFirst()) : trimmed
+        let alternatives = parseAlternatives(from: body)
+
+        return (isNegative, QueryClause(alternatives: alternatives))
+    }
+
+    private static func parseAlternatives(from body: String) -> [QueryPart] {
+        if let scoped = splitScopedTerm(body) {
+            let values = splitFieldValues(scoped.value, field: scoped.field)
+            return values.compactMap { parsePart(field: scoped.field, rawValue: $0) }
+        }
+
+        return splitAlternatives(body).compactMap { parsePart(field: .any, rawValue: $0) }
+    }
+
+    private static func parsePart(field: QueryField, rawValue: String) -> QueryPart? {
+        let parsed = parsePattern(rawValue)
+        guard !parsed.pattern.token.isEmpty else { return nil }
+
+        switch field {
+        case .any where parsed.pattern.token.hasPrefix(".") && parsed.pattern.token.count > 1:
+            return .fileExtension(makeSearchPattern(String(parsed.pattern.token.dropFirst()), mode: parsed.mode), mode: parsed.mode)
+        case .name, .path, .any:
+            return .text(field: field, pattern: parsed.pattern, mode: parsed.mode)
+        }
+    }
+
+    private static func parsePart(field: ScopedField, rawValue: String) -> QueryPart? {
+        let parsed = parsePattern(rawValue)
+        guard !parsed.pattern.token.isEmpty else { return nil }
+
+        switch field {
+        case .name:
+            return .text(field: .name, pattern: parsed.pattern, mode: parsed.mode)
+        case .path:
+            return .text(field: .path, pattern: parsed.pattern, mode: parsed.mode)
+        case .fileExtension:
+            let extensionToken = parsed.pattern.token.hasPrefix(".") ? String(parsed.pattern.token.dropFirst()) : parsed.pattern.token
+            guard !extensionToken.isEmpty else { return nil }
+            return .fileExtension(makeSearchPattern(extensionToken, mode: parsed.mode), mode: parsed.mode)
+        case .kind:
+            return .kind(parsed.pattern.token)
+        }
+    }
+
+    private enum ScopedField {
+        case name
+        case path
+        case fileExtension
+        case kind
+    }
+
+    private static func splitScopedTerm(_ body: String) -> (field: ScopedField, value: String)? {
+        guard let colon = body.firstIndex(of: ":") else { return nil }
+
+        let prefix = normalize(String(body[..<colon]))
+        guard let field = scopedField(for: prefix) else { return nil }
+
+        let valueStart = body.index(after: colon)
+        return (field, String(body[valueStart...]))
+    }
+
+    private static func scopedField(for prefix: String) -> ScopedField? {
+        switch prefix {
+        case "name", "file", "filename", "basename":
+            return .name
+        case "path", "folder", "dir", "directory":
+            return .path
+        case "ext", "extension", "suffix":
+            return .fileExtension
+        case "kind", "type":
+            return .kind
+        default:
+            return nil
+        }
+    }
+
+    private static func splitFieldValues(_ value: String, field: ScopedField) -> [String] {
+        switch field {
+        case .fileExtension, .kind:
+            return splitAlternatives(value).flatMap { splitCommaSeparated($0) }
+        case .name, .path:
+            return splitAlternatives(value)
+        }
+    }
+
+    private static func parsePattern(_ rawValue: String) -> (pattern: SearchPattern, mode: MatchMode) {
+        var value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        var mode: MatchMode = .fuzzy
+
+        if value.hasPrefix("\"") {
+            value.removeFirst()
+            if value.hasSuffix("\"") {
+                value.removeLast()
+            }
+            mode = .exact
+        } else if value.hasSuffix("\"") {
+            value.removeLast()
+            mode = .exact
+        } else if value.contains("*") || value.contains("?") {
+            mode = .wildcard
+        }
+
+        let token = normalize(value)
+        return (makeSearchPattern(token, mode: mode), mode)
+    }
+
+    private static func makeSearchPattern(_ token: String, mode: MatchMode) -> SearchPattern {
+        guard mode == .fuzzy, token.count <= maximumIfritPatternLength else {
+            return SearchPattern(token: token, ifritPattern: nil)
+        }
+
+        return SearchPattern(token: token, ifritPattern: fuse.createPattern(from: token))
+    }
+
+    private static func splitAlternatives(_ value: String) -> [String] {
+        split(value, separators: ["|"])
+    }
+
+    private static func splitCommaSeparated(_ value: String) -> [String] {
+        split(value, separators: [",", ";"])
+    }
+
+    private static func split(_ value: String, separators: Set<Character>) -> [String] {
+        var parts: [String] = []
+        var current = ""
+        var inQuote = false
+
+        for char in value {
+            if char == "\"" {
+                current.append(char)
+                inQuote.toggle()
+            } else if separators.contains(char) && !inQuote {
+                if !current.isEmpty {
+                    parts.append(current)
+                    current = ""
+                }
+            } else {
+                current.append(char)
+            }
+        }
+
+        if !current.isEmpty {
+            parts.append(current)
+        }
+
+        return parts
+    }
+
+    private static func scoreString(_ text: String, pattern: SearchPattern, basenameBias: Bool) -> Int? {
+        let token = pattern.token
         guard !token.isEmpty, !text.isEmpty else { return nil }
 
         if text == token {
@@ -127,11 +392,34 @@ public enum FuzzyMatcher {
             return acronym
         }
 
-        if let subsequence = subsequenceScore(text: text, token: token) {
-            return subsequence
+        if let ifritScore = ifritScoreString(text, pattern: pattern, basenameBias: basenameBias) {
+            return ifritScore
         }
 
         return nil
+    }
+
+    private static func ifritScoreString(_ text: String, pattern: SearchPattern, basenameBias: Bool) -> Int? {
+        guard
+            let ifritPattern = pattern.ifritPattern,
+            let result = fuse.search(ifritPattern, in: text)
+        else {
+            return subsequenceScore(text: text, token: pattern.token)
+        }
+
+        let quality = max(0.0, min(1.0, 1.0 - result.score))
+        let firstMatch = result.ranges.map(\.lowerBound).min() ?? 0
+        let matchedCharacters = result.ranges.reduce(0) { total, range in
+            total + range.count
+        }
+
+        let base = basenameBias ? 5_700 : 5_100
+        let qualityBonus = Int((quality * 1_900).rounded())
+        let boundaryBonus = isBoundary(in: text, atCharacterOffset: firstMatch) ? 450 : 0
+        let compactnessBonus = min(matchedCharacters * 45, 700)
+        let offsetPenalty = min(firstMatch * 8, 700)
+
+        return base + qualityBonus + boundaryBonus + compactnessBonus - offsetPenalty
     }
 
     private static func typoScore(record: FileRecord, token: String) -> Int? {
@@ -217,6 +505,46 @@ public enum FuzzyMatcher {
         return previous == "/" || previous == "-" || previous == "_" || previous == "." || previous == " "
     }
 
+    private static func isBoundary(in text: String, atCharacterOffset offset: Int) -> Bool {
+        guard offset > 0 else { return true }
+        guard offset < text.count else { return false }
+
+        let index = text.index(text.startIndex, offsetBy: offset)
+        return isBoundary(in: text, at: index)
+    }
+
+    private static func wildcardMatches(_ text: String, pattern: String) -> Bool {
+        let textChars = Array(text)
+        let patternChars = Array(pattern)
+        guard !patternChars.isEmpty else { return false }
+
+        var previous = Array(repeating: false, count: textChars.count + 1)
+        previous[0] = true
+
+        for patternChar in patternChars {
+            var current = Array(repeating: false, count: textChars.count + 1)
+
+            if patternChar == "*" {
+                current[0] = previous[0]
+                if !textChars.isEmpty {
+                    for index in 1...textChars.count {
+                        current[index] = previous[index] || current[index - 1]
+                    }
+                }
+            } else {
+                if !textChars.isEmpty {
+                    for index in 1...textChars.count {
+                        current[index] = previous[index - 1] && (patternChar == "?" || patternChar == textChars[index - 1])
+                    }
+                }
+            }
+
+            previous = current
+        }
+
+        return previous[textChars.count]
+    }
+
     private static func splitQuery(_ query: String) -> [String] {
         var parts: [String] = []
         var current = ""
@@ -274,5 +602,11 @@ public enum FuzzyMatcher {
 
         let distance = previous[b.count]
         return distance <= limit ? distance : nil
+    }
+}
+
+private extension String {
+    var removingWildcardSyntax: String {
+        filter { $0 != "*" && $0 != "?" }
     }
 }
