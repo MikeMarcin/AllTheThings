@@ -65,6 +65,7 @@ configure_file(
     "${APP_BUNDLE_DIR}/Contents/Info.plist"
     COPYONLY
 )
+file(COPY "${SOURCE_DIR}/Resources/AllTheThings.icns" DESTINATION "${APP_BUNDLE_DIR}/Contents/Resources")
 file(WRITE "${APP_BUNDLE_DIR}/Contents/PkgInfo" "APPL????")
 
 find_program(CODESIGN_EXECUTABLE codesign)
