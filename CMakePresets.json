@@ -1,0 +1,68 @@
+{
+    "version": 6,
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 25,
+        "patch": 0
+    },
+    "configurePresets": [
+        {
+            "name": "default",
+            "displayName": "Default",
+            "description": "Configure AllTheThings with the standard local build directory.",
+            "binaryDir": "${sourceDir}/build/cmake"
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "app",
+            "displayName": "Build Release App",
+            "configurePreset": "default",
+            "targets": [
+                "app"
+            ]
+        },
+        {
+            "name": "app-debug",
+            "displayName": "Build Debug App",
+            "configurePreset": "default",
+            "targets": [
+                "app-debug"
+            ]
+        },
+        {
+            "name": "check",
+            "displayName": "Run Swift Tests",
+            "configurePreset": "default",
+            "targets": [
+                "check"
+            ]
+        },
+        {
+            "name": "run",
+            "displayName": "Run Release App",
+            "configurePreset": "default",
+            "targets": [
+                "run"
+            ]
+        },
+        {
+            "name": "clean-app",
+            "displayName": "Clean App Bundles",
+            "configurePreset": "default",
+            "targets": [
+                "clean-app"
+            ]
+        }
+    ],
+    "testPresets": [
+        {
+            "name": "default",
+            "displayName": "CTest",
+            "configurePreset": "default",
+            "output": {
+                "outputOnFailure": true
+            }
+        }
+    ]
+}

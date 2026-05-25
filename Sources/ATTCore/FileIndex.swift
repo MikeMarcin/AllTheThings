@@ -68,7 +68,18 @@ public struct IndexStats: Sendable {
 }
 
 public final class FileIndex: @unchecked Sendable {
-    public var onStatsChanged: ((IndexStats) -> Void)?
+    public var onStatsChanged: ((IndexStats) -> Void)? {
+        get {
+            lock.withLock {
+                statsChangedHandler
+            }
+        }
+        set {
+            lock.withLock {
+                statsChangedHandler = newValue
+            }
+        }
+    }
 
     private struct PersistedSnapshot: Codable {
         let savedAt: Date
@@ -86,6 +97,7 @@ public final class FileIndex: @unchecked Sendable {
     private var indexing = false
     private var status = "Starting"
     private var lastUpdated = Date()
+    private var statsChangedHandler: ((IndexStats) -> Void)?
 
     public init(fileManager: FileManager = .default, applicationName: String = "AllTheThings") {
         self.fileManager = fileManager
@@ -395,7 +407,18 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     private func publishStats() {
-        onStatsChanged?(lockedStats())
+        let update = lock.withLock {
+            (
+                stats: IndexStats(
+                    indexedCount: recordsByPath.count,
+                    isIndexing: indexing,
+                    status: status,
+                    lastUpdated: lastUpdated
+                ),
+                handler: statsChangedHandler
+            )
+        }
+        update.handler?(update.stats)
     }
 
     private func lockedStats() -> IndexStats {

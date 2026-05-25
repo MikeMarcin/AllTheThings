@@ -1,0 +1,14 @@
+{
+    "cmake.useCMakePresets": "always",
+    "cmake.configureOnOpen": true,
+    "cmake.buildPreset": "app",
+    "cmake.testPreset": "default",
+    "cmake.debugConfig": {
+        "type": "lldb",
+        "request": "launch",
+        "program": "${workspaceFolder}/build/AllTheThings-Debug.app/Contents/MacOS/AllTheThings",
+        "cwd": "${workspaceFolder}",
+        "terminal": "integrated",
+        "internalConsoleOptions": "openOnSessionStart"
+    }
+}

@@ -1,0 +1,36 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Run AllTheThings",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/AllTheThings-Debug.app/Contents/MacOS/AllTheThings",
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "CMake: Build Debug App",
+            "terminal": "integrated",
+            "internalConsoleOptions": "openOnSessionStart"
+        },
+        {
+            "name": "Debug AllTheThings",
+            "type": "swift",
+            "request": "launch",
+            "cwd": "${workspaceFolder:AllTheThings}",
+            "preLaunchTask": "swift: Build Debug AllTheThings",
+            "terminal": "integrated",
+            "internalConsoleOptions": "openOnSessionStart",
+            "target": "AllTheThings",
+            "configuration": "debug"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:AllTheThings}",
+            "name": "Release AllTheThings",
+            "target": "AllTheThings",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release AllTheThings"
+        }
+    ]
+}

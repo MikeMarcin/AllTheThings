@@ -50,6 +50,7 @@ xcuserdata/
 # CMake generated files
 CMakeFiles/
 CMakeCache.txt
+CMakeUserPresets.json
 cmake_install.cmake
 install_manifest.txt
 compile_commands.json

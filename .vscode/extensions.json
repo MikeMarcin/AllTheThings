@@ -1,0 +1,7 @@
+{
+    "recommendations": [
+        "ms-vscode.cmake-tools",
+        "swiftlang.swift-vscode",
+        "vadimcn.vscode-lldb"
+    ]
+}

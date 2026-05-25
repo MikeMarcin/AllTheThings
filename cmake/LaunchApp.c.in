@@ -1,0 +1,33 @@
+#include <spawn.h>
+#include <stdio.h>
+#include <sys/wait.h>
+
+extern char **environ;
+
+int main(void) {
+    const char *app_path = "@APP_BUNDLE_DIR_FOR_LAUNCHER@";
+    char *const argv[] = { "open", "-W", (char *)app_path, NULL };
+    pid_t pid = 0;
+
+    int spawn_result = posix_spawn(&pid, "/usr/bin/open", NULL, NULL, argv, environ);
+    if (spawn_result != 0) {
+        fprintf(stderr, "Could not launch %s: posix_spawn returned %d\n", app_path, spawn_result);
+        return spawn_result;
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        perror("waitpid");
+        return 1;
+    }
+
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+
+    if (WIFSIGNALED(status)) {
+        return 128 + WTERMSIG(status);
+    }
+
+    return 1;
+}

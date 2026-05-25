@@ -4,8 +4,15 @@ foreach(required_var IN ITEMS SWIFT_EXECUTABLE SOURCE_DIR BUILD_PATH APP_BUNDLE_
     endif()
 endforeach()
 
+if(NOT DEFINED SWIFT_CONFIGURATION OR "${SWIFT_CONFIGURATION}" STREQUAL "")
+    set(SWIFT_CONFIGURATION "release")
+endif()
+
 execute_process(
-    COMMAND "${SWIFT_EXECUTABLE}" build -c release
+    COMMAND "${CMAKE_COMMAND}" -E env
+        "CLANG_MODULE_CACHE_PATH=${BUILD_PATH}/ModuleCache"
+        "${SWIFT_EXECUTABLE}" build -c "${SWIFT_CONFIGURATION}"
+        --disable-sandbox
         --package-path "${SOURCE_DIR}"
         --build-path "${BUILD_PATH}"
     WORKING_DIRECTORY "${SOURCE_DIR}"
@@ -17,7 +24,10 @@ if(NOT build_result EQUAL 0)
 endif()
 
 execute_process(
-    COMMAND "${SWIFT_EXECUTABLE}" build -c release
+    COMMAND "${CMAKE_COMMAND}" -E env
+        "CLANG_MODULE_CACHE_PATH=${BUILD_PATH}/ModuleCache"
+        "${SWIFT_EXECUTABLE}" build -c "${SWIFT_CONFIGURATION}"
+        --disable-sandbox
         --package-path "${SOURCE_DIR}"
         --build-path "${BUILD_PATH}"
         --show-bin-path
@@ -55,5 +65,19 @@ configure_file(
     "${APP_BUNDLE_DIR}/Contents/Info.plist"
     COPYONLY
 )
+file(WRITE "${APP_BUNDLE_DIR}/Contents/PkgInfo" "APPL????")
+
+find_program(CODESIGN_EXECUTABLE codesign)
+if(CODESIGN_EXECUTABLE)
+    execute_process(
+        COMMAND "${CODESIGN_EXECUTABLE}" --force --deep --sign - "${APP_BUNDLE_DIR}"
+        WORKING_DIRECTORY "${SOURCE_DIR}"
+        RESULT_VARIABLE codesign_result
+    )
+
+    if(NOT codesign_result EQUAL 0)
+        message(FATAL_ERROR "codesign failed with exit code ${codesign_result}")
+    endif()
+endif()
 
 message(STATUS "Built ${APP_BUNDLE_DIR}")

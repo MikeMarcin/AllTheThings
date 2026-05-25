@@ -1,17 +1,26 @@
 import AppKit
 import ATTCore
 
-@main
-@MainActor
+// AppKit invokes these Objective-C delegate hooks during startup; hop to the
+// main queue before touching Swift @MainActor AppKit APIs.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var windowController: SearchWindowController?
 
     func applicationWillFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.regular)
-        NSApp.appearance = NSAppearance(named: .darkAqua)
+        DispatchQueue.main.async {
+            NSApp.setActivationPolicy(.regular)
+            NSApp.appearance = NSAppearance(named: .darkAqua)
+        }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        DispatchQueue.main.async { [weak self] in
+            self?.finishLaunching()
+        }
+    }
+
+    @MainActor
+    private func finishLaunching() {
         configureMainMenu()
 
         let controller = SearchWindowController(index: FileIndex())
@@ -24,6 +33,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         false
     }
 
+    @MainActor
     private func configureMainMenu() {
         let mainMenu = NSMenu()
 
