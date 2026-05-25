@@ -6,6 +6,8 @@
     <string>en</string>
     <key>CFBundleExecutable</key>
     <string>AllTheThings</string>
+    <key>CFBundleIconFile</key>
+    <string>AllTheThings.icns</string>
     <key>CFBundleIdentifier</key>
     <string>com.allthethings.app</string>
     <key>CFBundleInfoDictionaryVersion</key>
