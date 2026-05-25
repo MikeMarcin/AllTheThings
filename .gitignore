@@ -54,9 +54,6 @@ cmake_install.cmake
 install_manifest.txt
 compile_commands.json
 
-# Project build entrypoint
-!Makefile
-
 # Temporary files
 .DS_Store
 *.tmp
