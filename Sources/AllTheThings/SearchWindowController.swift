@@ -2,16 +2,24 @@ import AppKit
 import ATTCore
 
 final class SearchWindowController: NSWindowController {
+    private enum WindowLayout {
+        static let preferredContentSize = NSSize(width: 1_180, height: 720)
+        static let minimumContentSize = NSSize(width: 920, height: 540)
+        static let visibleFrameInset: CGFloat = 64
+    }
+
     init(index: FileIndex) {
         let viewController = SearchViewController(index: index)
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1_120, height: 720),
+            contentRect: NSRect(origin: .zero, size: Self.startupContentSize()),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
         window.title = "AllTheThings"
         window.titlebarAppearsTransparent = true
+        window.isRestorable = false
+        window.contentMinSize = WindowLayout.minimumContentSize
         window.contentViewController = viewController
         window.center()
         super.init(window: window)
@@ -20,6 +28,20 @@ final class SearchWindowController: NSWindowController {
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    private static func startupContentSize() -> NSSize {
+        guard let visibleFrame = NSScreen.main?.visibleFrame else {
+            return WindowLayout.preferredContentSize
+        }
+
+        let availableWidth = max(WindowLayout.minimumContentSize.width, visibleFrame.width - WindowLayout.visibleFrameInset)
+        let availableHeight = max(WindowLayout.minimumContentSize.height, visibleFrame.height - WindowLayout.visibleFrameInset)
+
+        return NSSize(
+            width: min(WindowLayout.preferredContentSize.width, availableWidth),
+            height: min(WindowLayout.preferredContentSize.height, availableHeight)
+        )
     }
 }
 
@@ -319,6 +341,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             scrollView.bottomAnchor.constraint(equalTo: footer.topAnchor),
+            scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 400),
 
             footer.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             footer.trailingAnchor.constraint(equalTo: view.trailingAnchor),
