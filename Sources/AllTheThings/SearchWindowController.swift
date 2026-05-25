@@ -137,12 +137,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     override func viewDidLoad() {
         super.viewDidLoad()
 
-        index.onStatsChanged = { [weak self] stats in
-            DispatchQueue.main.async {
-                self?.indexStats = stats
-                self?.updateStatus()
-                self?.scheduleSearch()
-            }
+        index.onStatsChanged = { @MainActor @Sendable [weak self] stats in
+            self?.indexStats = stats
+            self?.updateStatus()
+            self?.scheduleSearch()
         }
 
         startWatching()

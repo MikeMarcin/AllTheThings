@@ -68,7 +68,7 @@ public struct IndexStats: Sendable {
 }
 
 public final class FileIndex: @unchecked Sendable {
-    public var onStatsChanged: ((IndexStats) -> Void)? {
+    public var onStatsChanged: (@MainActor @Sendable (IndexStats) -> Void)? {
         get {
             lock.withLock {
                 statsChangedHandler
@@ -97,7 +97,7 @@ public final class FileIndex: @unchecked Sendable {
     private var indexing = false
     private var status = "Starting"
     private var lastUpdated = Date()
-    private var statsChangedHandler: ((IndexStats) -> Void)?
+    private var statsChangedHandler: (@MainActor @Sendable (IndexStats) -> Void)?
 
     public init(fileManager: FileManager = .default, applicationName: String = "AllTheThings") {
         self.fileManager = fileManager
@@ -221,20 +221,20 @@ public final class FileIndex: @unchecked Sendable {
         var lastPublish = Date.distantPast
         var visited = 0
 
-        func publishPartial(force: Bool = false) {
+        func publishPartial(records: [String: FileRecord], visited: Int, force: Bool = false) {
             guard isCurrentGeneration(currentGeneration) else { return }
             let now = Date()
             guard force || now.timeIntervalSince(lastPublish) > 0.25 else { return }
             lastPublish = now
-            replaceRecords(localRecords, isIndexing: true, status: "Indexing \(visited.formatted()) files")
+            replaceRecords(records, isIndexing: true, status: "Indexing \(visited.formatted()) files")
         }
 
         for root in rootURLs {
             guard isCurrentGeneration(currentGeneration) else { return }
             scan(root: root, into: &localRecords, visited: &visited) {
-                publishPartial()
+                publishPartial(records: $0, visited: $1)
             }
-            publishPartial(force: true)
+            publishPartial(records: localRecords, visited: visited, force: true)
         }
 
         guard isCurrentGeneration(currentGeneration) else { return }
@@ -246,7 +246,7 @@ public final class FileIndex: @unchecked Sendable {
         root: URL,
         into records: inout [String: FileRecord],
         visited: inout Int,
-        progress: () -> Void
+        progress: (_ records: [String: FileRecord], _ visited: Int) -> Void
     ) {
         guard fileManager.fileExists(atPath: root.path), !shouldExclude(root) else { return }
 
@@ -282,7 +282,7 @@ public final class FileIndex: @unchecked Sendable {
             }
 
             if visited.isMultiple(of: 1_500) {
-                progress()
+                progress(records, visited)
             }
         }
     }
@@ -418,7 +418,12 @@ public final class FileIndex: @unchecked Sendable {
                 handler: statsChangedHandler
             )
         }
-        update.handler?(update.stats)
+
+        guard let handler = update.handler else { return }
+        let stats = update.stats
+        Task { @MainActor in
+            handler(stats)
+        }
     }
 
     private func lockedStats() -> IndexStats {
