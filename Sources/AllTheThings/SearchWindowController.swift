@@ -118,6 +118,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var totalMatches = 0
     private var queryElapsed: TimeInterval = 0
     private var queryGeneration: UInt64 = 0
+    private var activeSearchToken: SearchCancellationToken?
     private var sortSpec = SortSpec(column: .modified, ascending: false)
     private var indexedRoots: [URL]
     private var pendingEventPaths = Set<String>()
@@ -266,6 +267,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         searchField.delegate = self
         searchField.controlSize = .large
         searchField.font = .systemFont(ofSize: 16)
+        searchField.sendsSearchStringImmediately = true
+        searchField.sendsWholeSearchString = false
         searchField.translatesAutoresizingMaskIntoConstraints = false
         topBar.addArrangedSubview(searchField)
 
@@ -392,16 +395,21 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func scheduleSearch() {
+        activeSearchToken?.cancel()
+        let token = SearchCancellationToken()
+        activeSearchToken = token
+
         queryGeneration &+= 1
         let generation = queryGeneration
         let request = SearchRequest(query: searchField.stringValue, sort: sortSpec)
         let index = self.index
 
         searchQueue.async {
-            let response = index.search(request)
+            guard !token.isCancelled else { return }
+            guard let response = index.search(request, shouldCancel: { token.isCancelled }) else { return }
 
             DispatchQueue.main.async { [weak self] in
-                guard let self, self.queryGeneration == generation else { return }
+                guard let self, self.queryGeneration == generation, self.activeSearchToken === token else { return }
                 self.results = response.results
                 self.totalMatches = response.totalMatches
                 self.queryElapsed = response.elapsed
@@ -556,5 +564,30 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let roots = candidates.filter { fileManager.fileExists(atPath: $0.path) }
         defaults.set(roots.map(\.path), forKey: key)
         return roots
+    }
+}
+
+private final class SearchCancellationToken: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    var isCancelled: Bool {
+        lock.withLock {
+            cancelled
+        }
+    }
+
+    func cancel() {
+        lock.withLock {
+            cancelled = true
+        }
+    }
+}
+
+private extension NSLock {
+    func withLock<T>(_ body: () throws -> T) rethrows -> T {
+        lock()
+        defer { unlock() }
+        return try body()
     }
 }

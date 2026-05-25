@@ -33,7 +33,56 @@ struct FuzzyMatcherTests {
         #expect(FuzzyMatcher.score(record: record, query: "package !node_modules") == nil)
     }
 
-    private func makeRecord(name: String, directory: String = "/tmp/project") -> FileRecord? {
+    @Test("supports fielded fuzzy clauses")
+    func fieldedFuzzyClauses() throws {
+        let source = try #require(makeRecord(name: "SearchWindowController.swift", directory: "/tmp/project/Sources/AllTheThings"))
+        let test = try #require(makeRecord(name: "SearchWindowController.swift", directory: "/tmp/project/Tests/AllTheThings"))
+
+        let score = try #require(FuzzyMatcher.score(record: source, query: "name:swc path:Sources ext:swift"))
+        #expect(score > 0)
+        #expect(FuzzyMatcher.score(record: test, query: "name:swc path:Sources ext:swift") == nil)
+    }
+
+    @Test("supports extension alternatives")
+    func extensionAlternatives() throws {
+        let swift = try #require(makeRecord(name: "SearchWindow.swift"))
+        let markdown = try #require(makeRecord(name: "README.md"))
+        let pdf = try #require(makeRecord(name: "Manual.pdf"))
+
+        #expect(FuzzyMatcher.score(record: swift, query: "ext:swift|md") != nil)
+        #expect(FuzzyMatcher.score(record: markdown, query: "ext:swift|md") != nil)
+        #expect(FuzzyMatcher.score(record: pdf, query: "ext:swift|md") == nil)
+    }
+
+    @Test("supports kind filters")
+    func kindFilters() throws {
+        let directory = try #require(makeRecord(name: "Sources", isDirectory: true))
+        let file = try #require(makeRecord(name: "Sources.swift"))
+
+        #expect(FuzzyMatcher.score(record: directory, query: "kind:folder") != nil)
+        #expect(FuzzyMatcher.score(record: file, query: "kind:folder") == nil)
+        #expect(FuzzyMatcher.score(record: file, query: "type:file") != nil)
+    }
+
+    @Test("supports wildcard clauses")
+    func wildcardClauses() throws {
+        let match = try #require(makeRecord(name: "SearchWindow.swift"))
+        let miss = try #require(makeRecord(name: "WindowSearch.swift"))
+
+        #expect(FuzzyMatcher.score(record: match, query: "name:Search*.swift") != nil)
+        #expect(FuzzyMatcher.score(record: miss, query: "name:Search*.swift") == nil)
+    }
+
+    @Test("supports structured negative clauses")
+    func structuredNegativeClauses() throws {
+        let dependency = try #require(makeRecord(name: "Package.swift", directory: "/tmp/project/node_modules"))
+        let source = try #require(makeRecord(name: "Package.swift", directory: "/tmp/project/Sources"))
+
+        #expect(FuzzyMatcher.score(record: dependency, query: "package !path:node_modules") == nil)
+        #expect(FuzzyMatcher.score(record: source, query: "package !path:node_modules") != nil)
+    }
+
+    private func makeRecord(name: String, directory: String = "/tmp/project", isDirectory: Bool = false) -> FileRecord? {
         let url = URL(fileURLWithPath: directory).appendingPathComponent(name)
         let normalizedName = FuzzyMatcher.normalize(name)
         let normalizedPath = FuzzyMatcher.normalize(url.path)
@@ -47,7 +96,7 @@ struct FuzzyMatcherTests {
             sizeBytes: 128,
             modifiedTime: Date().timeIntervalSinceReferenceDate,
             createdTime: nil,
-            isDirectory: false,
+            isDirectory: isDirectory,
             isHidden: name.hasPrefix("."),
             volumeName: "Test",
             normalizedName: normalizedName,

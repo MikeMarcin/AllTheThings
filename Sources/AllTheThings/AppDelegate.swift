@@ -9,6 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private let defaults = UserDefaults.standard
     private var windowController: SearchWindowController?
+    private var noticesWindowController: NSWindowController?
     private var allowMultipleInstancesMenuItem: NSMenuItem?
 
     override init() {
@@ -121,6 +122,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateSettingsMenuItems()
     }
 
+    @objc @MainActor private func showThirdPartyNotices(_ sender: Any?) {
+        let controller: NSWindowController
+        if let existingController = noticesWindowController {
+            controller = existingController
+        } else {
+            controller = makeThirdPartyNoticesWindowController()
+            noticesWindowController = controller
+        }
+
+        controller.showWindow(nil)
+        controller.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate()
+    }
+
     @MainActor
     private func updateSettingsMenuItems() {
         allowMultipleInstancesMenuItem?.state = allowsMultipleInstances ? .on : .off
@@ -168,6 +183,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         windowItem.submenu = windowMenu
         mainMenu.addItem(windowItem)
 
+        let helpItem = NSMenuItem()
+        let helpMenu = NSMenu(title: "Help")
+        let noticesItem = NSMenuItem(
+            title: "Third-Party Notices",
+            action: #selector(showThirdPartyNotices(_:)),
+            keyEquivalent: ""
+        )
+        noticesItem.target = self
+        helpMenu.addItem(noticesItem)
+        helpItem.submenu = helpMenu
+        mainMenu.addItem(helpItem)
+
         NSApp.mainMenu = mainMenu
+    }
+
+    @MainActor
+    private func makeThirdPartyNoticesWindowController() -> NSWindowController {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 720, height: 560),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Third-Party Notices"
+        window.isRestorable = false
+        window.contentMinSize = NSSize(width: 520, height: 360)
+
+        let scrollView = NSScrollView()
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.borderType = .noBorder
+
+        let textView = NSTextView()
+        textView.string = ThirdPartyNotices.text
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.drawsBackground = false
+        textView.textContainerInset = NSSize(width: 18, height: 16)
+        textView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        textView.textColor = .labelColor
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.widthTracksTextView = true
+
+        scrollView.documentView = textView
+
+        let contentView = NSView()
+        contentView.addSubview(scrollView)
+        NSLayoutConstraint.activate([
+            scrollView.topAnchor.constraint(equalTo: contentView.topAnchor),
+            scrollView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor)
+        ])
+
+        window.contentView = contentView
+        window.center()
+
+        return NSWindowController(window: window)
     }
 }
