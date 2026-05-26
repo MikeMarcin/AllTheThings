@@ -1,16 +1,20 @@
 import Foundation
+import ATTCore
 
 enum AppSettings {
     static let allowMultipleInstancesKey = "ATTAllowMultipleInstances"
     static let highlightSearchTextKey = "ATTHighlightSearchText"
     static let indexedRootsKey = "ATTIndexedRoots"
     static let indexedRootsInitializedKey = "ATTIndexedRootsInitialized"
+    static let exclusionPatternsKey = "ATTExclusionPatterns"
     static let indexedRootsDidChangeNotification = Notification.Name("com.allthethings.settings.indexedRootsDidChange")
+    static let exclusionPatternsDidChangeNotification = Notification.Name("com.allthethings.settings.exclusionPatternsDidChange")
 
     static func registerDefaults(_ defaults: UserDefaults = .standard) {
         defaults.register(defaults: [
             allowMultipleInstancesKey: false,
-            highlightSearchTextKey: true
+            highlightSearchTextKey: true,
+            exclusionPatternsKey: FileExclusionRules.defaultPatterns
         ])
     }
 
@@ -32,6 +36,16 @@ enum AppSettings {
         defaults.set(true, forKey: indexedRootsInitializedKey)
         defaults.synchronize()
         NotificationCenter.default.post(name: indexedRootsDidChangeNotification, object: defaults)
+    }
+
+    static func exclusionPatterns(defaults: UserDefaults = .standard) -> [String] {
+        defaults.array(forKey: exclusionPatternsKey) as? [String] ?? FileExclusionRules.defaultPatterns
+    }
+
+    static func saveExclusionPatterns(_ patterns: [String], defaults: UserDefaults = .standard) {
+        defaults.set(patterns, forKey: exclusionPatternsKey)
+        defaults.synchronize()
+        NotificationCenter.default.post(name: exclusionPatternsDidChangeNotification, object: defaults)
     }
 
     static func displayPath(_ path: String) -> String {

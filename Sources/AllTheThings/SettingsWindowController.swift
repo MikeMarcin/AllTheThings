@@ -36,6 +36,8 @@ private final class SettingsViewController: NSViewController {
     private let automaticallyCheckForUpdatesSwitch = NSSwitch()
     private let rootsStack = NSStackView()
     private let addRootButton = NSButton()
+    private let exclusionPatternsTextView = NSTextView()
+    private let applyExclusionsButton = NSButton()
 
     init(defaults: UserDefaults) {
         self.defaults = defaults
@@ -55,6 +57,7 @@ private final class SettingsViewController: NSViewController {
         buildInterface()
         updateSwitches()
         renderIndexedRoots()
+        renderExclusionPatterns()
     }
 
     override func viewDidLoad() {
@@ -64,6 +67,12 @@ private final class SettingsViewController: NSViewController {
             self,
             selector: #selector(indexedRootsDidChange(_:)),
             name: AppSettings.indexedRootsDidChangeNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(exclusionPatternsDidChange(_:)),
+            name: AppSettings.exclusionPatternsDidChangeNotification,
             object: nil
         )
     }
@@ -139,8 +148,23 @@ private final class SettingsViewController: NSViewController {
     }
 
     private func makeContentView() -> NSView {
+        let scrollView = NSScrollView()
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.borderType = .noBorder
+        scrollView.drawsBackground = false
+
         let contentView = NSView()
         contentView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.documentView = contentView
+
+        NSLayoutConstraint.activate([
+            contentView.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
+            contentView.leadingAnchor.constraint(equalTo: scrollView.contentView.leadingAnchor),
+            contentView.trailingAnchor.constraint(equalTo: scrollView.contentView.trailingAnchor),
+            contentView.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor)
+        ])
 
         let titleLabel = NSTextField(labelWithString: "General")
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -201,11 +225,39 @@ private final class SettingsViewController: NSViewController {
 
         let rootsCard = makeIndexedRootsCard()
 
+        let exclusionsHeader = NSStackView()
+        exclusionsHeader.translatesAutoresizingMaskIntoConstraints = false
+        exclusionsHeader.orientation = .horizontal
+        exclusionsHeader.alignment = .centerY
+        exclusionsHeader.spacing = 8
+
+        let exclusionsLabel = NSTextField(labelWithString: "Excluded paths")
+        exclusionsLabel.translatesAutoresizingMaskIntoConstraints = false
+        exclusionsLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+        exclusionsLabel.textColor = .secondaryLabelColor
+
+        applyExclusionsButton.translatesAutoresizingMaskIntoConstraints = false
+        applyExclusionsButton.title = "Apply"
+        applyExclusionsButton.bezelStyle = .rounded
+        applyExclusionsButton.controlSize = .small
+        applyExclusionsButton.target = self
+        applyExclusionsButton.action = #selector(applyExclusionPatterns(_:))
+
+        let exclusionsHeaderSpacer = NSView()
+        exclusionsHeaderSpacer.translatesAutoresizingMaskIntoConstraints = false
+        exclusionsHeader.addArrangedSubview(exclusionsLabel)
+        exclusionsHeader.addArrangedSubview(exclusionsHeaderSpacer)
+        exclusionsHeader.addArrangedSubview(applyExclusionsButton)
+
+        let exclusionsCard = makeExclusionPatternsCard()
+
         contentView.addSubview(titleLabel)
         contentView.addSubview(sectionLabel)
         contentView.addSubview(settingsCard)
         contentView.addSubview(rootsHeader)
         contentView.addSubview(rootsCard)
+        contentView.addSubview(exclusionsHeader)
+        contentView.addSubview(exclusionsCard)
 
         NSLayoutConstraint.activate([
             titleLabel.topAnchor.constraint(equalTo: contentView.safeAreaLayoutGuide.topAnchor, constant: 58),
@@ -229,10 +281,20 @@ private final class SettingsViewController: NSViewController {
             rootsCard.topAnchor.constraint(equalTo: rootsHeader.bottomAnchor, constant: 10),
             rootsCard.leadingAnchor.constraint(equalTo: settingsCard.leadingAnchor),
             rootsCard.trailingAnchor.constraint(equalTo: settingsCard.trailingAnchor),
-            rootsCard.bottomAnchor.constraint(lessThanOrEqualTo: contentView.bottomAnchor, constant: -32)
+            rootsCard.bottomAnchor.constraint(lessThanOrEqualTo: contentView.bottomAnchor, constant: -32),
+
+            exclusionsHeader.topAnchor.constraint(equalTo: rootsCard.bottomAnchor, constant: 28),
+            exclusionsHeader.leadingAnchor.constraint(equalTo: settingsCard.leadingAnchor),
+            exclusionsHeader.trailingAnchor.constraint(equalTo: settingsCard.trailingAnchor),
+
+            exclusionsCard.topAnchor.constraint(equalTo: exclusionsHeader.bottomAnchor, constant: 10),
+            exclusionsCard.leadingAnchor.constraint(equalTo: settingsCard.leadingAnchor),
+            exclusionsCard.trailingAnchor.constraint(equalTo: settingsCard.trailingAnchor),
+            exclusionsCard.heightAnchor.constraint(equalToConstant: 156),
+            exclusionsCard.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -32)
         ])
 
-        return contentView
+        return scrollView
     }
 
     private func configureSwitch(_ control: NSSwitch, action: Selector) {
@@ -294,6 +356,46 @@ private final class SettingsViewController: NSViewController {
             rootsStack.leadingAnchor.constraint(equalTo: card.leadingAnchor),
             rootsStack.trailingAnchor.constraint(equalTo: card.trailingAnchor),
             rootsStack.bottomAnchor.constraint(equalTo: card.bottomAnchor)
+        ])
+
+        return card
+    }
+
+    private func makeExclusionPatternsCard() -> NSView {
+        let card = NSView()
+        card.translatesAutoresizingMaskIntoConstraints = false
+        card.wantsLayer = true
+        card.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+        card.layer?.borderColor = NSColor.separatorColor.cgColor
+        card.layer?.borderWidth = 1
+        card.layer?.cornerRadius = 8
+
+        let scrollView = NSScrollView()
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.borderType = .noBorder
+        scrollView.drawsBackground = false
+
+        exclusionPatternsTextView.drawsBackground = false
+        exclusionPatternsTextView.isRichText = false
+        exclusionPatternsTextView.isAutomaticQuoteSubstitutionEnabled = false
+        exclusionPatternsTextView.isAutomaticDashSubstitutionEnabled = false
+        exclusionPatternsTextView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        exclusionPatternsTextView.textColor = .labelColor
+        exclusionPatternsTextView.textContainerInset = NSSize(width: 10, height: 10)
+        exclusionPatternsTextView.isVerticallyResizable = true
+        exclusionPatternsTextView.isHorizontallyResizable = false
+        exclusionPatternsTextView.autoresizingMask = [.width]
+        exclusionPatternsTextView.textContainer?.widthTracksTextView = true
+        scrollView.documentView = exclusionPatternsTextView
+
+        card.addSubview(scrollView)
+        NSLayoutConstraint.activate([
+            scrollView.topAnchor.constraint(equalTo: card.topAnchor),
+            scrollView.leadingAnchor.constraint(equalTo: card.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: card.trailingAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: card.bottomAnchor)
         ])
 
         return card
@@ -441,6 +543,13 @@ private final class SettingsViewController: NSViewController {
         }
     }
 
+    private func renderExclusionPatterns() {
+        let patterns = AppSettings.exclusionPatterns(defaults: defaults)
+        let text = patterns.joined(separator: "\n")
+        guard exclusionPatternsTextView.string != text else { return }
+        exclusionPatternsTextView.string = text
+    }
+
     private func updateSwitches() {
         highlightSearchTextSwitch.state = defaults.bool(forKey: AppSettings.highlightSearchTextKey) ? .on : .off
         allowMultipleInstancesSwitch.state = defaults.bool(forKey: AppSettings.allowMultipleInstancesKey) ? .on : .off
@@ -502,5 +611,15 @@ private final class SettingsViewController: NSViewController {
 
     @objc private func indexedRootsDidChange(_ notification: Notification) {
         renderIndexedRoots()
+    }
+
+    @objc private func applyExclusionPatterns(_ sender: NSButton) {
+        let patterns = exclusionPatternsTextView.string
+            .components(separatedBy: .newlines)
+        AppSettings.saveExclusionPatterns(patterns, defaults: defaults)
+    }
+
+    @objc private func exclusionPatternsDidChange(_ notification: Notification) {
+        renderExclusionPatterns()
     }
 }
