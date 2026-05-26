@@ -4,6 +4,53 @@ import Testing
 
 @Suite("File index")
 struct FileIndexTests {
+    @Test("search combines fuzzy text with wildcard and structured path clauses")
+    func searchCombinesFuzzyWildcardAndStructuredPathClauses() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        let sourceDirectory = root.appendingPathComponent("source/gct/strings", isDirectory: true)
+        try fileManager.createDirectory(at: sourceDirectory, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        let cppMatch = sourceDirectory.appendingPathComponent("AITOBridge.cpp")
+        let swiftMiss = sourceDirectory.appendingPathComponent("AITOBridge.swift")
+        let fuzzyHeader = sourceDirectory.appendingPathComponent("fuzzy_match.hpp")
+        let cppMiss = root.appendingPathComponent("Other.cpp")
+        try "cpp".write(to: cppMatch, atomically: true, encoding: .utf8)
+        try "swift".write(to: swiftMiss, atomically: true, encoding: .utf8)
+        try "hpp".write(to: fuzzyHeader, atomically: true, encoding: .utf8)
+        try "other".write(to: cppMiss, atomically: true, encoding: .utf8)
+
+        let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)")
+        index.replaceRootsAndRebuild([root])
+
+        try await waitUntil {
+            let stats = index.currentStats()
+            return !stats.isIndexing && stats.indexedCount >= 8
+        }
+
+        var response = index.search(SearchRequest(
+            query: "aito *.cpp",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10)
+        #expect(response.results.map(\.record.path) == [cppMatch.path])
+
+        response = index.search(SearchRequest(
+            query: "source/**/*.hpp",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10)
+        #expect(response.results.map(\.record.path) == [fuzzyHeader.path])
+
+        response = index.search(SearchRequest(
+            query: "\(root.path)/source/gct/str/fuzzy",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10)
+        #expect(response.results.map(\.record.path) == [fuzzyHeader.path])
+    }
+
     @Test("refresh moves an updated file to the top of modified sort")
     func refreshResortsModifiedResults() async throws {
         let fileManager = FileManager.default

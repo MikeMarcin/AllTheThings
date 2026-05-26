@@ -129,6 +129,8 @@ public final class FileIndex: @unchecked Sendable {
         let modifiedDescending: [Int]
         let modifiedAscending: [Int]
         let gramIndex: [Int: [Int32]]
+        let nameGramIndex: [Int: [Int32]]
+        let extensionIndex: [String: [Int32]]
         let hasSortedOrder: Bool
 
         init(records: [FileRecord], buildsSearchStructures: Bool = true) {
@@ -137,6 +139,8 @@ public final class FileIndex: @unchecked Sendable {
 
             if buildsSearchStructures {
                 self.gramIndex = Self.makeGramIndex(records: records)
+                self.nameGramIndex = Self.makeNameGramIndex(records: records)
+                self.extensionIndex = Self.makeExtensionIndex(records: records)
                 let sortedByModified = records.indices.sorted { lhs, rhs in
                     let left = records[lhs]
                     let right = records[rhs]
@@ -152,16 +156,26 @@ public final class FileIndex: @unchecked Sendable {
                 self.modifiedAscending = Array(sortedByModified.reversed())
             } else {
                 self.gramIndex = [:]
+                self.nameGramIndex = [:]
+                self.extensionIndex = [:]
                 self.modifiedDescending = []
                 self.modifiedAscending = []
             }
         }
 
-        private init(records: [FileRecord], modifiedDescending: [Int], gramIndex: [Int: [Int32]]) {
+        private init(
+            records: [FileRecord],
+            modifiedDescending: [Int],
+            gramIndex: [Int: [Int32]],
+            nameGramIndex: [Int: [Int32]],
+            extensionIndex: [String: [Int32]]
+        ) {
             self.records = records
             self.modifiedDescending = modifiedDescending
             self.modifiedAscending = Array(modifiedDescending.reversed())
             self.gramIndex = gramIndex
+            self.nameGramIndex = nameGramIndex
+            self.extensionIndex = extensionIndex
             self.hasSortedOrder = true
         }
 
@@ -206,7 +220,13 @@ public final class FileIndex: @unchecked Sendable {
                 records: updatedRecords
             )
 
-            return SearchSnapshot(records: updatedRecords, modifiedDescending: mergedDescending, gramIndex: gramIndex)
+            return SearchSnapshot(
+                records: updatedRecords,
+                modifiedDescending: mergedDescending,
+                gramIndex: gramIndex,
+                nameGramIndex: nameGramIndex,
+                extensionIndex: extensionIndex
+            )
         }
 
         func orderedIndices(for sort: SortSpec, queryIsEmpty: Bool) -> [Int]? {
@@ -244,6 +264,91 @@ public final class FileIndex: @unchecked Sendable {
             }
 
             return FileIndex.intersectPostingLists(postings)
+        }
+
+        func candidateNameIndices(containing tokenBytes: [UInt8]) -> [Int32]? {
+            guard !nameGramIndex.isEmpty else { return nil }
+
+            let keys = FileIndex.searchGramKeys(for: tokenBytes)
+            guard !keys.isEmpty else { return nil }
+
+            var postings: [[Int32]] = []
+            postings.reserveCapacity(keys.count)
+
+            for key in keys {
+                guard let values = nameGramIndex[key] else {
+                    return []
+                }
+                postings.append(values)
+            }
+
+            postings.sort { $0.count < $1.count }
+            if postings.count == 1 {
+                return postings[0]
+            }
+
+            return FileIndex.intersectPostingLists(postings)
+        }
+
+        func candidateNameIndices(containingAny tokenByteSets: [[UInt8]]) -> [Int32]? {
+            guard !tokenByteSets.isEmpty else { return nil }
+
+            var candidates: [Int32] = []
+            for tokenBytes in tokenByteSets {
+                guard let values = candidateNameIndices(containingAllBytes: tokenBytes) else {
+                    return nil
+                }
+                candidates = FileIndex.unionPostingLists(candidates, values)
+            }
+
+            return candidates
+        }
+
+        private func candidateNameIndices(containingAllBytes tokenBytes: [UInt8]) -> [Int32]? {
+            guard !nameGramIndex.isEmpty, !tokenBytes.isEmpty else { return nil }
+
+            var postings: [[Int32]] = []
+            postings.reserveCapacity(tokenBytes.count)
+
+            for byte in tokenBytes {
+                let key = FileIndex.searchGramKey(bytes: [byte], start: 0, length: 1)
+                guard let values = nameGramIndex[key] else {
+                    return []
+                }
+                postings.append(values)
+            }
+
+            postings.sort { $0.count < $1.count }
+            if postings.count == 1 {
+                return postings[0]
+            }
+
+            return FileIndex.intersectPostingLists(postings)
+        }
+
+        func candidateIndices(fileExtension token: String, mode: FuzzyMatcher.MatchMode) -> [Int32]? {
+            guard !extensionIndex.isEmpty, !token.isEmpty else { return nil }
+
+            switch mode {
+            case .exact:
+                return extensionIndex[token] ?? []
+            case .fuzzy:
+                var candidates: [Int32] = []
+                for (fileExtension, values) in extensionIndex where fileExtension == token || fileExtension.hasPrefix(token) {
+                    candidates = FileIndex.unionPostingLists(candidates, values)
+                }
+                return candidates
+            case .wildcard:
+                if !token.contains("*"), !token.contains("?") {
+                    return extensionIndex[token] ?? []
+                }
+
+                var candidates: [Int32] = []
+                for (fileExtension, values) in extensionIndex where FileIndex.wildcardMatches(fileExtension, pattern: token) {
+                    candidates = FileIndex.unionPostingLists(candidates, values)
+                }
+                return candidates
+            }
         }
 
         private static func mergeModifiedDescending(changed: [Int], unchanged: [Int], records: [FileRecord]) -> [Int] {
@@ -303,6 +408,33 @@ public final class FileIndex: @unchecked Sendable {
                 for key in keys {
                     index[key, default: []].append(storedIndex)
                 }
+            }
+
+            return index
+        }
+
+        private static func makeNameGramIndex(records: [FileRecord]) -> [Int: [Int32]] {
+            var index: [Int: [Int32]] = [:]
+            var keys = Set<Int>()
+
+            for (recordIndex, record) in records.enumerated() {
+                keys.removeAll(keepingCapacity: true)
+                FileIndex.collectSearchGramKeys(from: record.normalizedName, into: &keys)
+
+                let storedIndex = Int32(recordIndex)
+                for key in keys {
+                    index[key, default: []].append(storedIndex)
+                }
+            }
+
+            return index
+        }
+
+        private static func makeExtensionIndex(records: [FileRecord]) -> [String: [Int32]] {
+            var index: [String: [Int32]] = [:]
+
+            for (recordIndex, record) in records.enumerated() where !record.fileExtension.isEmpty {
+                index[record.fileExtension, default: []].append(Int32(recordIndex))
             }
 
             return index
@@ -475,6 +607,17 @@ public final class FileIndex: @unchecked Sendable {
                 }
             }
 
+            if let indexedResponse = Self.indexedCandidateSearch(
+                snapshot: snapshot,
+                request: request,
+                parsedQuery: parsedQuery,
+                maxResults: boundedMaxResults,
+                started: started,
+                shouldCancel: shouldCancel
+            ) {
+                return indexedResponse
+            }
+
             for (offset, record) in records.enumerated() {
                 if offset.isMultiple(of: 512), shouldCancel() {
                     return nil
@@ -491,6 +634,72 @@ public final class FileIndex: @unchecked Sendable {
 
         guard !shouldCancel() else { return nil }
 
+        return SearchResponse(results: matches, totalMatches: total, elapsed: Date().timeIntervalSince(started))
+    }
+
+    private static func indexedCandidateSearch(
+        snapshot: SearchSnapshot,
+        request: SearchRequest,
+        parsedQuery: FuzzyMatcher.ParsedQuery,
+        maxResults: Int,
+        started: Date,
+        shouldCancel: @Sendable () -> Bool
+    ) -> SearchResponse? {
+        guard let candidateIndices = candidateIndices(snapshot: snapshot, parsedQuery: parsedQuery) else {
+            return nil
+        }
+
+        if candidateIndices.isEmpty {
+            return SearchResponse(results: [], totalMatches: 0, elapsed: Date().timeIntervalSince(started))
+        }
+
+        guard candidateIndices.count < snapshot.records.count else {
+            return nil
+        }
+
+        var matches: [SearchResult] = []
+        matches.reserveCapacity(min(candidateIndices.count, maxResults))
+        let trimThreshold = maxResults > 0 ? maxResults * 5 : 0
+        var total = 0
+
+        func trimMatches() {
+            guard maxResults > 0, matches.count > maxResults else { return }
+            matches.sort {
+                compare($0, $1, sort: request.sort, queryIsEmpty: false)
+            }
+            matches.removeSubrange(maxResults..<matches.count)
+        }
+
+        for (offset, candidate) in candidateIndices.enumerated() {
+            if offset.isMultiple(of: 512), shouldCancel() {
+                return nil
+            }
+
+            let index = Int(candidate)
+            guard index >= 0, index < snapshot.records.count else {
+                continue
+            }
+
+            let record = snapshot.records[index]
+            guard let score = FuzzyMatcher.score(record: record, parsedQuery: parsedQuery) else {
+                continue
+            }
+
+            total += 1
+            guard maxResults > 0 else {
+                continue
+            }
+
+            matches.append(SearchResult(record: record, score: score))
+            if matches.count > trimThreshold {
+                trimMatches()
+            }
+        }
+
+        guard !shouldCancel() else { return nil }
+        trimMatches()
+
+        guard !shouldCancel() else { return nil }
         return SearchResponse(results: matches, totalMatches: total, elapsed: Date().timeIntervalSince(started))
     }
 
@@ -569,6 +778,258 @@ public final class FileIndex: @unchecked Sendable {
         return SearchResponse(results: results, totalMatches: total, elapsed: Date().timeIntervalSince(started))
     }
 
+    private static func candidateIndices(snapshot: SearchSnapshot, parsedQuery: FuzzyMatcher.ParsedQuery) -> [Int32]? {
+        var candidates: [Int32]?
+        var foundUsableClause = false
+
+        for clause in parsedQuery.positive {
+            guard let clauseCandidates = candidateIndices(snapshot: snapshot, clause: clause) else {
+                continue
+            }
+
+            foundUsableClause = true
+            guard !clauseCandidates.isEmpty else {
+                return []
+            }
+
+            if let current = candidates {
+                candidates = intersectPostingLists(current, clauseCandidates)
+            } else {
+                candidates = clauseCandidates
+            }
+
+            if candidates?.isEmpty == true {
+                return []
+            }
+        }
+
+        return foundUsableClause ? candidates : nil
+    }
+
+    private static func candidateIndices(snapshot: SearchSnapshot, clause: FuzzyMatcher.QueryClause) -> [Int32]? {
+        var candidates: [Int32] = []
+        var foundUsableAlternative = false
+
+        for alternative in clause.alternatives {
+            guard let alternativeCandidates = candidateIndices(snapshot: snapshot, part: alternative) else {
+                return nil
+            }
+
+            foundUsableAlternative = true
+            candidates = unionPostingLists(candidates, alternativeCandidates)
+        }
+
+        return foundUsableAlternative ? candidates : nil
+    }
+
+    private static func candidateIndices(snapshot: SearchSnapshot, part: FuzzyMatcher.QueryPart) -> [Int32]? {
+        switch part {
+        case .kind:
+            return nil
+        case .fileExtension(let pattern, let mode):
+            return snapshot.candidateIndices(fileExtension: pattern.token, mode: mode)
+                ?? candidateIndices(snapshot: snapshot, token: pattern.token, mode: mode, allowsFuzzyPrefix: true)
+        case .text(let field, let pattern, let mode):
+            return candidateIndices(snapshot: snapshot, field: field, token: pattern.token, mode: mode)
+        }
+    }
+
+    private static func candidateIndices(
+        snapshot: SearchSnapshot,
+        field: FuzzyMatcher.QueryField,
+        token: String,
+        mode: FuzzyMatcher.MatchMode
+    ) -> [Int32]? {
+        switch mode {
+        case .exact:
+            return snapshot.candidateIndices(containing: Array(token.utf8))
+        case .wildcard:
+            return candidateIndices(snapshot: snapshot, requiredFragments: wildcardRequiredFragments(from: token))
+        case .fuzzy:
+            if tokenContainsPathSeparator(token) {
+                guard field != .name else {
+                    return nil
+                }
+                return candidateIndices(snapshot: snapshot, requiredFragments: pathLiteralFragments(from: token))
+            }
+
+            return fuzzyTextCandidateIndices(snapshot: snapshot, field: field, token: token)
+        }
+    }
+
+    private static func candidateIndices(
+        snapshot: SearchSnapshot,
+        token: String,
+        mode: FuzzyMatcher.MatchMode,
+        allowsFuzzyPrefix: Bool
+    ) -> [Int32]? {
+        switch mode {
+        case .exact:
+            return snapshot.candidateIndices(containing: Array(token.utf8))
+        case .wildcard:
+            return candidateIndices(snapshot: snapshot, requiredFragments: wildcardRequiredFragments(from: token))
+        case .fuzzy:
+            guard allowsFuzzyPrefix else {
+                return nil
+            }
+            return snapshot.candidateIndices(containing: Array(token.utf8))
+        }
+    }
+
+    private static func candidateIndices(snapshot: SearchSnapshot, requiredFragments fragments: [[UInt8]]) -> [Int32]? {
+        guard !fragments.isEmpty else {
+            return nil
+        }
+
+        var candidates: [Int32]?
+
+        for fragment in fragments {
+            guard let fragmentCandidates = snapshot.candidateIndices(containing: fragment) else {
+                return nil
+            }
+
+            guard !fragmentCandidates.isEmpty else {
+                return []
+            }
+
+            if let current = candidates {
+                candidates = intersectPostingLists(current, fragmentCandidates)
+            } else {
+                candidates = fragmentCandidates
+            }
+
+            if candidates?.isEmpty == true {
+                return []
+            }
+        }
+
+        return candidates
+    }
+
+    private static func wildcardRequiredFragments(from pattern: String) -> [[UInt8]] {
+        var fragments: [[UInt8]] = []
+        var current: [UInt8] = []
+
+        for byte in pattern.utf8 {
+            if byte == 42 || byte == 47 || byte == 63 || byte == 92 {
+                if !current.isEmpty {
+                    fragments.append(current)
+                    current.removeAll(keepingCapacity: true)
+                }
+            } else {
+                current.append(byte)
+            }
+        }
+
+        if !current.isEmpty {
+            fragments.append(current)
+        }
+
+        return fragments
+    }
+
+    private static func pathLiteralFragments(from token: String) -> [[UInt8]] {
+        token.split { $0 == "/" || $0 == "\\" }
+            .map(String.init)
+            .filter { !$0.isEmpty }
+            .map { Array($0.utf8) }
+    }
+
+    private static func fuzzyTextCandidateIndices(
+        snapshot: SearchSnapshot,
+        field: FuzzyMatcher.QueryField,
+        token: String
+    ) -> [Int32]? {
+        guard token.utf8.allSatisfy({ $0 < 128 }) else {
+            return nil
+        }
+
+        let tokenBytes = Array(token.utf8)
+        let nameCandidates = fuzzyNameCandidateIndices(snapshot: snapshot, tokenBytes: tokenBytes)
+
+        switch field {
+        case .name:
+            return nameCandidates
+        case .path:
+            return snapshot.candidateIndices(containing: tokenBytes)
+        case .any:
+            guard let nameCandidates else {
+                return nil
+            }
+            if let pathCandidates = snapshot.candidateIndices(containing: tokenBytes) {
+                return unionPostingLists(pathCandidates, nameCandidates)
+            }
+            return nameCandidates
+        }
+    }
+
+    private static func fuzzyNameCandidateIndices(snapshot: SearchSnapshot, tokenBytes: [UInt8]) -> [Int32]? {
+        guard tokenBytes.count >= 4, tokenBytes.count <= 12 else {
+            return nil
+        }
+
+        var seen = Set<UInt8>()
+        var distinctBytes: [UInt8] = []
+        distinctBytes.reserveCapacity(tokenBytes.count)
+
+        for byte in tokenBytes where seen.insert(byte).inserted {
+            distinctBytes.append(byte)
+        }
+
+        guard distinctBytes.count == tokenBytes.count else {
+            return nil
+        }
+
+        let allowedMissing = tokenBytes.count <= 5 ? 1 : 2
+        let requiredCount = distinctBytes.count - allowedMissing
+        guard requiredCount >= 3 else {
+            return nil
+        }
+
+        let requiredSubsets = byteSubsets(distinctBytes, count: requiredCount)
+        guard !requiredSubsets.isEmpty else {
+            return nil
+        }
+
+        return snapshot.candidateNameIndices(containingAny: requiredSubsets)
+    }
+
+    private static func byteSubsets(_ bytes: [UInt8], count: Int) -> [[UInt8]] {
+        guard count > 0, count <= bytes.count else {
+            return []
+        }
+
+        var subsets: [[UInt8]] = []
+        var current: [UInt8] = []
+        current.reserveCapacity(count)
+
+        func appendSubsets(start: Int) {
+            if current.count == count {
+                subsets.append(current)
+                return
+            }
+
+            let remainingSlots = count - current.count
+            guard bytes.count - start >= remainingSlots else {
+                return
+            }
+
+            let lastStart = bytes.count - remainingSlots
+            for index in start...lastStart {
+                current.append(bytes[index])
+                appendSubsets(start: index + 1)
+                current.removeLast()
+            }
+        }
+
+        appendSubsets(start: 0)
+        return subsets
+    }
+
+    private static func tokenContainsPathSeparator(_ token: String) -> Bool {
+        token.contains("/") || token.contains("\\")
+    }
+
     private static func exactTextFastQuery(from parsedQuery: FuzzyMatcher.ParsedQuery) -> ExactTextFastQuery? {
         guard parsedQuery.negative.isEmpty, !parsedQuery.positive.isEmpty else {
             return nil
@@ -584,7 +1045,7 @@ public final class FileIndex: @unchecked Sendable {
             for alternative in clause.alternatives {
                 switch alternative {
                 case .text(let field, let pattern, .fuzzy):
-                    guard !pattern.token.isEmpty else { return nil }
+                    guard !pattern.token.isEmpty, !tokenContainsPathSeparator(pattern.token) else { return nil }
                     alternatives.append(ExactTextFastAlternative(
                         field: field,
                         token: pattern.token,
@@ -756,6 +1217,74 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         return result
+    }
+
+    private static func unionPostingLists(_ lhs: [Int32], _ rhs: [Int32]) -> [Int32] {
+        guard !lhs.isEmpty else { return rhs }
+        guard !rhs.isEmpty else { return lhs }
+
+        var result: [Int32] = []
+        result.reserveCapacity(lhs.count + rhs.count)
+
+        var leftIndex = 0
+        var rightIndex = 0
+
+        while leftIndex < lhs.count, rightIndex < rhs.count {
+            let left = lhs[leftIndex]
+            let right = rhs[rightIndex]
+
+            if left == right {
+                result.append(left)
+                leftIndex += 1
+                rightIndex += 1
+            } else if left < right {
+                result.append(left)
+                leftIndex += 1
+            } else {
+                result.append(right)
+                rightIndex += 1
+            }
+        }
+
+        if leftIndex < lhs.count {
+            result.append(contentsOf: lhs[leftIndex...])
+        }
+
+        if rightIndex < rhs.count {
+            result.append(contentsOf: rhs[rightIndex...])
+        }
+
+        return result
+    }
+
+    private static func wildcardMatches(_ text: String, pattern: String) -> Bool {
+        let textBytes = Array(text.utf8)
+        let patternBytes = Array(pattern.utf8)
+        guard !patternBytes.isEmpty else { return false }
+
+        var previous = Array(repeating: false, count: textBytes.count + 1)
+        previous[0] = true
+
+        for patternByte in patternBytes {
+            var current = Array(repeating: false, count: textBytes.count + 1)
+
+            if patternByte == 42 {
+                current[0] = previous[0]
+                if !textBytes.isEmpty {
+                    for index in 1...textBytes.count {
+                        current[index] = previous[index] || current[index - 1]
+                    }
+                }
+            } else if !textBytes.isEmpty {
+                for index in 1...textBytes.count {
+                    current[index] = previous[index - 1] && (patternByte == 63 || patternByte == textBytes[index - 1])
+                }
+            }
+
+            previous = current
+        }
+
+        return previous[textBytes.count]
     }
 
     private static func firstUTF8Match(in text: String, token: [UInt8]) -> UTF8Match? {

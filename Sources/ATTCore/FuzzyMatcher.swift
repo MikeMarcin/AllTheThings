@@ -131,6 +131,10 @@ public enum FuzzyMatcher {
         case .wildcard:
             return wildcardScore(record: record, field: field, pattern: token)
         case .fuzzy:
+            if tokenContainsPathSeparator(token) {
+                return structuredPathScore(record: record, field: field, token: token)
+            }
+
             switch field {
             case .any:
                 let nameScore = scoreString(record.normalizedName, pattern: pattern, basenameBias: true)
@@ -144,6 +148,21 @@ public enum FuzzyMatcher {
             case .path:
                 return fuzzyPathScore(record: record, pattern: pattern)
             }
+        }
+    }
+
+    private static func structuredPathScore(record: FileRecord, field: QueryField, token: String) -> Int? {
+        switch field {
+        case .name:
+            return nil
+        case .any, .path:
+            guard let match = structuredPathMatches(path: record.normalizedPath, pattern: token) else {
+                return nil
+            }
+            let base = field == .path ? 4_500 : 4_100
+            let anchorBonus = match.startsAtRoot ? 450 : 0
+            let consumedBonus = min(match.matchedSegments * 90, 720)
+            return base + anchorBonus + consumedBonus - min(match.startSegment * 80, 800)
         }
     }
 
@@ -218,14 +237,28 @@ public enum FuzzyMatcher {
 
         switch field {
         case .any:
-            let nameScore = scoreCandidate(record.normalizedName, base: 5_100)
-            let pathScore = scoreCandidate(record.normalizedPath, base: 3_900)
+            let nameScore = tokenContainsPathSeparator(pattern) ? nil : scoreCandidate(record.normalizedName, base: 5_100)
+            let pathScore = pathWildcardScore(record.normalizedPath, pattern: pattern, base: 3_900)
             return [nameScore, pathScore].compactMap { $0 }.max()
         case .name:
+            guard !tokenContainsPathSeparator(pattern) else { return nil }
             return scoreCandidate(record.normalizedName, base: 5_100)
         case .path:
-            return scoreCandidate(record.normalizedPath, base: 4_100)
+            return pathWildcardScore(record.normalizedPath, pattern: pattern, base: 4_100)
         }
+    }
+
+    private static func pathWildcardScore(_ path: String, pattern: String, base: Int) -> Int? {
+        if tokenContainsPathSeparator(pattern) || pattern.contains("**") {
+            guard let match = structuredPathMatches(path: path, pattern: pattern) else {
+                return nil
+            }
+            let anchorBonus = match.startsAtRoot ? 450 : 0
+            let consumedBonus = min(match.matchedSegments * 80, 640)
+            return base + anchorBonus + consumedBonus - min(match.startSegment * 70, 700)
+        }
+
+        return wildcardMatches(path, pattern: pattern) ? base - min(path.count, 300) : nil
     }
 
     private static func parseClause(_ raw: String) -> (isNegative: Bool, clause: QueryClause) {
@@ -255,6 +288,8 @@ public enum FuzzyMatcher {
         guard !parsed.pattern.token.isEmpty else { return nil }
 
         switch field {
+        case .any where parsed.pattern.token.hasPrefix("*.") && parsed.pattern.token.count > 2:
+            return .fileExtension(makeSearchPattern(normalizedExtensionToken(parsed.pattern.token), mode: parsed.mode), mode: parsed.mode)
         case .any where parsed.pattern.token.hasPrefix(".") && parsed.pattern.token.count > 1:
             return .fileExtension(makeSearchPattern(String(parsed.pattern.token.dropFirst()), mode: parsed.mode), mode: parsed.mode)
         case .name, .path, .any:
@@ -272,12 +307,22 @@ public enum FuzzyMatcher {
         case .path:
             return .text(field: .path, pattern: parsed.pattern, mode: parsed.mode)
         case .fileExtension:
-            let extensionToken = parsed.pattern.token.hasPrefix(".") ? String(parsed.pattern.token.dropFirst()) : parsed.pattern.token
+            let extensionToken = normalizedExtensionToken(parsed.pattern.token)
             guard !extensionToken.isEmpty else { return nil }
             return .fileExtension(makeSearchPattern(extensionToken, mode: parsed.mode), mode: parsed.mode)
         case .kind:
             return .kind(parsed.pattern.token)
         }
+    }
+
+    private static func normalizedExtensionToken(_ token: String) -> String {
+        if token.hasPrefix("*.") {
+            return String(token.dropFirst(2))
+        }
+        if token.hasPrefix(".") {
+            return String(token.dropFirst())
+        }
+        return token
     }
 
     private enum ScopedField {
@@ -530,6 +575,128 @@ public enum FuzzyMatcher {
         }
 
         return previous[textChars.count]
+    }
+
+    private struct StructuredPathMatch {
+        let startSegment: Int
+        let matchedSegments: Int
+        let startsAtRoot: Bool
+    }
+
+    private static func structuredPathMatches(path: String, pattern rawPattern: String) -> StructuredPathMatch? {
+        let pattern = rawPattern.replacingOccurrences(of: "\\", with: "/")
+        let path = path.replacingOccurrences(of: "\\", with: "/")
+        let isRootAnchored = pattern.hasPrefix("/")
+        let pathSegments = splitPathSegments(from: path)
+        let patternSegments = splitPathSegments(from: pattern)
+
+        guard !patternSegments.isEmpty, !pathSegments.isEmpty else {
+            return nil
+        }
+
+        if isRootAnchored {
+            return structuredPathMatches(
+                pathSegments: pathSegments,
+                patternSegments: patternSegments,
+                startSegment: 0,
+                startsAtRoot: path.hasPrefix("/")
+            )
+        }
+
+        for start in pathSegments.indices {
+            if let match = structuredPathMatches(
+                pathSegments: pathSegments,
+                patternSegments: patternSegments,
+                startSegment: start,
+                startsAtRoot: false
+            ) {
+                return match
+            }
+        }
+
+        return nil
+    }
+
+    private static func structuredPathMatches(
+        pathSegments: [String],
+        patternSegments: [String],
+        startSegment: Int,
+        startsAtRoot: Bool
+    ) -> StructuredPathMatch? {
+        var memo: Set<Int> = []
+
+        func memoKey(patternIndex: Int, pathIndex: Int) -> Int {
+            (patternIndex << 16) | pathIndex
+        }
+
+        func match(patternIndex: Int, pathIndex: Int) -> Int? {
+            if patternIndex == patternSegments.count {
+                return pathIndex
+            }
+
+            let key = memoKey(patternIndex: patternIndex, pathIndex: pathIndex)
+            if memo.contains(key) {
+                return nil
+            }
+
+            let patternSegment = patternSegments[patternIndex]
+            if patternSegment == "**" {
+                if patternIndex == patternSegments.count - 1 {
+                    return pathSegments.count
+                }
+
+                for nextPathIndex in pathIndex...pathSegments.count {
+                    if let end = match(patternIndex: patternIndex + 1, pathIndex: nextPathIndex) {
+                        return end
+                    }
+                }
+
+                memo.insert(key)
+                return nil
+            }
+
+            guard pathIndex < pathSegments.count else {
+                memo.insert(key)
+                return nil
+            }
+
+            guard structuredSegmentMatches(pathSegments[pathIndex], pattern: patternSegment) else {
+                memo.insert(key)
+                return nil
+            }
+
+            if let end = match(patternIndex: patternIndex + 1, pathIndex: pathIndex + 1) {
+                return end
+            }
+
+            memo.insert(key)
+            return nil
+        }
+
+        guard let endSegment = match(patternIndex: 0, pathIndex: startSegment) else {
+            return nil
+        }
+
+        return StructuredPathMatch(
+            startSegment: startSegment,
+            matchedSegments: max(endSegment - startSegment, 0),
+            startsAtRoot: startsAtRoot
+        )
+    }
+
+    private static func structuredSegmentMatches(_ segment: String, pattern: String) -> Bool {
+        if pattern.contains("*") || pattern.contains("?") {
+            return wildcardMatches(segment, pattern: pattern)
+        }
+        return segment.hasPrefix(pattern)
+    }
+
+    private static func splitPathSegments(from value: String) -> [String] {
+        value.split { $0 == "/" || $0 == "\\" }.map(String.init)
+    }
+
+    private static func tokenContainsPathSeparator(_ token: String) -> Bool {
+        token.contains("/") || token.contains("\\")
     }
 
     private static func splitQuery(_ query: String) -> [String] {
