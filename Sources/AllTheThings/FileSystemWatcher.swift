@@ -43,7 +43,7 @@ final class FileSystemWatcher {
             &context,
             paths as CFArray,
             FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
-            0.2,
+            0.05,
             flags
         )
 
