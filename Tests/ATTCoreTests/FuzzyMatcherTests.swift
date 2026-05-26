@@ -18,6 +18,8 @@ struct FuzzyMatcherTests {
 
         #expect(FuzzyMatcher.score(record: cpp, query: ".cpp") != nil)
         #expect(FuzzyMatcher.score(record: swift, query: ".cpp") == nil)
+        #expect(FuzzyMatcher.score(record: cpp, query: "*.cpp") != nil)
+        #expect(FuzzyMatcher.score(record: swift, query: "*.cpp") == nil)
     }
 
     @Test("matches small typos")
@@ -84,6 +86,45 @@ struct FuzzyMatcherTests {
 
         #expect(FuzzyMatcher.score(record: match, query: "name:Search*.swift") != nil)
         #expect(FuzzyMatcher.score(record: miss, query: "name:Search*.swift") == nil)
+    }
+
+    @Test("supports Ant-style path wildcards")
+    func antStylePathWildcards() throws {
+        let record = try #require(makeRecord(
+            name: "fuzzy_match.hpp",
+            directory: "/Users/jaeger/Documents/Personal/containers/source/gct/strings"
+        ))
+
+        #expect(FuzzyMatcher.score(record: record, query: "source/**/*.hpp") != nil)
+        #expect(FuzzyMatcher.score(record: record, query: "**/gct/**/fuzzy*.hpp") != nil)
+        #expect(FuzzyMatcher.score(record: record, query: "source/*.hpp") == nil)
+        #expect(FuzzyMatcher.score(record: record, query: "**/gct/*.hpp") == nil)
+    }
+
+    @Test("supports slash-structured path prefixes")
+    func slashStructuredPathPrefixes() throws {
+        let record = try #require(makeRecord(
+            name: "fuzzy_match.hpp",
+            directory: "/Users/jaeger/Documents/Personal/containers/source/gct/strings"
+        ))
+
+        #expect(FuzzyMatcher.score(
+            record: record,
+            query: "/Users/jae/Doc/Per/cont/source/gct/str/fuzzy"
+        ) != nil)
+        #expect(FuzzyMatcher.score(
+            record: record,
+            query: "/Users/jaeger/Documents/Personal/source/containers"
+        ) == nil)
+    }
+
+    @Test("supports wildcard extension filters")
+    func wildcardExtensionFilters() throws {
+        let cpp = try #require(makeRecord(name: "SearchIndex.cpp"))
+        let swift = try #require(makeRecord(name: "SearchWindow.swift"))
+
+        #expect(FuzzyMatcher.score(record: cpp, query: "ext:*.cpp") != nil)
+        #expect(FuzzyMatcher.score(record: swift, query: "ext:*.cpp") == nil)
     }
 
     @Test("supports structured negative clauses")
