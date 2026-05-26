@@ -92,6 +92,7 @@ public final class FileIndex: @unchecked Sendable {
     private struct PersistedSnapshot: Codable {
         let savedAt: Date
         let roots: [String]?
+        let exclusionPatterns: [String]?
         let records: [FileRecord]
     }
 
@@ -464,6 +465,7 @@ public final class FileIndex: @unchecked Sendable {
     private var searchSnapshot = SearchSnapshot.empty
     private var searchSnapshotRevision: UInt64 = 0
     private var roots: [String] = []
+    private var exclusionRules: FileExclusionRules
     private var generation: UInt64 = 0
     private var persistRevision: UInt64 = 0
     private var snapshotLoadState = SnapshotLoadState.notStarted
@@ -475,9 +477,11 @@ public final class FileIndex: @unchecked Sendable {
     public init(
         fileManager: FileManager = .default,
         applicationName: String = "AllTheThings",
-        loadsSnapshotImmediately: Bool = true
+        loadsSnapshotImmediately: Bool = true,
+        exclusionPatterns: [String] = FileExclusionRules.defaultPatterns
     ) {
         self.fileManager = fileManager
+        self.exclusionRules = FileExclusionRules(patterns: exclusionPatterns)
 
         let supportRoot = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
@@ -504,6 +508,19 @@ public final class FileIndex: @unchecked Sendable {
     public func allRoots() -> [URL] {
         lock.withLock {
             roots.map { URL(fileURLWithPath: $0, isDirectory: true) }
+        }
+    }
+
+    public func allExclusionPatterns() -> [String] {
+        lock.withLock {
+            exclusionRules.patterns
+        }
+    }
+
+    public func updateExclusionPatterns(_ patterns: [String]) {
+        let rules = FileExclusionRules(patterns: patterns)
+        lock.withLock {
+            exclusionRules = rules
         }
     }
 
@@ -1495,6 +1512,14 @@ public final class FileIndex: @unchecked Sendable {
                 return false
             }
 
+            guard (persisted.exclusionPatterns ?? FileExclusionRules.defaultPatterns) == exclusionRules.patterns else {
+                snapshotLoadState = .finished
+                status = "Index settings changed"
+                indexing = false
+                lastUpdated = Date()
+                return true
+            }
+
             recordsByPath = records
             searchSnapshot = snapshot
             searchSnapshotRevision &+= 1
@@ -1512,6 +1537,7 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     private func rebuild(roots rootURLs: [URL], generation currentGeneration: UInt64) {
+        let exclusions = lock.withLock { exclusionRules }
         var localRecords: [String: FileRecord] = [:]
         let currentCount = lock.withLock { recordsByPath.count }
         localRecords.reserveCapacity(max(8_192, currentCount))
@@ -1529,7 +1555,7 @@ public final class FileIndex: @unchecked Sendable {
 
         for root in rootURLs {
             guard isCurrentGeneration(currentGeneration) else { return }
-            scan(root: root, into: &localRecords, visited: &visited) {
+            scan(root: root, exclusions: exclusions, rootPaths: rootURLs.map(\.path), into: &localRecords, visited: &visited) {
                 publishPartial(records: $0, visited: $1)
             }
             publishPartial(records: localRecords, visited: visited, force: true)
@@ -1542,11 +1568,13 @@ public final class FileIndex: @unchecked Sendable {
 
     private func scan(
         root: URL,
+        exclusions: FileExclusionRules,
+        rootPaths: [String],
         into records: inout [String: FileRecord],
         visited: inout Int,
         progress: (_ records: [String: FileRecord], _ visited: Int) -> Void
     ) {
-        guard fileManager.fileExists(atPath: root.path), !shouldExclude(root) else { return }
+        guard fileManager.fileExists(atPath: root.path), !shouldExclude(root, exclusions: exclusions, rootPaths: rootPaths, isDirectory: true) else { return }
 
         if let rootRecord = FileRecord(url: root) {
             records[rootRecord.path] = rootRecord
@@ -1563,12 +1591,14 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         for case let url as URL in enumerator {
-            if shouldExclude(url) {
-                enumerator.skipDescendants()
+            let values = try? url.resourceValues(forKeys: FileRecord.resourceKeys)
+            if shouldExclude(url, exclusions: exclusions, rootPaths: rootPaths, isDirectory: values?.isDirectory) {
+                if values?.isDirectory == true {
+                    enumerator.skipDescendants()
+                }
                 continue
             }
 
-            let values = try? url.resourceValues(forKeys: FileRecord.resourceKeys)
             if values?.isDirectory == true && isLikelyLoop(url) {
                 enumerator.skipDescendants()
                 continue
@@ -1586,22 +1616,30 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     private func refreshNow(paths: [String]) {
+        let indexState = lock.withLock {
+            (
+                exclusions: exclusionRules,
+                rootPaths: roots
+            )
+        }
         var upserts: [String: FileRecord] = [:]
         var deletedPrefixes: [String] = []
         var shallowDirectoryChildren: [String: Set<String>] = [:]
 
         for path in paths {
             let url = URL(fileURLWithPath: path).standardizedFileURL
-            guard !shouldExclude(url) else { continue }
+            guard !shouldExclude(url, exclusions: indexState.exclusions, rootPaths: indexState.rootPaths) else { continue }
 
             var isDirectory: ObjCBool = false
             if fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory) {
+                guard !shouldExclude(url, exclusions: indexState.exclusions, rootPaths: indexState.rootPaths, isDirectory: isDirectory.boolValue) else { continue }
+
                 if let record = FileRecord(url: url) {
                     upserts[record.path] = record
                 }
 
                 if isDirectory.boolValue {
-                    let children = scanDirectoryShallow(url)
+                    let children = scanDirectoryShallow(url, exclusions: indexState.exclusions, rootPaths: indexState.rootPaths)
                     shallowDirectoryChildren[url.path] = Set(children.map(\.path))
                     for record in children {
                         upserts[record.path] = record
@@ -1676,7 +1714,7 @@ public final class FileIndex: @unchecked Sendable {
         schedulePersist()
     }
 
-    private func scanDirectoryShallow(_ directory: URL) -> [FileRecord] {
+    private func scanDirectoryShallow(_ directory: URL, exclusions: FileExclusionRules, rootPaths: [String]) -> [FileRecord] {
         guard
             let children = try? fileManager.contentsOfDirectory(
                 at: directory,
@@ -1688,8 +1726,8 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         return children.compactMap { child in
-            guard !shouldExclude(child) else { return nil }
             let values = try? child.resourceValues(forKeys: FileRecord.resourceKeys)
+            guard !shouldExclude(child, exclusions: exclusions, rootPaths: rootPaths, isDirectory: values?.isDirectory) else { return nil }
             return FileRecord(url: child, resourceValues: values)
         }
     }
@@ -1723,10 +1761,16 @@ public final class FileIndex: @unchecked Sendable {
         let snapshotData = lock.withLock {
             (
                 roots: roots,
+                exclusionPatterns: exclusionRules.patterns,
                 records: Array(recordsByPath.values)
             )
         }
-        let snapshot = PersistedSnapshot(savedAt: Date(), roots: snapshotData.roots, records: snapshotData.records)
+        let snapshot = PersistedSnapshot(
+            savedAt: Date(),
+            roots: snapshotData.roots,
+            exclusionPatterns: snapshotData.exclusionPatterns,
+            records: snapshotData.records
+        )
 
         do {
             let data = try JSONEncoder().encode(snapshot)
@@ -1808,27 +1852,13 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
-    private func shouldExclude(_ url: URL) -> Bool {
-        let path = url.standardizedFileURL.path
-        let name = url.lastPathComponent
-
-        if name == "node_modules" || name == "DerivedData" {
-            return true
-        }
-
-        if path.hasSuffix("/.git/objects") || path.contains("/.git/objects/") {
-            return true
-        }
-
-        if path.contains("/Library/Caches/") || path.hasSuffix("/Library/Caches") {
-            return true
-        }
-
-        if path.contains("/.Trash/") || path.hasSuffix("/.Trash") {
-            return true
-        }
-
-        return false
+    private func shouldExclude(
+        _ url: URL,
+        exclusions: FileExclusionRules,
+        rootPaths: [String],
+        isDirectory: Bool? = nil
+    ) -> Bool {
+        exclusions.excludes(url: url, roots: rootPaths, isDirectory: isDirectory)
     }
 
     private func isLikelyLoop(_ url: URL) -> Bool {

@@ -278,6 +278,12 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             name: AppSettings.indexedRootsDidChangeNotification,
             object: nil
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(exclusionPatternsDidChange(_:)),
+            name: AppSettings.exclusionPatternsDidChangeNotification,
+            object: nil
+        )
 
         startWatching()
         updateLoadingOverlay()
@@ -704,7 +710,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         guard !stats.isLoadingSnapshot else { return }
 
-        guard indexRootPathsMatchConfiguredRoots() else {
+        guard indexSettingsMatchConfiguredSettings() else {
             startInitialRebuildIfNeeded()
             return
         }
@@ -786,7 +792,18 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         indexedRoots = updatedRoots
         startWatching()
+        rebuildIndexForCurrentSettings()
+    }
 
+    @objc private func exclusionPatternsDidChange(_ notification: Notification) {
+        let patterns = AppSettings.exclusionPatterns(defaults: defaults)
+        guard patterns != index.allExclusionPatterns() else { return }
+
+        index.updateExclusionPatterns(patterns)
+        rebuildIndexForCurrentSettings()
+    }
+
+    private func rebuildIndexForCurrentSettings() {
         activeSearchToken?.cancel()
         scheduledSearchSignature = nil
         results.removeAll(keepingCapacity: true)
@@ -799,7 +816,11 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         index.replaceRootsAndRebuild(indexedRoots)
     }
 
-    private func indexRootPathsMatchConfiguredRoots() -> Bool {
+    private func indexSettingsMatchConfiguredSettings() -> Bool {
+        guard index.allExclusionPatterns() == AppSettings.exclusionPatterns(defaults: defaults) else {
+            return false
+        }
+
         let indexRoots = index.allRoots()
         guard !indexRoots.isEmpty else {
             return indexStats.indexedCount == 0

@@ -133,6 +133,66 @@ struct FileIndexTests {
         #expect(response.results.map(\.record.name) == ["Alpha.swift", "Beta.swift"])
     }
 
+    @Test("custom exclusions apply during scan and refresh")
+    func customExclusionsApplyDuringScanAndRefresh() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        let ignoredDirectory = root.appendingPathComponent("ignored", isDirectory: true)
+        try fileManager.createDirectory(at: ignoredDirectory, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        let visibleFile = root.appendingPathComponent("Visible.swift")
+        let ignoredFile = root.appendingPathComponent("Ignored.tmp")
+        let ignoredChild = ignoredDirectory.appendingPathComponent("Hidden.swift")
+        try "visible".write(to: visibleFile, atomically: true, encoding: .utf8)
+        try "ignored".write(to: ignoredFile, atomically: true, encoding: .utf8)
+        try "hidden".write(to: ignoredChild, atomically: true, encoding: .utf8)
+
+        let index = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            exclusionPatterns: [
+                "*.tmp",
+                "ignored/"
+            ]
+        )
+        index.replaceRootsAndRebuild([root])
+
+        try await waitUntil {
+            let stats = index.currentStats()
+            return !stats.isIndexing && stats.indexedCount >= 2
+        }
+
+        var response = index.search(SearchRequest(
+            query: "",
+            sort: SortSpec(column: .name, ascending: true)
+        ), maxResults: 20)
+        var paths = Set(response.results.map(\.record.path))
+        #expect(paths.contains(visibleFile.path))
+        #expect(!paths.contains(ignoredFile.path))
+        #expect(!paths.contains(ignoredChild.path))
+
+        let refreshedVisible = root.appendingPathComponent("Refreshed.swift")
+        let refreshedIgnored = root.appendingPathComponent("Refreshed.tmp")
+        try "visible".write(to: refreshedVisible, atomically: true, encoding: .utf8)
+        try "ignored".write(to: refreshedIgnored, atomically: true, encoding: .utf8)
+        index.refresh(paths: [refreshedVisible.path, refreshedIgnored.path])
+
+        try await waitUntil {
+            response = index.search(SearchRequest(
+                query: "",
+                sort: SortSpec(column: .name, ascending: true)
+            ), maxResults: 20)
+            return response.results.contains { $0.record.path == refreshedVisible.path }
+        }
+
+        paths = Set(response.results.map(\.record.path))
+        #expect(paths.contains(refreshedVisible.path))
+        #expect(!paths.contains(refreshedIgnored.path))
+    }
+
     private func waitUntil(
         timeout: Duration = .seconds(5),
         pollInterval: Duration = .milliseconds(25),
