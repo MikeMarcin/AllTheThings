@@ -54,6 +54,12 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     private let contentContainer = NSView()
     private let generalSidebarRow = SidebarRow(section: .general)
     private let indexedFoldersSidebarRow = SidebarRow(section: .indexedFolders)
+    private let themeSegmentedControl = NSSegmentedControl(
+        labels: AppThemePreference.allCases.map(\.title),
+        trackingMode: .selectOne,
+        target: nil,
+        action: nil
+    )
     private let highlightSearchTextSwitch = NSSwitch()
     private let showHiddenFilesSwitch = NSSwitch()
     private let allowMultipleInstancesSwitch = NSSwitch()
@@ -86,11 +92,9 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     }
 
     override func loadView() {
-        view = NSView(frame: NSRect(x: 0, y: 0, width: 780, height: 640))
-        view.wantsLayer = true
-        view.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        view = ThemedBackgroundView(frame: NSRect(x: 0, y: 0, width: 780, height: 640))
         buildInterface()
-        updateSwitches()
+        updateControls()
         selectSection(.general)
     }
 
@@ -250,28 +254,34 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         let titleLabel = makeTitleLabel("General")
         let sectionLabel = makeSectionLabel("Application")
 
+        configureThemeControl()
         configureSwitch(highlightSearchTextSwitch, action: #selector(toggleHighlightSearchText(_:)))
         configureSwitch(showHiddenFilesSwitch, action: #selector(toggleShowHiddenFiles(_:)))
         configureSwitch(allowMultipleInstancesSwitch, action: #selector(toggleAllowMultipleInstances(_:)))
         configureSwitch(automaticallyCheckForUpdatesSwitch, action: #selector(toggleAutomaticallyCheckForUpdates(_:)))
 
         let settingsCard = makeSettingsCard(rows: [
-            makeSwitchRow(
+            makeControlRow(
+                title: "Theme",
+                detail: "Choose the app appearance.",
+                control: themeSegmentedControl
+            ),
+            makeControlRow(
                 title: "Highlight search text",
                 detail: "Highlight matching text in file names while searching.",
                 control: highlightSearchTextSwitch
             ),
-            makeSwitchRow(
+            makeControlRow(
                 title: "Show hidden files",
                 detail: "Include dotfiles and hidden items in search results.",
                 control: showHiddenFilesSwitch
             ),
-            makeSwitchRow(
+            makeControlRow(
                 title: "Allow multiple instances",
                 detail: "Open a new app instance instead of activating the existing one.",
                 control: allowMultipleInstancesSwitch
             ),
-            makeSwitchRow(
+            makeControlRow(
                 title: "Automatically check for updates",
                 detail: "Look for new GitHub releases in the background.",
                 control: automaticallyCheckForUpdatesSwitch
@@ -439,6 +449,19 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         control.action = action
     }
 
+    private func configureThemeControl() {
+        themeSegmentedControl.translatesAutoresizingMaskIntoConstraints = false
+        themeSegmentedControl.target = self
+        themeSegmentedControl.action = #selector(changeThemePreference(_:))
+        themeSegmentedControl.toolTip = "Theme"
+        themeSegmentedControl.setContentHuggingPriority(.required, for: .horizontal)
+        themeSegmentedControl.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        for segment in 0..<themeSegmentedControl.segmentCount {
+            themeSegmentedControl.setWidth(76, forSegment: segment)
+        }
+    }
+
     private func configureIconButton(_ button: NSButton, symbol: String, tooltip: String, action: Selector) {
         button.translatesAutoresizingMaskIntoConstraints = false
         button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: tooltip)
@@ -560,17 +583,10 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     }
 
     private func makeCard() -> NSView {
-        let card = NSView()
-        card.translatesAutoresizingMaskIntoConstraints = false
-        card.wantsLayer = true
-        card.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
-        card.layer?.borderColor = NSColor.separatorColor.cgColor
-        card.layer?.borderWidth = 1
-        card.layer?.cornerRadius = 8
-        return card
+        ThemedCardView(frame: .zero)
     }
 
-    private func makeSwitchRow(title: String, detail: String, control: NSSwitch) -> NSView {
+    private func makeControlRow(title: String, detail: String, control: NSControl) -> NSView {
         let row = NSView()
         row.translatesAutoresizingMaskIntoConstraints = false
 
@@ -781,11 +797,19 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         return true
     }
 
-    private func updateSwitches() {
+    private func updateControls() {
+        let themePreference = AppSettings.themePreference(defaults: defaults)
+        themeSegmentedControl.selectedSegment = AppThemePreference.allCases.firstIndex(of: themePreference) ?? 0
         highlightSearchTextSwitch.state = defaults.bool(forKey: AppSettings.highlightSearchTextKey) ? .on : .off
         showHiddenFilesSwitch.state = defaults.bool(forKey: AppSettings.showHiddenFilesKey) ? .on : .off
         allowMultipleInstancesSwitch.state = defaults.bool(forKey: AppSettings.allowMultipleInstancesKey) ? .on : .off
         automaticallyCheckForUpdatesSwitch.state = ReleaseUpdater.shared.automaticallyChecksForUpdates ? .on : .off
+    }
+
+    @objc private func changeThemePreference(_ sender: NSSegmentedControl) {
+        guard sender.selectedSegment >= 0, sender.selectedSegment < AppThemePreference.allCases.count else { return }
+
+        AppSettings.saveThemePreference(AppThemePreference.allCases[sender.selectedSegment], defaults: defaults)
     }
 
     @objc private func toggleHighlightSearchText(_ sender: NSSwitch) {
@@ -1001,7 +1025,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     }
 
     @objc private func userDefaultsDidChange(_ notification: Notification) {
-        updateSwitches()
+        updateControls()
     }
 }
 
@@ -1193,9 +1217,7 @@ private final class SidebarRow: NSControl {
 
     var isSelected = false {
         didSet {
-            layer?.backgroundColor = isSelected
-                ? NSColor.selectedContentBackgroundColor.withAlphaComponent(0.28).cgColor
-                : NSColor.clear.cgColor
+            updateSelectionBackground()
         }
     }
 
@@ -1206,6 +1228,7 @@ private final class SidebarRow: NSControl {
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
         layer?.cornerRadius = 8
+        updateSelectionBackground()
 
         iconView.translatesAutoresizingMaskIntoConstraints = false
         iconView.image = NSImage(systemSymbolName: section.symbolName, accessibilityDescription: section.title)
@@ -1236,6 +1259,17 @@ private final class SidebarRow: NSControl {
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateSelectionBackground()
+    }
+
+    private func updateSelectionBackground() {
+        layer?.backgroundColor = isSelected
+            ? AppTheme.resolvedCGColor(NSColor.selectedContentBackgroundColor.withAlphaComponent(0.28), for: self)
+            : AppTheme.resolvedCGColor(.clear, for: self)
     }
 
     override func mouseDown(with event: NSEvent) {

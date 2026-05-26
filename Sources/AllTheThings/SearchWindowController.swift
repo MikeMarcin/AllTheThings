@@ -189,7 +189,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private let copyButton = NSButton()
     private let addScopeButton = NSButton()
     private let reindexButton = NSButton()
-    private let loadingOverlay = NSView()
+    private let loadingOverlay = ThemedBackgroundView(backgroundColor: NSColor.windowBackgroundColor.withAlphaComponent(0.92))
     private let loadingIndicator = NSProgressIndicator()
     private let loadingLabel = NSTextField(labelWithString: "Loading file list...")
 
@@ -257,9 +257,11 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     override func loadView() {
-        view = NSView()
-        view.wantsLayer = true
-        view.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        let rootView = ThemedBackgroundView()
+        rootView.appearanceDidChange = { [weak self] in
+            self?.tableView.reloadData()
+        }
+        view = rootView
         buildInterface()
     }
 
@@ -528,8 +530,6 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     private func configureLoadingOverlay() {
         loadingOverlay.translatesAutoresizingMaskIntoConstraints = false
-        loadingOverlay.wantsLayer = true
-        loadingOverlay.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.92).cgColor
 
         loadingIndicator.translatesAutoresizingMaskIntoConstraints = false
         loadingIndicator.style = .spinning
@@ -914,12 +914,16 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             let lower = normalizedName.distance(from: normalizedName.startIndex, to: range.lowerBound)
             let upper = normalizedName.distance(from: normalizedName.startIndex, to: range.upperBound)
             attributed.addAttributes([
-                .foregroundColor: NSColor.systemYellow,
+                .foregroundColor: highlightTextColor(),
                 .font: NSFont.systemFont(ofSize: 12, weight: .bold)
             ], range: NSRange(location: lower, length: upper - lower))
         }
 
         return attributed
+    }
+
+    private func highlightTextColor() -> NSColor {
+        AppTheme.isDarkAppearance(for: view) ? .systemYellow : .systemOrange
     }
 
     private func sortSpec(for descriptor: NSSortDescriptor) -> SortSpec {

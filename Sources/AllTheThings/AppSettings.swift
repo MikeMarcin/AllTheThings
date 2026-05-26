@@ -1,14 +1,30 @@
 import Foundation
 import ATTCore
 
+enum AppThemePreference: String, CaseIterable {
+    case system
+    case light
+    case dark
+
+    var title: String {
+        switch self {
+        case .system: "System"
+        case .light: "Light"
+        case .dark: "Dark"
+        }
+    }
+}
+
 enum AppSettings {
     static let allowMultipleInstancesKey = "ATTAllowMultipleInstances"
     static let highlightSearchTextKey = "ATTHighlightSearchText"
     static let showHiddenFilesKey = "ATTShowHiddenFiles"
+    static let themePreferenceKey = "ATTThemePreference"
     static let indexedRootsKey = "ATTIndexedRoots"
     static let indexedRootsInitializedKey = "ATTIndexedRootsInitialized"
     static let exclusionPatternsKey = "ATTExclusionPatterns"
     static let exclusionDefaultsVersionKey = "ATTExclusionDefaultsVersion"
+    static let themePreferenceDidChangeNotification = Notification.Name("com.allthethings.settings.themePreferenceDidChange")
     static let indexedRootsDidChangeNotification = Notification.Name("com.allthethings.settings.indexedRootsDidChange")
     static let exclusionPatternsDidChangeNotification = Notification.Name("com.allthethings.settings.exclusionPatternsDidChange")
 
@@ -44,9 +60,29 @@ enum AppSettings {
             allowMultipleInstancesKey: false,
             highlightSearchTextKey: true,
             showHiddenFilesKey: false,
+            themePreferenceKey: AppThemePreference.system.rawValue,
             exclusionPatternsKey: FileExclusionRules.defaultPatterns
         ])
         migrateExclusionDefaults(defaults)
+    }
+
+    static func themePreference(defaults: UserDefaults = .standard) -> AppThemePreference {
+        guard
+            let rawValue = defaults.string(forKey: themePreferenceKey),
+            let preference = AppThemePreference(rawValue: rawValue)
+        else {
+            return .system
+        }
+
+        return preference
+    }
+
+    static func saveThemePreference(_ preference: AppThemePreference, defaults: UserDefaults = .standard) {
+        guard themePreference(defaults: defaults) != preference else { return }
+
+        defaults.set(preference.rawValue, forKey: themePreferenceKey)
+        defaults.synchronize()
+        NotificationCenter.default.post(name: themePreferenceDidChangeNotification, object: defaults)
     }
 
     static func indexedRoots(defaults: UserDefaults = .standard) -> [URL] {
