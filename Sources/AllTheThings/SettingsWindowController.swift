@@ -229,7 +229,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         scrollView.borderType = .noBorder
         scrollView.drawsBackground = false
 
-        let contentView = NSView()
+        let contentView = FlippedView()
         contentView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.documentView = contentView
 
@@ -237,7 +237,8 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
             contentView.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
             contentView.leadingAnchor.constraint(equalTo: scrollView.contentView.leadingAnchor),
             contentView.trailingAnchor.constraint(equalTo: scrollView.contentView.trailingAnchor),
-            contentView.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor)
+            contentView.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
+            contentView.heightAnchor.constraint(greaterThanOrEqualTo: scrollView.contentView.heightAnchor)
         ])
 
         return (scrollView, contentView)
@@ -1002,6 +1003,11 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     @objc private func userDefaultsDidChange(_ notification: Notification) {
         updateSwitches()
     }
+}
+
+@MainActor
+private final class FlippedView: NSView {
+    override var isFlipped: Bool { true }
 }
 
 @MainActor
