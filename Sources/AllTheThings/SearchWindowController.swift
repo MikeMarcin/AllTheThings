@@ -279,6 +279,11 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         updateActionButtons()
     }
 
+    func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
+        guard row >= 0, row < results.count else { return nil }
+        return results[row].record.url as NSURL
+    }
+
     func tableView(_ tableView: NSTableView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
         guard let descriptor = tableView.sortDescriptors.first else { return }
         sortSpec = sortSpec(for: descriptor)
@@ -358,6 +363,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         tableView.intercellSpacing = NSSize(width: 3, height: 1)
         tableView.style = .fullWidth
         tableView.allowsMultipleSelection = true
+        tableView.setDraggingSourceOperationMask(.copy, forLocal: false)
         tableView.allowsColumnReordering = true
         tableView.allowsColumnResizing = true
         tableView.doubleAction = #selector(openSelected(_:))
