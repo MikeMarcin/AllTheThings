@@ -170,6 +170,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private struct SearchSignature: Equatable {
         let query: String
         let sort: SortSpec
+        let includeHidden: Bool
     }
 
     private let index: FileIndex
@@ -207,6 +208,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var didRequestInitialSnapshotLoad = false
     private var didRequestInitialRebuild = false
     private var highlightsSearchText: Bool
+    private var showsHiddenFiles: Bool
 
     private enum DefaultsKey {
         static let sortColumn = "ATTSortColumn"
@@ -241,6 +243,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         self.sortSpec = Self.normalizedSortSpec(Self.loadSortSpec(defaults: defaults), visibleColumns: visibleColumns)
         self.indexedRoots = AppSettings.indexedRoots(defaults: defaults)
         self.highlightsSearchText = defaults.bool(forKey: AppSettings.highlightSearchTextKey)
+        self.showsHiddenFiles = defaults.bool(forKey: AppSettings.showHiddenFilesKey)
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -673,8 +676,12 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private func scheduleSearch(force: Bool = false) {
         guard !indexStats.isLoadingSnapshot else { return }
 
-        let request = SearchRequest(query: currentSearchText(), sort: sortSpec)
-        let signature = SearchSignature(query: request.query, sort: request.sort)
+        let request = SearchRequest(query: currentSearchText(), sort: sortSpec, includeHidden: showsHiddenFiles)
+        let signature = SearchSignature(
+            query: request.query,
+            sort: request.sort,
+            includeHidden: request.includeHidden
+        )
         guard force || signature != scheduledSearchSignature else { return }
         scheduledSearchSignature = signature
 
@@ -774,10 +781,17 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     private func settingsDidChange() {
         let updatedHighlightsSearchText = defaults.bool(forKey: AppSettings.highlightSearchTextKey)
-        guard updatedHighlightsSearchText != highlightsSearchText else { return }
+        let updatedShowsHiddenFiles = defaults.bool(forKey: AppSettings.showHiddenFilesKey)
 
-        highlightsSearchText = updatedHighlightsSearchText
-        tableView.reloadData()
+        if updatedHighlightsSearchText != highlightsSearchText {
+            highlightsSearchText = updatedHighlightsSearchText
+            tableView.reloadData()
+        }
+
+        if updatedShowsHiddenFiles != showsHiddenFiles {
+            showsHiddenFiles = updatedShowsHiddenFiles
+            scheduleSearch(force: true)
+        }
     }
 
     @objc private func userDefaultsDidChange(_ notification: Notification) {

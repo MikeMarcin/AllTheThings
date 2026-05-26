@@ -54,6 +54,7 @@ private final class SettingsViewController: NSViewController {
     private let generalSidebarRow = SidebarRow(section: .general)
     private let indexedFoldersSidebarRow = SidebarRow(section: .indexedFolders)
     private let highlightSearchTextSwitch = NSSwitch()
+    private let showHiddenFilesSwitch = NSSwitch()
     private let allowMultipleInstancesSwitch = NSSwitch()
     private let automaticallyCheckForUpdatesSwitch = NSSwitch()
     private let rootsStack = NSStackView()
@@ -96,6 +97,12 @@ private final class SettingsViewController: NSViewController {
             self,
             selector: #selector(exclusionPatternsDidChange(_:)),
             name: AppSettings.exclusionPatternsDidChangeNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(userDefaultsDidChange(_:)),
+            name: UserDefaults.didChangeNotification,
             object: nil
         )
     }
@@ -231,6 +238,7 @@ private final class SettingsViewController: NSViewController {
         let sectionLabel = makeSectionLabel("Application")
 
         configureSwitch(highlightSearchTextSwitch, action: #selector(toggleHighlightSearchText(_:)))
+        configureSwitch(showHiddenFilesSwitch, action: #selector(toggleShowHiddenFiles(_:)))
         configureSwitch(allowMultipleInstancesSwitch, action: #selector(toggleAllowMultipleInstances(_:)))
         configureSwitch(automaticallyCheckForUpdatesSwitch, action: #selector(toggleAutomaticallyCheckForUpdates(_:)))
 
@@ -239,6 +247,11 @@ private final class SettingsViewController: NSViewController {
                 title: "Highlight search text",
                 detail: "Highlight matching text in file names while searching.",
                 control: highlightSearchTextSwitch
+            ),
+            makeSwitchRow(
+                title: "Show hidden files",
+                detail: "Include dotfiles and hidden items in search results.",
+                control: showHiddenFilesSwitch
             ),
             makeSwitchRow(
                 title: "Allow multiple instances",
@@ -629,12 +642,18 @@ private final class SettingsViewController: NSViewController {
 
     private func updateSwitches() {
         highlightSearchTextSwitch.state = defaults.bool(forKey: AppSettings.highlightSearchTextKey) ? .on : .off
+        showHiddenFilesSwitch.state = defaults.bool(forKey: AppSettings.showHiddenFilesKey) ? .on : .off
         allowMultipleInstancesSwitch.state = defaults.bool(forKey: AppSettings.allowMultipleInstancesKey) ? .on : .off
         automaticallyCheckForUpdatesSwitch.state = ReleaseUpdater.shared.automaticallyChecksForUpdates ? .on : .off
     }
 
     @objc private func toggleHighlightSearchText(_ sender: NSSwitch) {
         defaults.set(sender.state == .on, forKey: AppSettings.highlightSearchTextKey)
+        defaults.synchronize()
+    }
+
+    @objc private func toggleShowHiddenFiles(_ sender: NSSwitch) {
+        defaults.set(sender.state == .on, forKey: AppSettings.showHiddenFilesKey)
         defaults.synchronize()
     }
 
@@ -698,6 +717,10 @@ private final class SettingsViewController: NSViewController {
 
     @objc private func exclusionPatternsDidChange(_ notification: Notification) {
         renderExclusionPatterns()
+    }
+
+    @objc private func userDefaultsDidChange(_ notification: Notification) {
+        updateSwitches()
     }
 }
 

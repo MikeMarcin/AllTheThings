@@ -4,6 +4,7 @@ import ATTCore
 enum AppSettings {
     static let allowMultipleInstancesKey = "ATTAllowMultipleInstances"
     static let highlightSearchTextKey = "ATTHighlightSearchText"
+    static let showHiddenFilesKey = "ATTShowHiddenFiles"
     static let indexedRootsKey = "ATTIndexedRoots"
     static let indexedRootsInitializedKey = "ATTIndexedRootsInitialized"
     static let exclusionPatternsKey = "ATTExclusionPatterns"
@@ -14,6 +15,7 @@ enum AppSettings {
         defaults.register(defaults: [
             allowMultipleInstancesKey: false,
             highlightSearchTextKey: true,
+            showHiddenFilesKey: false,
             exclusionPatternsKey: FileExclusionRules.defaultPatterns
         ])
     }
