@@ -91,6 +91,7 @@ public final class FileIndex: @unchecked Sendable {
 
     private struct PersistedSnapshot: Codable {
         let savedAt: Date
+        let roots: [String]?
         let records: [FileRecord]
     }
 
@@ -1497,6 +1498,7 @@ public final class FileIndex: @unchecked Sendable {
             recordsByPath = records
             searchSnapshot = snapshot
             searchSnapshotRevision &+= 1
+            roots = persisted.roots ?? []
             snapshotLoadState = .finished
             status = "Loaded \(records.count) indexed files"
             indexing = false
@@ -1718,10 +1720,13 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     private func persistSnapshot() {
-        let records = lock.withLock {
-            Array(recordsByPath.values)
+        let snapshotData = lock.withLock {
+            (
+                roots: roots,
+                records: Array(recordsByPath.values)
+            )
         }
-        let snapshot = PersistedSnapshot(savedAt: Date(), records: records)
+        let snapshot = PersistedSnapshot(savedAt: Date(), roots: snapshotData.roots, records: snapshotData.records)
 
         do {
             let data = try JSONEncoder().encode(snapshot)

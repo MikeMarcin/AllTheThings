@@ -209,7 +209,6 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var highlightsSearchText: Bool
 
     private enum DefaultsKey {
-        static let roots = "ATTIndexedRoots"
         static let sortColumn = "ATTSortColumn"
         static let sortAscending = "ATTSortAscending"
         static let visibleColumns = "ATTVisibleColumns"
@@ -240,7 +239,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         self.indexStats = index.currentStats()
         self.visibleColumns = visibleColumns
         self.sortSpec = Self.normalizedSortSpec(Self.loadSortSpec(defaults: defaults), visibleColumns: visibleColumns)
-        self.indexedRoots = Self.loadRoots(defaults: defaults, key: DefaultsKey.roots)
+        self.indexedRoots = AppSettings.indexedRoots(defaults: defaults)
         self.highlightsSearchText = defaults.bool(forKey: AppSettings.highlightSearchTextKey)
         super.init(nibName: nil, bundle: nil)
     }
@@ -271,6 +270,12 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             self,
             selector: #selector(userDefaultsDidChange(_:)),
             name: UserDefaults.didChangeNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(indexedRootsDidChange(_:)),
+            name: AppSettings.indexedRootsDidChangeNotification,
             object: nil
         )
 
@@ -314,7 +319,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             textField?.attributedStringValue = highlightedName(record.name)
             textField?.lineBreakMode = .byTruncatingMiddle
         case .path:
-            textField?.stringValue = record.directoryPath
+            textField?.stringValue = AppSettings.displayPath(record.directoryPath)
             textField?.textColor = .secondaryLabelColor
             textField?.lineBreakMode = .byTruncatingMiddle
         case .modified:
@@ -699,6 +704,11 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         guard !stats.isLoadingSnapshot else { return }
 
+        guard indexRootPathsMatchConfiguredRoots() else {
+            startInitialRebuildIfNeeded()
+            return
+        }
+
         if stats.indexedCount == 0, !stats.isIndexing {
             startInitialRebuildIfNeeded()
             return
@@ -725,7 +735,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func startInitialRebuildIfNeeded() {
-        guard didRequestInitialSnapshotLoad, !didRequestInitialRebuild, !indexedRoots.isEmpty else {
+        guard didRequestInitialSnapshotLoad, !didRequestInitialRebuild else {
             return
         }
 
@@ -768,6 +778,40 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         settingsDidChange()
     }
 
+    @objc private func indexedRootsDidChange(_ notification: Notification) {
+        let updatedRoots = AppSettings.indexedRoots(defaults: defaults)
+        guard rootPaths(updatedRoots) != rootPaths(indexedRoots) else {
+            return
+        }
+
+        indexedRoots = updatedRoots
+        startWatching()
+
+        activeSearchToken?.cancel()
+        scheduledSearchSignature = nil
+        results.removeAll(keepingCapacity: true)
+        totalMatches = 0
+        queryElapsed = 0
+        tableView.reloadData()
+        updateStatus()
+        updateLoadingOverlay()
+
+        index.replaceRootsAndRebuild(indexedRoots)
+    }
+
+    private func indexRootPathsMatchConfiguredRoots() -> Bool {
+        let indexRoots = index.allRoots()
+        guard !indexRoots.isEmpty else {
+            return indexStats.indexedCount == 0
+        }
+
+        return rootPaths(indexRoots) == rootPaths(indexedRoots)
+    }
+
+    private func rootPaths(_ roots: [URL]) -> [String] {
+        roots.map(\.standardizedFileURL.path)
+    }
+
     private func startWatching() {
         watcher.start(roots: indexedRoots) { @MainActor @Sendable [weak self] paths in
             self?.coalesceFSEvents(paths)
@@ -796,7 +840,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let milliseconds = Int((queryElapsed * 1_000).rounded())
         countLabel.stringValue = "\(shownCount.formatted()) shown / \(total) matches • \(indexed) indexed • \(milliseconds) ms"
 
-        let scopeText = indexedRoots.map(\.path).joined(separator: "  ")
+        let scopeText = indexedRoots.map { AppSettings.displayPath($0) }.joined(separator: "  ")
         let indexingText = indexStats.isLoadingSnapshot ? "Loading" : (indexStats.isIndexing ? "Indexing" : "Ready")
         statusLabel.stringValue = "\(indexingText) • \(indexStats.status) • \(scopeText)"
     }
@@ -1197,7 +1241,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func saveRoots() {
-        defaults.set(indexedRoots.map(\.path), forKey: DefaultsKey.roots)
+        AppSettings.saveIndexedRoots(indexedRoots, defaults: defaults)
     }
 
     private func saveSortSpec() {
@@ -1210,26 +1254,6 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             .filter { visibleColumns.contains($0) }
             .map(\.rawValue)
         defaults.set(ordered, forKey: DefaultsKey.visibleColumns)
-    }
-
-    private static func loadRoots(defaults: UserDefaults, key: String) -> [URL] {
-        if let saved = defaults.array(forKey: key) as? [String], !saved.isEmpty {
-            return saved.map { URL(fileURLWithPath: $0, isDirectory: true) }
-        }
-
-        let fileManager = FileManager.default
-        let home = fileManager.homeDirectoryForCurrentUser
-        let candidates = [
-            home.appendingPathComponent("Desktop", isDirectory: true),
-            home.appendingPathComponent("Documents", isDirectory: true),
-            home.appendingPathComponent("Downloads", isDirectory: true),
-            home.appendingPathComponent("Developer", isDirectory: true),
-            URL(fileURLWithPath: "/Applications", isDirectory: true)
-        ]
-
-        let roots = candidates.filter { fileManager.fileExists(atPath: $0.path) }
-        defaults.set(roots.map(\.path), forKey: key)
-        return roots
     }
 
     private static func loadSortSpec(defaults: UserDefaults) -> SortSpec {
