@@ -9,8 +9,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private let defaults = UserDefaults.standard
     private var windowController: SearchWindowController?
+    private var aboutWindowController: NSWindowController?
     private var noticesWindowController: NSWindowController?
     private var allowMultipleInstancesMenuItem: NSMenuItem?
+    private var automaticallyCheckForUpdatesMenuItem: NSMenuItem?
 
     override init() {
         defaults.register(defaults: [
@@ -54,11 +56,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @MainActor
     private func finishLaunching() {
         configureMainMenu()
-        showPrimaryWindow(activate: true)
+        let window = showPrimaryWindow(activate: true)
+        ReleaseUpdater.shared.checkAutomaticallyIfNeeded(presentingWindow: window)
     }
 
+    @discardableResult
     @MainActor
-    private func showPrimaryWindow(activate: Bool) {
+    private func showPrimaryWindow(activate: Bool) -> NSWindow? {
         let controller: SearchWindowController
         if let existingController = windowController {
             controller = existingController
@@ -73,6 +77,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if activate {
             NSApp.activate()
         }
+
+        return controller.window
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -122,6 +128,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateSettingsMenuItems()
     }
 
+    @objc @MainActor private func toggleAutomaticallyCheckForUpdates(_ sender: NSMenuItem) {
+        ReleaseUpdater.shared.automaticallyChecksForUpdates.toggle()
+        updateSettingsMenuItems()
+    }
+
+    @objc @MainActor private func checkForUpdates(_ sender: Any?) {
+        ReleaseUpdater.shared.checkForUpdates(presentingWindow: windowController?.window, userInitiated: true)
+    }
+
+    @objc @MainActor private func showAboutWindow(_ sender: Any?) {
+        let controller: NSWindowController
+        if let existingController = aboutWindowController {
+            controller = existingController
+        } else {
+            controller = makeAboutWindowController()
+            aboutWindowController = controller
+        }
+
+        controller.showWindow(nil)
+        controller.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate()
+    }
+
+    @objc @MainActor private func openGameCoreTechWebsite(_ sender: Any?) {
+        open(urlString: "https://gamecoretech.com/")
+    }
+
+    @objc @MainActor private func openGitHubRepository(_ sender: Any?) {
+        open(urlString: "https://github.com/MikeMarcin/AllTheThings")
+    }
+
     @objc @MainActor private func showThirdPartyNotices(_ sender: Any?) {
         let controller: NSWindowController
         if let existingController = noticesWindowController {
@@ -139,6 +176,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @MainActor
     private func updateSettingsMenuItems() {
         allowMultipleInstancesMenuItem?.state = allowsMultipleInstances ? .on : .off
+        automaticallyCheckForUpdatesMenuItem?.state = ReleaseUpdater.shared.automaticallyChecksForUpdates ? .on : .off
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -151,7 +189,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let appItem = NSMenuItem()
         let appMenu = NSMenu()
-        appMenu.addItem(withTitle: "About AllTheThings", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        let aboutItem = NSMenuItem(
+            title: "About AllTheThings",
+            action: #selector(showAboutWindow(_:)),
+            keyEquivalent: ""
+        )
+        aboutItem.target = self
+        appMenu.addItem(aboutItem)
         appMenu.addItem(.separator())
 
         let allowMultipleItem = NSMenuItem(
@@ -162,6 +206,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         allowMultipleItem.target = self
         appMenu.addItem(allowMultipleItem)
         allowMultipleInstancesMenuItem = allowMultipleItem
+
+        let automaticUpdatesItem = NSMenuItem(
+            title: "Automatically Check for Updates",
+            action: #selector(toggleAutomaticallyCheckForUpdates(_:)),
+            keyEquivalent: ""
+        )
+        automaticUpdatesItem.target = self
+        appMenu.addItem(automaticUpdatesItem)
+        automaticallyCheckForUpdatesMenuItem = automaticUpdatesItem
+
+        let checkUpdatesItem = NSMenuItem(
+            title: "Check for Updates...",
+            action: #selector(checkForUpdates(_:)),
+            keyEquivalent: ""
+        )
+        checkUpdatesItem.target = self
+        appMenu.addItem(checkUpdatesItem)
         updateSettingsMenuItems()
 
         appMenu.addItem(.separator())
@@ -205,6 +266,129 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         mainMenu.addItem(helpItem)
 
         NSApp.mainMenu = mainMenu
+    }
+
+    @MainActor
+    private func makeAboutWindowController() -> NSWindowController {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: 520),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "About AllTheThings"
+        window.isRestorable = false
+
+        let logoView = NSImageView()
+        logoView.translatesAutoresizingMaskIntoConstraints = false
+        logoView.image = gameCoreTechLogo()
+        logoView.imageScaling = .scaleProportionallyUpOrDown
+        logoView.imageAlignment = .alignCenter
+
+        let titleLabel = NSTextField(labelWithString: "AllTheThings")
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        titleLabel.font = .systemFont(ofSize: 24, weight: .semibold)
+        titleLabel.alignment = .center
+        titleLabel.textColor = .labelColor
+
+        let versionLabel = NSTextField(labelWithString: versionText())
+        versionLabel.translatesAutoresizingMaskIntoConstraints = false
+        versionLabel.font = .systemFont(ofSize: 13, weight: .regular)
+        versionLabel.alignment = .center
+        versionLabel.textColor = .secondaryLabelColor
+
+        let makerLabel = NSTextField(labelWithString: "Made by Game Core Tech")
+        makerLabel.translatesAutoresizingMaskIntoConstraints = false
+        makerLabel.font = .systemFont(ofSize: 15, weight: .medium)
+        makerLabel.alignment = .center
+        makerLabel.textColor = .labelColor
+
+        let websiteButton = makeLinkButton(
+            title: "gamecoretech.com",
+            action: #selector(openGameCoreTechWebsite(_:))
+        )
+        let githubButton = makeLinkButton(
+            title: "github.com/MikeMarcin/AllTheThings",
+            action: #selector(openGitHubRepository(_:))
+        )
+
+        let linkStack = NSStackView(views: [websiteButton, githubButton])
+        linkStack.translatesAutoresizingMaskIntoConstraints = false
+        linkStack.orientation = .vertical
+        linkStack.alignment = .centerX
+        linkStack.spacing = 6
+
+        let contentStack = NSStackView(views: [
+            logoView,
+            titleLabel,
+            versionLabel,
+            makerLabel,
+            linkStack
+        ])
+        contentStack.translatesAutoresizingMaskIntoConstraints = false
+        contentStack.orientation = .vertical
+        contentStack.alignment = .centerX
+        contentStack.spacing = 10
+        contentStack.setCustomSpacing(18, after: logoView)
+        contentStack.setCustomSpacing(20, after: versionLabel)
+
+        let contentView = NSView()
+        contentView.addSubview(contentStack)
+        NSLayoutConstraint.activate([
+            logoView.widthAnchor.constraint(equalToConstant: 250),
+            logoView.heightAnchor.constraint(equalToConstant: 250),
+            contentStack.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 34),
+            contentStack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 32),
+            contentStack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -32),
+            contentStack.bottomAnchor.constraint(lessThanOrEqualTo: contentView.bottomAnchor, constant: -28)
+        ])
+
+        window.contentView = contentView
+        window.center()
+
+        return NSWindowController(window: window)
+    }
+
+    @MainActor
+    private func makeLinkButton(title: String, action: Selector) -> NSButton {
+        let button = NSButton(title: title, target: self, action: action)
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.isBordered = false
+        button.bezelStyle = .inline
+        button.font = .systemFont(ofSize: 13, weight: .regular)
+        button.contentTintColor = .linkColor
+        button.setButtonType(.momentaryChange)
+        return button
+    }
+
+    @MainActor
+    private func gameCoreTechLogo() -> NSImage? {
+        if let url = Bundle.main.url(forResource: "GameCoreTechLogo", withExtension: "png"),
+           let image = NSImage(contentsOf: url) {
+            return image
+        }
+
+        return NSApp.applicationIconImage
+    }
+
+    private func versionText() -> String {
+        let info = Bundle.main.infoDictionary
+        let version = info?["CFBundleShortVersionString"] as? String
+        let build = info?["CFBundleVersion"] as? String
+
+        switch (version, build) {
+        case let (.some(version), .some(build)):
+            return "Version \(version) (\(build))"
+        case let (.some(version), .none):
+            return "Version \(version)"
+        default:
+            return "Version unavailable"
+        }
+    }
+
+    private func open(urlString: String) {
+        guard let url = URL(string: urlString) else { return }
+        NSWorkspace.shared.open(url)
     }
 
     @MainActor

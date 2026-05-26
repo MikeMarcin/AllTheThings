@@ -39,6 +39,12 @@ Run it with:
 cmake --build --preset run
 ```
 
+## Updates
+
+AllTheThings checks GitHub for new releases from `MikeMarcin/AllTheThings` once per day on launch. You can also run the check manually from **AllTheThings > Check for Updates...** or disable automatic checks from **AllTheThings > Automatically Check for Updates**.
+
+The updater expects published GitHub releases with a downloadable `.dmg`, `.zip`, `.tar.gz`, or `.tgz` asset. If no installable asset is attached, the app opens the release page instead.
+
 ## VSCode
 
 The repository includes VSCode workspace tasks:
