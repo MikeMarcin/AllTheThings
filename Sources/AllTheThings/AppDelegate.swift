@@ -4,20 +4,16 @@ import ATTCore
 // AppKit invokes these Objective-C delegate hooks during startup; hop to the
 // main queue before touching Swift @MainActor AppKit APIs.
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private static let allowMultipleInstancesKey = "ATTAllowMultipleInstances"
     private static let activationRequestNotification = Notification.Name("com.allthethings.app.activateExistingInstance")
 
     private let defaults = UserDefaults.standard
     private var windowController: SearchWindowController?
+    private var settingsWindowController: NSWindowController?
     private var aboutWindowController: NSWindowController?
     private var noticesWindowController: NSWindowController?
-    private var allowMultipleInstancesMenuItem: NSMenuItem?
-    private var automaticallyCheckForUpdatesMenuItem: NSMenuItem?
 
     override init() {
-        defaults.register(defaults: [
-            Self.allowMultipleInstancesKey: false
-        ])
+        AppSettings.registerDefaults(defaults)
         super.init()
 
         DistributedNotificationCenter.default().addObserver(
@@ -87,7 +83,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private var allowsMultipleInstances: Bool {
-        defaults.bool(forKey: Self.allowMultipleInstancesKey)
+        defaults.bool(forKey: AppSettings.allowMultipleInstancesKey)
     }
 
     private func existingInstance() -> NSRunningApplication? {
@@ -122,19 +118,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         showPrimaryWindow(activate: true)
     }
 
-    @objc @MainActor private func toggleAllowMultipleInstances(_ sender: NSMenuItem) {
-        defaults.set(!allowsMultipleInstances, forKey: Self.allowMultipleInstancesKey)
-        defaults.synchronize()
-        updateSettingsMenuItems()
-    }
-
-    @objc @MainActor private func toggleAutomaticallyCheckForUpdates(_ sender: NSMenuItem) {
-        ReleaseUpdater.shared.automaticallyChecksForUpdates.toggle()
-        updateSettingsMenuItems()
-    }
-
     @objc @MainActor private func checkForUpdates(_ sender: Any?) {
         ReleaseUpdater.shared.checkForUpdates(presentingWindow: windowController?.window, userInitiated: true)
+    }
+
+    @objc @MainActor private func showSettingsWindow(_ sender: Any?) {
+        let controller: NSWindowController
+        if let existingController = settingsWindowController {
+            controller = existingController
+        } else {
+            controller = SettingsWindowController(defaults: defaults)
+            settingsWindowController = controller
+        }
+
+        controller.showWindow(nil)
+        controller.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate()
     }
 
     @objc @MainActor private func showAboutWindow(_ sender: Any?) {
@@ -173,12 +172,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate()
     }
 
-    @MainActor
-    private func updateSettingsMenuItems() {
-        allowMultipleInstancesMenuItem?.state = allowsMultipleInstances ? .on : .off
-        automaticallyCheckForUpdatesMenuItem?.state = ReleaseUpdater.shared.automaticallyChecksForUpdates ? .on : .off
-    }
-
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
     }
@@ -196,25 +189,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         aboutItem.target = self
         appMenu.addItem(aboutItem)
+
+        let settingsItem = NSMenuItem(
+            title: "Settings...",
+            action: #selector(showSettingsWindow(_:)),
+            keyEquivalent: ","
+        )
+        settingsItem.target = self
+        appMenu.addItem(settingsItem)
+
         appMenu.addItem(.separator())
-
-        let allowMultipleItem = NSMenuItem(
-            title: "Allow Multiple Instances",
-            action: #selector(toggleAllowMultipleInstances(_:)),
-            keyEquivalent: ""
-        )
-        allowMultipleItem.target = self
-        appMenu.addItem(allowMultipleItem)
-        allowMultipleInstancesMenuItem = allowMultipleItem
-
-        let automaticUpdatesItem = NSMenuItem(
-            title: "Automatically Check for Updates",
-            action: #selector(toggleAutomaticallyCheckForUpdates(_:)),
-            keyEquivalent: ""
-        )
-        automaticUpdatesItem.target = self
-        appMenu.addItem(automaticUpdatesItem)
-        automaticallyCheckForUpdatesMenuItem = automaticUpdatesItem
 
         let checkUpdatesItem = NSMenuItem(
             title: "Check for Updates...",
@@ -223,7 +207,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         checkUpdatesItem.target = self
         appMenu.addItem(checkUpdatesItem)
-        updateSettingsMenuItems()
 
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Quit AllTheThings", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
