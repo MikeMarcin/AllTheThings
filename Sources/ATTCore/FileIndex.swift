@@ -157,6 +157,58 @@ public final class FileIndex: @unchecked Sendable {
             }
         }
 
+        private init(records: [FileRecord], modifiedDescending: [Int], gramIndex: [Int: [Int32]]) {
+            self.records = records
+            self.modifiedDescending = modifiedDescending
+            self.modifiedAscending = Array(modifiedDescending.reversed())
+            self.gramIndex = gramIndex
+            self.hasSortedOrder = true
+        }
+
+        func updatingMetadata(for upserts: [String: FileRecord]) -> SearchSnapshot? {
+            guard hasSortedOrder, !upserts.isEmpty else { return nil }
+
+            let upsertPaths = Set(upserts.keys)
+            var existingIndices: [String: Int] = [:]
+            existingIndices.reserveCapacity(upserts.count)
+
+            for (index, record) in records.enumerated() where upsertPaths.contains(record.path) {
+                existingIndices[record.path] = index
+                if existingIndices.count == upserts.count {
+                    break
+                }
+            }
+
+            guard existingIndices.count == upserts.count else {
+                return nil
+            }
+
+            var updatedRecords = records
+            var changedIndices: [Int] = []
+            changedIndices.reserveCapacity(upserts.count)
+
+            for (path, record) in upserts {
+                guard let index = existingIndices[path] else {
+                    return nil
+                }
+                updatedRecords[index] = record
+                changedIndices.append(index)
+            }
+
+            let changed = Set(changedIndices)
+            let unchangedDescending = modifiedDescending.filter { !changed.contains($0) }
+            let changedDescending = changedIndices.sorted {
+                Self.modifiedDescendingPrecedes($0, $1, records: updatedRecords)
+            }
+            let mergedDescending = Self.mergeModifiedDescending(
+                changed: changedDescending,
+                unchanged: unchangedDescending,
+                records: updatedRecords
+            )
+
+            return SearchSnapshot(records: updatedRecords, modifiedDescending: mergedDescending, gramIndex: gramIndex)
+        }
+
         func orderedIndices(for sort: SortSpec, queryIsEmpty: Bool) -> [Int]? {
             guard hasSortedOrder else { return nil }
 
@@ -192,6 +244,50 @@ public final class FileIndex: @unchecked Sendable {
             }
 
             return FileIndex.intersectPostingLists(postings)
+        }
+
+        private static func mergeModifiedDescending(changed: [Int], unchanged: [Int], records: [FileRecord]) -> [Int] {
+            var merged: [Int] = []
+            merged.reserveCapacity(changed.count + unchanged.count)
+
+            var changedIndex = 0
+            var unchangedIndex = 0
+
+            while changedIndex < changed.count, unchangedIndex < unchanged.count {
+                let changedRecordIndex = changed[changedIndex]
+                let unchangedRecordIndex = unchanged[unchangedIndex]
+
+                if modifiedDescendingPrecedes(changedRecordIndex, unchangedRecordIndex, records: records) {
+                    merged.append(changedRecordIndex)
+                    changedIndex += 1
+                } else {
+                    merged.append(unchangedRecordIndex)
+                    unchangedIndex += 1
+                }
+            }
+
+            if changedIndex < changed.count {
+                merged.append(contentsOf: changed[changedIndex...])
+            }
+
+            if unchangedIndex < unchanged.count {
+                merged.append(contentsOf: unchanged[unchangedIndex...])
+            }
+
+            return merged
+        }
+
+        private static func modifiedDescendingPrecedes(_ lhs: Int, _ rhs: Int, records: [FileRecord]) -> Bool {
+            let left = records[lhs]
+            let right = records[rhs]
+
+            if left.modifiedTime != right.modifiedTime {
+                return left.modifiedTime > right.modifiedTime
+            }
+            if left.normalizedName != right.normalizedName {
+                return left.normalizedName < right.normalizedName
+            }
+            return left.path < right.path
         }
 
         private static func makeGramIndex(records: [FileRecord]) -> [Int: [Int32]] {
@@ -894,10 +990,14 @@ public final class FileIndex: @unchecked Sendable {
             return
         }
 
+        var fastSnapshot: SearchSnapshot?
         var snapshotRecords: [FileRecord] = []
         var snapshotRevision: UInt64 = 0
+        let canUseFastMetadataUpdate = deletedPrefixes.isEmpty && shallowDirectoryChildren.isEmpty
 
         lock.withLock {
+            let previousSnapshot = searchSnapshot
+
             for prefix in deletedPrefixes {
                 recordsByPath = recordsByPath.filter { path, _ in
                     path != prefix && !path.hasPrefix(prefix + "/")
@@ -916,9 +1016,27 @@ public final class FileIndex: @unchecked Sendable {
 
             searchSnapshotRevision &+= 1
             snapshotRevision = searchSnapshotRevision
-            snapshotRecords = Array(recordsByPath.values)
             status = "Updated \(upserts.count + deletedPrefixes.count) changed path\(upserts.count + deletedPrefixes.count == 1 ? "" : "s")"
             lastUpdated = Date()
+
+            if canUseFastMetadataUpdate {
+                fastSnapshot = previousSnapshot.updatingMetadata(for: upserts)
+            }
+
+            if fastSnapshot == nil {
+                snapshotRecords = Array(recordsByPath.values)
+            }
+        }
+
+        if let fastSnapshot {
+            lock.withLock {
+                if searchSnapshotRevision == snapshotRevision {
+                    searchSnapshot = fastSnapshot
+                }
+            }
+            publishStats()
+            schedulePersist()
+            return
         }
 
         let snapshot = SearchSnapshot(records: snapshotRecords)

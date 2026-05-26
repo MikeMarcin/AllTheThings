@@ -108,7 +108,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private let rootsKey = "ATTIndexedRoots"
 
     private let searchField = NSSearchField()
-    private let tableView = NSTableView()
+    private let tableView = FileTableView()
     private let scrollView = NSScrollView()
     private let statusLabel = NSTextField(labelWithString: "")
     private let countLabel = NSTextField(labelWithString: "")
@@ -258,6 +258,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         menu.removeAllItems()
         menu.addItem(withTitle: "Open", action: #selector(openSelected(_:)), keyEquivalent: "")
         menu.addItem(withTitle: "Reveal in Finder", action: #selector(revealSelected(_:)), keyEquivalent: "")
+        menu.addItem(withTitle: "Copy File", action: #selector(copy(_:)), keyEquivalent: "")
         menu.addItem(withTitle: "Copy Path", action: #selector(copySelectedPath(_:)), keyEquivalent: "")
     }
 
@@ -308,6 +309,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         tableView.allowsColumnResizing = true
         tableView.doubleAction = #selector(openSelected(_:))
         tableView.target = self
+        tableView.copyAction = { [weak self] in
+            self?.copySelectedFiles()
+        }
 
         let menu = NSMenu()
         menu.delegate = self
@@ -456,7 +460,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
 
         eventDebounce = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: workItem)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: workItem)
     }
 
     private func updateStatus() {
@@ -472,16 +476,21 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func updateActionButtons() {
-        let enabled = selectedRecord() != nil
+        let enabled = !selectedRecords().isEmpty
         openButton.isEnabled = enabled
         revealButton.isEnabled = enabled
         copyButton.isEnabled = enabled
     }
 
     private func selectedRecord() -> FileRecord? {
-        let row = tableView.selectedRow
-        guard row >= 0, row < results.count else { return nil }
-        return results[row].record
+        selectedRecords().first
+    }
+
+    private func selectedRecords() -> [FileRecord] {
+        tableView.selectedRowIndexes.compactMap { row in
+            guard row >= 0, row < results.count else { return nil }
+            return results[row].record
+        }
     }
 
     private func highlightedName(_ name: String) -> NSAttributedString {
@@ -558,10 +567,26 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         NSWorkspace.shared.activateFileViewerSelecting([record.url])
     }
 
+    @objc private func copy(_ sender: Any?) {
+        copySelectedFiles()
+    }
+
+    private func copySelectedFiles() {
+        let records = selectedRecords()
+        guard !records.isEmpty else { return }
+
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.writeObjects(records.map { $0.url as NSURL })
+        pasteboard.setString(records.map(\.path).joined(separator: "\n"), forType: .string)
+    }
+
     @objc private func copySelectedPath(_ sender: Any?) {
-        guard let record = selectedRecord() else { return }
+        let records = selectedRecords()
+        guard !records.isEmpty else { return }
+
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(record.path, forType: .string)
+        NSPasteboard.general.setString(records.map(\.path).joined(separator: "\n"), forType: .string)
     }
 
     private func saveRoots() {
@@ -603,6 +628,14 @@ private final class SearchCancellationToken: @unchecked Sendable {
         lock.withLock {
             cancelled = true
         }
+    }
+}
+
+private final class FileTableView: NSTableView {
+    var copyAction: (() -> Void)?
+
+    @objc func copy(_ sender: Any?) {
+        copyAction?()
     }
 }
 
