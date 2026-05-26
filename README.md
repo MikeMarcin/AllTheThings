@@ -2,11 +2,10 @@
 
 AllTheThings is a native macOS file-search app for one fast workflow: type a filename or path query, then act on the matching files from a sortable, live-updating table.
 
-![AllTheThings filtering a sanitized demo folder](docs/images/allthethings-demo.webp)
-
-[Static PNG fallback](docs/images/allthethings-demo.png)
-
-The screenshot above was captured from a throwaway `/tmp/allthethings-readme-demo` folder. It does not contain real home-directory paths, client names, cloud folders, or personal files.
+<picture>
+  <source srcset="docs/images/allthethings-demo.webp" type="image/webp">
+  <img src="docs/images/allthethings-demo.png" alt="AllTheThings filtering a sample project folder with atlas *.swift">
+</picture>
 
 ## Requirements
 
