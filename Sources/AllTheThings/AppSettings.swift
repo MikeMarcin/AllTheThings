@@ -8,8 +8,36 @@ enum AppSettings {
     static let indexedRootsKey = "ATTIndexedRoots"
     static let indexedRootsInitializedKey = "ATTIndexedRootsInitialized"
     static let exclusionPatternsKey = "ATTExclusionPatterns"
+    static let exclusionDefaultsVersionKey = "ATTExclusionDefaultsVersion"
     static let indexedRootsDidChangeNotification = Notification.Name("com.allthethings.settings.indexedRootsDidChange")
     static let exclusionPatternsDidChangeNotification = Notification.Name("com.allthethings.settings.exclusionPatternsDidChange")
+
+    private static let currentExclusionDefaultsVersion = 3
+    private static let versionOneDefaultExclusionPatterns = [
+        "node_modules/",
+        "DerivedData/",
+        ".git/objects/",
+        "Library/Caches/",
+        ".Trash/"
+    ]
+    private static let retiredVersionTwoDefaultExclusionPatterns = [
+        "bower_components/",
+        "vendor/bundle/",
+        "Pods/",
+        "Carthage/Build/",
+        ".build/",
+        "build/",
+        "dist/",
+        "out/",
+        "target/",
+        "CMakeFiles/",
+        "cmake-build-*/",
+        ".gradle/",
+        ".next/",
+        ".nuxt/",
+        ".venv/",
+        "venv/"
+    ]
 
     static func registerDefaults(_ defaults: UserDefaults = .standard) {
         defaults.register(defaults: [
@@ -18,6 +46,7 @@ enum AppSettings {
             showHiddenFilesKey: false,
             exclusionPatternsKey: FileExclusionRules.defaultPatterns
         ])
+        migrateExclusionDefaults(defaults)
     }
 
     static func indexedRoots(defaults: UserDefaults = .standard) -> [URL] {
@@ -84,5 +113,44 @@ enum AppSettings {
         }
 
         return unique
+    }
+
+    private static func migrateExclusionDefaults(_ defaults: UserDefaults) {
+        let currentVersion = defaults.integer(forKey: exclusionDefaultsVersionKey)
+        guard currentVersion < currentExclusionDefaultsVersion else { return }
+
+        var patterns = exclusionPatterns(defaults: defaults)
+        var didChangePatterns = false
+
+        if currentVersion < 3 {
+            let retiredPatterns = Set(retiredVersionTwoDefaultExclusionPatterns)
+            let filteredPatterns = patterns.filter { !retiredPatterns.contains($0) }
+            if filteredPatterns.count != patterns.count {
+                patterns = filteredPatterns
+                didChangePatterns = true
+            }
+        }
+
+        let additions = defaultExclusionPatternsAdded(after: currentVersion)
+        if !additions.isEmpty {
+            var existingPatterns = Set(patterns)
+
+            for pattern in additions where existingPatterns.insert(pattern).inserted {
+                patterns.append(pattern)
+                didChangePatterns = true
+            }
+        }
+
+        if didChangePatterns {
+            defaults.set(patterns, forKey: exclusionPatternsKey)
+        }
+
+        defaults.set(currentExclusionDefaultsVersion, forKey: exclusionDefaultsVersionKey)
+        defaults.synchronize()
+    }
+
+    private static func defaultExclusionPatternsAdded(after version: Int) -> [String] {
+        guard version < 2 else { return [] }
+        return FileExclusionRules.defaultPatterns.filter { !versionOneDefaultExclusionPatterns.contains($0) }
     }
 }

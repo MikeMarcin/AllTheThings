@@ -2,9 +2,23 @@ import Foundation
 
 public struct FileExclusionRules: @unchecked Sendable {
     public static let defaultPatterns = [
+        ".git/objects/",
+        ".git/modules/**/objects/",
+        ".git/lfs/objects/",
+        ".hg/store/",
+        ".svn/pristine/",
         "node_modules/",
         "DerivedData/",
-        ".git/objects/",
+        ".gradle/caches/",
+        ".dart_tool/",
+        ".next/cache/",
+        ".parcel-cache/",
+        ".turbo/",
+        "__pycache__/",
+        ".pytest_cache/",
+        ".mypy_cache/",
+        ".ruff_cache/",
+        ".cache/",
         "Library/Caches/",
         ".Trash/"
     ]
