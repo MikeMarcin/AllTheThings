@@ -71,14 +71,14 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         var width: CGFloat {
             switch self {
-            case .name: 260
-            case .path: 420
-            case .modified: 150
-            case .size: 96
-            case .created: 150
-            case .ext: 70
-            case .kind: 80
-            case .volume: 120
+            case .name: 220
+            case .path: 380
+            case .modified: 112
+            case .size: 72
+            case .created: 112
+            case .ext: 48
+            case .kind: 52
+            case .volume: 80
             }
         }
 
@@ -132,8 +132,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     private lazy var dateFormatter: DateFormatter = {
         let formatter = DateFormatter()
-        formatter.dateStyle = .medium
-        formatter.timeStyle = .medium
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "M/d/yyyy HH:mm"
         return formatter
     }()
 
@@ -299,7 +299,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         tableView.delegate = self
         tableView.dataSource = self
         tableView.usesAlternatingRowBackgroundColors = true
-        tableView.rowSizeStyle = .medium
+        tableView.rowSizeStyle = .small
+        tableView.rowHeight = 20
+        tableView.intercellSpacing = NSSize(width: 3, height: 1)
         tableView.style = .fullWidth
         tableView.allowsMultipleSelection = true
         tableView.allowsColumnReordering = true
@@ -315,7 +317,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             let tableColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(column.rawValue))
             tableColumn.title = column.title
             tableColumn.width = column.width
-            tableColumn.minWidth = min(column.width, 70)
+            tableColumn.minWidth = min(column.width, 48)
             tableColumn.sortDescriptorPrototype = NSSortDescriptor(key: column.rawValue, ascending: column != .modified && column != .size)
             tableView.addTableColumn(tableColumn)
         }
@@ -389,7 +391,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         textField.translatesAutoresizingMaskIntoConstraints = false
         textField.usesSingleLineMode = true
         textField.lineBreakMode = .byTruncatingMiddle
-        textField.font = .systemFont(ofSize: 13)
+        textField.font = .systemFont(ofSize: 12)
         cell.addSubview(textField)
         cell.textField = textField
 
@@ -485,7 +487,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private func highlightedName(_ name: String) -> NSAttributedString {
         let attributed = NSMutableAttributedString(string: name, attributes: [
             .foregroundColor: NSColor.labelColor,
-            .font: NSFont.systemFont(ofSize: 13, weight: .semibold)
+            .font: NSFont.systemFont(ofSize: 12, weight: .semibold)
         ])
 
         let query = searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -499,7 +501,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             let upper = normalizedName.distance(from: normalizedName.startIndex, to: range.upperBound)
             attributed.addAttributes([
                 .foregroundColor: NSColor.systemYellow,
-                .font: NSFont.systemFont(ofSize: 13, weight: .bold)
+                .font: NSFont.systemFont(ofSize: 12, weight: .bold)
             ], range: NSRange(location: lower, length: upper - lower))
         }
 
