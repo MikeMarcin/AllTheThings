@@ -1,5 +1,6 @@
 import AppKit
 import ATTCore
+import UniformTypeIdentifiers
 
 final class SearchWindowController: NSWindowController {
     private enum WindowLayout {
@@ -92,6 +93,40 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             case .ext: .fileExtension
             case .kind: .kind
             case .volume: .volume
+            }
+        }
+    }
+
+    private enum TerminalService: CaseIterable {
+        case ghosttyTab
+        case ghosttyWindow
+        case iTermTab
+        case iTermWindow
+
+        var title: String {
+            switch self {
+            case .ghosttyTab: "New Ghostty Tab Here"
+            case .ghosttyWindow: "New Ghostty Window Here"
+            case .iTermTab: "New iTerm2 Tab Here"
+            case .iTermWindow: "New iTerm2 Window Here"
+            }
+        }
+
+        var bundleIdentifiers: [String] {
+            switch self {
+            case .ghosttyTab, .ghosttyWindow:
+                ["com.mitchellh.ghostty"]
+            case .iTermTab, .iTermWindow:
+                ["com.googlecode.iterm2"]
+            }
+        }
+
+        var fallbackAppNames: [String] {
+            switch self {
+            case .ghosttyTab, .ghosttyWindow:
+                ["Ghostty"]
+            case .iTermTab, .iTermWindow:
+                ["iTerm", "iTerm2"]
             }
         }
     }
@@ -256,10 +291,28 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        menu.addItem(withTitle: "Open", action: #selector(openSelected(_:)), keyEquivalent: "")
-        menu.addItem(withTitle: "Reveal in Finder", action: #selector(revealSelected(_:)), keyEquivalent: "")
-        menu.addItem(withTitle: "Copy File", action: #selector(copy(_:)), keyEquivalent: "")
-        menu.addItem(withTitle: "Copy Path", action: #selector(copySelectedPath(_:)), keyEquivalent: "")
+        let records = selectedRecords()
+        let hasSelection = !records.isEmpty
+        let hasSingleSelection = records.count == 1
+
+        menu.addItem(actionItem("Open", #selector(openSelected(_:)), enabled: hasSelection))
+        menu.addItem(openWithMenuItem(enabled: hasSingleSelection))
+        menu.addItem(.separator())
+        menu.addItem(actionItem("Move to Trash", #selector(moveSelectedToTrash(_:)), enabled: hasSelection))
+        menu.addItem(.separator())
+        menu.addItem(actionItem("Get Info", #selector(getInfoSelected(_:)), enabled: hasSingleSelection))
+        menu.addItem(actionItem("Rename", #selector(renameSelected(_:)), enabled: hasSingleSelection))
+        menu.addItem(actionItem("Quick Look", #selector(quickLookSelected(_:)), enabled: hasSelection))
+        menu.addItem(.separator())
+        menu.addItem(actionItem("Copy", #selector(copy(_:)), enabled: hasSelection))
+        menu.addItem(actionItem("Copy Path", #selector(copySelectedPath(_:)), enabled: hasSelection))
+        menu.addItem(actionItem("Reveal in Finder", #selector(revealSelected(_:)), enabled: hasSelection))
+
+        let terminalItems = terminalMenuItems(enabled: hasSingleSelection)
+        if !terminalItems.isEmpty {
+            menu.addItem(.separator())
+            terminalItems.forEach { menu.addItem($0) }
+        }
     }
 
     private func buildInterface() {
@@ -385,6 +438,63 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             button.widthAnchor.constraint(equalToConstant: 32),
             button.heightAnchor.constraint(equalToConstant: 28)
         ])
+    }
+
+    private func actionItem(_ title: String, _ selector: Selector, enabled: Bool = true) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
+        item.target = self
+        item.isEnabled = enabled
+        return item
+    }
+
+    private func openWithMenuItem(enabled: Bool) -> NSMenuItem {
+        let item = NSMenuItem(title: "Open With", action: nil, keyEquivalent: "")
+        item.isEnabled = enabled
+
+        let submenu = NSMenu(title: "Open With")
+        guard enabled, let record = selectedRecord() else {
+            let unavailable = NSMenuItem(title: "No Applications", action: nil, keyEquivalent: "")
+            unavailable.isEnabled = false
+            submenu.addItem(unavailable)
+            item.submenu = submenu
+            return item
+        }
+
+        let applicationURLs = NSWorkspace.shared.urlsForApplications(toOpen: record.url)
+        if applicationURLs.isEmpty {
+            let unavailable = NSMenuItem(title: "No Applications", action: nil, keyEquivalent: "")
+            unavailable.isEnabled = false
+            submenu.addItem(unavailable)
+        } else {
+            for applicationURL in applicationURLs.prefix(12) {
+                let applicationName = FileManager.default.displayName(atPath: applicationURL.path)
+                let applicationItem = NSMenuItem(title: applicationName, action: #selector(openSelectedWithApplication(_:)), keyEquivalent: "")
+                applicationItem.target = self
+                applicationItem.representedObject = applicationURL
+                applicationItem.image = NSWorkspace.shared.icon(forFile: applicationURL.path)
+                applicationItem.image?.size = NSSize(width: 16, height: 16)
+                submenu.addItem(applicationItem)
+            }
+        }
+
+        submenu.addItem(.separator())
+        submenu.addItem(actionItem("Other...", #selector(openSelectedWithOtherApplication(_:)), enabled: true))
+        item.submenu = submenu
+        return item
+    }
+
+    private func terminalMenuItems(enabled: Bool) -> [NSMenuItem] {
+        TerminalService.allCases.compactMap { service in
+            guard isApplicationInstalled(bundleIdentifiers: service.bundleIdentifiers, fallbackAppNames: service.fallbackAppNames) else {
+                return nil
+            }
+
+            let item = NSMenuItem(title: service.title, action: #selector(openTerminalHere(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = service.title
+            item.isEnabled = enabled
+            return item
+        }
     }
 
     private func makeCell(for identifier: NSUserInterfaceItemIdentifier) -> NSTableCellView {
@@ -565,9 +675,182 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         NSWorkspace.shared.open(record.url)
     }
 
+    @objc private func openSelectedWithApplication(_ sender: NSMenuItem) {
+        guard
+            let applicationURL = sender.representedObject as? URL,
+            !selectedRecords().isEmpty
+        else {
+            return
+        }
+
+        openSelectedRecords(with: applicationURL)
+    }
+
+    @objc private func openSelectedWithOtherApplication(_ sender: Any?) {
+        guard !selectedRecords().isEmpty else { return }
+
+        let panel = NSOpenPanel()
+        panel.title = "Choose Application"
+        panel.prompt = "Open"
+        panel.directoryURL = URL(fileURLWithPath: "/Applications", isDirectory: true)
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.applicationBundle]
+
+        let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard response == .OK, let applicationURL = panel.url else { return }
+            self?.openSelectedRecords(with: applicationURL)
+        }
+
+        if let window = view.window {
+            panel.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            completion(panel.runModal())
+        }
+    }
+
+    private func openSelectedRecords(with applicationURL: URL) {
+        let urls = selectedRecords().map(\.url)
+        guard !urls.isEmpty else { return }
+
+        NSWorkspace.shared.open(
+            urls,
+            withApplicationAt: applicationURL,
+            configuration: NSWorkspace.OpenConfiguration()
+        ) { [weak self] _, error in
+            if let error {
+                self?.presentError("Could not open item.", informativeText: error.localizedDescription)
+            }
+        }
+    }
+
     @objc private func revealSelected(_ sender: Any?) {
+        let urls = selectedRecords().map(\.url)
+        guard !urls.isEmpty else { return }
+        NSWorkspace.shared.activateFileViewerSelecting(urls)
+    }
+
+    @objc private func moveSelectedToTrash(_ sender: Any?) {
+        let records = selectedRecords()
+        guard !records.isEmpty else { return }
+
+        var changedPaths: [String] = []
+        for record in records {
+            do {
+                var trashedURL: NSURL?
+                try FileManager.default.trashItem(at: record.url, resultingItemURL: &trashedURL)
+                changedPaths.append(record.path)
+            } catch {
+                presentError("Could not move item to Trash.", informativeText: error.localizedDescription)
+                break
+            }
+        }
+
+        if !changedPaths.isEmpty {
+            index.refresh(paths: changedPaths)
+            scheduleSearch(force: true)
+        }
+    }
+
+    @objc private func getInfoSelected(_ sender: Any?) {
         guard let record = selectedRecord() else { return }
-        NSWorkspace.shared.activateFileViewerSelecting([record.url])
+        let path = appleScriptStringLiteral(record.path)
+        let source = """
+        tell application "Finder"
+            activate
+            open information window of (POSIX file "\(path)" as alias)
+        end tell
+        """
+
+        var error: NSDictionary?
+        NSAppleScript(source: source)?.executeAndReturnError(&error)
+        if let error {
+            presentError("Could not show item info.", informativeText: error.description)
+        }
+    }
+
+    @objc private func renameSelected(_ sender: Any?) {
+        guard let record = selectedRecord() else { return }
+
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
+        field.stringValue = record.name
+
+        let alert = NSAlert()
+        alert.messageText = "Rename"
+        alert.informativeText = record.directoryPath
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Rename")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+
+        let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            self?.rename(record: record, to: field.stringValue)
+        }
+
+        if let window = view.window {
+            alert.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            completion(alert.runModal())
+        }
+    }
+
+    private func rename(record: FileRecord, to rawName: String) {
+        let newName = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !newName.isEmpty, newName != record.name else { return }
+        guard !newName.contains("/") else {
+            presentError("Could not rename item.", informativeText: "Names cannot contain slashes.")
+            return
+        }
+
+        let destination = URL(fileURLWithPath: record.directoryPath, isDirectory: true).appendingPathComponent(newName)
+        guard !FileManager.default.fileExists(atPath: destination.path) else {
+            presentError("Could not rename item.", informativeText: "An item named \"\(newName)\" already exists.")
+            return
+        }
+
+        do {
+            try FileManager.default.moveItem(at: record.url, to: destination)
+            index.refresh(paths: [record.path, destination.path])
+            scheduleSearch(force: true)
+        } catch {
+            presentError("Could not rename item.", informativeText: error.localizedDescription)
+        }
+    }
+
+    @objc private func quickLookSelected(_ sender: Any?) {
+        let paths = selectedRecords().map(\.path)
+        guard !paths.isEmpty else { return }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/qlmanage")
+        process.arguments = ["-p"] + paths
+
+        do {
+            try process.run()
+        } catch {
+            presentError("Could not Quick Look item.", informativeText: error.localizedDescription)
+        }
+    }
+
+    @objc private func openTerminalHere(_ sender: NSMenuItem) {
+        guard
+            let serviceTitle = sender.representedObject as? String,
+            let record = selectedRecord()
+        else {
+            return
+        }
+
+        let directoryPath = terminalDirectoryPath(for: record)
+        let pasteboard = NSPasteboard.withUniqueName()
+        pasteboard.clearContents()
+        pasteboard.setString(directoryPath, forType: .string)
+        pasteboard.setPropertyList([directoryPath], forType: NSPasteboard.PasteboardType("NSFilenamesPboardType"))
+
+        if !NSPerformService(serviceTitle, pasteboard) {
+            presentError("Could not open terminal here.", informativeText: "\(serviceTitle) is not available from Services.")
+        }
     }
 
     @objc private func copy(_ sender: Any?) {
@@ -590,6 +873,52 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(records.map(\.path).joined(separator: "\n"), forType: .string)
+    }
+
+    private func terminalDirectoryPath(for record: FileRecord) -> String {
+        record.isDirectory ? record.path : record.directoryPath
+    }
+
+    private func isApplicationInstalled(bundleIdentifiers: [String], fallbackAppNames: [String]) -> Bool {
+        for bundleIdentifier in bundleIdentifiers where NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier) != nil {
+            return true
+        }
+
+        let homeApplications = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications", isDirectory: true)
+        let applicationDirectories = [
+            URL(fileURLWithPath: "/Applications", isDirectory: true),
+            homeApplications
+        ]
+
+        for directory in applicationDirectories {
+            for appName in fallbackAppNames {
+                let candidate = directory.appendingPathComponent(appName).appendingPathExtension("app")
+                if FileManager.default.fileExists(atPath: candidate.path) {
+                    return true
+                }
+            }
+        }
+
+        return false
+    }
+
+    private func appleScriptStringLiteral(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+    }
+
+    private func presentError(_ message: String, informativeText: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = message
+        alert.informativeText = informativeText
+
+        if let window = view.window {
+            alert.beginSheetModal(for: window)
+        } else {
+            alert.runModal()
+        }
     }
 
     private func saveRoots() {
@@ -640,6 +969,16 @@ private final class FileTableView: NSTableView {
 
     @objc func copy(_ sender: Any?) {
         copyAction?()
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        let location = convert(event.locationInWindow, from: nil)
+        let clickedRow = row(at: location)
+        if clickedRow >= 0, !selectedRowIndexes.contains(clickedRow) {
+            selectRowIndexes(IndexSet(integer: clickedRow), byExtendingSelection: false)
+        }
+
+        super.rightMouseDown(with: event)
     }
 
     override func keyDown(with event: NSEvent) {
