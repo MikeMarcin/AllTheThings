@@ -102,6 +102,37 @@ struct FileIndexTests {
         #expect(abs(refreshedModifiedTime - newestDate.timeIntervalSinceReferenceDate) < 0.001)
     }
 
+    @Test("search applies name sort to small result sets")
+    func searchAppliesNameSortToSmallResultSets() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        let beta = root.appendingPathComponent("Beta.swift")
+        let alpha = root.appendingPathComponent("Alpha.swift")
+        try "beta".write(to: beta, atomically: true, encoding: .utf8)
+        try "alpha".write(to: alpha, atomically: true, encoding: .utf8)
+
+        let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)")
+        index.replaceRootsAndRebuild([root])
+
+        try await waitUntil {
+            let stats = index.currentStats()
+            return !stats.isIndexing && stats.indexedCount >= 3
+        }
+
+        let response = index.search(SearchRequest(
+            query: ".swift",
+            sort: SortSpec(column: .name, ascending: true)
+        ), maxResults: 10)
+
+        #expect(response.results.map(\.record.name) == ["Alpha.swift", "Beta.swift"])
+    }
+
     private func waitUntil(
         timeout: Duration = .seconds(5),
         pollInterval: Duration = .milliseconds(25),

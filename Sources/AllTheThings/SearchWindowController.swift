@@ -95,6 +95,42 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             case .volume: .volume
             }
         }
+
+        var menuTitle: String {
+            switch self {
+            case .name: "Name"
+            case .path: "Path"
+            case .modified: "Date Modified"
+            case .size: "Size"
+            case .created: "Date Created"
+            case .ext: "Extension"
+            case .kind: "Kind"
+            case .volume: "Volume"
+            }
+        }
+
+        static func column(for sortColumn: SortColumn) -> Column? {
+            switch sortColumn {
+            case .relevance:
+                nil
+            case .name:
+                .name
+            case .path:
+                .path
+            case .modified:
+                .modified
+            case .created:
+                .created
+            case .size:
+                .size
+            case .fileExtension:
+                .ext
+            case .kind:
+                .kind
+            case .volume:
+                .volume
+            }
+        }
     }
 
     private enum TerminalService: CaseIterable {
@@ -140,10 +176,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private let watcher = FileSystemWatcher()
     private let searchQueue = DispatchQueue(label: "att.search", qos: .userInitiated, attributes: .concurrent)
     private let defaults = UserDefaults.standard
-    private let rootsKey = "ATTIndexedRoots"
 
     private let searchField = NSSearchField()
     private let tableView = FileTableView()
+    private let headerMenu = NSMenu()
     private let scrollView = NSScrollView()
     private let statusLabel = NSTextField(labelWithString: "")
     private let countLabel = NSTextField(labelWithString: "")
@@ -160,10 +196,21 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var queryGeneration: UInt64 = 0
     private var activeSearchToken: SearchCancellationToken?
     private var scheduledSearchSignature: SearchSignature?
-    private var sortSpec = SortSpec(column: .modified, ascending: false)
+    private var sortSpec: SortSpec
+    private var visibleColumns: Set<Column>
     private var indexedRoots: [URL]
     private var pendingEventPaths = Set<String>()
     private var eventDebounce: DispatchWorkItem?
+
+    private enum DefaultsKey {
+        static let roots = "ATTIndexedRoots"
+        static let sortColumn = "ATTSortColumn"
+        static let sortAscending = "ATTSortAscending"
+        static let visibleColumns = "ATTVisibleColumns"
+    }
+
+    private static let defaultSortSpec = SortSpec(column: .name, ascending: true)
+    private static let defaultVisibleColumns = Set(Column.allCases)
 
     private lazy var dateFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -180,9 +227,13 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }()
 
     init(index: FileIndex) {
+        let defaults = UserDefaults.standard
+        let visibleColumns = Self.loadVisibleColumns(defaults: defaults)
         self.index = index
         self.indexStats = index.currentStats()
-        self.indexedRoots = Self.loadRoots(defaults: defaults, key: rootsKey)
+        self.visibleColumns = visibleColumns
+        self.sortSpec = Self.normalizedSortSpec(Self.loadSortSpec(defaults: defaults), visibleColumns: visibleColumns)
+        self.indexedRoots = Self.loadRoots(defaults: defaults, key: DefaultsKey.roots)
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -287,6 +338,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     func tableView(_ tableView: NSTableView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
         guard let descriptor = tableView.sortDescriptors.first else { return }
         sortSpec = sortSpec(for: descriptor)
+        saveSortSpec()
         scheduleSearch(force: true)
     }
 
@@ -295,6 +347,11 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
+        if menu === headerMenu {
+            populateHeaderMenu(menu)
+            return
+        }
+
         menu.removeAllItems()
         let records = selectedRecords()
         let hasSelection = !records.isEmpty
@@ -378,16 +435,13 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let menu = NSMenu()
         menu.delegate = self
         tableView.menu = menu
+        headerMenu.delegate = self
+        tableView.headerView?.menu = headerMenu
 
-        for column in Column.allCases {
-            let tableColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(column.rawValue))
-            tableColumn.title = column.title
-            tableColumn.width = column.width
-            tableColumn.minWidth = min(column.width, 48)
-            tableColumn.sortDescriptorPrototype = NSSortDescriptor(key: column.rawValue, ascending: column != .modified && column != .size)
-            tableView.addTableColumn(tableColumn)
+        for column in Column.allCases where visibleColumns.contains(column) {
+            tableView.addTableColumn(makeTableColumn(for: column))
         }
-        tableView.sortDescriptors = [NSSortDescriptor(key: Column.modified.rawValue, ascending: false)]
+        tableView.sortDescriptors = [sortDescriptor(for: sortSpec)]
 
         let footer = NSStackView()
         footer.orientation = .horizontal
@@ -444,6 +498,28 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             button.widthAnchor.constraint(equalToConstant: 32),
             button.heightAnchor.constraint(equalToConstant: 28)
         ])
+    }
+
+    private func makeTableColumn(for column: Column) -> NSTableColumn {
+        let tableColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(column.rawValue))
+        tableColumn.title = column.title
+        tableColumn.width = column.width
+        tableColumn.minWidth = min(column.width, 48)
+        tableColumn.sortDescriptorPrototype = NSSortDescriptor(key: column.rawValue, ascending: column != .modified && column != .size)
+        return tableColumn
+    }
+
+    private func populateHeaderMenu(_ menu: NSMenu) {
+        menu.removeAllItems()
+
+        for column in Column.allCases {
+            let item = NSMenuItem(title: column.menuTitle, action: #selector(toggleColumnVisibility(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = column.rawValue
+            item.state = visibleColumns.contains(column) ? .on : .off
+            item.isEnabled = column != .name
+            menu.addItem(item)
+        }
     }
 
     private func actionItem(_ title: String, _ selector: Selector, enabled: Bool = true) -> NSMenuItem {
@@ -647,6 +723,47 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         return SortSpec(column: column.sortColumn, ascending: descriptor.ascending)
     }
 
+    private func sortDescriptor(for spec: SortSpec) -> NSSortDescriptor {
+        let column = Column.column(for: spec.column) ?? .name
+        return NSSortDescriptor(key: column.rawValue, ascending: spec.ascending)
+    }
+
+    private func insertVisibleColumn(_ column: Column) {
+        let identifier = NSUserInterfaceItemIdentifier(column.rawValue)
+        guard tableView.tableColumn(withIdentifier: identifier) == nil else {
+            return
+        }
+
+        tableView.addTableColumn(makeTableColumn(for: column))
+
+        guard
+            let fromIndex = tableView.tableColumns.firstIndex(where: { $0.identifier == identifier }),
+            let toIndex = Column.allCases.filter({ visibleColumns.contains($0) }).firstIndex(of: column),
+            fromIndex != toIndex
+        else {
+            return
+        }
+
+        tableView.moveColumn(fromIndex, toColumn: toIndex)
+    }
+
+    private func removeVisibleColumn(_ column: Column) {
+        guard let tableColumn = tableView.tableColumn(withIdentifier: NSUserInterfaceItemIdentifier(column.rawValue)) else {
+            return
+        }
+
+        tableView.removeTableColumn(tableColumn)
+    }
+
+    private func applySortFallbackIfNeeded(afterHiding column: Column) {
+        guard column.sortColumn == sortSpec.column else { return }
+
+        sortSpec = Self.defaultSortSpec
+        tableView.sortDescriptors = [sortDescriptor(for: sortSpec)]
+        saveSortSpec()
+        scheduleSearch(force: true)
+    }
+
     @objc private func addScope(_ sender: Any?) {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
@@ -674,6 +791,27 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     @objc private func searchFieldDidChange(_ sender: NSSearchField) {
         scheduleSearch()
+    }
+
+    @objc private func toggleColumnVisibility(_ sender: NSMenuItem) {
+        guard
+            let rawColumn = sender.representedObject as? String,
+            let column = Column(rawValue: rawColumn),
+            column != .name
+        else {
+            return
+        }
+
+        if visibleColumns.contains(column) {
+            visibleColumns.remove(column)
+            removeVisibleColumn(column)
+            applySortFallbackIfNeeded(afterHiding: column)
+        } else {
+            visibleColumns.insert(column)
+            insertVisibleColumn(column)
+        }
+
+        saveVisibleColumns()
     }
 
     @objc private func openSelected(_ sender: Any?) {
@@ -928,7 +1066,19 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func saveRoots() {
-        defaults.set(indexedRoots.map(\.path), forKey: rootsKey)
+        defaults.set(indexedRoots.map(\.path), forKey: DefaultsKey.roots)
+    }
+
+    private func saveSortSpec() {
+        defaults.set(sortSpec.column.rawValue, forKey: DefaultsKey.sortColumn)
+        defaults.set(sortSpec.ascending, forKey: DefaultsKey.sortAscending)
+    }
+
+    private func saveVisibleColumns() {
+        let ordered = Column.allCases
+            .filter { visibleColumns.contains($0) }
+            .map(\.rawValue)
+        defaults.set(ordered, forKey: DefaultsKey.visibleColumns)
     }
 
     private static func loadRoots(defaults: UserDefaults, key: String) -> [URL] {
@@ -949,6 +1099,39 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let roots = candidates.filter { fileManager.fileExists(atPath: $0.path) }
         defaults.set(roots.map(\.path), forKey: key)
         return roots
+    }
+
+    private static func loadSortSpec(defaults: UserDefaults) -> SortSpec {
+        guard
+            let rawColumn = defaults.string(forKey: DefaultsKey.sortColumn),
+            let column = SortColumn(rawValue: rawColumn),
+            Column.column(for: column) != nil
+        else {
+            return defaultSortSpec
+        }
+
+        let ascending = defaults.object(forKey: DefaultsKey.sortAscending) == nil
+            ? defaultSortSpec.ascending
+            : defaults.bool(forKey: DefaultsKey.sortAscending)
+        return SortSpec(column: column, ascending: ascending)
+    }
+
+    private static func loadVisibleColumns(defaults: UserDefaults) -> Set<Column> {
+        guard let saved = defaults.array(forKey: DefaultsKey.visibleColumns) as? [String] else {
+            return defaultVisibleColumns
+        }
+
+        var columns = Set(saved.compactMap(Column.init(rawValue:)))
+        columns.insert(.name)
+        return columns
+    }
+
+    private static func normalizedSortSpec(_ spec: SortSpec, visibleColumns: Set<Column>) -> SortSpec {
+        guard let column = Column.column(for: spec.column), visibleColumns.contains(column) else {
+            return defaultSortSpec
+        }
+
+        return spec
     }
 }
 
