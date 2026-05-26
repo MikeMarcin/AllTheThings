@@ -529,12 +529,19 @@ public final class FileIndex: @unchecked Sendable {
         let trimThreshold = boundedMaxResults > 0 ? boundedMaxResults * 5 : 0
         var total = 0
 
-        func trimMatches() {
-            guard boundedMaxResults > 0, matches.count > boundedMaxResults else { return }
+        func sortAndLimitMatches() {
+            guard boundedMaxResults > 0 else { return }
             matches.sort {
                 Self.compare($0, $1, sort: request.sort, queryIsEmpty: parsedQuery.isEmpty)
             }
-            matches.removeSubrange(boundedMaxResults..<matches.count)
+            if matches.count > boundedMaxResults {
+                matches.removeSubrange(boundedMaxResults..<matches.count)
+            }
+        }
+
+        func trimMatches() {
+            guard boundedMaxResults > 0, matches.count > boundedMaxResults else { return }
+            sortAndLimitMatches()
         }
 
         func appendMatch(_ match: SearchResult) {
@@ -599,7 +606,7 @@ public final class FileIndex: @unchecked Sendable {
 
                     if total > 0 {
                         guard !shouldCancel() else { return nil }
-                        trimMatches()
+                        sortAndLimitMatches()
 
                         guard !shouldCancel() else { return nil }
                         return SearchResponse(results: matches, totalMatches: total, elapsed: Date().timeIntervalSince(started))
@@ -630,7 +637,7 @@ public final class FileIndex: @unchecked Sendable {
 
         guard !shouldCancel() else { return nil }
 
-        trimMatches()
+        sortAndLimitMatches()
 
         guard !shouldCancel() else { return nil }
 
@@ -662,12 +669,19 @@ public final class FileIndex: @unchecked Sendable {
         let trimThreshold = maxResults > 0 ? maxResults * 5 : 0
         var total = 0
 
-        func trimMatches() {
-            guard maxResults > 0, matches.count > maxResults else { return }
+        func sortAndLimitMatches() {
+            guard maxResults > 0 else { return }
             matches.sort {
                 compare($0, $1, sort: request.sort, queryIsEmpty: false)
             }
-            matches.removeSubrange(maxResults..<matches.count)
+            if matches.count > maxResults {
+                matches.removeSubrange(maxResults..<matches.count)
+            }
+        }
+
+        func trimMatches() {
+            guard maxResults > 0, matches.count > maxResults else { return }
+            sortAndLimitMatches()
         }
 
         for (offset, candidate) in candidateIndices.enumerated() {
@@ -697,7 +711,7 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         guard !shouldCancel() else { return nil }
-        trimMatches()
+        sortAndLimitMatches()
 
         guard !shouldCancel() else { return nil }
         return SearchResponse(results: matches, totalMatches: total, elapsed: Date().timeIntervalSince(started))
