@@ -206,6 +206,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var eventDebounce: DispatchWorkItem?
     private var didRequestInitialSnapshotLoad = false
     private var didRequestInitialRebuild = false
+    private var highlightsSearchText: Bool
 
     private enum DefaultsKey {
         static let roots = "ATTIndexedRoots"
@@ -233,13 +234,19 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     init(index: FileIndex) {
         let defaults = UserDefaults.standard
+        AppSettings.registerDefaults(defaults)
         let visibleColumns = Self.loadVisibleColumns(defaults: defaults)
         self.index = index
         self.indexStats = index.currentStats()
         self.visibleColumns = visibleColumns
         self.sortSpec = Self.normalizedSortSpec(Self.loadSortSpec(defaults: defaults), visibleColumns: visibleColumns)
         self.indexedRoots = Self.loadRoots(defaults: defaults, key: DefaultsKey.roots)
+        self.highlightsSearchText = defaults.bool(forKey: AppSettings.highlightSearchTextKey)
         super.init(nibName: nil, bundle: nil)
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
     }
 
     @available(*, unavailable)
@@ -260,6 +267,12 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         index.onStatsChanged = { @MainActor @Sendable [weak self] stats in
             self?.handleStatsChanged(stats)
         }
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(userDefaultsDidChange(_:)),
+            name: UserDefaults.didChangeNotification,
+            object: nil
+        )
 
         startWatching()
         updateLoadingOverlay()
@@ -743,6 +756,18 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         searchField.currentEditor()?.string ?? searchField.stringValue
     }
 
+    private func settingsDidChange() {
+        let updatedHighlightsSearchText = defaults.bool(forKey: AppSettings.highlightSearchTextKey)
+        guard updatedHighlightsSearchText != highlightsSearchText else { return }
+
+        highlightsSearchText = updatedHighlightsSearchText
+        tableView.reloadData()
+    }
+
+    @objc private func userDefaultsDidChange(_ notification: Notification) {
+        settingsDidChange()
+    }
+
     private func startWatching() {
         watcher.start(roots: indexedRoots) { @MainActor @Sendable [weak self] paths in
             self?.coalesceFSEvents(paths)
@@ -801,7 +826,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         ])
 
         let query = searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let token = FuzzyMatcher.primaryHighlightToken(for: query) else {
+        guard highlightsSearchText, let token = FuzzyMatcher.primaryHighlightToken(for: query) else {
             return attributed
         }
 
