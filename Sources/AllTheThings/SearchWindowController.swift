@@ -312,6 +312,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         tableView.copyAction = { [weak self] in
             self?.copySelectedFiles()
         }
+        tableView.copyPathAction = { [weak self] in
+            self?.copySelectedPath(nil)
+        }
 
         let menu = NSMenu()
         menu.delegate = self
@@ -633,9 +636,26 @@ private final class SearchCancellationToken: @unchecked Sendable {
 
 private final class FileTableView: NSTableView {
     var copyAction: (() -> Void)?
+    var copyPathAction: (() -> Void)?
 
     @objc func copy(_ sender: Any?) {
         copyAction?()
+    }
+
+    override func keyDown(with event: NSEvent) {
+        guard
+            event.modifierFlags.contains(.command),
+            event.charactersIgnoringModifiers?.lowercased() == "c"
+        else {
+            super.keyDown(with: event)
+            return
+        }
+
+        if event.modifierFlags.contains(.option) {
+            copyPathAction?()
+        } else {
+            copyAction?()
+        }
     }
 }
 
