@@ -22,16 +22,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             name: Self.activationRequestNotification,
             object: Bundle.main.bundleIdentifier
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(themePreferenceDidChange(_:)),
+            name: AppSettings.themePreferenceDidChangeNotification,
+            object: nil
+        )
     }
 
     deinit {
         DistributedNotificationCenter.default().removeObserver(self)
+        NotificationCenter.default.removeObserver(self)
     }
 
     func applicationWillFinishLaunching(_ notification: Notification) {
-        DispatchQueue.main.async {
+        Task { @MainActor in
             NSApp.setActivationPolicy(.regular)
-            NSApp.appearance = NSAppearance(named: .darkAqua)
+            AppTheme.applyCurrent()
         }
     }
 
@@ -119,6 +126,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc @MainActor private func showPrimaryWindowFromActivationRequest() {
         showPrimaryWindow(activate: true)
+    }
+
+    @objc private func themePreferenceDidChange(_ notification: Notification) {
+        Task { @MainActor in
+            AppTheme.applyCurrent()
+        }
     }
 
     @objc @MainActor private func checkForUpdates(_ sender: Any?) {
