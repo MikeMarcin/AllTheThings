@@ -83,7 +83,7 @@ public struct FileRecord: Codable, Hashable, Identifiable, Sendable {
         }
 
         let isDirectory = loadedValues.isDirectory ?? false
-        let isHidden = (loadedValues.isHidden ?? false) || name.hasPrefix(".")
+        let isHidden = (loadedValues.isHidden ?? false) || Self.pathIsHidden(path)
         let size = UInt64(max(loadedValues.fileSize ?? 0, 0))
         let modified = loadedValues.contentModificationDate ?? .distantPast
         let created = loadedValues.creationDate
@@ -113,5 +113,11 @@ public struct FileRecord: Codable, Hashable, Identifiable, Sendable {
             hash &*= 1_099_511_628_211
         }
         return hash == 0 ? 1 : hash
+    }
+
+    public static func pathIsHidden(_ path: String) -> Bool {
+        URL(fileURLWithPath: path).pathComponents.contains { component in
+            component.hasPrefix(".") && component != "." && component != ".."
+        }
     }
 }

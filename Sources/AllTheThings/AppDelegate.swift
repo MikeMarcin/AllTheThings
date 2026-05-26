@@ -3,7 +3,7 @@ import ATTCore
 
 // AppKit invokes these Objective-C delegate hooks during startup; hop to the
 // main queue before touching Swift @MainActor AppKit APIs.
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private static let activationRequestNotification = Notification.Name("com.allthethings.app.activateExistingInstance")
 
     private let defaults = UserDefaults.standard
@@ -139,6 +139,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate()
     }
 
+    @objc @MainActor private func toggleHiddenFiles(_ sender: Any?) {
+        let showHiddenFiles = !defaults.bool(forKey: AppSettings.showHiddenFilesKey)
+        defaults.set(showHiddenFiles, forKey: AppSettings.showHiddenFilesKey)
+        defaults.synchronize()
+        (sender as? NSMenuItem)?.state = showHiddenFiles ? .on : .off
+    }
+
     @objc @MainActor private func showAboutWindow(_ sender: Any?) {
         let controller: NSWindowController
         if let existingController = aboutWindowController {
@@ -232,6 +239,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         editItem.submenu = editMenu
         mainMenu.addItem(editItem)
 
+        let viewItem = NSMenuItem()
+        let viewMenu = NSMenu(title: "View")
+        viewMenu.delegate = self
+        let hiddenFilesItem = NSMenuItem(
+            title: "Show Hidden Files",
+            action: #selector(toggleHiddenFiles(_:)),
+            keyEquivalent: "."
+        )
+        hiddenFilesItem.keyEquivalentModifierMask = [.command, .shift]
+        hiddenFilesItem.target = self
+        viewMenu.addItem(hiddenFilesItem)
+        viewItem.submenu = viewMenu
+        mainMenu.addItem(viewItem)
+
         let windowItem = NSMenuItem()
         let windowMenu = NSMenu(title: "Window")
         windowMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.miniaturize(_:)), keyEquivalent: "m")
@@ -252,6 +273,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         mainMenu.addItem(helpItem)
 
         NSApp.mainMenu = mainMenu
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        for item in menu.items where item.action == #selector(toggleHiddenFiles(_:)) {
+            item.state = defaults.bool(forKey: AppSettings.showHiddenFilesKey) ? .on : .off
+        }
     }
 
     @MainActor

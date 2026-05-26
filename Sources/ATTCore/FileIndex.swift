@@ -25,10 +25,12 @@ public struct SortSpec: Codable, Equatable, Sendable {
 public struct SearchRequest: Sendable {
     public let query: String
     public let sort: SortSpec
+    public let includeHidden: Bool
 
-    public init(query: String, sort: SortSpec) {
+    public init(query: String, sort: SortSpec, includeHidden: Bool = true) {
         self.query = query
         self.sort = sort
+        self.includeHidden = includeHidden
     }
 }
 
@@ -604,6 +606,7 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         func appendMatch(_ match: SearchResult) {
+            guard request.includeHidden || !Self.recordIsHidden(match.record) else { return }
             total += 1
             guard boundedMaxResults > 0 else { return }
             matches.append(match)
@@ -640,6 +643,7 @@ public final class FileIndex: @unchecked Sendable {
                             return nil
                         }
                         let record = records[index]
+                        guard request.includeHidden || !Self.recordIsHidden(record) else { continue }
                         guard let score = Self.exactTextScore(record: record, query: exactTextFastQuery) else {
                             continue
                         }
@@ -754,6 +758,9 @@ public final class FileIndex: @unchecked Sendable {
             }
 
             let record = snapshot.records[index]
+            guard request.includeHidden || !recordIsHidden(record) else {
+                continue
+            }
             guard let score = FuzzyMatcher.score(record: record, parsedQuery: parsedQuery) else {
                 continue
             }
@@ -810,9 +817,14 @@ public final class FileIndex: @unchecked Sendable {
                 continue
             }
 
+            let record = snapshot.records[index]
+            guard request.includeHidden || !recordIsHidden(record) else {
+                continue
+            }
+
             if !candidateListIsExact {
                 guard exactTextScore(
-                    record: snapshot.records[index],
+                    record: record,
                     field: alternative.field,
                     token: alternative.token,
                     tokenBytes: alternative.tokenBytes
@@ -849,6 +861,10 @@ public final class FileIndex: @unchecked Sendable {
 
         guard !shouldCancel() else { return nil }
         return SearchResponse(results: results, totalMatches: total, elapsed: Date().timeIntervalSince(started))
+    }
+
+    private static func recordIsHidden(_ record: FileRecord) -> Bool {
+        record.isHidden || FileRecord.pathIsHidden(record.path)
     }
 
     private static func candidateIndices(snapshot: SearchSnapshot, parsedQuery: FuzzyMatcher.ParsedQuery) -> [Int32]? {
