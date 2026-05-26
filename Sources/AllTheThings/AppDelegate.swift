@@ -67,7 +67,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let existingController = windowController {
             controller = existingController
         } else {
-            let newController = SearchWindowController(index: FileIndex())
+            let newController = SearchWindowController(index: FileIndex(loadsSnapshotImmediately: false))
             windowController = newController
             controller = newController
         }

@@ -188,6 +188,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private let copyButton = NSButton()
     private let addScopeButton = NSButton()
     private let reindexButton = NSButton()
+    private let loadingOverlay = NSView()
+    private let loadingIndicator = NSProgressIndicator()
+    private let loadingLabel = NSTextField(labelWithString: "Loading file list...")
 
     private var results: [SearchResult] = []
     private var indexStats: IndexStats
@@ -201,6 +204,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var indexedRoots: [URL]
     private var pendingEventPaths = Set<String>()
     private var eventDebounce: DispatchWorkItem?
+    private var didRequestInitialSnapshotLoad = false
+    private var didRequestInitialRebuild = false
 
     private enum DefaultsKey {
         static let roots = "ATTIndexedRoots"
@@ -253,16 +258,13 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         super.viewDidLoad()
 
         index.onStatsChanged = { @MainActor @Sendable [weak self] stats in
-            self?.indexStats = stats
-            self?.updateStatus()
-            self?.scheduleSearch(force: true)
+            self?.handleStatsChanged(stats)
         }
 
         startWatching()
+        updateLoadingOverlay()
 
-        if indexStats.indexedCount == 0 {
-            index.replaceRootsAndRebuild(indexedRoots)
-        } else {
+        if indexStats.indexedCount > 0 {
             scheduleSearch(force: true)
         }
     }
@@ -270,6 +272,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     override func viewDidAppear() {
         super.viewDidAppear()
         view.window?.makeFirstResponder(searchField)
+
+        DispatchQueue.main.async { [weak self] in
+            self?.startIndexingAfterFirstPaint()
+        }
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int {
@@ -463,6 +469,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         view.addSubview(topBar)
         view.addSubview(scrollView)
         view.addSubview(footer)
+        configureLoadingOverlay()
 
         NSLayoutConstraint.activate([
             topBar.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
@@ -479,11 +486,47 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             footer.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             footer.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             footer.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-            countLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 260)
+            countLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 260),
+
+            loadingOverlay.topAnchor.constraint(equalTo: scrollView.topAnchor),
+            loadingOverlay.leadingAnchor.constraint(equalTo: scrollView.leadingAnchor),
+            loadingOverlay.trailingAnchor.constraint(equalTo: scrollView.trailingAnchor),
+            loadingOverlay.bottomAnchor.constraint(equalTo: scrollView.bottomAnchor)
         ])
 
         updateActionButtons()
         updateStatus()
+        updateLoadingOverlay()
+    }
+
+    private func configureLoadingOverlay() {
+        loadingOverlay.translatesAutoresizingMaskIntoConstraints = false
+        loadingOverlay.wantsLayer = true
+        loadingOverlay.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.92).cgColor
+
+        loadingIndicator.translatesAutoresizingMaskIntoConstraints = false
+        loadingIndicator.style = .spinning
+        loadingIndicator.controlSize = .regular
+        loadingIndicator.isIndeterminate = true
+
+        loadingLabel.translatesAutoresizingMaskIntoConstraints = false
+        loadingLabel.font = .systemFont(ofSize: 13, weight: .medium)
+        loadingLabel.textColor = .secondaryLabelColor
+        loadingLabel.alignment = .center
+
+        let stack = NSStackView(views: [loadingIndicator, loadingLabel])
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = 10
+
+        loadingOverlay.addSubview(stack)
+        view.addSubview(loadingOverlay)
+
+        NSLayoutConstraint.activate([
+            stack.centerXAnchor.constraint(equalTo: loadingOverlay.centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: loadingOverlay.centerYAnchor)
+        ])
     }
 
     private func configureToolbarButton(_ button: NSButton, symbol: String, tooltip: String, action: Selector) {
@@ -604,6 +647,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func scheduleSearch(force: Bool = false) {
+        guard !indexStats.isLoadingSnapshot else { return }
+
         let request = SearchRequest(query: currentSearchText(), sort: sortSpec)
         let signature = SearchSignature(query: request.query, sort: request.sort)
         guard force || signature != scheduledSearchSignature else { return }
@@ -628,8 +673,69 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                 self.queryElapsed = response.elapsed
                 self.tableView.reloadData()
                 self.updateStatus()
+                self.updateLoadingOverlay()
                 self.updateActionButtons()
             }
+        }
+    }
+
+    private func handleStatsChanged(_ stats: IndexStats) {
+        indexStats = stats
+        updateStatus()
+        updateLoadingOverlay()
+
+        guard !stats.isLoadingSnapshot else { return }
+
+        if stats.indexedCount == 0, !stats.isIndexing {
+            startInitialRebuildIfNeeded()
+            return
+        }
+
+        scheduleSearch(force: true)
+    }
+
+    private func startIndexingAfterFirstPaint() {
+        guard !didRequestInitialSnapshotLoad else { return }
+        didRequestInitialSnapshotLoad = true
+        updateLoadingOverlay()
+
+        if indexStats.indexedCount > 0 {
+            scheduleSearch(force: true)
+            return
+        }
+
+        if index.loadSnapshotInBackground() {
+            return
+        }
+
+        startInitialRebuildIfNeeded()
+    }
+
+    private func startInitialRebuildIfNeeded() {
+        guard didRequestInitialSnapshotLoad, !didRequestInitialRebuild, !indexedRoots.isEmpty else {
+            return
+        }
+
+        didRequestInitialRebuild = true
+        index.replaceRootsAndRebuild(indexedRoots)
+    }
+
+    private func updateLoadingOverlay() {
+        let waitingForInitialLoad = !didRequestInitialSnapshotLoad && indexStats.indexedCount == 0
+        let indexingEmptyList = indexStats.isIndexing && results.isEmpty
+        let shouldShow = indexStats.isLoadingSnapshot || waitingForInitialLoad || indexingEmptyList
+
+        if indexStats.isLoadingSnapshot || waitingForInitialLoad {
+            loadingLabel.stringValue = "Loading file list..."
+        } else {
+            loadingLabel.stringValue = indexStats.status
+        }
+
+        loadingOverlay.isHidden = !shouldShow
+        if shouldShow {
+            loadingIndicator.startAnimation(nil)
+        } else {
+            loadingIndicator.stopAnimation(nil)
         }
     }
 
@@ -666,7 +772,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         countLabel.stringValue = "\(shownCount.formatted()) shown / \(total) matches • \(indexed) indexed • \(milliseconds) ms"
 
         let scopeText = indexedRoots.map(\.path).joined(separator: "  ")
-        let indexingText = indexStats.isIndexing ? "Indexing" : "Ready"
+        let indexingText = indexStats.isLoadingSnapshot ? "Loading" : (indexStats.isIndexing ? "Indexing" : "Ready")
         statusLabel.stringValue = "\(indexingText) • \(indexStats.status) • \(scopeText)"
     }
 
