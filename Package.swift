@@ -10,15 +10,11 @@ let package = Package(
     products: [
         .executable(name: "AllTheThings", targets: ["AllTheThings"])
     ],
-    dependencies: [
-        .package(url: "https://github.com/ukushu/Ifrit.git", exact: "4.0.0")
-    ],
+    dependencies: [],
     targets: [
         .target(
             name: "ATTCore",
-            dependencies: [
-                .product(name: "IfritStatic", package: "Ifrit")
-            ]
+            dependencies: []
         ),
         .executableTarget(
             name: "AllTheThings",

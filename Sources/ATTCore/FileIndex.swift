@@ -86,11 +86,140 @@ public final class FileIndex: @unchecked Sendable {
         let records: [FileRecord]
     }
 
+    private struct ExactTextFastQuery {
+        let clauses: [ExactTextFastClause]
+    }
+
+    private struct ExactTextFastClause {
+        let alternatives: [ExactTextFastAlternative]
+    }
+
+    private struct ExactTextFastAlternative {
+        let field: FuzzyMatcher.QueryField
+        let token: String
+        let tokenBytes: [UInt8]
+    }
+
+    private struct UTF8Match {
+        let offset: Int
+        let isBoundary: Bool
+        let textByteCount: Int
+    }
+
+    private struct CandidateBitSet {
+        private var words: [UInt64]
+
+        init(count: Int) {
+            words = Array(repeating: 0, count: (count + 63) / 64)
+        }
+
+        mutating func insert(_ index: Int) {
+            words[index >> 6] |= UInt64(1) << UInt64(index & 63)
+        }
+
+        func contains(_ index: Int) -> Bool {
+            (words[index >> 6] & (UInt64(1) << UInt64(index & 63))) != 0
+        }
+    }
+
+    private final class SearchSnapshot: @unchecked Sendable {
+        static let empty = SearchSnapshot(records: [], buildsSearchStructures: false)
+
+        let records: [FileRecord]
+        let modifiedDescending: [Int]
+        let modifiedAscending: [Int]
+        let gramIndex: [Int: [Int32]]
+        let hasSortedOrder: Bool
+
+        init(records: [FileRecord], buildsSearchStructures: Bool = true) {
+            self.records = records
+            self.hasSortedOrder = buildsSearchStructures
+
+            if buildsSearchStructures {
+                self.gramIndex = Self.makeGramIndex(records: records)
+                let sortedByModified = records.indices.sorted { lhs, rhs in
+                    let left = records[lhs]
+                    let right = records[rhs]
+                    if left.modifiedTime != right.modifiedTime {
+                        return left.modifiedTime > right.modifiedTime
+                    }
+                    if left.normalizedName != right.normalizedName {
+                        return left.normalizedName < right.normalizedName
+                    }
+                    return left.path < right.path
+                }
+                self.modifiedDescending = sortedByModified
+                self.modifiedAscending = Array(sortedByModified.reversed())
+            } else {
+                self.gramIndex = [:]
+                self.modifiedDescending = []
+                self.modifiedAscending = []
+            }
+        }
+
+        func orderedIndices(for sort: SortSpec, queryIsEmpty: Bool) -> [Int]? {
+            guard hasSortedOrder else { return nil }
+
+            switch sort.column {
+            case .modified:
+                return sort.ascending ? modifiedAscending : modifiedDescending
+            case .relevance where queryIsEmpty:
+                return modifiedDescending
+            case .relevance, .name, .path, .created, .size, .fileExtension, .kind, .volume:
+                return nil
+            }
+        }
+
+        func candidateIndices(containing tokenBytes: [UInt8]) -> [Int32]? {
+            guard !gramIndex.isEmpty else { return nil }
+
+            let keys = FileIndex.searchGramKeys(for: tokenBytes)
+            guard !keys.isEmpty else { return nil }
+
+            var postings: [[Int32]] = []
+            postings.reserveCapacity(keys.count)
+
+            for key in keys {
+                guard let values = gramIndex[key] else {
+                    return []
+                }
+                postings.append(values)
+            }
+
+            postings.sort { $0.count < $1.count }
+            if postings.count == 1 {
+                return postings[0]
+            }
+
+            return FileIndex.intersectPostingLists(postings)
+        }
+
+        private static func makeGramIndex(records: [FileRecord]) -> [Int: [Int32]] {
+            var index: [Int: [Int32]] = [:]
+            var keys = Set<Int>()
+
+            for (recordIndex, record) in records.enumerated() {
+                keys.removeAll(keepingCapacity: true)
+                FileIndex.collectSearchGramKeys(from: record.normalizedName, into: &keys)
+                FileIndex.collectSearchGramKeys(from: record.normalizedPath, into: &keys)
+
+                let storedIndex = Int32(recordIndex)
+                for key in keys {
+                    index[key, default: []].append(storedIndex)
+                }
+            }
+
+            return index
+        }
+    }
+
     private let lock = NSLock()
     private let fileManager: FileManager
     private let snapshotURL: URL
     private let persistenceQueue = DispatchQueue(label: "att.index.persistence", qos: .utility)
     private var recordsByPath: [String: FileRecord] = [:]
+    private var searchSnapshot = SearchSnapshot.empty
+    private var searchSnapshotRevision: UInt64 = 0
     private var roots: [String] = []
     private var generation: UInt64 = 0
     private var persistRevision: UInt64 = 0
@@ -158,54 +287,475 @@ public final class FileIndex: @unchecked Sendable {
         shouldCancel: @Sendable () -> Bool
     ) -> SearchResponse? {
         let started = Date()
-        let records = lock.withLock {
-            Array(recordsByPath.values)
-        }
+        let snapshot = lock.withLock { searchSnapshot }
+        let records = snapshot.records
 
         guard !shouldCancel() else { return nil }
 
         let trimmedQuery = request.query.trimmingCharacters(in: .whitespacesAndNewlines)
         let parsedQuery = FuzzyMatcher.parse(trimmedQuery)
+        let exactTextFastQuery = Self.exactTextFastQuery(from: parsedQuery)
+        let boundedMaxResults = max(maxResults, 0)
         var matches: [SearchResult] = []
-        matches.reserveCapacity(min(records.count, maxResults))
+        matches.reserveCapacity(min(records.count, boundedMaxResults))
+        let trimThreshold = boundedMaxResults > 0 ? boundedMaxResults * 5 : 0
+        var total = 0
+
+        func trimMatches() {
+            guard boundedMaxResults > 0, matches.count > boundedMaxResults else { return }
+            matches.sort {
+                Self.compare($0, $1, sort: request.sort, queryIsEmpty: parsedQuery.isEmpty)
+            }
+            matches.removeSubrange(boundedMaxResults..<matches.count)
+        }
+
+        func appendMatch(_ match: SearchResult) {
+            total += 1
+            guard boundedMaxResults > 0 else { return }
+            matches.append(match)
+            if matches.count > trimThreshold {
+                trimMatches()
+            }
+        }
 
         if parsedQuery.isEmpty {
-            for (offset, record) in records.enumerated() {
+            let orderedRecords = snapshot.orderedIndices(for: request.sort, queryIsEmpty: true)
+            for (offset, index) in (orderedRecords ?? Array(records.indices)).enumerated() {
                 if offset.isMultiple(of: 512), shouldCancel() {
                     return nil
                 }
-                matches.append(SearchResult(record: record, score: 0))
+                let record = records[index]
+                appendMatch(SearchResult(record: record, score: 0))
             }
         } else {
+            if let exactTextFastQuery {
+                if let indexedResponse = Self.indexedExactTextSearch(
+                    snapshot: snapshot,
+                    request: request,
+                    query: exactTextFastQuery,
+                    maxResults: boundedMaxResults,
+                    started: started,
+                    shouldCancel: shouldCancel
+                ) {
+                    return indexedResponse
+                }
+
+                if let orderedIndices = snapshot.orderedIndices(for: request.sort, queryIsEmpty: false) {
+                    for (offset, index) in orderedIndices.enumerated() {
+                        if offset.isMultiple(of: 512), shouldCancel() {
+                            return nil
+                        }
+                        let record = records[index]
+                        guard let score = Self.exactTextScore(record: record, query: exactTextFastQuery) else {
+                            continue
+                        }
+                        total += 1
+                        if matches.count < boundedMaxResults {
+                            matches.append(SearchResult(record: record, score: score))
+                        }
+                    }
+
+                    if total > 0 {
+                        guard !shouldCancel() else { return nil }
+                        return SearchResponse(results: matches, totalMatches: total, elapsed: Date().timeIntervalSince(started))
+                    }
+                } else {
+                    for (offset, record) in records.enumerated() {
+                        if offset.isMultiple(of: 512), shouldCancel() {
+                            return nil
+                        }
+                        if let score = Self.exactTextScore(record: record, query: exactTextFastQuery) {
+                            appendMatch(SearchResult(record: record, score: score))
+                        }
+                    }
+
+                    if total > 0 {
+                        guard !shouldCancel() else { return nil }
+                        trimMatches()
+
+                        guard !shouldCancel() else { return nil }
+                        return SearchResponse(results: matches, totalMatches: total, elapsed: Date().timeIntervalSince(started))
+                    }
+                }
+            }
+
             for (offset, record) in records.enumerated() {
                 if offset.isMultiple(of: 512), shouldCancel() {
                     return nil
                 }
                 if let score = FuzzyMatcher.score(record: record, parsedQuery: parsedQuery) {
-                    matches.append(SearchResult(record: record, score: score))
+                    appendMatch(SearchResult(record: record, score: score))
                 }
             }
         }
 
-        let total = matches.count
         guard !shouldCancel() else { return nil }
 
-        matches.sort { lhs, rhs in
-            Self.compare(lhs, rhs, sort: request.sort, queryIsEmpty: parsedQuery.isEmpty)
-        }
+        trimMatches()
 
         guard !shouldCancel() else { return nil }
-
-        if matches.count > maxResults {
-            matches.removeSubrange(maxResults..<matches.count)
-        }
 
         return SearchResponse(results: matches, totalMatches: total, elapsed: Date().timeIntervalSince(started))
+    }
+
+    private static func indexedExactTextSearch(
+        snapshot: SearchSnapshot,
+        request: SearchRequest,
+        query: ExactTextFastQuery,
+        maxResults: Int,
+        started: Date,
+        shouldCancel: @Sendable () -> Bool
+    ) -> SearchResponse? {
+        guard
+            let orderedIndices = snapshot.orderedIndices(for: request.sort, queryIsEmpty: false),
+            query.clauses.count == 1,
+            let clause = query.clauses.first,
+            clause.alternatives.count == 1,
+            let alternative = clause.alternatives.first,
+            let candidateIndices = snapshot.candidateIndices(containing: alternative.tokenBytes),
+            !candidateIndices.isEmpty
+        else {
+            return nil
+        }
+
+        var matches = CandidateBitSet(count: snapshot.records.count)
+        var total = 0
+        let candidateListIsExact = alternative.field == .any && alternative.tokenBytes.count <= 3
+
+        for (offset, candidate) in candidateIndices.enumerated() {
+            if offset.isMultiple(of: 512), shouldCancel() {
+                return nil
+            }
+
+            let index = Int(candidate)
+            guard index >= 0, index < snapshot.records.count else {
+                continue
+            }
+
+            if !candidateListIsExact {
+                guard exactTextScore(
+                    record: snapshot.records[index],
+                    field: alternative.field,
+                    token: alternative.token,
+                    tokenBytes: alternative.tokenBytes
+                ) != nil else {
+                    continue
+                }
+            }
+
+            total += 1
+            matches.insert(index)
+        }
+
+        guard total > 0, !shouldCancel() else {
+            return nil
+        }
+
+        var results: [SearchResult] = []
+        results.reserveCapacity(min(maxResults, total))
+
+        if maxResults > 0 {
+            for (offset, index) in orderedIndices.enumerated() {
+                if offset.isMultiple(of: 512), shouldCancel() {
+                    return nil
+                }
+                guard matches.contains(index) else {
+                    continue
+                }
+                results.append(SearchResult(record: snapshot.records[index], score: 0))
+                if results.count >= maxResults {
+                    break
+                }
+            }
+        }
+
+        guard !shouldCancel() else { return nil }
+        return SearchResponse(results: results, totalMatches: total, elapsed: Date().timeIntervalSince(started))
+    }
+
+    private static func exactTextFastQuery(from parsedQuery: FuzzyMatcher.ParsedQuery) -> ExactTextFastQuery? {
+        guard parsedQuery.negative.isEmpty, !parsedQuery.positive.isEmpty else {
+            return nil
+        }
+
+        var clauses: [ExactTextFastClause] = []
+        clauses.reserveCapacity(parsedQuery.positive.count)
+
+        for clause in parsedQuery.positive {
+            var alternatives: [ExactTextFastAlternative] = []
+            alternatives.reserveCapacity(clause.alternatives.count)
+
+            for alternative in clause.alternatives {
+                switch alternative {
+                case .text(let field, let pattern, .fuzzy):
+                    guard !pattern.token.isEmpty else { return nil }
+                    alternatives.append(ExactTextFastAlternative(
+                        field: field,
+                        token: pattern.token,
+                        tokenBytes: Array(pattern.token.utf8)
+                    ))
+                case .text, .fileExtension, .kind:
+                    return nil
+                }
+            }
+
+            guard !alternatives.isEmpty else {
+                return nil
+            }
+            clauses.append(ExactTextFastClause(alternatives: alternatives))
+        }
+
+        return ExactTextFastQuery(clauses: clauses)
+    }
+
+    private static func exactTextScore(record: FileRecord, query: ExactTextFastQuery) -> Int? {
+        var total = 0
+
+        for clause in query.clauses {
+            var best: Int?
+
+            for alternative in clause.alternatives {
+                guard let score = exactTextScore(
+                    record: record,
+                    field: alternative.field,
+                    token: alternative.token,
+                    tokenBytes: alternative.tokenBytes
+                ) else {
+                    continue
+                }
+                best = max(best ?? Int.min, score)
+            }
+
+            guard let best else {
+                return nil
+            }
+            total += best
+        }
+
+        let depthPenalty = pathDepthPenalty(record.normalizedPath)
+        let hiddenPenalty = record.isHidden ? 35 : 0
+        return total - depthPenalty - hiddenPenalty
+    }
+
+    private static func exactTextScore(record: FileRecord, field: FuzzyMatcher.QueryField, token: String, tokenBytes: [UInt8]) -> Int? {
+        switch field {
+        case .any:
+            let nameScore = exactNameScore(record.normalizedName, tokenBytes: tokenBytes)
+            let pathScore = exactPathScore(record.normalizedPath, tokenBytes: tokenBytes, base: 3_600)
+            switch (nameScore, pathScore) {
+            case (.some(let name), .some(let path)):
+                return max(name, path)
+            case (.some(let name), .none):
+                return name
+            case (.none, .some(let path)):
+                return path
+            case (.none, .none):
+                return nil
+            }
+        case .name:
+            return exactNameScore(record.normalizedName, tokenBytes: tokenBytes)
+        case .path:
+            return exactPathScore(record.normalizedPath, tokenBytes: tokenBytes, base: 4_000)
+        }
+    }
+
+    private static func exactNameScore(_ text: String, tokenBytes: [UInt8]) -> Int? {
+        guard let match = firstUTF8Match(in: text, token: tokenBytes) else {
+            return nil
+        }
+
+        if match.offset == 0, match.textByteCount == tokenBytes.count {
+            return 10_000
+        }
+
+        if match.offset == 0 {
+            return 9_200 - min(match.textByteCount, 300)
+        }
+
+        let boundaryBonus = match.isBoundary ? 650 : 0
+        return 7_700 + boundaryBonus - min(match.offset * 12, 900)
+    }
+
+    private static func exactPathScore(_ text: String, tokenBytes: [UInt8], base: Int) -> Int? {
+        guard let match = firstUTF8Match(in: text, token: tokenBytes) else {
+            return nil
+        }
+
+        let boundaryBonus = match.isBoundary ? 500 : 0
+        return base + boundaryBonus - min(match.offset * 10, 900)
+    }
+
+    private static func collectSearchGramKeys(from text: String, into keys: inout Set<Int>) {
+        guard !text.isEmpty else { return }
+        let bytes = Array(text.utf8)
+        guard !bytes.isEmpty else { return }
+
+        let maximumLength = min(3, bytes.count)
+        for length in 1...maximumLength {
+            let lastStart = bytes.count - length
+            for start in 0...lastStart {
+                keys.insert(searchGramKey(bytes: bytes, start: start, length: length))
+            }
+        }
+    }
+
+    private static func searchGramKeys(for tokenBytes: [UInt8]) -> [Int] {
+        guard !tokenBytes.isEmpty else { return [] }
+
+        if tokenBytes.count <= 3 {
+            return [searchGramKey(bytes: tokenBytes, start: 0, length: tokenBytes.count)]
+        }
+
+        var keys = Set<Int>()
+        let lastStart = tokenBytes.count - 3
+        for start in 0...lastStart {
+            keys.insert(searchGramKey(bytes: tokenBytes, start: start, length: 3))
+        }
+        return Array(keys)
+    }
+
+    private static func searchGramKey(bytes: [UInt8], start: Int, length: Int) -> Int {
+        var key = length << 24
+        for offset in 0..<length {
+            key |= Int(bytes[start + offset]) << ((2 - offset) * 8)
+        }
+        return key
+    }
+
+    private static func intersectPostingLists(_ postings: [[Int32]]) -> [Int32] {
+        guard var result = postings.first else {
+            return []
+        }
+
+        for posting in postings.dropFirst() {
+            if result.isEmpty {
+                break
+            }
+            result = intersectPostingLists(result, posting)
+        }
+
+        return result
+    }
+
+    private static func intersectPostingLists(_ lhs: [Int32], _ rhs: [Int32]) -> [Int32] {
+        var result: [Int32] = []
+        result.reserveCapacity(min(lhs.count, rhs.count))
+
+        var leftIndex = 0
+        var rightIndex = 0
+
+        while leftIndex < lhs.count, rightIndex < rhs.count {
+            let left = lhs[leftIndex]
+            let right = rhs[rightIndex]
+
+            if left == right {
+                result.append(left)
+                leftIndex += 1
+                rightIndex += 1
+            } else if left < right {
+                leftIndex += 1
+            } else {
+                rightIndex += 1
+            }
+        }
+
+        return result
+    }
+
+    private static func firstUTF8Match(in text: String, token: [UInt8]) -> UTF8Match? {
+        guard !token.isEmpty else { return nil }
+
+        if let match = text.utf8.withContiguousStorageIfAvailable({ haystack -> UTF8Match? in
+            firstUTF8Match(in: haystack, token: token)
+        }) {
+            return match
+        }
+
+        return firstUTF8Match(in: Array(text.utf8), token: token)
+    }
+
+    private static func firstUTF8Match(in haystack: UnsafeBufferPointer<UInt8>, token: [UInt8]) -> UTF8Match? {
+        guard token.count <= haystack.count else { return nil }
+
+        let first = token[0]
+        let lastStart = haystack.count - token.count
+        var index = 0
+
+        while index <= lastStart {
+            if haystack[index] == first {
+                var tokenIndex = 1
+                while tokenIndex < token.count, haystack[index + tokenIndex] == token[tokenIndex] {
+                    tokenIndex += 1
+                }
+
+                if tokenIndex == token.count {
+                    return UTF8Match(
+                        offset: index,
+                        isBoundary: index == 0 || isBoundaryByte(haystack[index - 1]),
+                        textByteCount: haystack.count
+                    )
+                }
+            }
+
+            index += 1
+        }
+
+        return nil
+    }
+
+    private static func firstUTF8Match(in haystack: ArraySlice<UInt8>, token: [UInt8]) -> UTF8Match? {
+        firstUTF8Match(in: Array(haystack), token: token)
+    }
+
+    private static func firstUTF8Match(in haystack: [UInt8], token: [UInt8]) -> UTF8Match? {
+        guard token.count <= haystack.count else { return nil }
+
+        let first = token[0]
+        let lastStart = haystack.count - token.count
+        var index = 0
+
+        while index <= lastStart {
+            if haystack[index] == first {
+                var tokenIndex = 1
+                while tokenIndex < token.count, haystack[index + tokenIndex] == token[tokenIndex] {
+                    tokenIndex += 1
+                }
+
+                if tokenIndex == token.count {
+                    return UTF8Match(
+                        offset: index,
+                        isBoundary: index == 0 || isBoundaryByte(haystack[index - 1]),
+                        textByteCount: haystack.count
+                    )
+                }
+            }
+
+            index += 1
+        }
+
+        return nil
+    }
+
+    private static func pathDepthPenalty(_ path: String) -> Int {
+        var slashCount = 0
+        for byte in path.utf8 where byte == 47 {
+            slashCount += 1
+            if slashCount >= 30 {
+                return 120
+            }
+        }
+        return min(slashCount * 4, 120)
+    }
+
+    private static func isBoundaryByte(_ byte: UInt8) -> Bool {
+        byte == 47 || byte == 45 || byte == 95 || byte == 46 || byte == 32
     }
 
     public func deleteSnapshot() {
         lock.withLock {
             recordsByPath.removeAll(keepingCapacity: true)
+            searchSnapshot = .empty
+            searchSnapshotRevision &+= 1
             status = "Index deleted"
             indexing = false
             lastUpdated = Date()
@@ -228,8 +778,11 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         let records = Dictionary(uniqueKeysWithValues: persisted.records.map { ($0.path, $0) })
+        let snapshot = SearchSnapshot(records: Array(records.values))
         lock.withLock {
             recordsByPath = records
+            searchSnapshot = snapshot
+            searchSnapshotRevision &+= 1
             status = "Loaded \(records.count) indexed files"
             indexing = false
             lastUpdated = persisted.savedAt
@@ -341,6 +894,9 @@ public final class FileIndex: @unchecked Sendable {
             return
         }
 
+        var snapshotRecords: [FileRecord] = []
+        var snapshotRevision: UInt64 = 0
+
         lock.withLock {
             for prefix in deletedPrefixes {
                 recordsByPath = recordsByPath.filter { path, _ in
@@ -358,8 +914,18 @@ public final class FileIndex: @unchecked Sendable {
                 recordsByPath[path] = record
             }
 
+            searchSnapshotRevision &+= 1
+            snapshotRevision = searchSnapshotRevision
+            snapshotRecords = Array(recordsByPath.values)
             status = "Updated \(upserts.count + deletedPrefixes.count) changed path\(upserts.count + deletedPrefixes.count == 1 ? "" : "s")"
             lastUpdated = Date()
+        }
+
+        let snapshot = SearchSnapshot(records: snapshotRecords)
+        lock.withLock {
+            if searchSnapshotRevision == snapshotRevision {
+                searchSnapshot = snapshot
+            }
         }
 
         publishStats()
@@ -385,8 +951,11 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     private func replaceRecords(_ records: [String: FileRecord], isIndexing: Bool, status: String) {
+        let snapshot = SearchSnapshot(records: Array(records.values), buildsSearchStructures: !isIndexing)
         lock.withLock {
             recordsByPath = records
+            searchSnapshot = snapshot
+            searchSnapshotRevision &+= 1
             indexing = isIndexing
             self.status = status
             lastUpdated = Date()
