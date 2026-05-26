@@ -33,6 +33,19 @@ struct FuzzyMatcherTests {
         #expect(FuzzyMatcher.score(record: record, query: "package !node_modules") == nil)
     }
 
+    @Test("plain text filters out unrelated paths")
+    func plainTextDoesNotMatchScatteredPathCharacters() throws {
+        let unrelated = try #require(makeRecord(name: "FETCH_HEAD", directory: "/Users/jaeger/Documents/Personal/embc/.git"))
+        let projectPath = try #require(makeRecord(name: "artifacts", directory: "/Users/jaeger/Documents/GitHub/AllTheThings", isDirectory: true))
+        let matchingName = try #require(makeRecord(name: "UnitTests.swift", directory: "/Users/jaeger/Documents/Personal/embc/Sources"))
+        let matchingPath = try #require(makeRecord(name: "Package.swift", directory: "/Users/jaeger/Documents/Personal/embc/Tests"))
+
+        #expect(FuzzyMatcher.score(record: unrelated, query: "test") == nil)
+        #expect(FuzzyMatcher.score(record: projectPath, query: "test") == nil)
+        #expect(FuzzyMatcher.score(record: matchingName, query: "test") != nil)
+        #expect(FuzzyMatcher.score(record: matchingPath, query: "test") != nil)
+    }
+
     @Test("supports fielded fuzzy clauses")
     func fieldedFuzzyClauses() throws {
         let source = try #require(makeRecord(name: "SearchWindowController.swift", directory: "/tmp/project/Sources/AllTheThings"))

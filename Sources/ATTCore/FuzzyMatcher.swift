@@ -1,5 +1,4 @@
 import Foundation
-import Ifrit
 
 public enum FuzzyMatcher {
     public struct ParsedQuery: Sendable {
@@ -17,7 +16,6 @@ public enum FuzzyMatcher {
 
     struct SearchPattern: Sendable {
         let token: String
-        let ifritPattern: Fuse.Pattern?
     }
 
     enum QueryPart: Sendable {
@@ -37,9 +35,6 @@ public enum FuzzyMatcher {
         case exact
         case wildcard
     }
-
-    private static let fuse = Fuse(location: 0, distance: 1_000, threshold: 0.35, isCaseSensitive: false, tokenize: false)
-    private static let maximumIfritPatternLength = MemoryLayout<Int>.size * 8 - 1
 
     public static func normalize(_ value: String) -> String {
         value
@@ -139,7 +134,7 @@ public enum FuzzyMatcher {
             switch field {
             case .any:
                 let nameScore = scoreString(record.normalizedName, pattern: pattern, basenameBias: true)
-                let pathScore = scoreString(record.normalizedPath, pattern: pattern, basenameBias: false).map { $0 - 400 }
+                let pathScore = fuzzyPathScore(record: record, pattern: pattern).map { $0 - 400 }
                 let typoScore = typoScore(record: record, token: token)
                 return [nameScore, pathScore, typoScore].compactMap { $0 }.max()
             case .name:
@@ -147,9 +142,28 @@ public enum FuzzyMatcher {
                 let typoScore = typoScore(record: record, token: token)
                 return [nameScore, typoScore].compactMap { $0 }.max()
             case .path:
-                return scoreString(record.normalizedPath, pattern: pattern, basenameBias: false)
+                return fuzzyPathScore(record: record, pattern: pattern)
             }
         }
+    }
+
+    private static func fuzzyPathScore(record: FileRecord, pattern: SearchPattern) -> Int? {
+        if let exactPathScore = exactScore(record: record, field: .path, token: pattern.token) {
+            return exactPathScore
+        }
+
+        guard pattern.token.count <= 3 else {
+            return nil
+        }
+
+        var best: Int?
+        for component in components(from: record.normalizedPath) {
+            guard let score = scoreString(component, pattern: pattern, basenameBias: false) else {
+                continue
+            }
+            best = max(best ?? Int.min, score)
+        }
+        return best
     }
 
     private static func extensionScore(_ extensionValue: String, pattern: SearchPattern, mode: MatchMode) -> Int? {
@@ -329,11 +343,7 @@ public enum FuzzyMatcher {
     }
 
     private static func makeSearchPattern(_ token: String, mode: MatchMode) -> SearchPattern {
-        guard mode == .fuzzy, token.count <= maximumIfritPatternLength else {
-            return SearchPattern(token: token, ifritPattern: nil)
-        }
-
-        return SearchPattern(token: token, ifritPattern: fuse.createPattern(from: token))
+        SearchPattern(token: token)
     }
 
     private static func splitAlternatives(_ value: String) -> [String] {
@@ -392,34 +402,11 @@ public enum FuzzyMatcher {
             return acronym
         }
 
-        if let ifritScore = ifritScoreString(text, pattern: pattern, basenameBias: basenameBias) {
-            return ifritScore
+        if token.count <= 3 {
+            return subsequenceScore(text: text, token: token)
         }
 
         return nil
-    }
-
-    private static func ifritScoreString(_ text: String, pattern: SearchPattern, basenameBias: Bool) -> Int? {
-        guard
-            let ifritPattern = pattern.ifritPattern,
-            let result = fuse.search(ifritPattern, in: text)
-        else {
-            return subsequenceScore(text: text, token: pattern.token)
-        }
-
-        let quality = max(0.0, min(1.0, 1.0 - result.score))
-        let firstMatch = result.ranges.map(\.lowerBound).min() ?? 0
-        let matchedCharacters = result.ranges.reduce(0) { total, range in
-            total + range.count
-        }
-
-        let base = basenameBias ? 5_700 : 5_100
-        let qualityBonus = Int((quality * 1_900).rounded())
-        let boundaryBonus = isBoundary(in: text, atCharacterOffset: firstMatch) ? 450 : 0
-        let compactnessBonus = min(matchedCharacters * 45, 700)
-        let offsetPenalty = min(firstMatch * 8, 700)
-
-        return base + qualityBonus + boundaryBonus + compactnessBonus - offsetPenalty
     }
 
     private static func typoScore(record: FileRecord, token: String) -> Int? {

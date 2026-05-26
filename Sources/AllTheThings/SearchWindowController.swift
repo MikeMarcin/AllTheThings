@@ -96,9 +96,14 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
     }
 
+    private struct SearchSignature: Equatable {
+        let query: String
+        let sort: SortSpec
+    }
+
     private let index: FileIndex
     private let watcher = FileSystemWatcher()
-    private let searchQueue = DispatchQueue(label: "att.search", qos: .userInitiated)
+    private let searchQueue = DispatchQueue(label: "att.search", qos: .userInitiated, attributes: .concurrent)
     private let defaults = UserDefaults.standard
     private let rootsKey = "ATTIndexedRoots"
 
@@ -119,6 +124,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var queryElapsed: TimeInterval = 0
     private var queryGeneration: UInt64 = 0
     private var activeSearchToken: SearchCancellationToken?
+    private var scheduledSearchSignature: SearchSignature?
     private var sortSpec = SortSpec(column: .modified, ascending: false)
     private var indexedRoots: [URL]
     private var pendingEventPaths = Set<String>()
@@ -163,7 +169,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         index.onStatsChanged = { @MainActor @Sendable [weak self] stats in
             self?.indexStats = stats
             self?.updateStatus()
-            self?.scheduleSearch()
+            self?.scheduleSearch(force: true)
         }
 
         startWatching()
@@ -171,7 +177,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         if indexStats.indexedCount == 0 {
             index.replaceRootsAndRebuild(indexedRoots)
         } else {
-            scheduleSearch()
+            scheduleSearch(force: true)
         }
     }
 
@@ -241,7 +247,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     func tableView(_ tableView: NSTableView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
         guard let descriptor = tableView.sortDescriptors.first else { return }
         sortSpec = sortSpec(for: descriptor)
-        scheduleSearch()
+        scheduleSearch(force: true)
     }
 
     func controlTextDidChange(_ obj: Notification) {
@@ -265,6 +271,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         searchField.placeholderString = "Search filenames and paths"
         searchField.delegate = self
+        searchField.target = self
+        searchField.action = #selector(searchFieldDidChange(_:))
         searchField.controlSize = .large
         searchField.font = .systemFont(ofSize: 16)
         searchField.sendsSearchStringImmediately = true
@@ -394,14 +402,18 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         return cell
     }
 
-    private func scheduleSearch() {
+    private func scheduleSearch(force: Bool = false) {
+        let request = SearchRequest(query: currentSearchText(), sort: sortSpec)
+        let signature = SearchSignature(query: request.query, sort: request.sort)
+        guard force || signature != scheduledSearchSignature else { return }
+        scheduledSearchSignature = signature
+
         activeSearchToken?.cancel()
         let token = SearchCancellationToken()
         activeSearchToken = token
 
         queryGeneration &+= 1
         let generation = queryGeneration
-        let request = SearchRequest(query: searchField.stringValue, sort: sortSpec)
         let index = self.index
 
         searchQueue.async {
@@ -418,6 +430,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                 self.updateActionButtons()
             }
         }
+    }
+
+    private func currentSearchText() -> String {
+        searchField.currentEditor()?.string ?? searchField.stringValue
     }
 
     private func startWatching() {
@@ -524,6 +540,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     @objc private func reindex(_ sender: Any?) {
         index.replaceRootsAndRebuild(indexedRoots)
+    }
+
+    @objc private func searchFieldDidChange(_ sender: NSSearchField) {
+        scheduleSearch()
     }
 
     @objc private func openSelected(_ sender: Any?) {
