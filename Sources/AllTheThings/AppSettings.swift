@@ -69,6 +69,10 @@ enum AppSettings {
         NotificationCenter.default.post(name: indexedRootsDidChangeNotification, object: defaults)
     }
 
+    static func resetIndexedRoots(defaults: UserDefaults = .standard) {
+        saveIndexedRoots(defaultIndexedRoots(), defaults: defaults)
+    }
+
     static func exclusionPatterns(defaults: UserDefaults = .standard) -> [String] {
         defaults.array(forKey: exclusionPatternsKey) as? [String] ?? FileExclusionRules.defaultPatterns
     }
@@ -79,6 +83,10 @@ enum AppSettings {
         NotificationCenter.default.post(name: exclusionPatternsDidChangeNotification, object: defaults)
     }
 
+    static func resetExclusionPatterns(defaults: UserDefaults = .standard) {
+        saveExclusionPatterns(FileExclusionRules.defaultPatterns, defaults: defaults)
+    }
+
     static func displayPath(_ path: String) -> String {
         (path as NSString).abbreviatingWithTildeInPath
     }
@@ -87,7 +95,7 @@ enum AppSettings {
         displayPath(url.standardizedFileURL.path)
     }
 
-    private static func defaultIndexedRoots() -> [URL] {
+    static func defaultIndexedRoots() -> [URL] {
         let fileManager = FileManager.default
         let home = fileManager.homeDirectoryForCurrentUser
         let candidates = [

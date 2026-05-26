@@ -1,4 +1,5 @@
 import AppKit
+import ATTCore
 
 @MainActor
 final class SettingsWindowController: NSWindowController {
@@ -48,7 +49,7 @@ private enum SettingsSection {
 }
 
 @MainActor
-private final class SettingsViewController: NSViewController, NSTextFieldDelegate {
+private final class SettingsViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate {
     private let defaults: UserDefaults
     private let contentContainer = NSView()
     private let generalSidebarRow = SidebarRow(section: .general)
@@ -57,15 +58,21 @@ private final class SettingsViewController: NSViewController, NSTextFieldDelegat
     private let showHiddenFilesSwitch = NSSwitch()
     private let allowMultipleInstancesSwitch = NSSwitch()
     private let automaticallyCheckForUpdatesSwitch = NSSwitch()
-    private let rootsStack = NSStackView()
+    private let rootsTableView = NSTableView()
     private let addRootButton = NSButton()
-    private let exclusionsStack = NSStackView()
+    private let resetRootsButton = NSButton()
+    private let exclusionsTableView = NSTableView()
     private let addExclusionButton = NSButton()
+    private let resetExclusionsButton = NSButton()
     private let exclusionHelpButton = NSButton()
     private var pageViews: [SettingsSection: NSView] = [:]
     private var selectedSection = SettingsSection.general
+    private var indexedRoots: [URL] = []
+    private var exclusionPatterns: [String] = []
 
     private static let exclusionPatternFieldIdentifier = NSUserInterfaceItemIdentifier("exclusionPatternField")
+    private static let indexedRootPasteboardType = NSPasteboard.PasteboardType("com.allthethings.settings.indexed-root-row")
+    private static let exclusionPatternPasteboardType = NSPasteboard.PasteboardType("com.allthethings.settings.exclusion-pattern-row")
 
     init(defaults: UserDefaults) {
         self.defaults = defaults
@@ -156,7 +163,9 @@ private final class SettingsViewController: NSViewController, NSTextFieldDelegat
         NSLayoutConstraint.activate([
             stack.topAnchor.constraint(equalTo: sidebar.safeAreaLayoutGuide.topAnchor, constant: 18),
             stack.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 12),
-            stack.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -12)
+            stack.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -12),
+            generalSidebarRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            indexedFoldersSidebarRow.widthAnchor.constraint(equalTo: stack.widthAnchor)
         ])
 
         return sidebar
@@ -302,6 +311,12 @@ private final class SettingsViewController: NSViewController, NSTextFieldDelegat
 
         let rootsLabel = makeSectionLabel("Folders")
 
+        configureIconButton(
+            resetRootsButton,
+            symbol: "arrow.counterclockwise",
+            tooltip: "Reset indexed folders to defaults",
+            action: #selector(resetIndexedRoots(_:))
+        )
         addRootButton.translatesAutoresizingMaskIntoConstraints = false
         addRootButton.image = NSImage(systemSymbolName: "plus", accessibilityDescription: "Add indexed folder")
         addRootButton.title = ""
@@ -314,6 +329,7 @@ private final class SettingsViewController: NSViewController, NSTextFieldDelegat
         rootsHeaderSpacer.translatesAutoresizingMaskIntoConstraints = false
         rootsHeader.addArrangedSubview(rootsLabel)
         rootsHeader.addArrangedSubview(rootsHeaderSpacer)
+        rootsHeader.addArrangedSubview(resetRootsButton)
         rootsHeader.addArrangedSubview(addRootButton)
 
         let rootsCard = makeIndexedRootsCard()
@@ -335,19 +351,25 @@ private final class SettingsViewController: NSViewController, NSTextFieldDelegat
         exclusionHelpButton.target = self
         exclusionHelpButton.action = #selector(showExclusionPatternHelp(_:))
 
-        addExclusionButton.translatesAutoresizingMaskIntoConstraints = false
-        addExclusionButton.image = NSImage(systemSymbolName: "plus", accessibilityDescription: "Add excluded path")
-        addExclusionButton.title = ""
-        addExclusionButton.bezelStyle = .texturedRounded
-        addExclusionButton.toolTip = "Add excluded path"
-        addExclusionButton.target = self
-        addExclusionButton.action = #selector(addExclusionPattern(_:))
+        configureIconButton(
+            resetExclusionsButton,
+            symbol: "arrow.counterclockwise",
+            tooltip: "Reset excluded paths to defaults",
+            action: #selector(resetExclusionPatterns(_:))
+        )
+        configureIconButton(
+            addExclusionButton,
+            symbol: "plus",
+            tooltip: "Add excluded path",
+            action: #selector(addExclusionPattern(_:))
+        )
 
         let exclusionsHeaderSpacer = NSView()
         exclusionsHeaderSpacer.translatesAutoresizingMaskIntoConstraints = false
         exclusionsHeader.addArrangedSubview(exclusionsLabel)
         exclusionsHeader.addArrangedSubview(exclusionHelpButton)
         exclusionsHeader.addArrangedSubview(exclusionsHeaderSpacer)
+        exclusionsHeader.addArrangedSubview(resetExclusionsButton)
         exclusionsHeader.addArrangedSubview(addExclusionButton)
 
         let exclusionsCard = makeExclusionPatternsCard()
@@ -366,6 +388,8 @@ private final class SettingsViewController: NSViewController, NSTextFieldDelegat
             rootsHeader.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 42),
             rootsHeader.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
             rootsHeader.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -52),
+            resetRootsButton.widthAnchor.constraint(equalToConstant: 28),
+            resetRootsButton.heightAnchor.constraint(equalToConstant: 24),
             addRootButton.widthAnchor.constraint(equalToConstant: 28),
             addRootButton.heightAnchor.constraint(equalToConstant: 24),
 
@@ -378,6 +402,8 @@ private final class SettingsViewController: NSViewController, NSTextFieldDelegat
             exclusionsHeader.trailingAnchor.constraint(equalTo: rootsCard.trailingAnchor),
             exclusionHelpButton.widthAnchor.constraint(equalToConstant: 20),
             exclusionHelpButton.heightAnchor.constraint(equalToConstant: 20),
+            resetExclusionsButton.widthAnchor.constraint(equalToConstant: 28),
+            resetExclusionsButton.heightAnchor.constraint(equalToConstant: 24),
             addExclusionButton.widthAnchor.constraint(equalToConstant: 28),
             addExclusionButton.heightAnchor.constraint(equalToConstant: 24),
 
@@ -412,6 +438,16 @@ private final class SettingsViewController: NSViewController, NSTextFieldDelegat
         control.action = action
     }
 
+    private func configureIconButton(_ button: NSButton, symbol: String, tooltip: String, action: Selector) {
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: tooltip)
+        button.title = ""
+        button.bezelStyle = .texturedRounded
+        button.toolTip = tooltip
+        button.target = self
+        button.action = action
+    }
+
     private func makeSettingsCard(rows: [NSView]) -> NSView {
         let card = makeCard()
 
@@ -442,17 +478,27 @@ private final class SettingsViewController: NSViewController, NSTextFieldDelegat
     private func makeIndexedRootsCard() -> NSView {
         let card = makeCard()
 
-        rootsStack.translatesAutoresizingMaskIntoConstraints = false
-        rootsStack.orientation = .vertical
-        rootsStack.alignment = .leading
-        rootsStack.spacing = 0
+        let scrollView = NSScrollView()
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.borderType = .noBorder
+        scrollView.drawsBackground = false
 
-        card.addSubview(rootsStack)
+        configureSettingsTable(
+            rootsTableView,
+            pasteboardType: Self.indexedRootPasteboardType,
+            columnIdentifier: IndexedRootCellView.identifier
+        )
+
+        scrollView.documentView = rootsTableView
+        card.addSubview(scrollView)
         NSLayoutConstraint.activate([
-            rootsStack.topAnchor.constraint(equalTo: card.topAnchor),
-            rootsStack.leadingAnchor.constraint(equalTo: card.leadingAnchor),
-            rootsStack.trailingAnchor.constraint(equalTo: card.trailingAnchor),
-            rootsStack.bottomAnchor.constraint(equalTo: card.bottomAnchor)
+            scrollView.topAnchor.constraint(equalTo: card.topAnchor),
+            scrollView.leadingAnchor.constraint(equalTo: card.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: card.trailingAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: card.bottomAnchor),
+            card.heightAnchor.constraint(greaterThanOrEqualToConstant: 132)
         ])
 
         return card
@@ -461,20 +507,55 @@ private final class SettingsViewController: NSViewController, NSTextFieldDelegat
     private func makeExclusionPatternsCard() -> NSView {
         let card = makeCard()
 
-        exclusionsStack.translatesAutoresizingMaskIntoConstraints = false
-        exclusionsStack.orientation = .vertical
-        exclusionsStack.alignment = .leading
-        exclusionsStack.spacing = 0
+        let scrollView = NSScrollView()
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.borderType = .noBorder
+        scrollView.drawsBackground = false
 
-        card.addSubview(exclusionsStack)
+        configureSettingsTable(
+            exclusionsTableView,
+            pasteboardType: Self.exclusionPatternPasteboardType,
+            columnIdentifier: ExclusionPatternCellView.identifier
+        )
+
+        scrollView.documentView = exclusionsTableView
+
+        card.addSubview(scrollView)
         NSLayoutConstraint.activate([
-            exclusionsStack.topAnchor.constraint(equalTo: card.topAnchor),
-            exclusionsStack.leadingAnchor.constraint(equalTo: card.leadingAnchor),
-            exclusionsStack.trailingAnchor.constraint(equalTo: card.trailingAnchor),
-            exclusionsStack.bottomAnchor.constraint(equalTo: card.bottomAnchor)
+            scrollView.topAnchor.constraint(equalTo: card.topAnchor),
+            scrollView.leadingAnchor.constraint(equalTo: card.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: card.trailingAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: card.bottomAnchor),
+            card.heightAnchor.constraint(greaterThanOrEqualToConstant: 180)
         ])
 
         return card
+    }
+
+    private func configureSettingsTable(
+        _ tableView: NSTableView,
+        pasteboardType: NSPasteboard.PasteboardType,
+        columnIdentifier: NSUserInterfaceItemIdentifier
+    ) {
+        tableView.translatesAutoresizingMaskIntoConstraints = false
+        tableView.headerView = nil
+        tableView.usesAlternatingRowBackgroundColors = false
+        tableView.rowHeight = 42
+        tableView.intercellSpacing = NSSize(width: 0, height: 0)
+        tableView.style = .fullWidth
+        tableView.allowsMultipleSelection = false
+        tableView.selectionHighlightStyle = .none
+        tableView.dataSource = self
+        tableView.delegate = self
+        tableView.registerForDraggedTypes([pasteboardType])
+
+        if tableView.tableColumns.isEmpty {
+            let column = NSTableColumn(identifier: columnIdentifier)
+            column.resizingMask = .autoresizingMask
+            tableView.addTableColumn(column)
+        }
     }
 
     private func makeCard() -> NSView {
@@ -539,204 +620,164 @@ private final class SettingsViewController: NSViewController, NSTextFieldDelegat
         return separator
     }
 
-    private func makeIndexedRootRow(_ root: URL) -> NSView {
-        let row = NSView()
-        row.translatesAutoresizingMaskIntoConstraints = false
-
-        let icon = NSImageView()
-        icon.translatesAutoresizingMaskIntoConstraints = false
-        icon.image = NSImage(systemSymbolName: "folder", accessibilityDescription: "Indexed folder")
-        icon.contentTintColor = .secondaryLabelColor
-
-        let pathLabel = NSTextField(labelWithString: AppSettings.displayPath(root))
-        pathLabel.translatesAutoresizingMaskIntoConstraints = false
-        pathLabel.font = .systemFont(ofSize: 12, weight: .regular)
-        pathLabel.textColor = .labelColor
-        pathLabel.lineBreakMode = .byTruncatingMiddle
-
-        let removeButton = NSButton()
-        removeButton.translatesAutoresizingMaskIntoConstraints = false
-        removeButton.image = NSImage(systemSymbolName: "minus.circle", accessibilityDescription: "Remove indexed folder")
-        removeButton.title = ""
-        removeButton.isBordered = false
-        removeButton.contentTintColor = .secondaryLabelColor
-        removeButton.toolTip = "Remove indexed folder"
-        removeButton.identifier = NSUserInterfaceItemIdentifier(root.standardizedFileURL.path)
-        removeButton.target = self
-        removeButton.action = #selector(removeIndexedRoot(_:))
-
-        row.addSubview(icon)
-        row.addSubview(pathLabel)
-        row.addSubview(removeButton)
-
-        NSLayoutConstraint.activate([
-            row.heightAnchor.constraint(equalToConstant: 38),
-
-            icon.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 18),
-            icon.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-            icon.widthAnchor.constraint(equalToConstant: 16),
-            icon.heightAnchor.constraint(equalToConstant: 16),
-
-            pathLabel.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 10),
-            pathLabel.trailingAnchor.constraint(equalTo: removeButton.leadingAnchor, constant: -14),
-            pathLabel.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-
-            removeButton.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -16),
-            removeButton.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-            removeButton.widthAnchor.constraint(equalToConstant: 22),
-            removeButton.heightAnchor.constraint(equalToConstant: 22)
-        ])
-
-        return row
-    }
-
-    private func makeEmptyRootsRow() -> NSView {
-        let row = NSView()
-        row.translatesAutoresizingMaskIntoConstraints = false
-
-        let label = NSTextField(labelWithString: "No indexed folders")
-        label.translatesAutoresizingMaskIntoConstraints = false
-        label.font = .systemFont(ofSize: 12, weight: .regular)
-        label.textColor = .secondaryLabelColor
-
-        row.addSubview(label)
-        NSLayoutConstraint.activate([
-            row.heightAnchor.constraint(equalToConstant: 44),
-            label.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 20),
-            label.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -20),
-            label.centerYAnchor.constraint(equalTo: row.centerYAnchor)
-        ])
-
-        return row
-    }
-
-    private func makeExclusionPatternRow(_ pattern: String, index: Int) -> NSView {
-        let row = NSView()
-        row.translatesAutoresizingMaskIntoConstraints = false
-
-        let icon = NSImageView()
-        icon.translatesAutoresizingMaskIntoConstraints = false
-        icon.image = NSImage(systemSymbolName: "line.3.horizontal.decrease.circle", accessibilityDescription: "Excluded path")
-        icon.contentTintColor = .secondaryLabelColor
-
-        let field = NSTextField(string: pattern)
-        field.translatesAutoresizingMaskIntoConstraints = false
-        field.identifier = Self.exclusionPatternFieldIdentifier
-        field.placeholderString = "**/.cache/"
-        field.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
-        field.textColor = .labelColor
-        field.bezelStyle = .roundedBezel
-        field.isBordered = true
-        field.drawsBackground = true
-        field.delegate = self
-        field.target = self
-        field.action = #selector(exclusionPatternFieldDidCommit(_:))
-        field.tag = index
-
-        let removeButton = NSButton()
-        removeButton.translatesAutoresizingMaskIntoConstraints = false
-        removeButton.image = NSImage(systemSymbolName: "minus.circle", accessibilityDescription: "Remove excluded path")
-        removeButton.title = ""
-        removeButton.isBordered = false
-        removeButton.contentTintColor = .secondaryLabelColor
-        removeButton.toolTip = "Remove excluded path"
-        removeButton.tag = index
-        removeButton.target = self
-        removeButton.action = #selector(removeExclusionPattern(_:))
-
-        row.addSubview(icon)
-        row.addSubview(field)
-        row.addSubview(removeButton)
-
-        NSLayoutConstraint.activate([
-            row.heightAnchor.constraint(equalToConstant: 44),
-
-            icon.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 18),
-            icon.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-            icon.widthAnchor.constraint(equalToConstant: 16),
-            icon.heightAnchor.constraint(equalToConstant: 16),
-
-            field.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 10),
-            field.trailingAnchor.constraint(equalTo: removeButton.leadingAnchor, constant: -14),
-            field.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-
-            removeButton.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -16),
-            removeButton.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-            removeButton.widthAnchor.constraint(equalToConstant: 22),
-            removeButton.heightAnchor.constraint(equalToConstant: 22)
-        ])
-
-        return row
-    }
-
-    private func makeEmptyExclusionsRow() -> NSView {
-        let row = NSView()
-        row.translatesAutoresizingMaskIntoConstraints = false
-
-        let label = NSTextField(labelWithString: "No excluded paths")
-        label.translatesAutoresizingMaskIntoConstraints = false
-        label.font = .systemFont(ofSize: 12, weight: .regular)
-        label.textColor = .secondaryLabelColor
-
-        row.addSubview(label)
-        NSLayoutConstraint.activate([
-            row.heightAnchor.constraint(equalToConstant: 44),
-            label.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 20),
-            label.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -20),
-            label.centerYAnchor.constraint(equalTo: row.centerYAnchor)
-        ])
-
-        return row
-    }
-
-    private func addFullWidthRootSubview(_ subview: NSView) {
-        rootsStack.addArrangedSubview(subview)
-        subview.widthAnchor.constraint(equalTo: rootsStack.widthAnchor).isActive = true
-    }
-
-    private func addFullWidthExclusionSubview(_ subview: NSView) {
-        exclusionsStack.addArrangedSubview(subview)
-        subview.widthAnchor.constraint(equalTo: exclusionsStack.widthAnchor).isActive = true
-    }
-
     private func renderIndexedRoots() {
-        for view in rootsStack.arrangedSubviews {
-            rootsStack.removeArrangedSubview(view)
-            view.removeFromSuperview()
-        }
-
-        let roots = AppSettings.indexedRoots(defaults: defaults)
-        guard !roots.isEmpty else {
-            addFullWidthRootSubview(makeEmptyRootsRow())
-            return
-        }
-
-        for (index, root) in roots.enumerated() {
-            addFullWidthRootSubview(makeIndexedRootRow(root))
-            if index < roots.count - 1 {
-                addFullWidthRootSubview(makeSeparator())
-            }
-        }
+        indexedRoots = AppSettings.indexedRoots(defaults: defaults)
+        rootsTableView.reloadData()
     }
 
     private func renderExclusionPatterns() {
-        let patterns = AppSettings.exclusionPatterns(defaults: defaults)
-        for view in exclusionsStack.arrangedSubviews {
-            exclusionsStack.removeArrangedSubview(view)
-            view.removeFromSuperview()
+        exclusionPatterns = AppSettings.exclusionPatterns(defaults: defaults)
+        exclusionsTableView.reloadData()
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int {
+        if tableView === rootsTableView {
+            return indexedRoots.isEmpty ? 1 : indexedRoots.count
         }
 
-        guard !patterns.isEmpty else {
-            addFullWidthExclusionSubview(makeEmptyExclusionsRow())
-            return
+        if tableView === exclusionsTableView {
+            return exclusionPatterns.isEmpty ? 1 : exclusionPatterns.count
         }
 
-        for (index, pattern) in patterns.enumerated() {
-            addFullWidthExclusionSubview(makeExclusionPatternRow(pattern, index: index))
-            if index < patterns.count - 1 {
-                addFullWidthExclusionSubview(makeSeparator())
+        return 0
+    }
+
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        42
+    }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        if tableView === rootsTableView {
+            guard !indexedRoots.isEmpty else {
+                let view = EmptyListCellView()
+                view.messageLabel.stringValue = "No indexed folders"
+                return view
             }
+
+            guard row >= 0, row < indexedRoots.count else { return nil }
+
+            let cell = IndexedRootCellView()
+            cell.configure(
+                root: indexedRoots[row],
+                index: row,
+                target: self,
+                removeAction: #selector(removeIndexedRoot(_:))
+            )
+            return cell
         }
+
+        if tableView === exclusionsTableView {
+            guard !exclusionPatterns.isEmpty else {
+                let view = EmptyListCellView()
+                view.messageLabel.stringValue = "No excluded paths"
+                return view
+            }
+
+            guard row >= 0, row < exclusionPatterns.count else { return nil }
+
+            let cell = ExclusionPatternCellView()
+            cell.configure(
+                pattern: exclusionPatterns[row],
+                index: row,
+                target: self,
+                removeAction: #selector(removeExclusionPattern(_:)),
+                fieldAction: #selector(exclusionPatternFieldDidCommit(_:))
+            )
+            cell.patternField.delegate = self
+            return cell
+        }
+
+        return nil
+    }
+
+    func tableView(
+        _ tableView: NSTableView,
+        pasteboardWriterForRow row: Int
+    ) -> NSPasteboardWriting? {
+        let count = tableView === rootsTableView ? indexedRoots.count : exclusionPatterns.count
+        guard row >= 0, row < count else { return nil }
+
+        let item = NSPasteboardItem()
+        item.setString(String(row), forType: pasteboardType(for: tableView))
+        return item
+    }
+
+    func tableView(
+        _ tableView: NSTableView,
+        validateDrop info: NSDraggingInfo,
+        proposedRow row: Int,
+        proposedDropOperation dropOperation: NSTableView.DropOperation
+    ) -> NSDragOperation {
+        guard info.draggingPasteboard.string(forType: pasteboardType(for: tableView)) != nil else {
+            return []
+        }
+
+        tableView.setDropRow(row, dropOperation: .above)
+        return .move
+    }
+
+    func tableView(
+        _ tableView: NSTableView,
+        acceptDrop info: NSDraggingInfo,
+        row proposedRow: Int,
+        dropOperation: NSTableView.DropOperation
+    ) -> Bool {
+        guard
+            let sourceString = info.draggingPasteboard.string(forType: pasteboardType(for: tableView)),
+            let sourceIndex = Int(sourceString)
+        else {
+            return false
+        }
+
+        if tableView === rootsTableView {
+            return moveIndexedRoot(from: sourceIndex, to: proposedRow)
+        }
+
+        if tableView === exclusionsTableView {
+            return moveExclusionPattern(from: sourceIndex, to: proposedRow)
+        }
+
+        return false
+    }
+
+    private func pasteboardType(for tableView: NSTableView) -> NSPasteboard.PasteboardType {
+        tableView === rootsTableView ? Self.indexedRootPasteboardType : Self.exclusionPatternPasteboardType
+    }
+
+    private func moveIndexedRoot(from sourceIndex: Int, to proposedRow: Int) -> Bool {
+        guard sourceIndex >= 0, sourceIndex < indexedRoots.count else { return false }
+
+        var destinationIndex = min(max(proposedRow, 0), indexedRoots.count)
+        guard destinationIndex != sourceIndex && destinationIndex != sourceIndex + 1 else {
+            return false
+        }
+
+        let root = indexedRoots.remove(at: sourceIndex)
+        if destinationIndex > sourceIndex {
+            destinationIndex -= 1
+        }
+        indexedRoots.insert(root, at: destinationIndex)
+        AppSettings.saveIndexedRoots(indexedRoots, defaults: defaults)
+        renderIndexedRoots()
+        return true
+    }
+
+    private func moveExclusionPattern(from sourceIndex: Int, to proposedRow: Int) -> Bool {
+        guard sourceIndex >= 0, sourceIndex < exclusionPatterns.count else { return false }
+
+        var destinationIndex = min(max(proposedRow, 0), exclusionPatterns.count)
+        guard destinationIndex != sourceIndex && destinationIndex != sourceIndex + 1 else {
+            return false
+        }
+
+        let pattern = exclusionPatterns.remove(at: sourceIndex)
+        if destinationIndex > sourceIndex {
+            destinationIndex -= 1
+        }
+        exclusionPatterns.insert(pattern, at: destinationIndex)
+        AppSettings.saveExclusionPatterns(exclusionPatterns, defaults: defaults)
+        renderExclusionPatterns()
+        return true
     }
 
     private func updateSwitches() {
@@ -795,12 +836,15 @@ private final class SettingsViewController: NSViewController, NSTextFieldDelegat
     }
 
     @objc private func removeIndexedRoot(_ sender: NSButton) {
-        guard let path = sender.identifier?.rawValue else { return }
+        guard sender.tag >= 0, sender.tag < indexedRoots.count else { return }
 
-        let roots = AppSettings.indexedRoots(defaults: defaults).filter {
-            $0.standardizedFileURL.path != path
-        }
-        AppSettings.saveIndexedRoots(roots, defaults: defaults)
+        indexedRoots.remove(at: sender.tag)
+        AppSettings.saveIndexedRoots(indexedRoots, defaults: defaults)
+        renderIndexedRoots()
+    }
+
+    @objc private func resetIndexedRoots(_ sender: NSButton) {
+        AppSettings.resetIndexedRoots(defaults: defaults)
         renderIndexedRoots()
     }
 
@@ -841,16 +885,20 @@ private final class SettingsViewController: NSViewController, NSTextFieldDelegat
     }
 
     @objc private func removeExclusionPattern(_ sender: NSButton) {
-        var patterns = AppSettings.exclusionPatterns(defaults: defaults)
-        guard sender.tag >= 0, sender.tag < patterns.count else { return }
+        guard sender.tag >= 0, sender.tag < exclusionPatterns.count else { return }
 
-        patterns.remove(at: sender.tag)
-        AppSettings.saveExclusionPatterns(patterns, defaults: defaults)
+        exclusionPatterns.remove(at: sender.tag)
+        AppSettings.saveExclusionPatterns(exclusionPatterns, defaults: defaults)
+        renderExclusionPatterns()
+    }
+
+    @objc private func resetExclusionPatterns(_ sender: NSButton) {
+        AppSettings.resetExclusionPatterns(defaults: defaults)
         renderExclusionPatterns()
     }
 
     @objc private func exclusionPatternFieldDidCommit(_ sender: NSTextField) {
-        saveExclusionPatternsFromRows()
+        saveExclusionPattern(sender)
     }
 
     func controlTextDidEndEditing(_ obj: Notification) {
@@ -861,11 +909,11 @@ private final class SettingsViewController: NSViewController, NSTextFieldDelegat
             return
         }
 
-        saveExclusionPatternsFromRows()
+        saveExclusionPattern(field)
     }
 
     private func saveExclusionPatternsFromRows() {
-        let patterns = normalizedExclusionPatterns(exclusionPatternFields().map(\.stringValue))
+        let patterns = normalizedExclusionPatterns(exclusionPatterns)
         guard patterns != AppSettings.exclusionPatterns(defaults: defaults) else {
             renderExclusionPatterns()
             return
@@ -875,11 +923,11 @@ private final class SettingsViewController: NSViewController, NSTextFieldDelegat
         renderExclusionPatterns()
     }
 
-    private func exclusionPatternFields() -> [NSTextField] {
-        exclusionsStack.arrangedSubviews.compactMap { row in
-            row.subviews.compactMap { $0 as? NSTextField }
-                .first { $0.identifier == Self.exclusionPatternFieldIdentifier }
-        }
+    private func saveExclusionPattern(_ field: NSTextField) {
+        guard field.tag >= 0, field.tag < exclusionPatterns.count else { return }
+
+        exclusionPatterns[field.tag] = field.stringValue
+        saveExclusionPatternsFromRows()
     }
 
     private func normalizedExclusionPatterns(_ rawPatterns: [String]) -> [String] {
@@ -898,7 +946,7 @@ private final class SettingsViewController: NSViewController, NSTextFieldDelegat
     @objc private func showExclusionPatternHelp(_ sender: NSButton) {
         let popover = NSPopover()
         popover.behavior = .transient
-        popover.contentSize = NSSize(width: 340, height: 230)
+        popover.contentSize = NSSize(width: 300, height: 176)
 
         let contentViewController = NSViewController()
         let contentView = NSView(frame: NSRect(origin: .zero, size: popover.contentSize))
@@ -910,19 +958,19 @@ private final class SettingsViewController: NSViewController, NSTextFieldDelegat
         titleLabel.textColor = .labelColor
 
         let examples = [
-            "folder/ excludes that folder anywhere.",
-            "*.tmp matches file or folder names.",
-            "path/*.log matches relative paths.",
-            "** spans across folders.",
-            "!pattern re-includes an earlier match.",
-            "# starts a comment. Use \\# for a literal #."
+            "folder/ excludes a folder anywhere",
+            "*.tmp matches names",
+            "path/*.log matches relative paths",
+            "** spans folders",
+            "!pattern re-includes earlier matches",
+            "# comments, \\# literal #"
         ]
 
         let stack = NSStackView()
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 7
+        stack.spacing = 5
         stack.addArrangedSubview(titleLabel)
 
         for example in examples {
@@ -931,15 +979,15 @@ private final class SettingsViewController: NSViewController, NSTextFieldDelegat
             label.font = .systemFont(ofSize: 12, weight: .regular)
             label.textColor = .secondaryLabelColor
             stack.addArrangedSubview(label)
-            label.widthAnchor.constraint(equalToConstant: 300).isActive = true
+            label.widthAnchor.constraint(equalToConstant: 260).isActive = true
         }
 
         contentView.addSubview(stack)
         NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 16),
-            stack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 18),
-            stack.trailingAnchor.constraint(lessThanOrEqualTo: contentView.trailingAnchor, constant: -18),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: contentView.bottomAnchor, constant: -16)
+            stack.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 12),
+            stack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 14),
+            stack.trailingAnchor.constraint(lessThanOrEqualTo: contentView.trailingAnchor, constant: -14),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: contentView.bottomAnchor, constant: -12)
         ])
 
         contentViewController.view = contentView
@@ -953,6 +1001,181 @@ private final class SettingsViewController: NSViewController, NSTextFieldDelegat
 
     @objc private func userDefaultsDidChange(_ notification: Notification) {
         updateSwitches()
+    }
+}
+
+@MainActor
+private final class EmptyListCellView: NSTableCellView {
+    let messageLabel = NSTextField(labelWithString: "")
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+
+        messageLabel.translatesAutoresizingMaskIntoConstraints = false
+        messageLabel.font = .systemFont(ofSize: 12, weight: .regular)
+        messageLabel.textColor = .secondaryLabelColor
+
+        addSubview(messageLabel)
+        NSLayoutConstraint.activate([
+            messageLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 18),
+            messageLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -18),
+            messageLabel.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+}
+
+@MainActor
+private final class IndexedRootCellView: NSTableCellView {
+    static let identifier = NSUserInterfaceItemIdentifier("IndexedRootCell")
+
+    private let dragHandleView = NSImageView()
+    private let iconView = NSImageView()
+    private let pathLabel = NSTextField(labelWithString: "")
+    private let removeButton = NSButton()
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+
+        identifier = Self.identifier
+
+        dragHandleView.translatesAutoresizingMaskIntoConstraints = false
+        dragHandleView.image = NSImage(systemSymbolName: "line.3.horizontal", accessibilityDescription: "Drag indexed folder")
+        dragHandleView.contentTintColor = .tertiaryLabelColor
+
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+        iconView.image = NSImage(systemSymbolName: "folder", accessibilityDescription: "Indexed folder")
+        iconView.contentTintColor = .secondaryLabelColor
+
+        pathLabel.translatesAutoresizingMaskIntoConstraints = false
+        pathLabel.font = .systemFont(ofSize: 12, weight: .regular)
+        pathLabel.textColor = .labelColor
+        pathLabel.lineBreakMode = .byTruncatingMiddle
+
+        removeButton.translatesAutoresizingMaskIntoConstraints = false
+        removeButton.image = NSImage(systemSymbolName: "minus.circle", accessibilityDescription: "Remove indexed folder")
+        removeButton.title = ""
+        removeButton.isBordered = false
+        removeButton.contentTintColor = .secondaryLabelColor
+        removeButton.toolTip = "Remove indexed folder"
+
+        for subview in [dragHandleView, iconView, pathLabel, removeButton] {
+            addSubview(subview)
+        }
+
+        NSLayoutConstraint.activate([
+            dragHandleView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            dragHandleView.centerYAnchor.constraint(equalTo: centerYAnchor),
+            dragHandleView.widthAnchor.constraint(equalToConstant: 14),
+            dragHandleView.heightAnchor.constraint(equalToConstant: 14),
+
+            iconView.leadingAnchor.constraint(equalTo: dragHandleView.trailingAnchor, constant: 10),
+            iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
+            iconView.widthAnchor.constraint(equalToConstant: 16),
+            iconView.heightAnchor.constraint(equalToConstant: 16),
+
+            pathLabel.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 10),
+            pathLabel.trailingAnchor.constraint(equalTo: removeButton.leadingAnchor, constant: -14),
+            pathLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+
+            removeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
+            removeButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            removeButton.widthAnchor.constraint(equalToConstant: 22),
+            removeButton.heightAnchor.constraint(equalToConstant: 22)
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func configure(root: URL, index: Int, target: AnyObject, removeAction: Selector) {
+        pathLabel.stringValue = AppSettings.displayPath(root)
+        removeButton.tag = index
+        removeButton.target = target
+        removeButton.action = removeAction
+    }
+}
+
+@MainActor
+private final class ExclusionPatternCellView: NSTableCellView {
+    static let identifier = NSUserInterfaceItemIdentifier("ExclusionPatternCell")
+
+    let patternField = NSTextField(string: "")
+    private let dragHandleView = NSImageView()
+    private let removeButton = NSButton()
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+
+        identifier = Self.identifier
+
+        dragHandleView.translatesAutoresizingMaskIntoConstraints = false
+        dragHandleView.image = NSImage(systemSymbolName: "line.3.horizontal", accessibilityDescription: "Drag excluded path")
+        dragHandleView.contentTintColor = .tertiaryLabelColor
+
+        patternField.translatesAutoresizingMaskIntoConstraints = false
+        patternField.identifier = NSUserInterfaceItemIdentifier("exclusionPatternField")
+        patternField.placeholderString = "**/.cache/"
+        patternField.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        patternField.textColor = .labelColor
+        patternField.bezelStyle = .roundedBezel
+        patternField.isBordered = true
+        patternField.drawsBackground = true
+
+        removeButton.translatesAutoresizingMaskIntoConstraints = false
+        removeButton.image = NSImage(systemSymbolName: "minus.circle", accessibilityDescription: "Remove excluded path")
+        removeButton.title = ""
+        removeButton.isBordered = false
+        removeButton.contentTintColor = .secondaryLabelColor
+        removeButton.toolTip = "Remove excluded path"
+
+        for subview in [dragHandleView, patternField, removeButton] {
+            addSubview(subview)
+        }
+
+        NSLayoutConstraint.activate([
+            dragHandleView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            dragHandleView.centerYAnchor.constraint(equalTo: centerYAnchor),
+            dragHandleView.widthAnchor.constraint(equalToConstant: 14),
+            dragHandleView.heightAnchor.constraint(equalToConstant: 14),
+
+            patternField.leadingAnchor.constraint(equalTo: dragHandleView.trailingAnchor, constant: 12),
+            patternField.trailingAnchor.constraint(equalTo: removeButton.leadingAnchor, constant: -14),
+            patternField.centerYAnchor.constraint(equalTo: centerYAnchor),
+
+            removeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
+            removeButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            removeButton.widthAnchor.constraint(equalToConstant: 22),
+            removeButton.heightAnchor.constraint(equalToConstant: 22)
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func configure(
+        pattern: String,
+        index: Int,
+        target: AnyObject,
+        removeAction: Selector,
+        fieldAction: Selector
+    ) {
+        patternField.stringValue = pattern
+        patternField.tag = index
+        patternField.target = target
+        patternField.action = fieldAction
+
+        removeButton.tag = index
+        removeButton.target = target
+        removeButton.action = removeAction
     }
 }
 
