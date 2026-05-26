@@ -582,12 +582,11 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private func populateHeaderMenu(_ menu: NSMenu) {
         menu.removeAllItems()
 
-        for column in Column.allCases {
+        for column in Column.allCases where column != .name {
             let item = NSMenuItem(title: column.menuTitle, action: #selector(toggleColumnVisibility(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = column.rawValue
             item.state = visibleColumns.contains(column) ? .on : .off
-            item.isEnabled = column != .name
             menu.addItem(item)
         }
     }
