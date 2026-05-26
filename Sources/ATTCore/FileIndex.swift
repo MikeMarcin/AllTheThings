@@ -56,12 +56,20 @@ public struct SearchResponse: Sendable {
 public struct IndexStats: Sendable {
     public let indexedCount: Int
     public let isIndexing: Bool
+    public let isLoadingSnapshot: Bool
     public let status: String
     public let lastUpdated: Date
 
-    public init(indexedCount: Int, isIndexing: Bool, status: String, lastUpdated: Date) {
+    public init(
+        indexedCount: Int,
+        isIndexing: Bool,
+        isLoadingSnapshot: Bool = false,
+        status: String,
+        lastUpdated: Date
+    ) {
         self.indexedCount = indexedCount
         self.isIndexing = isIndexing
+        self.isLoadingSnapshot = isLoadingSnapshot
         self.status = status
         self.lastUpdated = lastUpdated
     }
@@ -104,6 +112,12 @@ public final class FileIndex: @unchecked Sendable {
         let offset: Int
         let isBoundary: Bool
         let textByteCount: Int
+    }
+
+    private enum SnapshotLoadState {
+        case notStarted
+        case loading
+        case finished
     }
 
     private struct CandidateBitSet {
@@ -451,12 +465,17 @@ public final class FileIndex: @unchecked Sendable {
     private var roots: [String] = []
     private var generation: UInt64 = 0
     private var persistRevision: UInt64 = 0
+    private var snapshotLoadState = SnapshotLoadState.notStarted
     private var indexing = false
     private var status = "Starting"
     private var lastUpdated = Date()
     private var statsChangedHandler: (@MainActor @Sendable (IndexStats) -> Void)?
 
-    public init(fileManager: FileManager = .default, applicationName: String = "AllTheThings") {
+    public init(
+        fileManager: FileManager = .default,
+        applicationName: String = "AllTheThings",
+        loadsSnapshotImmediately: Bool = true
+    ) {
         self.fileManager = fileManager
 
         let supportRoot = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
@@ -465,7 +484,16 @@ public final class FileIndex: @unchecked Sendable {
         try? fileManager.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
         self.snapshotURL = supportDirectory.appendingPathComponent("filename-index.json", isDirectory: false)
 
-        loadSnapshot()
+        if loadsSnapshotImmediately {
+            if beginSnapshotLoad() {
+                loadSnapshotAfterBegin(generationAtStart: currentGeneration())
+            }
+        } else {
+            lock.withLock {
+                status = "Waiting to load index"
+                lastUpdated = Date()
+            }
+        }
     }
 
     public func currentStats() -> IndexStats {
@@ -482,6 +510,7 @@ public final class FileIndex: @unchecked Sendable {
         let canonicalRoots = canonicalizedRoots(rootURLs)
         let currentGeneration = lock.withLock { () -> UInt64 in
             generation &+= 1
+            snapshotLoadState = .finished
             roots = canonicalRoots.map(\.path)
             indexing = true
             status = "Indexing \(canonicalRoots.count) scope\(canonicalRoots.count == 1 ? "" : "s")"
@@ -494,6 +523,18 @@ public final class FileIndex: @unchecked Sendable {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             self?.rebuild(roots: canonicalRoots, generation: currentGeneration)
         }
+    }
+
+    @discardableResult
+    public func loadSnapshotInBackground() -> Bool {
+        guard beginSnapshotLoad() else { return false }
+        let generationAtStart = currentGeneration()
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.loadSnapshotAfterBegin(generationAtStart: generationAtStart)
+        }
+
+        return true
     }
 
     public func refresh(paths rawPaths: [String]) {
@@ -1404,27 +1445,67 @@ public final class FileIndex: @unchecked Sendable {
         publishStats()
     }
 
-    private func loadSnapshot() {
+    private func beginSnapshotLoad() -> Bool {
+        let didBegin = lock.withLock { () -> Bool in
+            guard snapshotLoadState == .notStarted else {
+                return false
+            }
+
+            snapshotLoadState = .loading
+            status = "Loading saved index"
+            lastUpdated = Date()
+            return true
+        }
+
+        if didBegin {
+            publishStats()
+        }
+
+        return didBegin
+    }
+
+    private func loadSnapshotAfterBegin(generationAtStart: UInt64) {
         guard
             let data = try? Data(contentsOf: snapshotURL),
             let persisted = try? JSONDecoder().decode(PersistedSnapshot.self, from: data)
         else {
-            lock.withLock {
+            let didUpdate = lock.withLock { () -> Bool in
+                guard generation == generationAtStart else {
+                    return false
+                }
+
+                snapshotLoadState = .finished
                 status = "No index yet"
+                indexing = false
                 lastUpdated = Date()
+                return true
+            }
+
+            if didUpdate {
+                publishStats()
             }
             return
         }
 
         let records = Dictionary(uniqueKeysWithValues: persisted.records.map { ($0.path, $0) })
         let snapshot = SearchSnapshot(records: Array(records.values))
-        lock.withLock {
+        let didApply = lock.withLock { () -> Bool in
+            guard generation == generationAtStart else {
+                return false
+            }
+
             recordsByPath = records
             searchSnapshot = snapshot
             searchSnapshotRevision &+= 1
+            snapshotLoadState = .finished
             status = "Loaded \(records.count) indexed files"
             indexing = false
             lastUpdated = persisted.savedAt
+            return true
+        }
+
+        if didApply {
+            publishStats()
         }
     }
 
@@ -1665,6 +1746,7 @@ public final class FileIndex: @unchecked Sendable {
                 stats: IndexStats(
                     indexedCount: recordsByPath.count,
                     isIndexing: indexing,
+                    isLoadingSnapshot: snapshotLoadState == .loading,
                     status: status,
                     lastUpdated: lastUpdated
                 ),
@@ -1684,9 +1766,16 @@ public final class FileIndex: @unchecked Sendable {
             IndexStats(
                 indexedCount: recordsByPath.count,
                 isIndexing: indexing,
+                isLoadingSnapshot: snapshotLoadState == .loading,
                 status: status,
                 lastUpdated: lastUpdated
             )
+        }
+    }
+
+    private func currentGeneration() -> UInt64 {
+        lock.withLock {
+            generation
         }
     }
 
