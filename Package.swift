@@ -21,7 +21,8 @@ let package = Package(
             dependencies: ["ATTCore"],
             linkerSettings: [
                 .linkedFramework("AppKit"),
-                .linkedFramework("CoreServices")
+                .linkedFramework("CoreServices"),
+                .linkedFramework("ServiceManagement")
             ]
         ),
         .testTarget(

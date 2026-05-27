@@ -1,5 +1,6 @@
 import AppKit
 import ATTCore
+import Carbon.HIToolbox
 
 @MainActor
 final class SettingsWindowController: NSWindowController {
@@ -60,6 +61,9 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         target: nil,
         action: nil
     )
+    private let globalHotKeySwitch = NSSwitch()
+    private let changeGlobalHotKeyButton = NSButton()
+    private let launchAtLoginSwitch = NSSwitch()
     private let highlightSearchTextSwitch = NSSwitch()
     private let showHiddenFilesSwitch = NSSwitch()
     private let allowMultipleInstancesSwitch = NSSwitch()
@@ -255,6 +259,9 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         let sectionLabel = makeSectionLabel("Application")
 
         configureThemeControl()
+        configureSwitch(globalHotKeySwitch, action: #selector(toggleGlobalHotKey(_:)))
+        configureGlobalHotKeyButton()
+        configureSwitch(launchAtLoginSwitch, action: #selector(toggleLaunchAtLogin(_:)))
         configureSwitch(highlightSearchTextSwitch, action: #selector(toggleHighlightSearchText(_:)))
         configureSwitch(showHiddenFilesSwitch, action: #selector(toggleShowHiddenFiles(_:)))
         configureSwitch(allowMultipleInstancesSwitch, action: #selector(toggleAllowMultipleInstances(_:)))
@@ -265,6 +272,16 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
                 title: "Theme",
                 detail: "Choose the app appearance.",
                 control: themeSegmentedControl
+            ),
+            makeControlRow(
+                title: "Global search hotkey",
+                detail: "Focus the search window from any app.",
+                control: makeGlobalHotKeyControl()
+            ),
+            makeControlRow(
+                title: "Launch at login",
+                detail: "Start quietly when you sign in so the global hotkey is ready.",
+                control: launchAtLoginSwitch
             ),
             makeControlRow(
                 title: "Highlight search text",
@@ -462,6 +479,30 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         }
     }
 
+    private func configureGlobalHotKeyButton() {
+        changeGlobalHotKeyButton.translatesAutoresizingMaskIntoConstraints = false
+        changeGlobalHotKeyButton.bezelStyle = .rounded
+        changeGlobalHotKeyButton.target = self
+        changeGlobalHotKeyButton.action = #selector(changeGlobalHotKey(_:))
+        changeGlobalHotKeyButton.toolTip = "Change global search hotkey"
+        changeGlobalHotKeyButton.setContentHuggingPriority(.required, for: .horizontal)
+        changeGlobalHotKeyButton.setContentCompressionResistancePriority(.required, for: .horizontal)
+    }
+
+    private func makeGlobalHotKeyControl() -> NSView {
+        let stack = NSStackView(views: [globalHotKeySwitch, changeGlobalHotKeyButton])
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 10
+
+        NSLayoutConstraint.activate([
+            changeGlobalHotKeyButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 116)
+        ])
+
+        return stack
+    }
+
     private func configureIconButton(_ button: NSButton, symbol: String, tooltip: String, action: Selector) {
         button.translatesAutoresizingMaskIntoConstraints = false
         button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: tooltip)
@@ -586,7 +627,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         ThemedCardView(frame: .zero)
     }
 
-    private func makeControlRow(title: String, detail: String, control: NSControl) -> NSView {
+    private func makeControlRow(title: String, detail: String, control: NSView) -> NSView {
         let row = NSView()
         row.translatesAutoresizingMaskIntoConstraints = false
 
@@ -800,6 +841,11 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     private func updateControls() {
         let themePreference = AppSettings.themePreference(defaults: defaults)
         themeSegmentedControl.selectedSegment = AppThemePreference.allCases.firstIndex(of: themePreference) ?? 0
+        let globalHotKeyEnabled = AppSettings.globalSearchHotKeyEnabled(defaults: defaults)
+        globalHotKeySwitch.state = globalHotKeyEnabled ? .on : .off
+        changeGlobalHotKeyButton.title = AppSettings.globalSearchHotKey(defaults: defaults).displayString
+        changeGlobalHotKeyButton.isEnabled = true
+        launchAtLoginSwitch.state = LaunchAtLoginController.isEnabled ? .on : .off
         highlightSearchTextSwitch.state = defaults.bool(forKey: AppSettings.highlightSearchTextKey) ? .on : .off
         showHiddenFilesSwitch.state = defaults.bool(forKey: AppSettings.showHiddenFilesKey) ? .on : .off
         allowMultipleInstancesSwitch.state = defaults.bool(forKey: AppSettings.allowMultipleInstancesKey) ? .on : .off
@@ -810,6 +856,167 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         guard sender.selectedSegment >= 0, sender.selectedSegment < AppThemePreference.allCases.count else { return }
 
         AppSettings.saveThemePreference(AppThemePreference.allCases[sender.selectedSegment], defaults: defaults)
+    }
+
+    @objc private func toggleLaunchAtLogin(_ sender: NSSwitch) {
+        do {
+            try LaunchAtLoginController.setEnabled(sender.state == .on)
+            if LaunchAtLoginController.requiresApproval {
+                presentLaunchAtLoginApprovalRequired()
+            }
+        } catch {
+            presentError("Could not update launch at login.", informativeText: error.localizedDescription)
+        }
+
+        updateControls()
+    }
+
+    private func presentLaunchAtLoginApprovalRequired() {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "Approve launch at login"
+        alert.informativeText = "macOS needs approval before AllTheThings can launch at login."
+        alert.addButton(withTitle: "Open System Settings")
+        alert.addButton(withTitle: "OK")
+
+        let handler: (NSApplication.ModalResponse) -> Void = { response in
+            guard response == .alertFirstButtonReturn else { return }
+            LaunchAtLoginController.openSystemSettings()
+        }
+
+        if let window = view.window {
+            alert.beginSheetModal(for: window, completionHandler: handler)
+        } else {
+            handler(alert.runModal())
+        }
+    }
+
+    @objc private func toggleGlobalHotKey(_ sender: NSSwitch) {
+        let hotKey = AppSettings.globalSearchHotKey(defaults: defaults)
+        guard sender.state == .on else {
+            saveGlobalHotKey(enabled: false, hotKey: hotKey)
+            return
+        }
+
+        confirmGlobalHotKeyChange(hotKey) { [weak self] didConfirm in
+            guard let self else { return }
+            if didConfirm {
+                self.saveGlobalHotKey(enabled: true, hotKey: hotKey)
+            } else {
+                self.updateControls()
+            }
+        }
+    }
+
+    @objc private func changeGlobalHotKey(_ sender: NSButton) {
+        let recorder = HotKeyRecorderView()
+        let alert = NSAlert()
+        alert.messageText = "Change global search hotkey"
+        alert.informativeText = "Press a shortcut with a non-modifier key and at least one modifier."
+        alert.accessoryView = recorder
+        let saveButton = alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        saveButton.isEnabled = false
+        alert.window.initialFirstResponder = recorder
+
+        recorder.onChange = { hotKey in
+            saveButton.isEnabled = hotKey != nil
+        }
+        recorder.onCancel = { [weak alert] in
+            guard let window = alert?.window else { return }
+            if let sheetParent = window.sheetParent {
+                sheetParent.endSheet(window, returnCode: .cancel)
+            } else {
+                NSApp.stopModal(withCode: .cancel)
+                window.orderOut(nil)
+            }
+        }
+
+        let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard
+                response == .alertFirstButtonReturn,
+                let self,
+                let hotKey = recorder.recordedHotKey
+            else {
+                self?.updateControls()
+                return
+            }
+
+            guard
+                !AppSettings.globalSearchHotKeyEnabled(defaults: self.defaults)
+                    || hotKey != AppSettings.globalSearchHotKey(defaults: self.defaults)
+            else {
+                self.updateControls()
+                return
+            }
+
+            self.confirmGlobalHotKeyChange(hotKey) { [weak self] didConfirm in
+                guard let self else { return }
+                if didConfirm {
+                    self.saveGlobalHotKey(enabled: true, hotKey: hotKey)
+                } else {
+                    self.updateControls()
+                }
+            }
+        }
+
+        if let window = view.window {
+            alert.beginSheetModal(for: window, completionHandler: completion)
+            DispatchQueue.main.async {
+                alert.window.makeFirstResponder(recorder)
+            }
+        } else {
+            DispatchQueue.main.async {
+                alert.window.makeFirstResponder(recorder)
+            }
+            completion(alert.runModal())
+        }
+    }
+
+    private func confirmGlobalHotKeyChange(_ hotKey: GlobalHotKey, completion: @escaping (Bool) -> Void) {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "Use \(hotKey.displayString) as the global search hotkey?"
+        alert.informativeText = "AllTheThings will claim this shortcut system-wide while it is running. If another app or macOS feature already uses this shortcut, choose a different one instead."
+        alert.addButton(withTitle: "Use Shortcut")
+        alert.addButton(withTitle: "Cancel")
+
+        let handler: (NSApplication.ModalResponse) -> Void = { response in
+            completion(response == .alertFirstButtonReturn)
+        }
+
+        if let window = view.window {
+            alert.beginSheetModal(for: window, completionHandler: handler)
+        } else {
+            handler(alert.runModal())
+        }
+    }
+
+    private func saveGlobalHotKey(enabled: Bool, hotKey: GlobalHotKey) {
+        do {
+            if let appDelegate = NSApp.delegate as? AppDelegate {
+                try appDelegate.saveGlobalSearchHotKey(enabled: enabled, hotKey: hotKey)
+            } else {
+                AppSettings.saveGlobalSearchHotKey(enabled: enabled, hotKey: hotKey, defaults: defaults)
+            }
+        } catch {
+            presentError("Could not register global search hotkey.", informativeText: error.localizedDescription)
+        }
+
+        updateControls()
+    }
+
+    private func presentError(_ message: String, informativeText: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = message
+        alert.informativeText = informativeText
+
+        if let window = view.window {
+            alert.beginSheetModal(for: window)
+        } else {
+            alert.runModal()
+        }
     }
 
     @objc private func toggleHighlightSearchText(_ sender: NSSwitch) {
@@ -1026,6 +1233,90 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
 
     @objc private func userDefaultsDidChange(_ notification: Notification) {
         updateControls()
+    }
+}
+
+@MainActor
+private final class HotKeyRecorderView: NSView {
+    private let titleLabel = NSTextField(labelWithString: "Press shortcut")
+    private let detailLabel = NSTextField(labelWithString: "Escape cancels")
+    private(set) var recordedHotKey: GlobalHotKey?
+    var onChange: ((GlobalHotKey?) -> Void)?
+    var onCancel: (() -> Void)?
+
+    override var acceptsFirstResponder: Bool { true }
+
+    init() {
+        super.init(frame: NSRect(x: 0, y: 0, width: 320, height: 74))
+
+        wantsLayer = true
+        layer?.cornerRadius = 8
+        layer?.borderWidth = 1
+        layer?.borderColor = NSColor.separatorColor.cgColor
+        layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        titleLabel.font = .systemFont(ofSize: 17, weight: .semibold)
+        titleLabel.alignment = .center
+        titleLabel.textColor = .labelColor
+
+        detailLabel.translatesAutoresizingMaskIntoConstraints = false
+        detailLabel.font = .systemFont(ofSize: 12, weight: .regular)
+        detailLabel.alignment = .center
+        detailLabel.textColor = .secondaryLabelColor
+
+        let stack = NSStackView(views: [titleLabel, detailLabel])
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = 5
+
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            widthAnchor.constraint(equalToConstant: 320),
+            heightAnchor.constraint(equalToConstant: 74),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
+            stack.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        window?.makeFirstResponder(self)
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        layer?.borderColor = NSColor.separatorColor.cgColor
+        layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == UInt16(kVK_Escape) {
+            onCancel?()
+            return
+        }
+
+        guard let hotKey = GlobalHotKey(event: event) else {
+            recordedHotKey = nil
+            titleLabel.stringValue = "Invalid shortcut"
+            titleLabel.textColor = .systemRed
+            detailLabel.stringValue = "Use a non-modifier key with a modifier"
+            onChange?(nil)
+            return
+        }
+
+        recordedHotKey = hotKey
+        titleLabel.stringValue = hotKey.displayString
+        titleLabel.textColor = .labelColor
+        detailLabel.stringValue = "Ready to save"
+        onChange?(hotKey)
     }
 }
 

@@ -17,6 +17,10 @@ enum AppThemePreference: String, CaseIterable {
 
 enum AppSettings {
     static let allowMultipleInstancesKey = "ATTAllowMultipleInstances"
+    static let globalSearchHotKeyEnabledKey = "ATTGlobalSearchHotKeyEnabled"
+    static let globalSearchHotKeyConfirmationResolvedKey = "ATTGlobalSearchHotKeyConfirmationResolved"
+    static let globalSearchHotKeyKeyCodeKey = "ATTGlobalSearchHotKeyKeyCode"
+    static let globalSearchHotKeyModifierFlagsKey = "ATTGlobalSearchHotKeyModifierFlags"
     static let highlightSearchTextKey = "ATTHighlightSearchText"
     static let showHiddenFilesKey = "ATTShowHiddenFiles"
     static let themePreferenceKey = "ATTThemePreference"
@@ -24,6 +28,7 @@ enum AppSettings {
     static let indexedRootsInitializedKey = "ATTIndexedRootsInitialized"
     static let exclusionPatternsKey = "ATTExclusionPatterns"
     static let exclusionDefaultsVersionKey = "ATTExclusionDefaultsVersion"
+    static let globalSearchHotKeyDidChangeNotification = Notification.Name("com.allthethings.settings.globalSearchHotKeyDidChange")
     static let themePreferenceDidChangeNotification = Notification.Name("com.allthethings.settings.themePreferenceDidChange")
     static let indexedRootsDidChangeNotification = Notification.Name("com.allthethings.settings.indexedRootsDidChange")
     static let exclusionPatternsDidChangeNotification = Notification.Name("com.allthethings.settings.exclusionPatternsDidChange")
@@ -58,6 +63,10 @@ enum AppSettings {
     static func registerDefaults(_ defaults: UserDefaults = .standard) {
         defaults.register(defaults: [
             allowMultipleInstancesKey: false,
+            globalSearchHotKeyEnabledKey: true,
+            globalSearchHotKeyConfirmationResolvedKey: false,
+            globalSearchHotKeyKeyCodeKey: Int(GlobalHotKey.defaultSearch.keyCode),
+            globalSearchHotKeyModifierFlagsKey: Int(GlobalHotKey.defaultSearch.modifiers),
             highlightSearchTextKey: true,
             showHiddenFilesKey: false,
             themePreferenceKey: AppThemePreference.system.rawValue,
@@ -83,6 +92,36 @@ enum AppSettings {
         defaults.set(preference.rawValue, forKey: themePreferenceKey)
         defaults.synchronize()
         NotificationCenter.default.post(name: themePreferenceDidChangeNotification, object: defaults)
+    }
+
+    static func globalSearchHotKeyEnabled(defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: globalSearchHotKeyEnabledKey)
+    }
+
+    static func globalSearchHotKeyNeedsConfirmation(defaults: UserDefaults = .standard) -> Bool {
+        globalSearchHotKeyEnabled(defaults: defaults)
+            && !defaults.bool(forKey: globalSearchHotKeyConfirmationResolvedKey)
+    }
+
+    static func globalSearchHotKey(defaults: UserDefaults = .standard) -> GlobalHotKey {
+        let keyCode = defaults.integer(forKey: globalSearchHotKeyKeyCodeKey)
+        let modifiers = defaults.integer(forKey: globalSearchHotKeyModifierFlagsKey)
+        let hotKey = GlobalHotKey(keyCode: UInt32(max(0, keyCode)), modifiers: UInt32(max(0, modifiers)))
+
+        return hotKey.isValid ? hotKey : .defaultSearch
+    }
+
+    static func saveGlobalSearchHotKey(
+        enabled: Bool,
+        hotKey: GlobalHotKey,
+        defaults: UserDefaults = .standard
+    ) {
+        defaults.set(enabled, forKey: globalSearchHotKeyEnabledKey)
+        defaults.set(true, forKey: globalSearchHotKeyConfirmationResolvedKey)
+        defaults.set(Int(hotKey.keyCode), forKey: globalSearchHotKeyKeyCodeKey)
+        defaults.set(Int(hotKey.modifiers), forKey: globalSearchHotKeyModifierFlagsKey)
+        defaults.synchronize()
+        NotificationCenter.default.post(name: globalSearchHotKeyDidChangeNotification, object: defaults)
     }
 
     static func indexedRoots(defaults: UserDefaults = .standard) -> [URL] {
