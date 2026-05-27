@@ -80,10 +80,15 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     private var selectedSection = SettingsSection.general
     private var indexedRoots: [URL] = []
     private var exclusionPatterns: [String] = []
+    private var indexedRootsCardHeightConstraint: NSLayoutConstraint?
+    private var exclusionPatternsCardHeightConstraint: NSLayoutConstraint?
 
     private static let exclusionPatternFieldIdentifier = NSUserInterfaceItemIdentifier("exclusionPatternField")
     private static let indexedRootPasteboardType = NSPasteboard.PasteboardType("com.allthethings.settings.indexed-root-row")
     private static let exclusionPatternPasteboardType = NSPasteboard.PasteboardType("com.allthethings.settings.exclusion-pattern-row")
+    private static let settingsTableRowHeight: CGFloat = 42
+    private static let indexedRootsMaximumVisibleRows = 8
+    private static let exclusionPatternsMaximumVisibleRows = 10
 
     init(defaults: UserDefaults) {
         self.defaults = defaults
@@ -256,7 +261,6 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     private func makeGeneralPage() -> NSView {
         let (scrollView, contentView) = makePageScrollView()
 
-        let titleLabel = makeTitleLabel("General")
         let sectionLabel = makeSectionLabel("Application")
 
         configureThemeControl()
@@ -312,23 +316,18 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
             )
         ])
 
-        contentView.addSubview(titleLabel)
         contentView.addSubview(sectionLabel)
         contentView.addSubview(settingsCard)
 
         NSLayoutConstraint.activate([
-            titleLabel.topAnchor.constraint(equalTo: contentView.safeAreaLayoutGuide.topAnchor, constant: 58),
-            titleLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 52),
-            titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: contentView.trailingAnchor, constant: -52),
-
-            sectionLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 42),
-            sectionLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
-            sectionLabel.trailingAnchor.constraint(lessThanOrEqualTo: titleLabel.trailingAnchor),
+            sectionLabel.topAnchor.constraint(equalTo: contentView.safeAreaLayoutGuide.topAnchor, constant: 26),
+            sectionLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 36),
+            sectionLabel.trailingAnchor.constraint(lessThanOrEqualTo: contentView.trailingAnchor, constant: -36),
 
             settingsCard.topAnchor.constraint(equalTo: sectionLabel.bottomAnchor, constant: 12),
-            settingsCard.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
-            settingsCard.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -52),
-            settingsCard.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -32)
+            settingsCard.leadingAnchor.constraint(equalTo: sectionLabel.leadingAnchor),
+            settingsCard.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -36),
+            settingsCard.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -24)
         ])
 
         return scrollView
@@ -337,7 +336,6 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     private func makeIndexedFoldersPage() -> NSView {
         let (scrollView, contentView) = makePageScrollView()
 
-        let titleLabel = makeTitleLabel("Indexed Folders")
         let rootsHeader = NSStackView()
         rootsHeader.translatesAutoresizingMaskIntoConstraints = false
         rootsHeader.orientation = .horizontal
@@ -352,13 +350,11 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
             tooltip: "Reset indexed folders to defaults",
             action: #selector(resetIndexedRoots(_:))
         )
-        addRootButton.translatesAutoresizingMaskIntoConstraints = false
-        addRootButton.image = NSImage(systemSymbolName: "plus", accessibilityDescription: "Add indexed folder")
-        addRootButton.title = ""
-        addRootButton.bezelStyle = .texturedRounded
-        addRootButton.toolTip = "Add indexed folder"
-        addRootButton.target = self
-        addRootButton.action = #selector(addIndexedRoot(_:))
+        configureAddButton(
+            addRootButton,
+            tooltip: "Add indexed folder",
+            action: #selector(addIndexedRoot(_:))
+        )
 
         let rootsHeaderSpacer = NSView()
         rootsHeaderSpacer.translatesAutoresizingMaskIntoConstraints = false
@@ -392,9 +388,8 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
             tooltip: "Reset excluded paths to defaults",
             action: #selector(resetExclusionPatterns(_:))
         )
-        configureIconButton(
+        configureAddButton(
             addExclusionButton,
-            symbol: "plus",
             tooltip: "Add excluded path",
             action: #selector(addExclusionPattern(_:))
         )
@@ -408,25 +403,22 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         exclusionsHeader.addArrangedSubview(addExclusionButton)
 
         let exclusionsCard = makeExclusionPatternsCard()
+        let contentBottomConstraint = exclusionsCard.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -24)
+        contentBottomConstraint.priority = .defaultLow
 
-        contentView.addSubview(titleLabel)
         contentView.addSubview(rootsHeader)
         contentView.addSubview(rootsCard)
         contentView.addSubview(exclusionsHeader)
         contentView.addSubview(exclusionsCard)
 
         NSLayoutConstraint.activate([
-            titleLabel.topAnchor.constraint(equalTo: contentView.safeAreaLayoutGuide.topAnchor, constant: 58),
-            titleLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 52),
-            titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: contentView.trailingAnchor, constant: -52),
-
-            rootsHeader.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 42),
-            rootsHeader.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
-            rootsHeader.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -52),
+            rootsHeader.topAnchor.constraint(equalTo: contentView.safeAreaLayoutGuide.topAnchor, constant: 26),
+            rootsHeader.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 36),
+            rootsHeader.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -36),
             resetRootsButton.widthAnchor.constraint(equalToConstant: 28),
             resetRootsButton.heightAnchor.constraint(equalToConstant: 24),
-            addRootButton.widthAnchor.constraint(equalToConstant: 28),
-            addRootButton.heightAnchor.constraint(equalToConstant: 24),
+            addRootButton.widthAnchor.constraint(equalToConstant: 74),
+            addRootButton.heightAnchor.constraint(equalToConstant: 30),
 
             rootsCard.topAnchor.constraint(equalTo: rootsHeader.bottomAnchor, constant: 10),
             rootsCard.leadingAnchor.constraint(equalTo: rootsHeader.leadingAnchor),
@@ -439,24 +431,17 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
             exclusionHelpButton.heightAnchor.constraint(equalToConstant: 20),
             resetExclusionsButton.widthAnchor.constraint(equalToConstant: 28),
             resetExclusionsButton.heightAnchor.constraint(equalToConstant: 24),
-            addExclusionButton.widthAnchor.constraint(equalToConstant: 28),
-            addExclusionButton.heightAnchor.constraint(equalToConstant: 24),
+            addExclusionButton.widthAnchor.constraint(equalToConstant: 74),
+            addExclusionButton.heightAnchor.constraint(equalToConstant: 30),
 
             exclusionsCard.topAnchor.constraint(equalTo: exclusionsHeader.bottomAnchor, constant: 10),
             exclusionsCard.leadingAnchor.constraint(equalTo: rootsCard.leadingAnchor),
             exclusionsCard.trailingAnchor.constraint(equalTo: rootsCard.trailingAnchor),
-            exclusionsCard.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -32)
+            exclusionsCard.bottomAnchor.constraint(lessThanOrEqualTo: contentView.bottomAnchor, constant: -24),
+            contentBottomConstraint
         ])
 
         return scrollView
-    }
-
-    private func makeTitleLabel(_ title: String) -> NSTextField {
-        let label = NSTextField(labelWithString: title)
-        label.translatesAutoresizingMaskIntoConstraints = false
-        label.font = .systemFont(ofSize: 26, weight: .semibold)
-        label.textColor = .labelColor
-        return label
     }
 
     private func makeSectionLabel(_ title: String) -> NSTextField {
@@ -520,6 +505,19 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         button.action = action
     }
 
+    private func configureAddButton(_ button: NSButton, tooltip: String, action: Selector) {
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.image = NSImage(systemSymbolName: "plus", accessibilityDescription: tooltip)
+        button.imagePosition = .imageLeading
+        button.title = "Add"
+        button.bezelStyle = .rounded
+        button.toolTip = tooltip
+        button.target = self
+        button.action = action
+        button.setContentHuggingPriority(.required, for: .horizontal)
+        button.setContentCompressionResistancePriority(.required, for: .horizontal)
+    }
+
     private func makeSettingsCard(rows: [NSView]) -> NSView {
         let card = makeCard()
 
@@ -553,6 +551,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         let scrollView = NSScrollView()
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
         scrollView.hasHorizontalScroller = false
         scrollView.borderType = .noBorder
         scrollView.drawsBackground = false
@@ -564,13 +563,19 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         )
 
         scrollView.documentView = rootsTableView
+        let heightConstraint = card.heightAnchor.constraint(equalToConstant: Self.tableCardHeight(
+            itemCount: indexedRoots.count,
+            maximumVisibleRows: Self.indexedRootsMaximumVisibleRows
+        ))
+        indexedRootsCardHeightConstraint = heightConstraint
+
         card.addSubview(scrollView)
         NSLayoutConstraint.activate([
             scrollView.topAnchor.constraint(equalTo: card.topAnchor),
             scrollView.leadingAnchor.constraint(equalTo: card.leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: card.trailingAnchor),
             scrollView.bottomAnchor.constraint(equalTo: card.bottomAnchor),
-            card.heightAnchor.constraint(greaterThanOrEqualToConstant: 132)
+            heightConstraint
         ])
 
         return card
@@ -582,6 +587,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         let scrollView = NSScrollView()
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
         scrollView.hasHorizontalScroller = false
         scrollView.borderType = .noBorder
         scrollView.drawsBackground = false
@@ -593,6 +599,11 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         )
 
         scrollView.documentView = exclusionsTableView
+        let heightConstraint = card.heightAnchor.constraint(equalToConstant: Self.tableCardHeight(
+            itemCount: exclusionPatterns.count,
+            maximumVisibleRows: Self.exclusionPatternsMaximumVisibleRows
+        ))
+        exclusionPatternsCardHeightConstraint = heightConstraint
 
         card.addSubview(scrollView)
         NSLayoutConstraint.activate([
@@ -600,7 +611,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
             scrollView.leadingAnchor.constraint(equalTo: card.leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: card.trailingAnchor),
             scrollView.bottomAnchor.constraint(equalTo: card.bottomAnchor),
-            card.heightAnchor.constraint(greaterThanOrEqualToConstant: 180)
+            heightConstraint
         ])
 
         return card
@@ -614,7 +625,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         tableView.translatesAutoresizingMaskIntoConstraints = false
         tableView.headerView = nil
         tableView.usesAlternatingRowBackgroundColors = false
-        tableView.rowHeight = 42
+        tableView.rowHeight = Self.settingsTableRowHeight
         tableView.intercellSpacing = NSSize(width: 0, height: 0)
         tableView.style = .fullWidth
         tableView.allowsMultipleSelection = false
@@ -688,11 +699,29 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     private func renderIndexedRoots() {
         indexedRoots = AppSettings.indexedRoots(defaults: defaults)
         rootsTableView.reloadData()
+        updateIndexedFolderCardHeights()
     }
 
     private func renderExclusionPatterns() {
         exclusionPatterns = AppSettings.exclusionPatterns(defaults: defaults)
         exclusionsTableView.reloadData()
+        updateIndexedFolderCardHeights()
+    }
+
+    private func updateIndexedFolderCardHeights() {
+        indexedRootsCardHeightConstraint?.constant = Self.tableCardHeight(
+            itemCount: indexedRoots.count,
+            maximumVisibleRows: Self.indexedRootsMaximumVisibleRows
+        )
+        exclusionPatternsCardHeightConstraint?.constant = Self.tableCardHeight(
+            itemCount: exclusionPatterns.count,
+            maximumVisibleRows: Self.exclusionPatternsMaximumVisibleRows
+        )
+    }
+
+    private static func tableCardHeight(itemCount: Int, maximumVisibleRows: Int) -> CGFloat {
+        let visibleRows = min(max(itemCount, 1), maximumVisibleRows)
+        return CGFloat(visibleRows) * settingsTableRowHeight
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int {
@@ -708,7 +737,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     }
 
     func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
-        42
+        Self.settingsTableRowHeight
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
