@@ -1219,48 +1219,71 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     @objc private func showExclusionPatternHelp(_ sender: NSButton) {
         let popover = NSPopover()
         popover.behavior = .transient
-        popover.contentSize = NSSize(width: 300, height: 176)
+        popover.contentSize = NSSize(width: 276, height: 168)
 
         let contentViewController = NSViewController()
         let contentView = NSView(frame: NSRect(origin: .zero, size: popover.contentSize))
         contentView.wantsLayer = true
 
-        let titleLabel = NSTextField(labelWithString: "Ignore pattern syntax")
+        let titleLabel = NSTextField(labelWithString: "Ignore patterns")
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
-        titleLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+        titleLabel.font = .systemFont(ofSize: 12, weight: .semibold)
         titleLabel.textColor = .labelColor
+        titleLabel.alignment = .left
 
         let examples = [
-            "folder/ excludes a folder anywhere",
-            "*.tmp matches names",
-            "path/*.log matches relative paths",
-            "** spans folders",
-            "!pattern re-includes earlier matches",
-            "# comments, \\# literal #"
+            ("folder/", "folder anywhere"),
+            ("*.tmp", "filename match"),
+            ("path/*.log", "relative path"),
+            ("**", "spans folders"),
+            ("!pattern", "re-include match"),
+            ("#", "comment, \\# literal")
         ]
 
         let stack = NSStackView()
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 5
+        stack.spacing = 7
         stack.addArrangedSubview(titleLabel)
+        stack.setCustomSpacing(9, after: titleLabel)
 
-        for example in examples {
-            let label = NSTextField(wrappingLabelWithString: example)
-            label.translatesAutoresizingMaskIntoConstraints = false
-            label.font = .systemFont(ofSize: 12, weight: .regular)
-            label.textColor = .secondaryLabelColor
-            stack.addArrangedSubview(label)
-            label.widthAnchor.constraint(equalToConstant: 260).isActive = true
+        for (pattern, description) in examples {
+            let row = NSStackView()
+            row.translatesAutoresizingMaskIntoConstraints = false
+            row.orientation = .horizontal
+            row.alignment = .firstBaseline
+            row.spacing = 10
+
+            let patternLabel = NSTextField(labelWithString: pattern)
+            patternLabel.translatesAutoresizingMaskIntoConstraints = false
+            patternLabel.font = .monospacedSystemFont(ofSize: 11, weight: .medium)
+            patternLabel.textColor = .labelColor
+            patternLabel.lineBreakMode = .byTruncatingTail
+
+            let descriptionLabel = NSTextField(labelWithString: description)
+            descriptionLabel.translatesAutoresizingMaskIntoConstraints = false
+            descriptionLabel.font = .systemFont(ofSize: 11, weight: .regular)
+            descriptionLabel.textColor = .secondaryLabelColor
+            descriptionLabel.lineBreakMode = .byTruncatingTail
+            descriptionLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+            row.addArrangedSubview(patternLabel)
+            row.addArrangedSubview(descriptionLabel)
+            stack.addArrangedSubview(row)
+
+            NSLayoutConstraint.activate([
+                row.widthAnchor.constraint(equalToConstant: 248),
+                patternLabel.widthAnchor.constraint(equalToConstant: 86)
+            ])
         }
 
         contentView.addSubview(stack)
         NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 12),
+            stack.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 13),
             stack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 14),
             stack.trailingAnchor.constraint(lessThanOrEqualTo: contentView.trailingAnchor, constant: -14),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: contentView.bottomAnchor, constant: -12)
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: contentView.bottomAnchor, constant: -13)
         ])
 
         contentViewController.view = contentView
