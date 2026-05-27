@@ -64,6 +64,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     private let globalHotKeySwitch = NSSwitch()
     private let changeGlobalHotKeyButton = NSButton()
     private let launchAtLoginSwitch = NSSwitch()
+    private let menuBarIconSwitch = NSSwitch()
     private let highlightSearchTextSwitch = NSSwitch()
     private let showHiddenFilesSwitch = NSSwitch()
     private let allowMultipleInstancesSwitch = NSSwitch()
@@ -262,6 +263,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         configureSwitch(globalHotKeySwitch, action: #selector(toggleGlobalHotKey(_:)))
         configureGlobalHotKeyButton()
         configureSwitch(launchAtLoginSwitch, action: #selector(toggleLaunchAtLogin(_:)))
+        configureSwitch(menuBarIconSwitch, action: #selector(toggleMenuBarIcon(_:)))
         configureSwitch(highlightSearchTextSwitch, action: #selector(toggleHighlightSearchText(_:)))
         configureSwitch(showHiddenFilesSwitch, action: #selector(toggleShowHiddenFiles(_:)))
         configureSwitch(allowMultipleInstancesSwitch, action: #selector(toggleAllowMultipleInstances(_:)))
@@ -282,6 +284,11 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
                 title: "Launch at login",
                 detail: "Start quietly when you sign in so the global hotkey is ready.",
                 control: launchAtLoginSwitch
+            ),
+            makeControlRow(
+                title: "Menu bar icon",
+                detail: "Show the menu bar loupe for quick search access.",
+                control: menuBarIconSwitch
             ),
             makeControlRow(
                 title: "Highlight search text",
@@ -846,6 +853,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         changeGlobalHotKeyButton.title = AppSettings.globalSearchHotKey(defaults: defaults).displayString
         changeGlobalHotKeyButton.isEnabled = true
         launchAtLoginSwitch.state = LaunchAtLoginController.isEnabled ? .on : .off
+        menuBarIconSwitch.state = AppSettings.menuBarIconEnabled(defaults: defaults) ? .on : .off
         highlightSearchTextSwitch.state = defaults.bool(forKey: AppSettings.highlightSearchTextKey) ? .on : .off
         showHiddenFilesSwitch.state = defaults.bool(forKey: AppSettings.showHiddenFilesKey) ? .on : .off
         allowMultipleInstancesSwitch.state = defaults.bool(forKey: AppSettings.allowMultipleInstancesKey) ? .on : .off
@@ -1022,6 +1030,10 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     @objc private func toggleHighlightSearchText(_ sender: NSSwitch) {
         defaults.set(sender.state == .on, forKey: AppSettings.highlightSearchTextKey)
         defaults.synchronize()
+    }
+
+    @objc private func toggleMenuBarIcon(_ sender: NSSwitch) {
+        AppSettings.saveMenuBarIconEnabled(sender.state == .on, defaults: defaults)
     }
 
     @objc private func toggleShowHiddenFiles(_ sender: NSSwitch) {
