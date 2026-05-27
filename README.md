@@ -16,7 +16,7 @@ AllTheThings is a native macOS file-search app built for one fast loop: type a f
 
 On first launch, AllTheThings indexes the default folders that exist on your Mac: `~/Desktop`, `~/Documents`, `~/Downloads`, `~/Developer`, and `/Applications`.
 
-Use the folder-plus toolbar button to add folders. Use the refresh toolbar button to rebuild indexed scopes. The footer shows indexing state, match count, query time, and current indexed roots. The default global search shortcut is `Command-Shift-Space`; confirm it on first launch, or disable/remap it in Settings. Enable launch at login to keep the shortcut available after signing in.
+Use the folder-plus toolbar button to add folders. Use the refresh toolbar button to rebuild indexed scopes. The footer shows indexing state, match count, and query time. The default global search shortcut is `Command-Shift-Space`; confirm it on first launch, or disable/remap it in Settings. Enable launch at login to keep the shortcut available after signing in. The optional menu bar loupe can focus search, open Settings, toggle launch at login, or quit the app.
 
 High-noise folders such as `node_modules`, `DerivedData`, `.git/objects`, `Library/Caches`, and `.Trash` are skipped.
 

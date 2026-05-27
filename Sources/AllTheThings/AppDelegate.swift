@@ -13,6 +13,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var aboutWindowController: NSWindowController?
     private var noticesWindowController: NSWindowController?
     private var globalHotKeyController: GlobalHotKeyController?
+    private var statusItem: NSStatusItem?
+    private var statusMenu: NSMenu?
     private var didPresentGlobalHotKeyRegistrationError = false
 
     override init() {
@@ -35,6 +37,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self,
             selector: #selector(globalSearchHotKeyDidChange(_:)),
             name: AppSettings.globalSearchHotKeyDidChangeNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(menuBarIconDidChange(_:)),
+            name: AppSettings.menuBarIconDidChangeNotification,
             object: nil
         )
     }
@@ -68,6 +76,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @MainActor
     private func finishLaunching() {
         configureMainMenu()
+        applyMenuBarIconSetting()
         let launchedAsLoginItem = Self.launchedAsLoginItem()
         let window = launchedAsLoginItem ? nil : showPrimaryWindow(activate: true)
         configureGlobalHotKey(presentsErrors: !launchedAsLoginItem)
@@ -259,12 +268,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         windowController?.focusSearchField(selectText: true)
     }
 
+    @objc @MainActor private func toggleLaunchAtLoginFromStatusItem(_ sender: Any?) {
+        do {
+            try LaunchAtLoginController.setEnabled(!LaunchAtLoginController.isEnabled)
+            if LaunchAtLoginController.requiresApproval {
+                presentLaunchAtLoginApprovalAlert()
+            }
+        } catch {
+            presentLaunchAtLoginErrorAlert(error)
+        }
+    }
+
+    @objc @MainActor private func activateStatusItem(_ sender: NSStatusBarButton) {
+        let event = NSApp.currentEvent
+        let shouldShowMenu = event?.type == .rightMouseUp
+            || event?.modifierFlags.contains(.control) == true
+
+        if shouldShowMenu {
+            showStatusMenu(relativeTo: sender)
+        } else {
+            focusSearchFromHotKey()
+        }
+    }
+
     @objc private func globalSearchHotKeyDidChange(_ notification: Notification) {
         performSelector(onMainThread: #selector(applyGlobalHotKeySettingsFromNotification), with: nil, waitUntilDone: false)
     }
 
     @objc @MainActor private func applyGlobalHotKeySettingsFromNotification() {
         applyGlobalHotKeySettings()
+    }
+
+    @objc private func menuBarIconDidChange(_ notification: Notification) {
+        performSelector(onMainThread: #selector(applyMenuBarIconSettingFromNotification), with: nil, waitUntilDone: false)
+    }
+
+    @objc @MainActor private func applyMenuBarIconSettingFromNotification() {
+        applyMenuBarIconSetting()
     }
 
     @objc private func themePreferenceDidChange(_ notification: Notification) {
@@ -427,9 +467,195 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.mainMenu = mainMenu
     }
 
+    @MainActor
+    private func applyMenuBarIconSetting() {
+        if AppSettings.menuBarIconEnabled(defaults: defaults) {
+            configureStatusItem()
+        } else {
+            removeStatusItem()
+        }
+    }
+
+    @MainActor
+    private func configureStatusItem() {
+        guard statusItem == nil else { return }
+
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        if let button = item.button {
+            button.image = Self.makeStatusIconImage()
+            button.imagePosition = .imageOnly
+            button.toolTip = "AllTheThings - Click to focus search. Control-click for menu."
+            button.target = self
+            button.action = #selector(activateStatusItem(_:))
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        }
+
+        let menu = NSMenu(title: "AllTheThings")
+        menu.delegate = self
+
+        let settingsItem = NSMenuItem(
+            title: "Settings...",
+            action: #selector(showSettingsWindow(_:)),
+            keyEquivalent: ""
+        )
+        settingsItem.target = self
+        menu.addItem(settingsItem)
+
+        menu.addItem(.separator())
+
+        let launchAtLoginItem = NSMenuItem(
+            title: "Launch at Login",
+            action: #selector(toggleLaunchAtLoginFromStatusItem(_:)),
+            keyEquivalent: ""
+        )
+        launchAtLoginItem.target = self
+        menu.addItem(launchAtLoginItem)
+
+        menu.addItem(.separator())
+
+        let quitItem = NSMenuItem(
+            title: "Quit AllTheThings",
+            action: #selector(NSApplication.terminate(_:)),
+            keyEquivalent: ""
+        )
+        menu.addItem(quitItem)
+
+        statusItem = item
+        statusMenu = menu
+    }
+
+    @MainActor
+    private func removeStatusItem() {
+        guard let item = statusItem else {
+            statusMenu = nil
+            return
+        }
+
+        NSStatusBar.system.removeStatusItem(item)
+        statusItem = nil
+        statusMenu = nil
+    }
+
+    private static func makeStatusIconImage() -> NSImage {
+        let size = NSSize(width: 18, height: 18)
+        let image = NSImage(size: size, flipped: false) { rect in
+            guard let context = NSGraphicsContext.current?.cgContext else { return false }
+            let scale = rect.width / size.width
+            func point(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
+                CGPoint(x: rect.minX + x * scale, y: rect.minY + y * scale)
+            }
+            func radians(_ degrees: CGFloat) -> CGFloat {
+                degrees * .pi / 180
+            }
+
+            let contrastUnderlay = NSColor.labelColor.withAlphaComponent(0.24).cgColor
+            let cyan = CGColor(red: 0.08, green: 0.88, blue: 1.0, alpha: 1.0)
+            let blue = CGColor(red: 0.22, green: 0.40, blue: 1.0, alpha: 0.94)
+            let magenta = CGColor(red: 1.0, green: 0.14, blue: 0.84, alpha: 1.0)
+            let highlight = CGColor(red: 1.0, green: 1.0, blue: 1.0, alpha: 0.52)
+            let center = point(7.3, 10.4)
+            let radius = 4.35 * scale
+            let ringWidth = 2.55 * scale
+            let handleWidth = 3.15 * scale
+
+            context.setLineCap(.round)
+            context.setLineJoin(.round)
+
+            context.setStrokeColor(contrastUnderlay)
+            context.setLineWidth(4.9 * scale)
+            context.move(to: point(10.8, 6.9))
+            context.addLine(to: point(15.1, 2.6))
+            context.strokePath()
+
+            context.setStrokeColor(contrastUnderlay)
+            context.setLineWidth(4.3 * scale)
+            context.addArc(center: center, radius: radius, startAngle: 0, endAngle: .pi * 2, clockwise: false)
+            context.strokePath()
+
+            context.setStrokeColor(magenta)
+            context.setLineWidth(handleWidth)
+            context.move(to: point(10.8, 6.9))
+            context.addLine(to: point(15.1, 2.6))
+            context.strokePath()
+
+            context.setStrokeColor(cyan)
+            context.setLineWidth(ringWidth)
+            context.addArc(center: center, radius: radius, startAngle: radians(14), endAngle: radians(204), clockwise: false)
+            context.strokePath()
+
+            context.setStrokeColor(blue)
+            context.setLineWidth(ringWidth)
+            context.addArc(center: center, radius: radius, startAngle: radians(204), endAngle: radians(298), clockwise: false)
+            context.strokePath()
+
+            context.setStrokeColor(magenta)
+            context.setLineWidth(ringWidth)
+            context.addArc(center: center, radius: radius, startAngle: radians(298), endAngle: radians(374), clockwise: false)
+            context.strokePath()
+
+            context.setStrokeColor(highlight)
+            context.setLineWidth(0.85 * scale)
+            context.addArc(center: center, radius: 3.25 * scale, startAngle: radians(112), endAngle: radians(158), clockwise: false)
+            context.strokePath()
+
+            return true
+        }
+        image.isTemplate = false
+        image.cacheMode = .never
+        return image
+    }
+
+    @MainActor
+    private func showStatusMenu(relativeTo button: NSStatusBarButton) {
+        guard let menu = statusMenu else { return }
+        menuNeedsUpdate(menu)
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height + 2), in: button)
+    }
+
     func menuNeedsUpdate(_ menu: NSMenu) {
         for item in menu.items where item.action == #selector(toggleHiddenFiles(_:)) {
             item.state = defaults.bool(forKey: AppSettings.showHiddenFilesKey) ? .on : .off
+        }
+
+        for item in menu.items where item.action == #selector(toggleLaunchAtLoginFromStatusItem(_:)) {
+            item.state = LaunchAtLoginController.isEnabled ? .on : .off
+        }
+    }
+
+    @MainActor
+    private func presentLaunchAtLoginApprovalAlert() {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "Approve launch at login"
+        alert.informativeText = "macOS needs approval before AllTheThings can start automatically when you sign in."
+        alert.addButton(withTitle: "Open System Settings")
+        alert.addButton(withTitle: "Not Now")
+
+        let completion: (NSApplication.ModalResponse) -> Void = { response in
+            if response == .alertFirstButtonReturn {
+                LaunchAtLoginController.openSystemSettings()
+            }
+        }
+
+        if let window = windowController?.window ?? settingsWindowController?.window {
+            alert.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            completion(alert.runModal())
+        }
+    }
+
+    @MainActor
+    private func presentLaunchAtLoginErrorAlert(_ error: Error) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Could not update launch at login"
+        alert.informativeText = error.localizedDescription
+        alert.addButton(withTitle: "OK")
+
+        if let window = windowController?.window ?? settingsWindowController?.window {
+            alert.beginSheetModal(for: window)
+        } else {
+            alert.runModal()
         }
     }
 

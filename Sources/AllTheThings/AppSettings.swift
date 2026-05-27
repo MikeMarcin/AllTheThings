@@ -22,6 +22,7 @@ enum AppSettings {
     static let globalSearchHotKeyKeyCodeKey = "ATTGlobalSearchHotKeyKeyCode"
     static let globalSearchHotKeyModifierFlagsKey = "ATTGlobalSearchHotKeyModifierFlags"
     static let highlightSearchTextKey = "ATTHighlightSearchText"
+    static let menuBarIconEnabledKey = "ATTMenuBarIconEnabled"
     static let showHiddenFilesKey = "ATTShowHiddenFiles"
     static let themePreferenceKey = "ATTThemePreference"
     static let indexedRootsKey = "ATTIndexedRoots"
@@ -29,6 +30,7 @@ enum AppSettings {
     static let exclusionPatternsKey = "ATTExclusionPatterns"
     static let exclusionDefaultsVersionKey = "ATTExclusionDefaultsVersion"
     static let globalSearchHotKeyDidChangeNotification = Notification.Name("com.allthethings.settings.globalSearchHotKeyDidChange")
+    static let menuBarIconDidChangeNotification = Notification.Name("com.allthethings.settings.menuBarIconDidChange")
     static let themePreferenceDidChangeNotification = Notification.Name("com.allthethings.settings.themePreferenceDidChange")
     static let indexedRootsDidChangeNotification = Notification.Name("com.allthethings.settings.indexedRootsDidChange")
     static let exclusionPatternsDidChangeNotification = Notification.Name("com.allthethings.settings.exclusionPatternsDidChange")
@@ -68,6 +70,7 @@ enum AppSettings {
             globalSearchHotKeyKeyCodeKey: Int(GlobalHotKey.defaultSearch.keyCode),
             globalSearchHotKeyModifierFlagsKey: Int(GlobalHotKey.defaultSearch.modifiers),
             highlightSearchTextKey: true,
+            menuBarIconEnabledKey: true,
             showHiddenFilesKey: false,
             themePreferenceKey: AppThemePreference.system.rawValue,
             exclusionPatternsKey: FileExclusionRules.defaultPatterns
@@ -122,6 +125,18 @@ enum AppSettings {
         defaults.set(Int(hotKey.modifiers), forKey: globalSearchHotKeyModifierFlagsKey)
         defaults.synchronize()
         NotificationCenter.default.post(name: globalSearchHotKeyDidChangeNotification, object: defaults)
+    }
+
+    static func menuBarIconEnabled(defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: menuBarIconEnabledKey)
+    }
+
+    static func saveMenuBarIconEnabled(_ enabled: Bool, defaults: UserDefaults = .standard) {
+        guard menuBarIconEnabled(defaults: defaults) != enabled else { return }
+
+        defaults.set(enabled, forKey: menuBarIconEnabledKey)
+        defaults.synchronize()
+        NotificationCenter.default.post(name: menuBarIconDidChangeNotification, object: defaults)
     }
 
     static func indexedRoots(defaults: UserDefaults = .standard) -> [URL] {
