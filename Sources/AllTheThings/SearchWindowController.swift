@@ -19,6 +19,7 @@ final class SearchWindowController: NSWindowController {
         )
         window.title = "AllTheThings"
         window.titlebarAppearsTransparent = true
+        window.collectionBehavior.insert(.moveToActiveSpace)
         window.isRestorable = false
         window.contentMinSize = WindowLayout.minimumContentSize
         window.contentViewController = viewController
@@ -29,6 +30,12 @@ final class SearchWindowController: NSWindowController {
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    @MainActor
+    func focusSearchField(selectText: Bool) {
+        guard let viewController = window?.contentViewController as? SearchViewController else { return }
+        viewController.focusSearchField(selectText: selectText)
     }
 
     private static func startupContentSize() -> NSSize {
@@ -300,10 +307,18 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     override func viewDidAppear() {
         super.viewDidAppear()
-        view.window?.makeFirstResponder(searchField)
+        focusSearchField(selectText: false)
 
         DispatchQueue.main.async { [weak self] in
             self?.startIndexingAfterFirstPaint()
+        }
+    }
+
+    @MainActor
+    func focusSearchField(selectText: Bool) {
+        view.window?.makeFirstResponder(searchField)
+        if selectText {
+            searchField.selectText(nil)
         }
     }
 
@@ -874,9 +889,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let milliseconds = Int((queryElapsed * 1_000).rounded())
         countLabel.stringValue = "\(shownCount.formatted()) shown / \(total) matches • \(indexed) indexed • \(milliseconds) ms"
 
-        let scopeText = indexedRoots.map { AppSettings.displayPath($0) }.joined(separator: "  ")
         let indexingText = indexStats.isLoadingSnapshot ? "Loading" : (indexStats.isIndexing ? "Indexing" : "Ready")
-        statusLabel.stringValue = "\(indexingText) • \(indexStats.status) • \(scopeText)"
+        statusLabel.stringValue = "\(indexingText) • \(indexStats.status)"
     }
 
     private func updateActionButtons() {
