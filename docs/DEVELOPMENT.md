@@ -28,6 +28,33 @@ Run it with:
 cmake --build --preset run
 ```
 
+## Release Packaging
+
+Create a Developer ID Application certificate in your Apple Developer account or in Xcode, then install it in your login keychain. Store notarization credentials once with:
+
+```sh
+xcrun notarytool store-credentials "AllTheThings-notary" \
+  --apple-id "you@example.com" \
+  --team-id "TEAMID1234" \
+  --password "app-specific-password"
+```
+
+Package a release with:
+
+```sh
+APPLE_CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID1234)" \
+APPLE_NOTARY_PROFILE="AllTheThings-notary" \
+tools/release.sh
+```
+
+The script reads the version from `Resources/Info.plist`, runs the test suite, builds `build/AllTheThings.app`, signs it with hardened runtime, submits it for notarization, staples the ticket, and writes a zip plus SHA-256 checksum under `build/releases/<version>/`.
+
+For a local packaging smoke test without Developer ID credentials:
+
+```sh
+tools/release.sh --skip-sign --skip-notarize --allow-dirty
+```
+
 ## VSCode
 
 The repository includes VSCode workspace tasks:
