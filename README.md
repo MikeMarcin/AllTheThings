@@ -56,7 +56,7 @@ Select one or more rows, then use the toolbar or context menu:
 
 ## Updates
 
-AllTheThings checks GitHub for new releases from `MikeMarcin/AllTheThings` once per day on launch. You can run a manual check from **AllTheThings > Check for Updates...** or disable automatic checks from **AllTheThings > Automatically Check for Updates**.
+AllTheThings checks GitHub for new releases from `MikeMarcin/AllTheThings` once per day on launch. When an installable release archive is available, it can download the update, replace the current app bundle, and relaunch the updated app. You can run a manual check from **AllTheThings > Check for Updates...** or disable automatic checks from **AllTheThings > Automatically Check for Updates**.
 
 ## Privacy
 
