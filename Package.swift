@@ -29,6 +29,10 @@ let package = Package(
         .testTarget(
             name: "ATTCoreTests",
             dependencies: ["ATTCore"]
+        ),
+        .testTarget(
+            name: "AllTheThingsTests",
+            dependencies: ["AllTheThings"]
         )
     ]
 )
