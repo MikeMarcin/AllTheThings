@@ -69,6 +69,13 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     private let showHiddenFilesSwitch = NSSwitch()
     private let allowMultipleInstancesSwitch = NSSwitch()
     private let automaticallyCheckForUpdatesSwitch = NSSwitch()
+    private let fullDiskAccessStatusIconView = NSImageView()
+    private let fullDiskAccessStatusLabel = NSTextField(labelWithString: "")
+    private let fullDiskAccessExplanationLabel = NSTextField(labelWithString: "")
+    private let openFullDiskAccessSettingsButton = NSButton()
+    private let recheckFullDiskAccessButton = NSButton()
+    private let indexedFoldersAccessWarningView = SettingsWarningView()
+    private let indexedFoldersAccessWarningLabel = NSTextField(labelWithString: "")
     private let rootsTableView = NSTableView()
     private let addRootButton = NSButton()
     private let resetRootsButton = NSButton()
@@ -81,7 +88,9 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     private var indexedRoots: [URL] = []
     private var exclusionPatterns: [String] = []
     private var indexedRootsCardHeightConstraint: NSLayoutConstraint?
+    private var indexedRootsCardTopConstraint: NSLayoutConstraint?
     private var exclusionPatternsCardHeightConstraint: NSLayoutConstraint?
+    private var indexedFoldersAccessWarningCollapsedHeightConstraint: NSLayoutConstraint?
 
     private static let exclusionPatternFieldIdentifier = NSUserInterfaceItemIdentifier("exclusionPatternField")
     private static let indexedRootPasteboardType = NSPasteboard.PasteboardType("com.allthethings.settings.indexed-root-row")
@@ -262,6 +271,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         let (scrollView, contentView) = makePageScrollView()
 
         let sectionLabel = makeSectionLabel("Application")
+        let privacyLabel = makeSectionLabel("Privacy & Access")
 
         configureThemeControl()
         configureSwitch(globalHotKeySwitch, action: #selector(toggleGlobalHotKey(_:)))
@@ -272,6 +282,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         configureSwitch(showHiddenFilesSwitch, action: #selector(toggleShowHiddenFiles(_:)))
         configureSwitch(allowMultipleInstancesSwitch, action: #selector(toggleAllowMultipleInstances(_:)))
         configureSwitch(automaticallyCheckForUpdatesSwitch, action: #selector(toggleAutomaticallyCheckForUpdates(_:)))
+        configureFullDiskAccessButtons()
 
         let settingsCard = makeSettingsCard(rows: [
             makeControlRow(
@@ -315,9 +326,12 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
                 control: automaticallyCheckForUpdatesSwitch
             )
         ])
+        let fullDiskAccessCard = makeFullDiskAccessCard()
 
         contentView.addSubview(sectionLabel)
         contentView.addSubview(settingsCard)
+        contentView.addSubview(privacyLabel)
+        contentView.addSubview(fullDiskAccessCard)
 
         NSLayoutConstraint.activate([
             sectionLabel.topAnchor.constraint(equalTo: contentView.safeAreaLayoutGuide.topAnchor, constant: 26),
@@ -327,9 +341,18 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
             settingsCard.topAnchor.constraint(equalTo: sectionLabel.bottomAnchor, constant: 12),
             settingsCard.leadingAnchor.constraint(equalTo: sectionLabel.leadingAnchor),
             settingsCard.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -36),
-            settingsCard.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -24)
+
+            privacyLabel.topAnchor.constraint(equalTo: settingsCard.bottomAnchor, constant: 28),
+            privacyLabel.leadingAnchor.constraint(equalTo: settingsCard.leadingAnchor),
+            privacyLabel.trailingAnchor.constraint(lessThanOrEqualTo: settingsCard.trailingAnchor),
+
+            fullDiskAccessCard.topAnchor.constraint(equalTo: privacyLabel.bottomAnchor, constant: 12),
+            fullDiskAccessCard.leadingAnchor.constraint(equalTo: settingsCard.leadingAnchor),
+            fullDiskAccessCard.trailingAnchor.constraint(equalTo: settingsCard.trailingAnchor),
+            fullDiskAccessCard.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -24)
         ])
 
+        updateFullDiskAccessStatus()
         return scrollView
     }
 
@@ -363,6 +386,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         rootsHeader.addArrangedSubview(resetRootsButton)
         rootsHeader.addArrangedSubview(addRootButton)
 
+        let accessWarning = makeIndexedFoldersAccessWarningView()
         let rootsCard = makeIndexedRootsCard()
 
         let exclusionsHeader = NSStackView()
@@ -405,8 +429,13 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         let exclusionsCard = makeExclusionPatternsCard()
         let contentBottomConstraint = exclusionsCard.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -24)
         contentBottomConstraint.priority = .defaultLow
+        let warningCollapsedHeightConstraint = accessWarning.heightAnchor.constraint(equalToConstant: 0)
+        let rootsCardTopConstraint = rootsCard.topAnchor.constraint(equalTo: accessWarning.bottomAnchor, constant: 10)
+        indexedFoldersAccessWarningCollapsedHeightConstraint = warningCollapsedHeightConstraint
+        indexedRootsCardTopConstraint = rootsCardTopConstraint
 
         contentView.addSubview(rootsHeader)
+        contentView.addSubview(accessWarning)
         contentView.addSubview(rootsCard)
         contentView.addSubview(exclusionsHeader)
         contentView.addSubview(exclusionsCard)
@@ -420,7 +449,12 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
             addRootButton.widthAnchor.constraint(equalToConstant: 74),
             addRootButton.heightAnchor.constraint(equalToConstant: 30),
 
-            rootsCard.topAnchor.constraint(equalTo: rootsHeader.bottomAnchor, constant: 10),
+            accessWarning.topAnchor.constraint(equalTo: rootsHeader.bottomAnchor, constant: 10),
+            accessWarning.leadingAnchor.constraint(equalTo: rootsHeader.leadingAnchor),
+            accessWarning.trailingAnchor.constraint(equalTo: rootsHeader.trailingAnchor),
+            warningCollapsedHeightConstraint,
+
+            rootsCardTopConstraint,
             rootsCard.leadingAnchor.constraint(equalTo: rootsHeader.leadingAnchor),
             rootsCard.trailingAnchor.constraint(equalTo: rootsHeader.trailingAnchor),
 
@@ -441,6 +475,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
             contentBottomConstraint
         ])
 
+        updateIndexedFoldersAccessWarning()
         return scrollView
     }
 
@@ -495,6 +530,21 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         return stack
     }
 
+    private func configureFullDiskAccessButtons() {
+        configureTextButton(
+            openFullDiskAccessSettingsButton,
+            title: "Open Full Disk Access Settings",
+            symbol: "gearshape",
+            action: #selector(openFullDiskAccessSettings(_:))
+        )
+        configureTextButton(
+            recheckFullDiskAccessButton,
+            title: "Recheck Access",
+            symbol: "arrow.clockwise",
+            action: #selector(recheckFullDiskAccess(_:))
+        )
+    }
+
     private func configureIconButton(_ button: NSButton, symbol: String, tooltip: String, action: Selector) {
         button.translatesAutoresizingMaskIntoConstraints = false
         button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: tooltip)
@@ -512,6 +562,19 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         button.title = "Add"
         button.bezelStyle = .rounded
         button.toolTip = tooltip
+        button.target = self
+        button.action = action
+        button.setContentHuggingPriority(.required, for: .horizontal)
+        button.setContentCompressionResistancePriority(.required, for: .horizontal)
+    }
+
+    private func configureTextButton(_ button: NSButton, title: String, symbol: String, action: Selector) {
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.title = title
+        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
+        button.imagePosition = .imageLeading
+        button.bezelStyle = .rounded
+        button.toolTip = title
         button.target = self
         button.action = action
         button.setContentHuggingPriority(.required, for: .horizontal)
@@ -543,6 +606,108 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         ])
 
         return card
+    }
+
+    private func makeFullDiskAccessCard() -> NSView {
+        let card = makeCard()
+
+        fullDiskAccessStatusIconView.translatesAutoresizingMaskIntoConstraints = false
+        fullDiskAccessStatusIconView.image = NSImage(
+            systemSymbolName: "questionmark.circle",
+            accessibilityDescription: "Full Disk Access status"
+        )
+
+        fullDiskAccessStatusLabel.translatesAutoresizingMaskIntoConstraints = false
+        fullDiskAccessStatusLabel.font = .systemFont(ofSize: 14, weight: .medium)
+        fullDiskAccessStatusLabel.textColor = .labelColor
+
+        fullDiskAccessExplanationLabel.translatesAutoresizingMaskIntoConstraints = false
+        fullDiskAccessExplanationLabel.font = .systemFont(ofSize: 12, weight: .regular)
+        fullDiskAccessExplanationLabel.textColor = .secondaryLabelColor
+        fullDiskAccessExplanationLabel.lineBreakMode = .byWordWrapping
+        fullDiskAccessExplanationLabel.maximumNumberOfLines = 3
+        fullDiskAccessExplanationLabel.preferredMaxLayoutWidth = 520
+        fullDiskAccessExplanationLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        fullDiskAccessExplanationLabel.stringValue = "Without Full Disk Access, macOS may prompt when AllTheThings indexes or refreshes protected folders such as Desktop, Documents, Downloads, external drives, and cloud folders."
+
+        let textStack = NSStackView(views: [fullDiskAccessStatusLabel, fullDiskAccessExplanationLabel])
+        textStack.translatesAutoresizingMaskIntoConstraints = false
+        textStack.orientation = .vertical
+        textStack.alignment = .leading
+        textStack.spacing = 5
+        textStack.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let buttonStack = NSStackView(views: [openFullDiskAccessSettingsButton, recheckFullDiskAccessButton])
+        buttonStack.translatesAutoresizingMaskIntoConstraints = false
+        buttonStack.orientation = .horizontal
+        buttonStack.alignment = .centerY
+        buttonStack.spacing = 8
+
+        card.addSubview(fullDiskAccessStatusIconView)
+        card.addSubview(textStack)
+        card.addSubview(buttonStack)
+
+        NSLayoutConstraint.activate([
+            fullDiskAccessStatusIconView.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 20),
+            fullDiskAccessStatusIconView.topAnchor.constraint(equalTo: card.topAnchor, constant: 20),
+            fullDiskAccessStatusIconView.widthAnchor.constraint(equalToConstant: 20),
+            fullDiskAccessStatusIconView.heightAnchor.constraint(equalToConstant: 20),
+
+            textStack.leadingAnchor.constraint(equalTo: fullDiskAccessStatusIconView.trailingAnchor, constant: 12),
+            textStack.topAnchor.constraint(equalTo: card.topAnchor, constant: 18),
+            textStack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -20),
+            textStack.widthAnchor.constraint(lessThanOrEqualToConstant: 520),
+
+            buttonStack.topAnchor.constraint(equalTo: textStack.bottomAnchor, constant: 14),
+            buttonStack.leadingAnchor.constraint(equalTo: textStack.leadingAnchor),
+            buttonStack.trailingAnchor.constraint(lessThanOrEqualTo: card.trailingAnchor, constant: -20),
+            buttonStack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -18)
+        ])
+
+        return card
+    }
+
+    private func makeIndexedFoldersAccessWarningView() -> NSView {
+        let warningView = indexedFoldersAccessWarningView
+        warningView.translatesAutoresizingMaskIntoConstraints = false
+        warningView.isHidden = true
+
+        let iconView = NSImageView()
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+        iconView.image = NSImage(
+            systemSymbolName: "exclamationmark.triangle.fill",
+            accessibilityDescription: "Indexed folders access warning"
+        )
+        iconView.contentTintColor = .systemYellow
+
+        indexedFoldersAccessWarningLabel.translatesAutoresizingMaskIntoConstraints = false
+        indexedFoldersAccessWarningLabel.font = .systemFont(ofSize: 12, weight: .regular)
+        indexedFoldersAccessWarningLabel.textColor = .secondaryLabelColor
+        indexedFoldersAccessWarningLabel.lineBreakMode = .byWordWrapping
+        indexedFoldersAccessWarningLabel.maximumNumberOfLines = 3
+
+        warningView.addSubview(iconView)
+        warningView.addSubview(indexedFoldersAccessWarningLabel)
+
+        let warningLabelBottomConstraint = indexedFoldersAccessWarningLabel.bottomAnchor.constraint(
+            equalTo: warningView.bottomAnchor,
+            constant: -10
+        )
+        warningLabelBottomConstraint.priority = .defaultLow
+
+        NSLayoutConstraint.activate([
+            iconView.leadingAnchor.constraint(equalTo: warningView.leadingAnchor, constant: 12),
+            iconView.topAnchor.constraint(equalTo: warningView.topAnchor, constant: 11),
+            iconView.widthAnchor.constraint(equalToConstant: 16),
+            iconView.heightAnchor.constraint(equalToConstant: 16),
+
+            indexedFoldersAccessWarningLabel.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 10),
+            indexedFoldersAccessWarningLabel.topAnchor.constraint(equalTo: warningView.topAnchor, constant: 10),
+            indexedFoldersAccessWarningLabel.trailingAnchor.constraint(equalTo: warningView.trailingAnchor, constant: -12),
+            warningLabelBottomConstraint
+        ])
+
+        return warningView
     }
 
     private func makeIndexedRootsCard() -> NSView {
@@ -700,6 +865,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         indexedRoots = AppSettings.indexedRoots(defaults: defaults)
         rootsTableView.reloadData()
         updateIndexedFolderCardHeights()
+        updateIndexedFoldersAccessWarning()
     }
 
     private func renderExclusionPatterns() {
@@ -717,6 +883,22 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
             itemCount: exclusionPatterns.count,
             maximumVisibleRows: Self.exclusionPatternsMaximumVisibleRows
         )
+    }
+
+    private func updateIndexedFoldersAccessWarning() {
+        let protectedFolders = FullDiskAccessController.protectedDefaultFoldersCovered(by: AppSettings.indexedRoots(defaults: defaults))
+        let shouldShow = !protectedFolders.isEmpty && !FullDiskAccessController.currentStatus().isConfirmed
+
+        indexedFoldersAccessWarningView.isHidden = !shouldShow
+        indexedFoldersAccessWarningCollapsedHeightConstraint?.isActive = !shouldShow
+        indexedRootsCardTopConstraint?.constant = shouldShow ? 10 : 0
+
+        guard shouldShow else { return }
+
+        let folderNames = protectedFolders
+            .map(\.lastPathComponent)
+            .joined(separator: ", ")
+        indexedFoldersAccessWarningLabel.stringValue = "\(folderNames) are indexed, but Full Disk Access is not confirmed. Grant Full Disk Access or remove protected folders from indexing to avoid macOS prompts during indexing and refreshes."
     }
 
     private static func tableCardHeight(itemCount: Int, maximumVisibleRows: Int) -> CGFloat {
@@ -887,6 +1069,43 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         showHiddenFilesSwitch.state = defaults.bool(forKey: AppSettings.showHiddenFilesKey) ? .on : .off
         allowMultipleInstancesSwitch.state = defaults.bool(forKey: AppSettings.allowMultipleInstancesKey) ? .on : .off
         automaticallyCheckForUpdatesSwitch.state = ReleaseUpdater.shared.automaticallyChecksForUpdates ? .on : .off
+        updateFullDiskAccessStatus()
+        updateIndexedFoldersAccessWarning()
+    }
+
+    private func updateFullDiskAccessStatus() {
+        let status = FullDiskAccessController.currentStatus()
+        fullDiskAccessStatusLabel.stringValue = "Full Disk Access: \(status.displayTitle)"
+
+        switch status {
+        case .confirmed:
+            fullDiskAccessStatusIconView.image = NSImage(
+                systemSymbolName: "checkmark.circle.fill",
+                accessibilityDescription: "Full Disk Access confirmed"
+            )
+            fullDiskAccessStatusIconView.contentTintColor = .systemGreen
+        case .notConfirmed:
+            fullDiskAccessStatusIconView.image = NSImage(
+                systemSymbolName: "exclamationmark.triangle.fill",
+                accessibilityDescription: "Full Disk Access not confirmed"
+            )
+            fullDiskAccessStatusIconView.contentTintColor = .systemYellow
+        case .unknown:
+            fullDiskAccessStatusIconView.image = NSImage(
+                systemSymbolName: "questionmark.circle.fill",
+                accessibilityDescription: "Full Disk Access unknown"
+            )
+            fullDiskAccessStatusIconView.contentTintColor = .secondaryLabelColor
+        }
+    }
+
+    @objc private func openFullDiskAccessSettings(_ sender: NSButton) {
+        FullDiskAccessController.openSystemSettings()
+    }
+
+    @objc private func recheckFullDiskAccess(_ sender: NSButton) {
+        updateFullDiskAccessStatus()
+        updateIndexedFoldersAccessWarning()
     }
 
     @objc private func changeThemePreference(_ sender: NSSegmentedControl) {
@@ -1411,6 +1630,33 @@ private final class EmptyListCellView: NSTableCellView {
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+}
+
+@MainActor
+private final class SettingsWarningView: NSView {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        layer?.cornerRadius = 8
+        layer?.borderWidth = 1
+        updateThemeColors()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateThemeColors()
+    }
+
+    private func updateThemeColors() {
+        layer?.backgroundColor = AppTheme.resolvedCGColor(NSColor.systemYellow.withAlphaComponent(0.08), for: self)
+        layer?.borderColor = AppTheme.resolvedCGColor(NSColor.systemYellow.withAlphaComponent(0.26), for: self)
     }
 }
 

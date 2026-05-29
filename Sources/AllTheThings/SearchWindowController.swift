@@ -186,6 +186,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private let defaults = UserDefaults.standard
 
     private let searchField = NSSearchField()
+    private let setupSuggestionPanel = SetupSuggestionPanelView()
     private let tableView = FileTableView()
     private let headerMenu = NSMenu()
     private let scrollView = NSScrollView()
@@ -428,6 +429,13 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func buildInterface() {
+        let rootStack = NSStackView()
+        rootStack.orientation = .vertical
+        rootStack.alignment = .width
+        rootStack.spacing = 0
+        rootStack.detachesHiddenViews = true
+        rootStack.translatesAutoresizingMaskIntoConstraints = false
+
         let topBar = NSStackView()
         topBar.orientation = .horizontal
         topBar.alignment = .centerY
@@ -455,6 +463,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         for button in [addScopeButton, reindexButton, openButton, revealButton, copyButton] {
             topBar.addArrangedSubview(button)
         }
+
+        configureSetupSuggestionPanel()
 
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.hasVerticalScroller = true
@@ -510,26 +520,30 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         footer.addArrangedSubview(countLabel)
         footer.addArrangedSubview(statusLabel)
 
-        view.addSubview(topBar)
-        view.addSubview(scrollView)
-        view.addSubview(footer)
+        rootStack.addArrangedSubview(topBar)
+        rootStack.addArrangedSubview(setupSuggestionPanel)
+        rootStack.addArrangedSubview(scrollView)
+        rootStack.addArrangedSubview(footer)
+        view.addSubview(rootStack)
         configureLoadingOverlay()
 
         NSLayoutConstraint.activate([
-            topBar.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
-            topBar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            topBar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            rootStack.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+            rootStack.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            rootStack.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            rootStack.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            topBar.leadingAnchor.constraint(equalTo: rootStack.leadingAnchor),
+            topBar.trailingAnchor.constraint(equalTo: rootStack.trailingAnchor),
+            setupSuggestionPanel.leadingAnchor.constraint(equalTo: rootStack.leadingAnchor),
+            setupSuggestionPanel.trailingAnchor.constraint(equalTo: rootStack.trailingAnchor),
+            scrollView.leadingAnchor.constraint(equalTo: rootStack.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: rootStack.trailingAnchor),
+            footer.leadingAnchor.constraint(equalTo: rootStack.leadingAnchor),
+            footer.trailingAnchor.constraint(equalTo: rootStack.trailingAnchor),
             searchField.widthAnchor.constraint(greaterThanOrEqualToConstant: 360),
 
-            scrollView.topAnchor.constraint(equalTo: topBar.bottomAnchor),
-            scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            scrollView.bottomAnchor.constraint(equalTo: footer.topAnchor),
             scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 400),
 
-            footer.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            footer.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            footer.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             countLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 260),
 
             loadingOverlay.topAnchor.constraint(equalTo: scrollView.topAnchor),
@@ -540,7 +554,85 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         updateActionButtons()
         updateStatus()
+        updateSetupSuggestions()
         updateLoadingOverlay()
+    }
+
+    private func configureSetupSuggestionPanel() {
+        setupSuggestionPanel.translatesAutoresizingMaskIntoConstraints = false
+        setupSuggestionPanel.enableGlobalHotKeyButton.target = self
+        setupSuggestionPanel.enableGlobalHotKeyButton.action = #selector(enableSuggestedGlobalHotKey(_:))
+        setupSuggestionPanel.chooseGlobalHotKeyButton.target = self
+        setupSuggestionPanel.chooseGlobalHotKeyButton.action = #selector(chooseSuggestedGlobalHotKey(_:))
+        setupSuggestionPanel.openFullDiskAccessButton.target = self
+        setupSuggestionPanel.openFullDiskAccessButton.action = #selector(openSuggestedFullDiskAccessSettings(_:))
+        setupSuggestionPanel.dismissGlobalHotKeyButton.target = self
+        setupSuggestionPanel.dismissGlobalHotKeyButton.action = #selector(dismissSuggestedGlobalHotKey(_:))
+        setupSuggestionPanel.dismissFullDiskAccessButton.target = self
+        setupSuggestionPanel.dismissFullDiskAccessButton.action = #selector(dismissSuggestedFullDiskAccess(_:))
+    }
+
+    private func updateSetupSuggestions() {
+        let needsGlobalHotKey = AppSettings.globalSearchHotKeyNeedsConfirmation(defaults: defaults)
+        let needsFullDiskAccess = !defaults.bool(forKey: AppSettings.fullDiskAccessOnboardingShownKey)
+            && !FullDiskAccessController.currentStatus().isConfirmed
+
+        setupSuggestionPanel.update(
+            hotKey: AppSettings.globalSearchHotKey(defaults: defaults),
+            needsGlobalHotKey: needsGlobalHotKey,
+            needsFullDiskAccess: needsFullDiskAccess
+        )
+    }
+
+    @objc private func enableSuggestedGlobalHotKey(_ sender: NSButton) {
+        let hotKey = AppSettings.globalSearchHotKey(defaults: defaults)
+
+        do {
+            if let appDelegate = NSApp.delegate as? AppDelegate {
+                try appDelegate.saveGlobalSearchHotKey(enabled: true, hotKey: hotKey)
+            } else {
+                AppSettings.saveGlobalSearchHotKey(enabled: true, hotKey: hotKey, defaults: defaults)
+            }
+        } catch {
+            presentError("Could not register global search hotkey.", informativeText: error.localizedDescription)
+        }
+
+        updateSetupSuggestions()
+    }
+
+    @objc private func chooseSuggestedGlobalHotKey(_ sender: NSButton) {
+        AppSettings.saveGlobalSearchHotKey(
+            enabled: false,
+            hotKey: AppSettings.globalSearchHotKey(defaults: defaults),
+            defaults: defaults
+        )
+        (NSApp.delegate as? AppDelegate)?.showSettings()
+        updateSetupSuggestions()
+    }
+
+    @objc private func openSuggestedFullDiskAccessSettings(_ sender: NSButton) {
+        markFullDiskAccessOnboardingShown()
+        FullDiskAccessController.openSystemSettings()
+        updateSetupSuggestions()
+    }
+
+    @objc private func dismissSuggestedGlobalHotKey(_ sender: NSButton) {
+        AppSettings.saveGlobalSearchHotKey(
+            enabled: false,
+            hotKey: AppSettings.globalSearchHotKey(defaults: defaults),
+            defaults: defaults
+        )
+        updateSetupSuggestions()
+    }
+
+    @objc private func dismissSuggestedFullDiskAccess(_ sender: NSButton) {
+        markFullDiskAccessOnboardingShown()
+        updateSetupSuggestions()
+    }
+
+    private func markFullDiskAccessOnboardingShown() {
+        defaults.set(true, forKey: AppSettings.fullDiskAccessOnboardingShownKey)
+        defaults.synchronize()
     }
 
     private func configureLoadingOverlay() {
@@ -810,6 +902,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     @objc private func userDefaultsDidChange(_ notification: Notification) {
         settingsDidChange()
+        updateSetupSuggestions()
     }
 
     @objc private func indexedRootsDidChange(_ notification: Notification) {
@@ -1339,6 +1432,200 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
 
         return spec
+    }
+}
+
+private final class SetupSuggestionPanelView: NSView {
+    let enableGlobalHotKeyButton = NSButton()
+    let chooseGlobalHotKeyButton = NSButton()
+    let openFullDiskAccessButton = NSButton()
+    let dismissGlobalHotKeyButton = NSButton()
+    let dismissFullDiskAccessButton = NSButton()
+
+    private let globalHotKeyRow = NSView()
+    private let fullDiskAccessRow = NSView()
+    private let rowSeparator = SetupSuggestionSeparatorView()
+    private let globalHotKeyDetailLabel = NSTextField(labelWithString: "")
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+
+        let globalHotKeyTitleLabel = Self.makeTitleLabel("Global search hotkey")
+        let fullDiskAccessTitleLabel = Self.makeTitleLabel("Full Disk Access")
+        let fullDiskAccessDetailLabel = Self.makeDetailLabel(
+            "Avoid macOS folder prompts when indexing protected locations."
+        )
+        Self.configureSuggestionRow(
+            globalHotKeyRow,
+            symbolName: "keyboard",
+            titleLabel: globalHotKeyTitleLabel,
+            detailLabel: globalHotKeyDetailLabel,
+            buttons: [
+                Self.configureActionButton(enableGlobalHotKeyButton, title: "Enable", symbolName: "checkmark.circle"),
+                Self.configureActionButton(chooseGlobalHotKeyButton, title: "Customize", symbolName: "slider.horizontal.3"),
+                Self.configureActionButton(dismissGlobalHotKeyButton, title: "Not Now", symbolName: "xmark")
+            ]
+        )
+        Self.configureSuggestionRow(
+            fullDiskAccessRow,
+            symbolName: "externaldrive.badge.checkmark",
+            titleLabel: fullDiskAccessTitleLabel,
+            detailLabel: fullDiskAccessDetailLabel,
+            buttons: [
+                Self.configureActionButton(openFullDiskAccessButton, title: "Open Settings", symbolName: "gearshape"),
+                Self.configureActionButton(dismissFullDiskAccessButton, title: "Not Now", symbolName: "xmark")
+            ]
+        )
+
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        layer?.cornerRadius = 8
+        layer?.borderWidth = 1
+        updateThemeColors()
+
+        let rowsStack = NSStackView(views: [globalHotKeyRow, rowSeparator, fullDiskAccessRow])
+        rowsStack.translatesAutoresizingMaskIntoConstraints = false
+        rowsStack.orientation = .vertical
+        rowsStack.alignment = .width
+        rowsStack.spacing = 5
+        rowsStack.detachesHiddenViews = true
+
+        addSubview(rowsStack)
+        NSLayoutConstraint.activate([
+            rowsStack.topAnchor.constraint(equalTo: topAnchor, constant: 8),
+            rowsStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+            rowsStack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+            rowsStack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
+            rowSeparator.heightAnchor.constraint(equalToConstant: 2)
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateThemeColors()
+    }
+
+    func update(hotKey: GlobalHotKey, needsGlobalHotKey: Bool, needsFullDiskAccess: Bool) {
+        globalHotKeyDetailLabel.stringValue = "Use \(hotKey.displayString) to open search from anywhere."
+        globalHotKeyRow.isHidden = !needsGlobalHotKey
+        fullDiskAccessRow.isHidden = !needsFullDiskAccess
+        rowSeparator.isHidden = !needsGlobalHotKey || !needsFullDiskAccess
+        isHidden = !needsGlobalHotKey && !needsFullDiskAccess
+    }
+
+    private func updateThemeColors() {
+        layer?.backgroundColor = AppTheme.resolvedCGColor(NSColor.controlBackgroundColor, for: self)
+        layer?.borderColor = AppTheme.resolvedCGColor(NSColor.separatorColor, for: self)
+    }
+
+    private static func configureSuggestionRow(
+        _ row: NSView,
+        symbolName: String,
+        titleLabel: NSTextField,
+        detailLabel: NSTextField,
+        buttons: [NSButton]
+    ) {
+        row.translatesAutoresizingMaskIntoConstraints = false
+
+        let iconView = NSImageView()
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+        iconView.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: titleLabel.stringValue)
+        iconView.contentTintColor = .secondaryLabelColor
+
+        let textStack = NSStackView(views: [titleLabel, detailLabel])
+        textStack.translatesAutoresizingMaskIntoConstraints = false
+        textStack.orientation = .vertical
+        textStack.alignment = .leading
+        textStack.spacing = 3
+
+        let buttonStack = NSStackView(views: buttons)
+        buttonStack.translatesAutoresizingMaskIntoConstraints = false
+        buttonStack.orientation = .horizontal
+        buttonStack.alignment = .centerY
+        buttonStack.spacing = 8
+
+        row.addSubview(iconView)
+        row.addSubview(textStack)
+        row.addSubview(buttonStack)
+
+        NSLayoutConstraint.activate([
+            row.heightAnchor.constraint(greaterThanOrEqualToConstant: 30),
+
+            iconView.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+            iconView.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            iconView.widthAnchor.constraint(equalToConstant: 16),
+            iconView.heightAnchor.constraint(equalToConstant: 16),
+
+            textStack.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 10),
+            textStack.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            textStack.bottomAnchor.constraint(lessThanOrEqualTo: row.bottomAnchor),
+            textStack.trailingAnchor.constraint(lessThanOrEqualTo: buttonStack.leadingAnchor, constant: -16),
+
+            buttonStack.trailingAnchor.constraint(equalTo: row.trailingAnchor),
+            buttonStack.centerYAnchor.constraint(equalTo: row.centerYAnchor)
+        ])
+    }
+
+    private static func makeTitleLabel(_ value: String) -> NSTextField {
+        let label = NSTextField(labelWithString: value)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.font = .systemFont(ofSize: 12, weight: .semibold)
+        label.textColor = .labelColor
+        label.lineBreakMode = .byTruncatingTail
+        return label
+    }
+
+    private static func makeDetailLabel(_ value: String) -> NSTextField {
+        let label = NSTextField(labelWithString: value)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.font = .systemFont(ofSize: 12, weight: .regular)
+        label.textColor = .secondaryLabelColor
+        label.lineBreakMode = .byTruncatingTail
+        label.maximumNumberOfLines = 1
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return label
+    }
+
+    @discardableResult
+    private static func configureActionButton(_ button: NSButton, title: String, symbolName: String) -> NSButton {
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.title = title
+        button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: title)
+        button.imagePosition = .imageLeading
+        button.bezelStyle = .rounded
+        button.controlSize = .small
+        button.font = .systemFont(ofSize: 12, weight: .regular)
+        button.setContentHuggingPriority(.required, for: .horizontal)
+        button.setContentCompressionResistancePriority(.required, for: .horizontal)
+        return button
+    }
+}
+
+private final class SetupSuggestionSeparatorView: NSView {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        updateThemeColors()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateThemeColors()
+    }
+
+    private func updateThemeColors() {
+        layer?.backgroundColor = AppTheme.resolvedCGColor(NSColor.labelColor.withAlphaComponent(0.28), for: self)
     }
 }
 

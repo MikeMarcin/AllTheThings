@@ -93,4 +93,4 @@ This is a working MVP, not the final high-performance engine described in the pr
 - The snapshot is JSON rather than memory-mapped columnar storage.
 - Search is currently in-memory scoring over indexed records, with supporting indexes for common fast paths.
 - FSEvents are treated as dirty-path refresh signals, but there is not yet a WAL or full reconciliation scheduler.
-- Full Disk Access onboarding is not implemented yet.
+- Full Disk Access status is informational and conservative; indexing behavior has not been overhauled around macOS privacy prompts yet.

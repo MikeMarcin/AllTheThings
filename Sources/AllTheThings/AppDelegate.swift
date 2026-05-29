@@ -9,7 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private let defaults = UserDefaults.standard
     private var windowController: SearchWindowController?
-    private var settingsWindowController: NSWindowController?
+    private var settingsWindowController: SettingsWindowController?
     private var aboutWindowController: NSWindowController?
     private var noticesWindowController: NSWindowController?
     private var globalHotKeyController: GlobalHotKeyController?
@@ -181,9 +181,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @MainActor
     private func applyGlobalHotKeySettings(presentsErrors: Bool = false) {
         if AppSettings.globalSearchHotKeyNeedsConfirmation(defaults: defaults) {
-            if presentsErrors {
-                presentGlobalHotKeyEnableConfirmation()
-            }
             return
         }
 
@@ -198,48 +195,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             } else {
                 NSLog("AllTheThings could not register global search hotkey: \(error.localizedDescription)")
             }
-        }
-    }
-
-    @MainActor
-    private func presentGlobalHotKeyEnableConfirmation() {
-        let hotKey = AppSettings.globalSearchHotKey(defaults: defaults)
-        let alert = NSAlert()
-        alert.alertStyle = .informational
-        alert.messageText = "Enable \(hotKey.displayString) for global search?"
-        alert.informativeText = "AllTheThings can claim this shortcut system-wide while it is running. If another app or macOS feature already uses this shortcut, choose a different shortcut in Settings instead."
-        alert.addButton(withTitle: "Enable Shortcut")
-        alert.addButton(withTitle: "Choose Shortcut...")
-        alert.addButton(withTitle: "Not Now")
-
-        let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
-            guard let self else { return }
-            switch response {
-            case .alertFirstButtonReturn:
-                self.enableConfirmedGlobalHotKey(hotKey)
-            case .alertSecondButtonReturn:
-                AppSettings.saveGlobalSearchHotKey(enabled: false, hotKey: hotKey, defaults: self.defaults)
-                self.showSettingsWindow(nil)
-            default:
-                AppSettings.saveGlobalSearchHotKey(enabled: false, hotKey: hotKey, defaults: self.defaults)
-            }
-        }
-
-        if let window = windowController?.window {
-            alert.beginSheetModal(for: window, completionHandler: completion)
-        } else {
-            completion(alert.runModal())
-        }
-    }
-
-    @MainActor
-    private func enableConfirmedGlobalHotKey(_ hotKey: GlobalHotKey) {
-        do {
-            try globalHotKeyController?.configure(isEnabled: true, hotKey: hotKey)
-            AppSettings.saveGlobalSearchHotKey(enabled: true, hotKey: hotKey, defaults: defaults)
-        } catch {
-            AppSettings.saveGlobalSearchHotKey(enabled: false, hotKey: hotKey, defaults: defaults)
-            presentGlobalHotKeyRegistrationError(error)
         }
     }
 
@@ -317,8 +272,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ReleaseUpdater.shared.checkForUpdates(presentingWindow: windowController?.window, userInitiated: true)
     }
 
+    @MainActor
+    func showSettings() {
+        presentSettingsWindow()
+    }
+
     @objc @MainActor private func showSettingsWindow(_ sender: Any?) {
-        let controller: NSWindowController
+        presentSettingsWindow()
+    }
+
+    @MainActor
+    private func presentSettingsWindow() {
+        let controller: SettingsWindowController
         if let existingController = settingsWindowController {
             controller = existingController
         } else {
