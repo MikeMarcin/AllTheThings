@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 import Security
 
@@ -428,7 +429,12 @@ final class ReleaseUpdater {
 
             shouldCleanUp = false
             defaults.removeObject(forKey: DefaultsKey.skippedReleaseTag)
+            progressWindowController?.closeProgress()
+            progressWindowController = nil
             NSApp.terminate(nil)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) {
+                Darwin.exit(EXIT_SUCCESS)
+            }
         } catch {
             if shouldCleanUp, let workDirectory {
                 try? FileManager.default.removeItem(at: workDirectory)
@@ -634,10 +640,22 @@ final class ReleaseUpdater {
         pid=\(processIdentifier)
         backup_path="${app_path}.previous-update-$(date +%Y%m%d%H%M%S)"
         log_path="${work_dir}/install.log"
+        wait_deadline=$(( $(/bin/date +%s) + 15 ))
 
         {
             echo "Waiting for AllTheThings process ${pid} to exit"
             while /bin/kill -0 "${pid}" 2>/dev/null; do
+                if (( $(/bin/date +%s) >= wait_deadline )); then
+                    echo "Process ${pid} did not exit; sending SIGTERM"
+                    /bin/kill "${pid}" 2>/dev/null || true
+                    /bin/sleep 2
+
+                    if /bin/kill -0 "${pid}" 2>/dev/null; then
+                        echo "Process ${pid} did not terminate; sending SIGKILL"
+                        /bin/kill -9 "${pid}" 2>/dev/null || true
+                    fi
+                fi
+
                 /bin/sleep 0.2
             done
 
