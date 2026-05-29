@@ -14,9 +14,9 @@ AllTheThings is a native macOS file-search app built for one fast loop: type a f
 
 ## Getting Started
 
-On first launch, AllTheThings indexes the default folders that exist on your Mac: `~/Desktop`, `~/Documents`, `~/Downloads`, `~/Developer`, and `/Applications`.
+On first launch, AllTheThings indexes the default folders that exist on your Mac: `~/Desktop`, `~/Documents`, `~/Downloads`, `~/Developer`, and `/Applications`. If setup suggestions are available, they appear at the top of the search window instead of blocking the app.
 
-Use the folder-plus toolbar button to add folders. Use the refresh toolbar button to rebuild indexed scopes. The footer shows indexing state, match count, and query time. The default global search shortcut is `Command-Shift-Space`; confirm it on first launch, or disable/remap it in Settings. Enable launch at login to keep the shortcut available after signing in. The optional menu bar loupe can focus search, open Settings, toggle launch at login, or quit the app.
+Use the folder-plus toolbar button to add folders. Use the refresh toolbar button to rebuild indexed scopes. The footer shows indexing state, match count, and query time. The default global search shortcut is `Command-Shift-Space`; enable it from the setup suggestion, or disable/remap it in Settings. Enable launch at login to keep the shortcut available after signing in. The optional menu bar loupe can focus search, open Settings, toggle launch at login, or quit the app.
 
 High-noise folders such as `node_modules`, `DerivedData`, `.git/objects`, `Library/Caches`, and `.Trash` are skipped.
 
@@ -62,11 +62,15 @@ AllTheThings checks GitHub for new releases from `MikeMarcin/AllTheThings` once 
 
 AllTheThings indexes file metadata needed for search: paths, names, extensions, sizes, timestamps, folder/file status, hidden status, and volume names. It does not read file contents for search indexing.
 
+macOS protects locations such as Desktop, Documents, Downloads, some external or cloud folders, and other privacy-sensitive folders. AllTheThings can index folders you explicitly choose without Full Disk Access, but macOS may prompt when the app indexes or refreshes protected locations. Broad indexing works best after granting Full Disk Access in **System Settings > Privacy & Security > Full Disk Access**.
+
+Use **AllTheThings > Settings > General** to check Full Disk Access status or open the matching System Settings pane. Use **AllTheThings > Settings > Indexed Folders** to add or remove indexed folders.
+
 Be careful when sharing screenshots or recordings. A file-search window can expose usernames, project names, client names, cloud folder names, and recently touched files.
 
 ## Troubleshooting
 
-If expected files are missing, confirm the parent folder is indexed, click the refresh toolbar button, check whether the file is under a skipped folder, and make sure macOS privacy protections are not hiding the location.
+If expected files are missing, confirm the parent folder is indexed in **Settings > Indexed Folders**, click the refresh toolbar button, check whether the file is under a skipped folder, and make sure macOS privacy protections are not hiding the location. Grant Full Disk Access or remove protected folders from indexing if macOS keeps asking for folder access.
 
 If the app opens an existing running instance instead of starting a second copy, use **AllTheThings > Allow Multiple Instances**.
 

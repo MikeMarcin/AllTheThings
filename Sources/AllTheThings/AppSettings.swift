@@ -21,6 +21,7 @@ enum AppSettings {
     static let globalSearchHotKeyConfirmationResolvedKey = "ATTGlobalSearchHotKeyConfirmationResolved"
     static let globalSearchHotKeyKeyCodeKey = "ATTGlobalSearchHotKeyKeyCode"
     static let globalSearchHotKeyModifierFlagsKey = "ATTGlobalSearchHotKeyModifierFlags"
+    static let fullDiskAccessOnboardingShownKey = "ATTFullDiskAccessOnboardingShown"
     static let highlightSearchTextKey = "ATTHighlightSearchText"
     static let menuBarIconEnabledKey = "ATTMenuBarIconEnabled"
     static let showHiddenFilesKey = "ATTShowHiddenFiles"
@@ -69,6 +70,7 @@ enum AppSettings {
             globalSearchHotKeyConfirmationResolvedKey: false,
             globalSearchHotKeyKeyCodeKey: Int(GlobalHotKey.defaultSearch.keyCode),
             globalSearchHotKeyModifierFlagsKey: Int(GlobalHotKey.defaultSearch.modifiers),
+            fullDiskAccessOnboardingShownKey: false,
             highlightSearchTextKey: true,
             menuBarIconEnabledKey: true,
             showHiddenFilesKey: false,
