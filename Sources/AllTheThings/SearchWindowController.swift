@@ -909,8 +909,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
 
         let waitingForInitialLoad = !didRequestInitialSnapshotLoad && indexStats.indexedCount == 0
-        let indexingEmptyList = indexStats.isIndexing && results.isEmpty
-        let shouldShow = indexStats.isLoadingSnapshot || waitingForInitialLoad || indexingEmptyList
+        let indexingBeforeSearchableSnapshot = indexStats.phase == .scanning
+            && indexStats.searchableCount == 0
+            && results.isEmpty
+        let shouldShow = indexStats.isLoadingSnapshot || waitingForInitialLoad || indexingBeforeSearchableSnapshot
 
         if indexStats.isLoadingSnapshot || waitingForInitialLoad {
             loadingLabel.stringValue = "Loading file list..."
@@ -1082,13 +1084,30 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let milliseconds = Int((queryElapsed * 1_000).rounded())
         countLabel.stringValue = "\(shownCount.formatted()) shown / \(total) matches • \(indexed) indexed • \(milliseconds) ms"
 
-        let indexingText: String
+        statusLabel.stringValue = "\(indexStatusText()) • \(memoryStatusText)"
+    }
+
+    private func indexStatusText() -> String {
         if indexedRoots.isEmpty {
-            indexingText = "No folders"
-        } else {
-            indexingText = indexStats.isLoadingSnapshot ? "Loading" : (indexStats.isIndexing ? "Indexing" : "Ready")
+            return "No folders"
         }
-        statusLabel.stringValue = "\(indexingText) • \(indexStats.status) • \(memoryStatusText)"
+
+        switch indexStats.phase {
+        case .idle:
+            return indexStats.status
+        case .loading:
+            return "Loading • \(indexStats.status)"
+        case .scanning:
+            return "Indexing \(indexStats.discoveredCount.formatted()) discovered • \(indexStats.searchableCount.formatted()) searchable"
+        case .optimizing:
+            return "\(indexStats.status) • \(indexStats.searchableCount.formatted()) searchable"
+        case .saving:
+            return "Saving index • \(indexStats.searchableCount.formatted()) searchable"
+        case .ready:
+            return "Ready • \(indexStats.status)"
+        case .failed:
+            return indexStats.status
+        }
     }
 
     private func updateActionButtons() {

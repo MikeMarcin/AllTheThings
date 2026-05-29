@@ -104,3 +104,4 @@ ATT_MEMORY_BENCH_RECORDS=250000 swift test --filter optInSyntheticMemoryBenchmar
 ```
 
 Use a larger value, such as `5000000`, for local stress testing on a machine with enough memory headroom.
+Initial scan parallelism defaults to `min(8, max(2, activeProcessorCount))`; set `ATT_INDEX_SCAN_WORKERS` to compare filesystem throughput with a fixed worker count.
