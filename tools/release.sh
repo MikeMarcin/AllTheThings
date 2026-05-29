@@ -6,12 +6,14 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INFO_PLIST="${ROOT_DIR}/Resources/Info.plist"
 APP_PATH="${ROOT_DIR}/build/${APP_NAME}.app"
 DIST_ROOT="${ROOT_DIR}/build/releases"
+DEFAULT_CODESIGN_IDENTITY="Developer ID Application: Michael Marcin (YTQKP2V2A8)"
+DEFAULT_NOTARY_PROFILE="AllTheThings-notary"
 
 CONFIGURE_PRESET="${CONFIGURE_PRESET:-default}"
 BUILD_PRESET="${BUILD_PRESET:-app}"
-CODESIGN_IDENTITY="${APPLE_CODESIGN_IDENTITY:-}"
+CODESIGN_IDENTITY="${APPLE_CODESIGN_IDENTITY:-${DEFAULT_CODESIGN_IDENTITY}}"
 CODESIGN_ENTITLEMENTS="${CODESIGN_ENTITLEMENTS:-}"
-NOTARY_PROFILE="${APPLE_NOTARY_PROFILE:-}"
+NOTARY_PROFILE="${APPLE_NOTARY_PROFILE:-${DEFAULT_NOTARY_PROFILE}}"
 
 ALLOW_DIRTY=0
 SKIP_NOTARIZE=0
@@ -28,9 +30,9 @@ Build, sign, optionally notarize, and package ${APP_NAME}.
 
 Options:
   --version VERSION         Assert the Info.plist version matches VERSION.
-  --identity NAME          Codesigning identity. Defaults to APPLE_CODESIGN_IDENTITY.
+  --identity NAME          Codesigning identity. Defaults to APPLE_CODESIGN_IDENTITY or ${DEFAULT_CODESIGN_IDENTITY}.
   --entitlements PATH      Optional entitlements plist. Defaults to CODESIGN_ENTITLEMENTS.
-  --notary-profile NAME    notarytool keychain profile. Defaults to APPLE_NOTARY_PROFILE.
+  --notary-profile NAME    notarytool keychain profile. Defaults to APPLE_NOTARY_PROFILE or ${DEFAULT_NOTARY_PROFILE}.
   --output-dir DIR         Release output directory. Defaults to build/releases/VERSION.
   --skip-tests             Do not run the CMake check preset.
   --skip-sign              Leave the CMake-built app's existing signature in place.
@@ -39,8 +41,8 @@ Options:
   -h, --help               Show this help.
 
 Environment:
-  APPLE_CODESIGN_IDENTITY  Developer ID Application identity for codesign.
-  APPLE_NOTARY_PROFILE     xcrun notarytool keychain profile name.
+  APPLE_CODESIGN_IDENTITY  Developer ID Application identity for codesign. Default: ${DEFAULT_CODESIGN_IDENTITY}.
+  APPLE_NOTARY_PROFILE     xcrun notarytool keychain profile name. Default: ${DEFAULT_NOTARY_PROFILE}.
   CODESIGN_ENTITLEMENTS    Optional entitlements plist path.
   CONFIGURE_PRESET         CMake configure preset. Default: default.
   BUILD_PRESET             CMake build preset. Default: app.
