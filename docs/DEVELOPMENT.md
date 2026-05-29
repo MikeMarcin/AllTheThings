@@ -47,7 +47,7 @@ APPLE_NOTARY_PROFILE="AllTheThings-notary" \
 tools/release.sh
 ```
 
-The script reads the version from `Resources/Info.plist`, runs the test suite, builds `build/AllTheThings.app`, signs it with hardened runtime, submits it for notarization, staples the ticket, and writes a zip plus SHA-256 checksum under `build/releases/<version>/`.
+The script reads the version from `Resources/Info.plist`, runs the test suite, builds `build/AllTheThings.app`, signs it with hardened runtime, submits it for notarization, staples the ticket, and writes a zip plus SHA-256 checksum under `build/releases/<version>/`. Upload the zip asset to the matching GitHub Release so the in-app updater can download, verify, install, and relaunch it.
 
 For a local packaging smoke test without Developer ID credentials:
 
