@@ -1,5 +1,23 @@
 import Foundation
 
+protocol SearchRecordReadable {
+    var path: String { get }
+    var name: String { get }
+    var directoryPath: String { get }
+    var fileExtension: String { get }
+    var sizeBytes: UInt64 { get }
+    var modifiedTime: TimeInterval { get }
+    var createdTime: TimeInterval? { get }
+    var isDirectory: Bool { get }
+    var isHidden: Bool { get }
+    var volumeName: String { get }
+    var normalizedName: String { get }
+    var normalizedPath: String { get }
+}
+
+extension FileRecord: SearchRecordReadable {}
+extension RecordSearchView: SearchRecordReadable {}
+
 public enum FuzzyMatcher {
     public struct ParsedQuery: Sendable {
         let positive: [QueryClause]
@@ -69,6 +87,14 @@ public enum FuzzyMatcher {
     }
 
     public static func score(record: FileRecord, parsedQuery: ParsedQuery) -> Int? {
+        scoreReadable(record: record, parsedQuery: parsedQuery)
+    }
+
+    static func score(record: RecordSearchView, parsedQuery: ParsedQuery) -> Int? {
+        scoreReadable(record: record, parsedQuery: parsedQuery)
+    }
+
+    private static func scoreReadable<Record: SearchRecordReadable>(record: Record, parsedQuery: ParsedQuery) -> Int? {
         guard !parsedQuery.isEmpty else { return 0 }
 
         for negative in parsedQuery.negative {
@@ -106,11 +132,11 @@ public enum FuzzyMatcher {
         return nil
     }
 
-    private static func score(clause: QueryClause, record: FileRecord) -> Int? {
+    private static func score<Record: SearchRecordReadable>(clause: QueryClause, record: Record) -> Int? {
         clause.alternatives.compactMap { score(part: $0, record: record) }.max()
     }
 
-    private static func score(part: QueryPart, record: FileRecord) -> Int? {
+    private static func score<Record: SearchRecordReadable>(part: QueryPart, record: Record) -> Int? {
         switch part {
         case .fileExtension(let pattern, let mode):
             return extensionScore(record.fileExtension, pattern: pattern, mode: mode)
@@ -121,7 +147,7 @@ public enum FuzzyMatcher {
         }
     }
 
-    private static func textScore(record: FileRecord, field: QueryField, pattern: SearchPattern, mode: MatchMode) -> Int? {
+    private static func textScore<Record: SearchRecordReadable>(record: Record, field: QueryField, pattern: SearchPattern, mode: MatchMode) -> Int? {
         let token = pattern.token
         guard !token.isEmpty else { return nil }
 
@@ -151,7 +177,7 @@ public enum FuzzyMatcher {
         }
     }
 
-    private static func structuredPathScore(record: FileRecord, field: QueryField, token: String) -> Int? {
+    private static func structuredPathScore<Record: SearchRecordReadable>(record: Record, field: QueryField, token: String) -> Int? {
         switch field {
         case .name:
             return nil
@@ -166,7 +192,7 @@ public enum FuzzyMatcher {
         }
     }
 
-    private static func fuzzyPathScore(record: FileRecord, pattern: SearchPattern) -> Int? {
+    private static func fuzzyPathScore<Record: SearchRecordReadable>(record: Record, pattern: SearchPattern) -> Int? {
         if let exactPathScore = exactScore(record: record, field: .path, token: pattern.token) {
             return exactPathScore
         }
@@ -205,12 +231,12 @@ public enum FuzzyMatcher {
         }
     }
 
-    private static func kindScore(record: FileRecord, token: String) -> Int? {
+    private static func kindScore<Record: SearchRecordReadable>(record: Record, token: String) -> Int? {
         let values = record.isDirectory ? ["folder", "directory", "dir"] : ["file"]
         return values.contains { $0.hasPrefix(token) } ? 4_400 : nil
     }
 
-    private static func exactScore(record: FileRecord, field: QueryField, token: String) -> Int? {
+    private static func exactScore<Record: SearchRecordReadable>(record: Record, field: QueryField, token: String) -> Int? {
         func scoreCandidate(_ text: String, base: Int) -> Int? {
             guard let range = text.range(of: token) else { return nil }
             let offset = text.distance(from: text.startIndex, to: range.lowerBound)
@@ -230,7 +256,7 @@ public enum FuzzyMatcher {
         }
     }
 
-    private static func wildcardScore(record: FileRecord, field: QueryField, pattern: String) -> Int? {
+    private static func wildcardScore<Record: SearchRecordReadable>(record: Record, field: QueryField, pattern: String) -> Int? {
         func scoreCandidate(_ text: String, base: Int) -> Int? {
             wildcardMatches(text, pattern: pattern) ? base - min(text.count, 300) : nil
         }
@@ -454,7 +480,7 @@ public enum FuzzyMatcher {
         return nil
     }
 
-    private static func typoScore(record: FileRecord, token: String) -> Int? {
+    private static func typoScore<Record: SearchRecordReadable>(record: Record, token: String) -> Int? {
         guard token.count >= 3 else { return nil }
         let maxDistance = token.count <= 5 ? 1 : 2
         var best: Int?
