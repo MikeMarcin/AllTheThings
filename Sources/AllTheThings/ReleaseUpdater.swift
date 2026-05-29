@@ -82,8 +82,8 @@ final class ReleaseUpdater {
         }
 
         var installAsset: GitHubAsset? {
-            assets.first(where: { $0.isZipArchive }) ??
-                assets.first(where: { $0.isDiskImage }) ??
+            assets.first(where: { $0.isDiskImage }) ??
+                assets.first(where: { $0.isZipArchive }) ??
                 assets.first(where: { $0.isDownloadableArchive })
         }
 

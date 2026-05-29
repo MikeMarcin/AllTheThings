@@ -147,6 +147,7 @@ done
 require_command cmake
 require_command codesign
 require_command ditto
+require_command hdiutil
 require_command swift
 
 VERSION="$(plist_value CFBundleShortVersionString)"
@@ -230,19 +231,46 @@ log "Verifying code signature"
 codesign --verify --strict --verbose=4 "${APP_PATH}"
 
 mkdir -p "${OUTPUT_DIR}"
-WORK_DIR="$(mktemp -d "${OUTPUT_DIR}/notary.XXXXXX")"
-trap 'rm -rf "${WORK_DIR}"' EXIT
+
+ARCH="$(uname -m)"
+ASSET_BASE="${APP_NAME}-${VERSION}-macos-${ARCH}"
+DMG_PATH="${OUTPUT_DIR}/${ASSET_BASE}.dmg"
+ZIP_PATH="${OUTPUT_DIR}/${ASSET_BASE}.zip"
+DMG_CHECKSUM_PATH="${DMG_PATH}.sha256"
+ZIP_CHECKSUM_PATH="${ZIP_PATH}.sha256"
+
+rm -f "${DMG_PATH}" "${ZIP_PATH}" "${DMG_CHECKSUM_PATH}" "${ZIP_CHECKSUM_PATH}"
+
+log "Creating release DMG"
+hdiutil create \
+    -volname "${APP_NAME}" \
+    -srcfolder "${APP_PATH}" \
+    -ov \
+    -format UDZO \
+    "${DMG_PATH}"
+
+if [[ "${SKIP_SIGN}" == "0" ]]; then
+    log "Signing release DMG"
+    codesign --force --timestamp --sign "${CODESIGN_IDENTITY}" "${DMG_PATH}"
+else
+    log "Skipping DMG signing"
+fi
+
+log "Verifying DMG signature"
+codesign --verify --strict --verbose=4 "${DMG_PATH}"
 
 if [[ "${SKIP_NOTARIZE}" == "0" ]]; then
-    NOTARY_ZIP="${WORK_DIR}/${APP_NAME}-${VERSION}-notary.zip"
+    log "Submitting DMG to Apple notary service"
+    xcrun notarytool submit "${DMG_PATH}" --keychain-profile "${NOTARY_PROFILE}" --wait
 
-    log "Creating notarization archive"
-    ditto -c -k --keepParent "${APP_PATH}" "${NOTARY_ZIP}"
+    log "Stapling notarization ticket to DMG"
+    xcrun stapler staple "${DMG_PATH}"
+    xcrun stapler validate "${DMG_PATH}"
 
-    log "Submitting to Apple notary service"
-    xcrun notarytool submit "${NOTARY_ZIP}" --keychain-profile "${NOTARY_PROFILE}" --wait
+    log "Assessing DMG with Gatekeeper"
+    spctl --assess --type open --context context:primary-signature --verbose=4 "${DMG_PATH}"
 
-    log "Stapling notarization ticket"
+    log "Stapling notarization ticket to app"
     xcrun stapler staple "${APP_PATH}"
     xcrun stapler validate "${APP_PATH}"
 
@@ -252,16 +280,12 @@ else
     log "Skipping notarization"
 fi
 
-ARCH="$(uname -m)"
-ASSET_BASE="${APP_NAME}-${VERSION}-macos-${ARCH}"
-ZIP_PATH="${OUTPUT_DIR}/${ASSET_BASE}.zip"
-CHECKSUM_PATH="${ZIP_PATH}.sha256"
-
-rm -f "${ZIP_PATH}" "${CHECKSUM_PATH}"
-
-log "Creating release zip"
+log "Creating backup release ZIP"
 ditto -c -k --keepParent "${APP_PATH}" "${ZIP_PATH}"
-shasum -a 256 "${ZIP_PATH}" > "${CHECKSUM_PATH}"
+
+log "Writing SHA-256 checksums"
+shasum -a 256 "${DMG_PATH}" > "${DMG_CHECKSUM_PATH}"
+shasum -a 256 "${ZIP_PATH}" > "${ZIP_CHECKSUM_PATH}"
 
 cat <<EOF
 
@@ -269,6 +293,8 @@ Release package complete
   App:      ${APP_PATH}
   Version:  ${VERSION}
   Build:    ${BUILD_NUMBER}
-  Zip:      ${ZIP_PATH}
-  SHA-256:  ${CHECKSUM_PATH}
+  DMG:      ${DMG_PATH}
+  ZIP:      ${ZIP_PATH}
+  SHA-256:  ${DMG_CHECKSUM_PATH}
+           ${ZIP_CHECKSUM_PATH}
 EOF
