@@ -238,16 +238,22 @@ DMG_PATH="${OUTPUT_DIR}/${ASSET_BASE}.dmg"
 ZIP_PATH="${OUTPUT_DIR}/${ASSET_BASE}.zip"
 DMG_CHECKSUM_PATH="${DMG_PATH}.sha256"
 ZIP_CHECKSUM_PATH="${ZIP_PATH}.sha256"
+DMG_ROOT="${OUTPUT_DIR}/${ASSET_BASE}-dmg-root"
 
 rm -f "${DMG_PATH}" "${ZIP_PATH}" "${DMG_CHECKSUM_PATH}" "${ZIP_CHECKSUM_PATH}"
+rm -rf "${DMG_ROOT}"
+mkdir -p "${DMG_ROOT}"
+ditto "${APP_PATH}" "${DMG_ROOT}/${APP_NAME}.app"
+ln -s /Applications "${DMG_ROOT}/Applications"
 
 log "Creating release DMG"
 hdiutil create \
     -volname "${APP_NAME}" \
-    -srcfolder "${APP_PATH}" \
+    -srcfolder "${DMG_ROOT}" \
     -ov \
     -format UDZO \
     "${DMG_PATH}"
+rm -rf "${DMG_ROOT}"
 
 if [[ "${SKIP_SIGN}" == "0" ]]; then
     log "Signing release DMG"
