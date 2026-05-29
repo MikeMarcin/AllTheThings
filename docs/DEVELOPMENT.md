@@ -78,20 +78,20 @@ ATTCore Swift package
         +
 filesystem crawler
         +
-JSON snapshot persistence
+mmap-backed snapshot package
         +
 FSEvents refresh pipeline
 ```
 
-The core is isolated in `Sources/ATTCore` so the persistence/search backend can later move to the planned mmap snapshot and WAL design without rewriting the AppKit table experience.
+The core is isolated in `Sources/ATTCore` so the mmap snapshot and refresh-overlay backend can evolve without rewriting the AppKit table experience.
 
 ## Current Limits
 
 This is a working MVP, not the final high-performance engine described in the product design.
 
 - The initial crawler uses Foundation APIs rather than `getattrlistbulk`.
-- The snapshot is newline-delimited JSON rather than memory-mapped columnar storage.
-- Search is currently in-memory scoring over indexed records, with supporting indexes for common fast paths.
+- The saved snapshot is a v4 `filename-index-v4.attindex` package with mapped row/string/path-lookup files; old JSON/JSONL snapshots are ignored and rebuilt.
+- Search scores lightweight record views and only materializes `FileRecord` values for returned rows, with supporting indexes for common fast paths.
 - FSEvents are treated as dirty-path refresh signals, but there is not yet a WAL or full reconciliation scheduler.
 - Full Disk Access status is informational and conservative; indexing behavior has not been overhauled around macOS privacy prompts yet.
 

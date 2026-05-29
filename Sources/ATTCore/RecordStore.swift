@@ -1,0 +1,957 @@
+import Foundation
+
+enum RecordStoreKind: String, Sendable {
+    case empty
+    case heapPaged
+    case mapped
+    case overlay
+}
+
+protocol RecordStore: AnyObject, Sendable {
+    var count: Int { get }
+    var kind: RecordStoreKind { get }
+    var mappedByteSize: Int { get }
+    var heapPageCount: Int { get }
+    var overlayCount: Int { get }
+
+    func record(at index: Int) -> FileRecord
+    func view(at index: Int) -> RecordSearchView
+    func rowID(forPath path: String) -> Int?
+    func allRecords() -> [FileRecord]
+    func recordID(at index: Int) -> UInt64
+    func path(at index: Int) -> String
+    func name(at index: Int) -> String
+    func directoryPath(at index: Int) -> String
+    func fileExtension(at index: Int) -> String
+    func sizeBytes(at index: Int) -> UInt64
+    func modifiedTime(at index: Int) -> TimeInterval
+    func createdTime(at index: Int) -> TimeInterval?
+    func isDirectory(at index: Int) -> Bool
+    func isHidden(at index: Int) -> Bool
+    func volumeName(at index: Int) -> String
+    func normalizedName(at index: Int) -> String
+    func normalizedPath(at index: Int) -> String
+}
+
+struct RecordSearchView: Sendable {
+    fileprivate let store: RecordStore
+    let rowID: Int
+
+    var id: UInt64 { store.recordID(at: rowID) }
+    var path: String { store.path(at: rowID) }
+    var name: String { store.name(at: rowID) }
+    var directoryPath: String { store.directoryPath(at: rowID) }
+    var fileExtension: String { store.fileExtension(at: rowID) }
+    var sizeBytes: UInt64 { store.sizeBytes(at: rowID) }
+    var modifiedTime: TimeInterval { store.modifiedTime(at: rowID) }
+    var createdTime: TimeInterval? { store.createdTime(at: rowID) }
+    var isDirectory: Bool { store.isDirectory(at: rowID) }
+    var isHidden: Bool { store.isHidden(at: rowID) }
+    var volumeName: String { store.volumeName(at: rowID) }
+    var normalizedName: String { store.normalizedName(at: rowID) }
+    var normalizedPath: String { store.normalizedPath(at: rowID) }
+
+    func materializedRecord() -> FileRecord {
+        store.record(at: rowID)
+    }
+}
+
+extension RecordStore {
+    var mappedByteSize: Int { 0 }
+    var heapPageCount: Int { 0 }
+    var overlayCount: Int { 0 }
+
+    func view(at index: Int) -> RecordSearchView {
+        RecordSearchView(store: self, rowID: index)
+    }
+
+    func allRecords() -> [FileRecord] {
+        (0..<count).map { record(at: $0) }
+    }
+
+    func recordID(at index: Int) -> UInt64 { record(at: index).id }
+    func path(at index: Int) -> String { record(at: index).path }
+    func name(at index: Int) -> String { record(at: index).name }
+    func directoryPath(at index: Int) -> String { record(at: index).directoryPath }
+    func fileExtension(at index: Int) -> String { record(at: index).fileExtension }
+    func sizeBytes(at index: Int) -> UInt64 { record(at: index).sizeBytes }
+    func modifiedTime(at index: Int) -> TimeInterval { record(at: index).modifiedTime }
+    func createdTime(at index: Int) -> TimeInterval? { record(at: index).createdTime }
+    func isDirectory(at index: Int) -> Bool { record(at: index).isDirectory }
+    func isHidden(at index: Int) -> Bool { record(at: index).isHidden }
+    func volumeName(at index: Int) -> String { record(at: index).volumeName }
+    func normalizedName(at index: Int) -> String { record(at: index).normalizedName }
+    func normalizedPath(at index: Int) -> String { record(at: index).normalizedPath }
+}
+
+final class EmptyRecordStore: RecordStore {
+    static let shared = EmptyRecordStore()
+
+    let count = 0
+    let kind = RecordStoreKind.empty
+
+    private init() {}
+
+    func record(at index: Int) -> FileRecord {
+        preconditionFailure("Record index \(index) is out of bounds")
+    }
+
+    func rowID(forPath path: String) -> Int? {
+        nil
+    }
+}
+
+final class HeapPagedRecordStore: RecordStore {
+    static let pageSize = 4_096
+
+    let kind = RecordStoreKind.heapPaged
+    let pages: [[FileRecord]]
+    private let pathIndex: [String: Int]?
+    let count: Int
+
+    var heapPageCount: Int { pages.count }
+
+    init(records: [FileRecord], buildsPathIndex: Bool = true) {
+        var builtPages: [[FileRecord]] = []
+        builtPages.reserveCapacity((records.count + Self.pageSize - 1) / Self.pageSize)
+
+        var start = 0
+        while start < records.count {
+            let end = min(start + Self.pageSize, records.count)
+            builtPages.append(Array(records[start..<end]))
+            start = end
+        }
+
+        self.pages = builtPages
+        self.count = records.count
+        if buildsPathIndex {
+            self.pathIndex = Dictionary(uniqueKeysWithValues: records.enumerated().map { ($0.element.path, $0.offset) })
+        } else {
+            self.pathIndex = nil
+        }
+    }
+
+    fileprivate init(pages: [[FileRecord]], count: Int, pathIndex: [String: Int]?) {
+        self.pages = pages
+        self.count = count
+        self.pathIndex = pathIndex
+    }
+
+    func record(at index: Int) -> FileRecord {
+        precondition(index >= 0 && index < count, "Record index \(index) is out of bounds")
+        return pages[index / Self.pageSize][index % Self.pageSize]
+    }
+
+    func rowID(forPath path: String) -> Int? {
+        if let pathIndex {
+            return pathIndex[path]
+        }
+
+        for row in 0..<count where record(at: row).path == path {
+            return row
+        }
+        return nil
+    }
+
+    func recordID(at index: Int) -> UInt64 { record(at: index).id }
+}
+
+extension HeapPagedRecordStore {
+    final class Builder: @unchecked Sendable {
+        private var sealedPages: [[FileRecord]] = []
+        private var currentPage: [FileRecord] = []
+        private var pathIndex: [String: Int] = [:]
+        private var recordCount = 0
+
+        var count: Int { recordCount }
+
+        init(reservedCapacity: Int) {
+            currentPage.reserveCapacity(HeapPagedRecordStore.pageSize)
+            pathIndex.reserveCapacity(reservedCapacity)
+        }
+
+        func append(_ record: FileRecord) {
+            if let existing = pathIndex[record.path] {
+                replace(at: existing, with: record)
+                return
+            }
+
+            if currentPage.count == HeapPagedRecordStore.pageSize {
+                sealedPages.append(currentPage)
+                currentPage = []
+                currentPage.reserveCapacity(HeapPagedRecordStore.pageSize)
+            }
+
+            currentPage.append(record)
+            pathIndex[record.path] = recordCount
+            recordCount += 1
+        }
+
+        func append(contentsOf records: [FileRecord]) {
+            for record in records {
+                append(record)
+            }
+        }
+
+        func snapshot(includesPathIndex: Bool = false) -> HeapPagedRecordStore {
+            var pages = sealedPages
+            if !currentPage.isEmpty {
+                pages.append(currentPage)
+            }
+            return HeapPagedRecordStore(
+                pages: pages,
+                count: recordCount,
+                pathIndex: includesPathIndex ? pathIndex : nil
+            )
+        }
+
+        func allRecords() -> [FileRecord] {
+            snapshot(includesPathIndex: true).allRecords()
+        }
+
+        private func replace(at index: Int, with record: FileRecord) {
+            if index < sealedPages.count * HeapPagedRecordStore.pageSize {
+                sealedPages[index / HeapPagedRecordStore.pageSize][index % HeapPagedRecordStore.pageSize] = record
+            } else {
+                currentPage[index - sealedPages.count * HeapPagedRecordStore.pageSize] = record
+            }
+        }
+    }
+}
+
+final class OverlayRecordStore: RecordStore {
+    let kind = RecordStoreKind.overlay
+
+    private let base: RecordStore
+    private let upserts: [FileRecord]
+    private let deletedRows: Set<Int>
+    private let visibleBaseRows: [Int]
+    private let pathToOverlay: [String: Int]
+
+    var count: Int { visibleBaseRows.count + upserts.count }
+    var mappedByteSize: Int { base.mappedByteSize }
+    var heapPageCount: Int { base.heapPageCount }
+    var overlayCount: Int { upserts.count + deletedRows.count }
+
+    init(base: RecordStore, upserts: [FileRecord], deletedRows: Set<Int>) {
+        self.base = base
+        self.upserts = upserts
+        self.deletedRows = deletedRows
+        self.visibleBaseRows = (0..<base.count).filter { !deletedRows.contains($0) }
+        self.pathToOverlay = Dictionary(uniqueKeysWithValues: upserts.enumerated().map { ($0.element.path, base.count + $0.offset) })
+    }
+
+    func record(at index: Int) -> FileRecord {
+        if index < visibleBaseRows.count {
+            return base.record(at: visibleBaseRows[index])
+        }
+        return upserts[index - visibleBaseRows.count]
+    }
+
+    func rowID(forPath path: String) -> Int? {
+        if let row = pathToOverlay[path] {
+            return visibleBaseRows.count + (row - base.count)
+        }
+        guard let row = base.rowID(forPath: path), !deletedRows.contains(row) else {
+            return nil
+        }
+        return visibleBaseRows.firstIndex(of: row)
+    }
+}
+
+final class MappedRecordStore: RecordStore {
+    let kind = RecordStoreKind.mapped
+
+    private static let recordsMagic: UInt64 = 0x3452575441545441 // ATTRW4 little-endian bytes.
+    private static let recordsVersion: UInt32 = 1
+    private static let pathLookupMagic: UInt64 = 0x344b4c5441545441 // ATTLK4 little-endian bytes.
+    private static let rowSize = 104
+    private static let recordsHeaderSize = 32
+    private static let pathLookupHeaderSize = 24
+    private static let pathLookupEntrySize = 16
+
+    private struct Row {
+        let id: UInt64
+        let parent: Int32
+        let flags: UInt32
+        let sizeBytes: UInt64
+        let modifiedBits: UInt64
+        let createdBits: UInt64
+        let nameOffset: UInt64
+        let nameLength: UInt32
+        let normalizedNameOffset: UInt64
+        let normalizedNameLength: UInt32
+        let baseDirectoryOffset: UInt64
+        let baseDirectoryLength: UInt32
+        let normalizedBaseDirectoryOffset: UInt64
+        let normalizedBaseDirectoryLength: UInt32
+        let extensionID: UInt32
+        let volumeID: UInt32
+    }
+
+    private struct PathLookupEntry {
+        let hash: UInt64
+        let rowID: Int32
+    }
+
+    let count: Int
+    private let recordsData: Data
+    private let stringsData: Data
+    private let pathLookupData: Data
+    private let extensions: [String]
+    private let volumes: [String]
+    private let cache = PathMaterializationCache(limit: 16_384)
+
+    var mappedByteSize: Int {
+        recordsData.count + stringsData.count + pathLookupData.count
+    }
+
+    init(packageURL: URL) throws {
+        let recordsURL = packageURL.appendingPathComponent("records.bin", isDirectory: false)
+        let stringsURL = packageURL.appendingPathComponent("strings.bin", isDirectory: false)
+        let internsURL = packageURL.appendingPathComponent("interns.bin", isDirectory: false)
+        let lookupURL = packageURL.appendingPathComponent("pathLookup.bin", isDirectory: false)
+
+        self.recordsData = try Data(contentsOf: recordsURL, options: [.mappedIfSafe])
+        self.stringsData = try Data(contentsOf: stringsURL, options: [.mappedIfSafe])
+        self.pathLookupData = try Data(contentsOf: lookupURL, options: [.mappedIfSafe])
+
+        guard
+            recordsData.count >= Self.recordsHeaderSize,
+            recordsData.readUInt64LE(at: 0) == Self.recordsMagic,
+            recordsData.readUInt32LE(at: 8) == Self.recordsVersion
+        else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+
+        let rowCount = Int(recordsData.readUInt64LE(at: 16))
+        guard recordsData.count == Self.recordsHeaderSize + rowCount * Self.rowSize else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        self.count = rowCount
+
+        guard
+            pathLookupData.count >= Self.pathLookupHeaderSize,
+            pathLookupData.readUInt64LE(at: 0) == Self.pathLookupMagic
+        else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        let lookupCount = Int(pathLookupData.readUInt64LE(at: 16))
+        guard pathLookupData.count == Self.pathLookupHeaderSize + lookupCount * Self.pathLookupEntrySize else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+
+        let interns = try Self.loadInterns(from: internsURL)
+        self.extensions = interns.extensions
+        self.volumes = interns.volumes
+    }
+
+    func record(at index: Int) -> FileRecord {
+        let row = readRow(index)
+        let path = path(at: index)
+        let directoryPath = directoryPath(at: index)
+        let normalizedName = string(offset: row.normalizedNameOffset, length: row.normalizedNameLength)
+        let normalizedPath = normalizedPath(at: index)
+
+        return FileRecord(
+            id: row.id,
+            path: path,
+            name: string(offset: row.nameOffset, length: row.nameLength),
+            directoryPath: directoryPath,
+            fileExtension: intern(extensions, id: row.extensionID),
+            sizeBytes: row.sizeBytes,
+            modifiedTime: TimeInterval(bitPattern: row.modifiedBits),
+            createdTime: row.flags & 4 == 0 ? nil : TimeInterval(bitPattern: row.createdBits),
+            isDirectory: row.flags & 1 != 0,
+            isHidden: row.flags & 2 != 0,
+            volumeName: intern(volumes, id: row.volumeID),
+            normalizedName: normalizedName,
+            normalizedPath: normalizedPath
+        )
+    }
+
+    func rowID(forPath path: String) -> Int? {
+        let hash = FileRecord.stableID(for: path)
+        let lookupCount = Int(pathLookupData.readUInt64LE(at: 16))
+        var low = 0
+        var high = lookupCount
+
+        while low < high {
+            let mid = (low + high) / 2
+            let entry = readLookupEntry(mid)
+            if entry.hash < hash {
+                low = mid + 1
+            } else {
+                high = mid
+            }
+        }
+
+        var index = low
+        while index < lookupCount {
+            let entry = readLookupEntry(index)
+            guard entry.hash == hash else { break }
+            let rowID = Int(entry.rowID)
+            if rowID >= 0, rowID < count, self.path(at: rowID) == path {
+                return rowID
+            }
+            index += 1
+        }
+
+        return nil
+    }
+
+    func recordID(at index: Int) -> UInt64 { readRow(index).id }
+    func name(at index: Int) -> String {
+        let row = readRow(index)
+        return string(offset: row.nameOffset, length: row.nameLength)
+    }
+
+    func directoryPath(at index: Int) -> String {
+        if let cached = cache.directoryPath(for: index) {
+            return cached
+        }
+
+        let row = readRow(index)
+        let value: String
+        if row.parent >= 0 {
+            value = path(at: Int(row.parent))
+        } else {
+            value = string(offset: row.baseDirectoryOffset, length: row.baseDirectoryLength)
+        }
+        cache.setDirectoryPath(value, for: index)
+        return value
+    }
+
+    func path(at index: Int) -> String {
+        if let cached = cache.path(for: index) {
+            return cached
+        }
+
+        let row = readRow(index)
+        let name = string(offset: row.nameOffset, length: row.nameLength)
+        let directory = directoryPath(at: index)
+        let value: String
+        if directory.isEmpty || directory == "/" {
+            value = directory == "/" ? "/\(name)" : name
+        } else {
+            value = "\(directory)/\(name)"
+        }
+        cache.setPath(value, for: index)
+        return value
+    }
+
+    func fileExtension(at index: Int) -> String { intern(extensions, id: readRow(index).extensionID) }
+    func sizeBytes(at index: Int) -> UInt64 { readRow(index).sizeBytes }
+    func modifiedTime(at index: Int) -> TimeInterval { TimeInterval(bitPattern: readRow(index).modifiedBits) }
+    func createdTime(at index: Int) -> TimeInterval? {
+        let row = readRow(index)
+        return row.flags & 4 == 0 ? nil : TimeInterval(bitPattern: row.createdBits)
+    }
+    func isDirectory(at index: Int) -> Bool { readRow(index).flags & 1 != 0 }
+    func isHidden(at index: Int) -> Bool { readRow(index).flags & 2 != 0 }
+    func volumeName(at index: Int) -> String { intern(volumes, id: readRow(index).volumeID) }
+    func normalizedName(at index: Int) -> String {
+        let row = readRow(index)
+        return string(offset: row.normalizedNameOffset, length: row.normalizedNameLength)
+    }
+    func normalizedPath(at index: Int) -> String {
+        if let cached = cache.normalizedPath(for: index) {
+            return cached
+        }
+
+        let row = readRow(index)
+        let name = string(offset: row.normalizedNameOffset, length: row.normalizedNameLength)
+        let directory: String
+        if row.parent >= 0 {
+            directory = normalizedPath(at: Int(row.parent))
+        } else {
+            directory = string(offset: row.normalizedBaseDirectoryOffset, length: row.normalizedBaseDirectoryLength)
+        }
+
+        let value: String
+        if directory.isEmpty || directory == "/" {
+            value = directory == "/" ? "/\(name)" : name
+        } else {
+            value = "\(directory)/\(name)"
+        }
+        cache.setNormalizedPath(value, for: index)
+        return value
+    }
+
+    private func readRow(_ index: Int) -> Row {
+        precondition(index >= 0 && index < count, "Record index \(index) is out of bounds")
+        let offset = Self.recordsHeaderSize + index * Self.rowSize
+        return Row(
+            id: recordsData.readUInt64LE(at: offset),
+            parent: recordsData.readInt32LE(at: offset + 8),
+            flags: recordsData.readUInt32LE(at: offset + 12),
+            sizeBytes: recordsData.readUInt64LE(at: offset + 16),
+            modifiedBits: recordsData.readUInt64LE(at: offset + 24),
+            createdBits: recordsData.readUInt64LE(at: offset + 32),
+            nameOffset: recordsData.readUInt64LE(at: offset + 40),
+            nameLength: recordsData.readUInt32LE(at: offset + 48),
+            normalizedNameOffset: recordsData.readUInt64LE(at: offset + 52),
+            normalizedNameLength: recordsData.readUInt32LE(at: offset + 60),
+            baseDirectoryOffset: recordsData.readUInt64LE(at: offset + 64),
+            baseDirectoryLength: recordsData.readUInt32LE(at: offset + 72),
+            normalizedBaseDirectoryOffset: recordsData.readUInt64LE(at: offset + 76),
+            normalizedBaseDirectoryLength: recordsData.readUInt32LE(at: offset + 84),
+            extensionID: recordsData.readUInt32LE(at: offset + 88),
+            volumeID: recordsData.readUInt32LE(at: offset + 92)
+        )
+    }
+
+    private func readLookupEntry(_ index: Int) -> PathLookupEntry {
+        let offset = Self.pathLookupHeaderSize + index * Self.pathLookupEntrySize
+        return PathLookupEntry(
+            hash: pathLookupData.readUInt64LE(at: offset),
+            rowID: pathLookupData.readInt32LE(at: offset + 8)
+        )
+    }
+
+    private func string(offset: UInt64, length: UInt32) -> String {
+        let lower = Int(offset)
+        let upper = lower + Int(length)
+        guard lower >= 0, upper <= stringsData.count else {
+            return ""
+        }
+        return String(decoding: stringsData[lower..<upper], as: UTF8.self)
+    }
+
+    private func intern(_ values: [String], id: UInt32) -> String {
+        let index = Int(id)
+        guard index >= 0, index < values.count else {
+            return ""
+        }
+        return values[index]
+    }
+
+    private static func loadInterns(from url: URL) throws -> (extensions: [String], volumes: [String]) {
+        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        var offset = 0
+
+        func readStringTable() throws -> [String] {
+            guard offset + 4 <= data.count else { throw CocoaError(.fileReadCorruptFile) }
+            let count = Int(data.readUInt32LE(at: offset))
+            offset += 4
+
+            var values: [String] = []
+            values.reserveCapacity(count)
+            for _ in 0..<count {
+                guard offset + 4 <= data.count else { throw CocoaError(.fileReadCorruptFile) }
+                let length = Int(data.readUInt32LE(at: offset))
+                offset += 4
+                guard offset + length <= data.count else { throw CocoaError(.fileReadCorruptFile) }
+                values.append(String(decoding: data[offset..<offset + length], as: UTF8.self))
+                offset += length
+            }
+            return values
+        }
+
+        let extensions = try readStringTable()
+        let volumes = try readStringTable()
+        guard offset == data.count else { throw CocoaError(.fileReadCorruptFile) }
+        return (extensions, volumes)
+    }
+
+    static func writePackage(
+        records: [FileRecord],
+        roots: [String],
+        exclusionPatterns: [String],
+        packageURL: URL,
+        savedAt: Date = Date(),
+        fileManager: FileManager = .default
+    ) throws {
+        if fileManager.fileExists(atPath: packageURL.path) {
+            try fileManager.removeItem(at: packageURL)
+        }
+        try fileManager.createDirectory(at: packageURL, withIntermediateDirectories: true)
+
+        let manifest = CompactSnapshotManifest(
+            schemaVersion: 4,
+            savedAt: savedAt,
+            roots: roots,
+            exclusionPatterns: exclusionPatterns,
+            recordCount: records.count
+        )
+        let manifestData = try JSONEncoder().encode(manifest)
+        try manifestData.write(to: packageURL.appendingPathComponent("manifest.json", isDirectory: false), options: .atomic)
+
+        var extensionIDs: [String: UInt32] = ["": 0]
+        var volumeIDs: [String: UInt32] = ["": 0]
+        for record in records {
+            if extensionIDs[record.fileExtension] == nil {
+                extensionIDs[record.fileExtension] = UInt32(extensionIDs.count)
+            }
+            if volumeIDs[record.volumeName] == nil {
+                volumeIDs[record.volumeName] = UInt32(volumeIDs.count)
+            }
+        }
+
+        try writeInterns(
+            extensions: sortedInterns(extensionIDs),
+            volumes: sortedInterns(volumeIDs),
+            to: packageURL.appendingPathComponent("interns.bin", isDirectory: false)
+        )
+
+        let stringsURL = packageURL.appendingPathComponent("strings.bin", isDirectory: false)
+        let recordsURL = packageURL.appendingPathComponent("records.bin", isDirectory: false)
+        let lookupURL = packageURL.appendingPathComponent("pathLookup.bin", isDirectory: false)
+
+        guard
+            fileManager.createFile(atPath: stringsURL.path, contents: nil),
+            fileManager.createFile(atPath: recordsURL.path, contents: nil),
+            fileManager.createFile(atPath: lookupURL.path, contents: nil)
+        else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+
+        let stringsHandle = try FileHandle(forWritingTo: stringsURL)
+        let recordsHandle = try FileHandle(forWritingTo: recordsURL)
+        let lookupHandle = try FileHandle(forWritingTo: lookupURL)
+        defer {
+            try? stringsHandle.close()
+            try? recordsHandle.close()
+            try? lookupHandle.close()
+        }
+
+        var stringOffset: UInt64 = 0
+        func appendString(_ value: String) throws -> (offset: UInt64, length: UInt32) {
+            let data = Data(value.utf8)
+            let result = (stringOffset, UInt32(data.count))
+            try stringsHandle.write(contentsOf: data)
+            stringOffset += UInt64(data.count)
+            return result
+        }
+
+        var pathToRow: [String: Int32] = [:]
+        pathToRow.reserveCapacity(records.count)
+        for (index, record) in records.enumerated() {
+            pathToRow[record.path] = Int32(index)
+        }
+
+        var header = Data()
+        header.appendUInt64LE(Self.recordsMagic)
+        header.appendUInt32LE(Self.recordsVersion)
+        header.appendUInt32LE(UInt32(Self.rowSize))
+        header.appendUInt64LE(UInt64(records.count))
+        header.appendUInt64LE(0)
+        try recordsHandle.write(contentsOf: header)
+
+        var lookupEntries: [(hash: UInt64, rowID: Int32)] = []
+        lookupEntries.reserveCapacity(records.count)
+
+        for (index, record) in records.enumerated() {
+            try autoreleasepool {
+                let name = try appendString(record.name)
+                let normalizedName = try appendString(record.normalizedName)
+                let parent = record.directoryPath == record.path ? -1 : (pathToRow[record.directoryPath] ?? -1)
+                let baseDirectory: (offset: UInt64, length: UInt32) = parent >= 0 ? (0, 0) : try appendString(record.directoryPath)
+                let normalizedDirectory: (offset: UInt64, length: UInt32) = parent >= 0 ? (0, 0) : try appendString(FuzzyMatcher.normalize(record.directoryPath))
+
+                var flags: UInt32 = 0
+                if record.isDirectory { flags |= 1 }
+                if record.isHidden { flags |= 2 }
+                if record.createdTime != nil { flags |= 4 }
+
+                var row = Data()
+                row.appendUInt64LE(record.id)
+                row.appendInt32LE(parent)
+                row.appendUInt32LE(flags)
+                row.appendUInt64LE(record.sizeBytes)
+                row.appendUInt64LE(record.modifiedTime.bitPattern)
+                row.appendUInt64LE((record.createdTime ?? 0).bitPattern)
+                row.appendUInt64LE(name.offset)
+                row.appendUInt32LE(name.length)
+                row.appendUInt64LE(normalizedName.offset)
+                row.appendUInt32LE(normalizedName.length)
+                row.appendUInt64LE(baseDirectory.0)
+                row.appendUInt32LE(baseDirectory.1)
+                row.appendUInt64LE(normalizedDirectory.0)
+                row.appendUInt32LE(normalizedDirectory.1)
+                row.appendUInt32LE(extensionIDs[record.fileExtension] ?? 0)
+                row.appendUInt32LE(volumeIDs[record.volumeName] ?? 0)
+                row.appendUInt64LE(0)
+
+                precondition(row.count == Self.rowSize)
+                try recordsHandle.write(contentsOf: row)
+                lookupEntries.append((FileRecord.stableID(for: record.path), Int32(index)))
+            }
+        }
+
+        lookupEntries.sort {
+            if $0.hash != $1.hash { return $0.hash < $1.hash }
+            return $0.rowID < $1.rowID
+        }
+
+        var lookupHeader = Data()
+        lookupHeader.appendUInt64LE(Self.pathLookupMagic)
+        lookupHeader.appendUInt32LE(1)
+        lookupHeader.appendUInt32LE(UInt32(Self.pathLookupEntrySize))
+        lookupHeader.appendUInt64LE(UInt64(lookupEntries.count))
+        try lookupHandle.write(contentsOf: lookupHeader)
+
+        for entry in lookupEntries {
+            var data = Data()
+            data.appendUInt64LE(entry.hash)
+            data.appendInt32LE(entry.rowID)
+            data.appendUInt32LE(0)
+            try lookupHandle.write(contentsOf: data)
+        }
+
+        try Data().write(to: packageURL.appendingPathComponent("modifiedOrder.bin", isDirectory: false))
+        try Data().write(to: packageURL.appendingPathComponent("namePostings.bin", isDirectory: false))
+        try Data().write(to: packageURL.appendingPathComponent("extensionPostings.bin", isDirectory: false))
+    }
+
+    private static func sortedInterns(_ ids: [String: UInt32]) -> [String] {
+        ids.sorted { $0.value < $1.value }.map(\.key)
+    }
+
+    private static func writeInterns(extensions: [String], volumes: [String], to url: URL) throws {
+        var data = Data()
+        func appendTable(_ values: [String]) {
+            data.appendUInt32LE(UInt32(values.count))
+            for value in values {
+                let bytes = Data(value.utf8)
+                data.appendUInt32LE(UInt32(bytes.count))
+                data.append(bytes)
+            }
+        }
+        appendTable(extensions)
+        appendTable(volumes)
+        try data.write(to: url, options: .atomic)
+    }
+}
+
+final class MappedIntPostingIndex: @unchecked Sendable {
+    private static let magic: UInt64 = 0x3150495441545441 // ATTIP1 little-endian bytes.
+    private static let headerSize = 32
+    private static let entrySize = 16
+
+    private let data: Data
+    private let temporaryURL: URL?
+    let keyCount: Int
+    let postingCount: Int
+
+    private init(data: Data, temporaryURL: URL?) throws {
+        guard
+            data.count >= Self.headerSize,
+            data.readUInt64LE(at: 0) == Self.magic
+        else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+
+        let keyCount = Int(data.readUInt64LE(at: 8))
+        let postingCount = Int(data.readUInt64LE(at: 16))
+        let expectedCount = Self.headerSize + keyCount * Self.entrySize + postingCount * 4
+        guard data.count == expectedCount else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+
+        self.data = data
+        self.temporaryURL = temporaryURL
+        self.keyCount = keyCount
+        self.postingCount = postingCount
+    }
+
+    deinit {
+        if let temporaryURL {
+            try? FileManager.default.removeItem(at: temporaryURL)
+        }
+    }
+
+    static func build(from index: [Int: [Int32]], temporaryName: String) throws -> MappedIntPostingIndex? {
+        guard !index.isEmpty else { return nil }
+
+        let temporaryURL = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("\(temporaryName)-\(UUID().uuidString).bin", isDirectory: false)
+        var data = Data()
+        let sortedEntries = index.sorted { $0.key < $1.key }
+        let postingCount = sortedEntries.reduce(0) { $0 + $1.value.count }
+
+        data.reserveCapacity(Self.headerSize + sortedEntries.count * Self.entrySize + postingCount * 4)
+        data.appendUInt64LE(Self.magic)
+        data.appendUInt64LE(UInt64(sortedEntries.count))
+        data.appendUInt64LE(UInt64(postingCount))
+        data.appendUInt64LE(0)
+
+        var postingOffset = 0
+        for (key, values) in sortedEntries {
+            data.appendInt32LE(Int32(key))
+            data.appendUInt32LE(UInt32(postingOffset))
+            data.appendUInt32LE(UInt32(values.count))
+            data.appendUInt32LE(0)
+            postingOffset += values.count
+        }
+
+        for (_, values) in sortedEntries {
+            for value in values {
+                data.appendInt32LE(value)
+            }
+        }
+
+        try data.write(to: temporaryURL, options: .atomic)
+        let mapped = try Data(contentsOf: temporaryURL, options: [.mappedIfSafe])
+        return try MappedIntPostingIndex(data: mapped, temporaryURL: temporaryURL)
+    }
+
+    func values(for key: Int) -> [Int32]? {
+        var low = 0
+        var high = keyCount
+
+        while low < high {
+            let mid = (low + high) / 2
+            let midKey = entryKey(at: mid)
+            if midKey < key {
+                low = mid + 1
+            } else {
+                high = mid
+            }
+        }
+
+        guard low < keyCount, entryKey(at: low) == key else {
+            return nil
+        }
+
+        let offset = entryOffset(at: low)
+        let count = entryCount(at: low)
+        let postingsStart = Self.headerSize + keyCount * Self.entrySize + offset * 4
+
+        var result: [Int32] = []
+        result.reserveCapacity(count)
+        for index in 0..<count {
+            result.append(data.readInt32LE(at: postingsStart + index * 4))
+        }
+        return result
+    }
+
+    private func entryKey(at index: Int) -> Int {
+        Int(data.readInt32LE(at: Self.headerSize + index * Self.entrySize))
+    }
+
+    private func entryOffset(at index: Int) -> Int {
+        Int(data.readUInt32LE(at: Self.headerSize + index * Self.entrySize + 4))
+    }
+
+    private func entryCount(at index: Int) -> Int {
+        Int(data.readUInt32LE(at: Self.headerSize + index * Self.entrySize + 8))
+    }
+}
+
+struct CompactSnapshotManifest: Codable, Sendable {
+    let schemaVersion: Int
+    let savedAt: Date
+    let roots: [String]
+    let exclusionPatterns: [String]
+    let recordCount: Int
+}
+
+private final class PathMaterializationCache: @unchecked Sendable {
+    private let lock = NSLock()
+    private let limit: Int
+    private var paths: [Int: String] = [:]
+    private var directories: [Int: String] = [:]
+    private var normalizedPaths: [Int: String] = [:]
+
+    init(limit: Int) {
+        self.limit = limit
+    }
+
+    func path(for row: Int) -> String? {
+        lock.withLock { paths[row] }
+    }
+
+    func setPath(_ value: String, for row: Int) {
+        lock.withLock {
+            evictIfNeeded(&paths)
+            paths[row] = value
+        }
+    }
+
+    func directoryPath(for row: Int) -> String? {
+        lock.withLock { directories[row] }
+    }
+
+    func setDirectoryPath(_ value: String, for row: Int) {
+        lock.withLock {
+            evictIfNeeded(&directories)
+            directories[row] = value
+        }
+    }
+
+    func normalizedPath(for row: Int) -> String? {
+        lock.withLock { normalizedPaths[row] }
+    }
+
+    func setNormalizedPath(_ value: String, for row: Int) {
+        lock.withLock {
+            evictIfNeeded(&normalizedPaths)
+            normalizedPaths[row] = value
+        }
+    }
+
+    private func evictIfNeeded(_ values: inout [Int: String]) {
+        guard values.count >= limit, let key = values.keys.first else {
+            return
+        }
+        values.removeValue(forKey: key)
+    }
+}
+
+private extension NSLock {
+    func withLock<T>(_ body: () throws -> T) rethrows -> T {
+        lock()
+        defer { unlock() }
+        return try body()
+    }
+}
+
+private extension Data {
+    mutating func appendUInt32LE(_ value: UInt32) {
+        append(contentsOf: [
+            UInt8(value & 0xff),
+            UInt8((value >> 8) & 0xff),
+            UInt8((value >> 16) & 0xff),
+            UInt8((value >> 24) & 0xff)
+        ])
+    }
+
+    mutating func appendInt32LE(_ value: Int32) {
+        appendUInt32LE(UInt32(bitPattern: value))
+    }
+
+    mutating func appendUInt64LE(_ value: UInt64) {
+        append(contentsOf: [
+            UInt8(value & 0xff),
+            UInt8((value >> 8) & 0xff),
+            UInt8((value >> 16) & 0xff),
+            UInt8((value >> 24) & 0xff),
+            UInt8((value >> 32) & 0xff),
+            UInt8((value >> 40) & 0xff),
+            UInt8((value >> 48) & 0xff),
+            UInt8((value >> 56) & 0xff)
+        ])
+    }
+
+    func readUInt32LE(at offset: Int) -> UInt32 {
+        precondition(offset >= 0 && offset + 4 <= count)
+        return UInt32(self[offset])
+            | (UInt32(self[offset + 1]) << 8)
+            | (UInt32(self[offset + 2]) << 16)
+            | (UInt32(self[offset + 3]) << 24)
+    }
+
+    func readInt32LE(at offset: Int) -> Int32 {
+        Int32(bitPattern: readUInt32LE(at: offset))
+    }
+
+    func readUInt64LE(at offset: Int) -> UInt64 {
+        precondition(offset >= 0 && offset + 8 <= count)
+        var result: UInt64 = 0
+        for index in 0..<8 {
+            result |= UInt64(self[offset + index]) << UInt64(index * 8)
+        }
+        return result
+    }
+}

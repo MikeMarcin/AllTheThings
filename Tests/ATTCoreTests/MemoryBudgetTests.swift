@@ -123,8 +123,8 @@ struct MemoryBudgetTests {
         #expect(after.completedSnapshotRebuilds == before.completedSnapshotRebuilds)
     }
 
-    @Test("streaming snapshot persists and reloads")
-    func streamingSnapshotPersistsAndReloads() {
+    @Test("mmap snapshot persists and reloads")
+    func mmapSnapshotPersistsAndReloads() {
         let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
         let records = makeSyntheticRecords(count: 25)
         let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
@@ -133,10 +133,33 @@ struct MemoryBudgetTests {
 
         let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
         #expect(reloaded.currentStats().indexedCount == records.count)
+        #expect(reloaded.currentDiagnostics().recordStoreKind == .mapped)
+        #expect(reloaded.currentDiagnostics().mappedByteSize > 0)
         #expect(reloaded.search(SearchRequest(
             query: "File000010",
             sort: SortSpec(column: .relevance, ascending: false)
         ), maxResults: 5).results.contains { $0.record.name == "File000010.swift" })
+    }
+
+    @Test("corrupt mmap snapshots are ignored")
+    func corruptMmapSnapshotsAreIgnored() throws {
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let supportDirectory = try applicationSupportDirectory(for: applicationName)
+        let packageURL = supportDirectory.appendingPathComponent("filename-index-v4.attindex", isDirectory: true)
+        try FileManager.default.createDirectory(at: packageURL, withIntermediateDirectories: true)
+        let manifest = CompactSnapshotManifest(
+            schemaVersion: 4,
+            savedAt: Date(),
+            roots: [],
+            exclusionPatterns: FileExclusionRules.defaultPatterns,
+            recordCount: 1
+        )
+        try JSONEncoder().encode(manifest).write(to: packageURL.appendingPathComponent("manifest.json"))
+        try Data([1, 2, 3]).write(to: packageURL.appendingPathComponent("records.bin"))
+
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
+        #expect(index.currentStats().indexedCount == 0)
+        #expect(!FileManager.default.fileExists(atPath: packageURL.path))
     }
 
     @Test("primary-only snapshots are searchable while scanning")
@@ -159,6 +182,8 @@ struct MemoryBudgetTests {
         #expect(stats.discoveredCount == records.count)
         #expect(stats.searchableCount == records.count)
         #expect(stats.optimizedCount == 0)
+        #expect(index.currentDiagnostics().recordStoreKind == .heapPaged)
+        #expect(index.currentDiagnostics().heapPageCount > 0)
 
         let response = index.search(SearchRequest(
             query: "File000010",
