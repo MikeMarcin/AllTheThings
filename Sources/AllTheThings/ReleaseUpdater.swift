@@ -431,10 +431,7 @@ final class ReleaseUpdater {
             defaults.removeObject(forKey: DefaultsKey.skippedReleaseTag)
             progressWindowController?.closeProgress()
             progressWindowController = nil
-            NSApp.terminate(nil)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) {
-                Darwin.exit(EXIT_SUCCESS)
-            }
+            Darwin.exit(EXIT_SUCCESS)
         } catch {
             if shouldCleanUp, let workDirectory {
                 try? FileManager.default.removeItem(at: workDirectory)
