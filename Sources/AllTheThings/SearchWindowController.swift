@@ -213,6 +213,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var indexedRoots: [URL]
     private var pendingEventPaths = Set<String>()
     private var eventDebounce: DispatchWorkItem?
+    private var memoryStatusTask: Task<Void, Never>?
+    private var memoryStatusText = ProcessMemoryFormatter.label(for: ProcessMemorySampler.currentUsage())
     private var didRequestInitialSnapshotLoad = false
     private var didRequestInitialRebuild = false
     private var highlightsSearchText: Bool
@@ -256,6 +258,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     deinit {
+        memoryStatusTask?.cancel()
         NotificationCenter.default.removeObserver(self)
     }
 
@@ -299,6 +302,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         )
 
         startWatchingIfNeeded()
+        startMemoryStatusPolling()
         updateLoadingOverlay()
 
         if indexStats.indexedCount > 0 {
@@ -516,6 +520,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         statusLabel.font = .systemFont(ofSize: 12)
         statusLabel.textColor = .tertiaryLabelColor
         statusLabel.lineBreakMode = .byTruncatingMiddle
+        statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         footer.addArrangedSubview(countLabel)
         footer.addArrangedSubview(statusLabel)
@@ -828,7 +833,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                 self.totalMatches = response.totalMatches
                 self.queryElapsed = response.elapsed
                 self.tableView.reloadData()
-                self.updateStatus()
+                self.updateStatus(refreshesMemory: true)
                 self.updateLoadingOverlay()
                 self.updateActionButtons()
             }
@@ -837,7 +842,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     private func handleStatsChanged(_ stats: IndexStats) {
         indexStats = stats
-        updateStatus()
+        updateStatus(refreshesMemory: true)
         updateLoadingOverlay()
 
         guard AppSettings.indexedRootsConfigured(defaults: defaults), !indexedRoots.isEmpty else {
@@ -1038,10 +1043,36 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: workItem)
     }
 
-    private func updateStatus() {
+    private func startMemoryStatusPolling() {
+        guard memoryStatusTask == nil else { return }
+
+        refreshMemoryStatus()
+        memoryStatusTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(2))
+                guard !Task.isCancelled else { return }
+                self?.refreshMemoryStatusAndUpdateFooter()
+            }
+        }
+    }
+
+    private func refreshMemoryStatusAndUpdateFooter() {
+        refreshMemoryStatus()
+        updateStatus()
+    }
+
+    private func refreshMemoryStatus() {
+        memoryStatusText = ProcessMemoryFormatter.label(for: ProcessMemorySampler.currentUsage())
+    }
+
+    private func updateStatus(refreshesMemory: Bool = false) {
+        if refreshesMemory {
+            refreshMemoryStatus()
+        }
+
         guard AppSettings.indexedRootsConfigured(defaults: defaults) else {
             countLabel.stringValue = "0 shown / 0 matches • 0 indexed • 0 ms"
-            statusLabel.stringValue = "Setup needed • Start indexing or choose folders"
+            statusLabel.stringValue = "Setup needed • Start indexing or choose folders • \(memoryStatusText)"
             return
         }
 
@@ -1057,7 +1088,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         } else {
             indexingText = indexStats.isLoadingSnapshot ? "Loading" : (indexStats.isIndexing ? "Indexing" : "Ready")
         }
-        statusLabel.stringValue = "\(indexingText) • \(indexStats.status)"
+        statusLabel.stringValue = "\(indexingText) • \(indexStats.status) • \(memoryStatusText)"
     }
 
     private func updateActionButtons() {
