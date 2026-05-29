@@ -139,6 +139,110 @@ struct MemoryBudgetTests {
         ), maxResults: 5).results.contains { $0.record.name == "File000010.swift" })
     }
 
+    @Test("primary-only snapshots are searchable while scanning")
+    func primaryOnlySnapshotsAreSearchableWhileScanning() {
+        let records = makeSyntheticRecords(count: 1_000)
+        let index = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        index.replaceRecordsForTesting(
+            records,
+            buildsSearchStructures: false,
+            phase: .scanning,
+            status: "Indexing 1,000 discovered"
+        )
+
+        let stats = index.currentStats()
+        #expect(stats.phase == .scanning)
+        #expect(stats.isIndexing)
+        #expect(stats.discoveredCount == records.count)
+        #expect(stats.searchableCount == records.count)
+        #expect(stats.optimizedCount == 0)
+
+        let response = index.search(SearchRequest(
+            query: "File000010",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10)
+        #expect(response.results.contains { $0.record.name == "File000010.swift" })
+    }
+
+    @Test("primary-only and optimized snapshots return the same matches")
+    func primaryOnlyAndOptimizedSnapshotsReturnSameMatches() {
+        var records = makeSyntheticRecords(count: 50_000)
+        let hiddenPath = "/tmp/allthethings-memory/.hidden/module/Secret500.swift"
+        records.append(FileRecord(
+            id: FileRecord.stableID(for: hiddenPath),
+            path: hiddenPath,
+            name: "Secret500.swift",
+            directoryPath: "/tmp/allthethings-memory/.hidden/module",
+            fileExtension: "swift",
+            sizeBytes: 500,
+            modifiedTime: 500_000,
+            createdTime: nil,
+            isDirectory: false,
+            isHidden: true,
+            volumeName: "Synthetic",
+            normalizedName: FuzzyMatcher.normalize("Secret500.swift"),
+            normalizedPath: FuzzyMatcher.normalize(hiddenPath)
+        ))
+
+        let primary = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        let optimized = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        primary.replaceRecordsForTesting(records, buildsSearchStructures: false, phase: .scanning)
+        optimized.replaceRecordsForTesting(records)
+
+        let requests = [
+            SearchRequest(query: "File000010", sort: SortSpec(column: .relevance, ascending: false)),
+            SearchRequest(query: "ext:swift", sort: SortSpec(column: .name, ascending: true)),
+            SearchRequest(query: "path:module-1", sort: SortSpec(column: .relevance, ascending: false)),
+            SearchRequest(query: "*.swift", sort: SortSpec(column: .modified, ascending: false)),
+            SearchRequest(query: "Secret500", sort: SortSpec(column: .relevance, ascending: false), includeHidden: false),
+            SearchRequest(query: "", sort: SortSpec(column: .modified, ascending: false))
+        ]
+
+        for request in requests {
+            let primaryResponse = primary.search(request, maxResults: 25)
+            let optimizedResponse = optimized.search(request, maxResults: 25)
+
+            #expect(primaryResponse.totalMatches == optimizedResponse.totalMatches)
+            #expect(primaryResponse.results.map(\.record.path) == optimizedResponse.results.map(\.record.path))
+        }
+    }
+
+    @Test("index stats expose progressive phase counts")
+    func indexStatsExposeProgressivePhaseCounts() {
+        let records = makeSyntheticRecords(count: 100)
+        let index = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+
+        index.replaceRecordsForTesting(records, buildsSearchStructures: false, phase: .scanning)
+        var stats = index.currentStats()
+        #expect(stats.phase == .scanning)
+        #expect(stats.isIndexing)
+        #expect(stats.searchableCount == records.count)
+        #expect(stats.optimizedCount == 0)
+
+        index.replaceRecordsForTesting(records, buildsSearchStructures: false, phase: .saving)
+        stats = index.currentStats()
+        #expect(stats.phase == .saving)
+        #expect(stats.isIndexing)
+
+        index.replaceRecordsForTesting(records)
+        stats = index.currentStats()
+        #expect(stats.phase == .ready)
+        #expect(!stats.isIndexing)
+        #expect(stats.optimizedCount == records.count)
+    }
+
     @Test("opt-in synthetic memory benchmark")
     func optInSyntheticMemoryBenchmark() {
         guard
