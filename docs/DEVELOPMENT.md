@@ -90,7 +90,17 @@ The core is isolated in `Sources/ATTCore` so the persistence/search backend can 
 This is a working MVP, not the final high-performance engine described in the product design.
 
 - The initial crawler uses Foundation APIs rather than `getattrlistbulk`.
-- The snapshot is JSON rather than memory-mapped columnar storage.
+- The snapshot is newline-delimited JSON rather than memory-mapped columnar storage.
 - Search is currently in-memory scoring over indexed records, with supporting indexes for common fast paths.
 - FSEvents are treated as dirty-path refresh signals, but there is not yet a WAL or full reconciliation scheduler.
 - Full Disk Access status is informational and conservative; indexing behavior has not been overhauled around macOS privacy prompts yet.
+
+## Memory Diagnostics
+
+Index load, rebuild, refresh, snapshot build, and persistence paths emit `com.allthethings.index` memory log events with `task_vm_info` counters and index structure sizes. For synthetic budget checks without creating files on disk, run:
+
+```sh
+ATT_MEMORY_BENCH_RECORDS=250000 swift test --filter optInSyntheticMemoryBenchmark
+```
+
+Use a larger value, such as `5000000`, for local stress testing on a machine with enough memory headroom.

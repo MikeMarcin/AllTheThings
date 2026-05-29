@@ -298,7 +298,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             object: nil
         )
 
-        startWatching()
+        startWatchingIfNeeded()
         updateLoadingOverlay()
 
         if indexStats.indexedCount > 0 {
@@ -566,6 +566,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         setupSuggestionPanel.chooseGlobalHotKeyButton.action = #selector(chooseSuggestedGlobalHotKey(_:))
         setupSuggestionPanel.openFullDiskAccessButton.target = self
         setupSuggestionPanel.openFullDiskAccessButton.action = #selector(openSuggestedFullDiskAccessSettings(_:))
+        setupSuggestionPanel.startIndexingButton.target = self
+        setupSuggestionPanel.startIndexingButton.action = #selector(startSuggestedIndexing(_:))
+        setupSuggestionPanel.chooseIndexedFoldersButton.target = self
+        setupSuggestionPanel.chooseIndexedFoldersButton.action = #selector(chooseSuggestedIndexedFolders(_:))
         setupSuggestionPanel.dismissGlobalHotKeyButton.target = self
         setupSuggestionPanel.dismissGlobalHotKeyButton.action = #selector(dismissSuggestedGlobalHotKey(_:))
         setupSuggestionPanel.dismissFullDiskAccessButton.target = self
@@ -573,12 +577,14 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func updateSetupSuggestions() {
+        let needsIndexingSetup = !AppSettings.indexedRootsConfigured(defaults: defaults)
         let needsGlobalHotKey = AppSettings.globalSearchHotKeyNeedsConfirmation(defaults: defaults)
         let needsFullDiskAccess = !defaults.bool(forKey: AppSettings.fullDiskAccessOnboardingShownKey)
-            && !FullDiskAccessController.currentStatus().isConfirmed
+            && (needsIndexingSetup || !FullDiskAccessController.protectedDefaultFoldersCovered(by: indexedRoots).isEmpty)
 
         setupSuggestionPanel.update(
             hotKey: AppSettings.globalSearchHotKey(defaults: defaults),
+            needsIndexingSetup: needsIndexingSetup,
             needsGlobalHotKey: needsGlobalHotKey,
             needsFullDiskAccess: needsFullDiskAccess
         )
@@ -628,6 +634,19 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     @objc private func dismissSuggestedFullDiskAccess(_ sender: NSButton) {
         markFullDiskAccessOnboardingShown()
         updateSetupSuggestions()
+    }
+
+    @objc private func startSuggestedIndexing(_ sender: NSButton) {
+        let roots = AppSettings.suggestedDefaultIndexedRoots()
+        indexedRoots = roots
+        saveRoots()
+        startWatchingIfNeeded()
+        rebuildIndexForCurrentSettings()
+        updateSetupSuggestions()
+    }
+
+    @objc private func chooseSuggestedIndexedFolders(_ sender: NSButton) {
+        presentIndexedFolderChooser(prompt: "Index")
     }
 
     private func markFullDiskAccessOnboardingShown() {
@@ -821,6 +840,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         updateStatus()
         updateLoadingOverlay()
 
+        guard AppSettings.indexedRootsConfigured(defaults: defaults), !indexedRoots.isEmpty else {
+            return
+        }
+
         guard !stats.isLoadingSnapshot else { return }
 
         guard indexSettingsMatchConfiguredSettings() else {
@@ -841,6 +864,12 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         didRequestInitialSnapshotLoad = true
         updateLoadingOverlay()
 
+        guard AppSettings.indexedRootsConfigured(defaults: defaults), !indexedRoots.isEmpty else {
+            updateStatus()
+            updateSetupSuggestions()
+            return
+        }
+
         if indexStats.indexedCount > 0 {
             scheduleSearch(force: true)
             return
@@ -854,7 +883,12 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func startInitialRebuildIfNeeded() {
-        guard didRequestInitialSnapshotLoad, !didRequestInitialRebuild else {
+        guard
+            didRequestInitialSnapshotLoad,
+            !didRequestInitialRebuild,
+            AppSettings.indexedRootsConfigured(defaults: defaults),
+            !indexedRoots.isEmpty
+        else {
             return
         }
 
@@ -863,6 +897,12 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func updateLoadingOverlay() {
+        guard AppSettings.indexedRootsConfigured(defaults: defaults), !indexedRoots.isEmpty else {
+            loadingOverlay.isHidden = true
+            loadingIndicator.stopAnimation(nil)
+            return
+        }
+
         let waitingForInitialLoad = !didRequestInitialSnapshotLoad && indexStats.indexedCount == 0
         let indexingEmptyList = indexStats.isIndexing && results.isEmpty
         let shouldShow = indexStats.isLoadingSnapshot || waitingForInitialLoad || indexingEmptyList
@@ -908,12 +948,19 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     @objc private func indexedRootsDidChange(_ notification: Notification) {
         let updatedRoots = AppSettings.indexedRoots(defaults: defaults)
         guard rootPaths(updatedRoots) != rootPaths(indexedRoots) else {
+            updateSetupSuggestions()
+            updateLoadingOverlay()
+            updateStatus()
+            updateActionButtons()
             return
         }
 
         indexedRoots = updatedRoots
-        startWatching()
+        didRequestInitialRebuild = false
+        startWatchingIfNeeded()
         rebuildIndexForCurrentSettings()
+        updateSetupSuggestions()
+        updateActionButtons()
     }
 
     @objc private func exclusionPatternsDidChange(_ notification: Notification) {
@@ -921,6 +968,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         guard patterns != index.allExclusionPatterns() else { return }
 
         index.updateExclusionPatterns(patterns)
+        guard AppSettings.indexedRootsConfigured(defaults: defaults) else { return }
         rebuildIndexForCurrentSettings()
     }
 
@@ -933,7 +981,17 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         tableView.reloadData()
         updateStatus()
         updateLoadingOverlay()
+        updateActionButtons()
 
+        guard AppSettings.indexedRootsConfigured(defaults: defaults) else {
+            updateStatus()
+            updateLoadingOverlay()
+            updateActionButtons()
+            return
+        }
+
+        didRequestInitialSnapshotLoad = true
+        didRequestInitialRebuild = true
         index.replaceRootsAndRebuild(indexedRoots)
     }
 
@@ -954,7 +1012,12 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         roots.map(\.standardizedFileURL.path)
     }
 
-    private func startWatching() {
+    private func startWatchingIfNeeded() {
+        guard AppSettings.indexedRootsConfigured(defaults: defaults), !indexedRoots.isEmpty else {
+            watcher.stop()
+            return
+        }
+
         watcher.start(roots: indexedRoots) { @MainActor @Sendable [weak self] paths in
             self?.coalesceFSEvents(paths)
         }
@@ -967,7 +1030,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let workItem = DispatchWorkItem { [weak self] in
             guard let self else { return }
             let paths = Array(self.pendingEventPaths)
-            self.pendingEventPaths.removeAll(keepingCapacity: true)
+            self.pendingEventPaths.removeAll(keepingCapacity: false)
             self.index.refresh(paths: paths)
         }
 
@@ -976,13 +1039,24 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func updateStatus() {
+        guard AppSettings.indexedRootsConfigured(defaults: defaults) else {
+            countLabel.stringValue = "0 shown / 0 matches • 0 indexed • 0 ms"
+            statusLabel.stringValue = "Setup needed • Start indexing or choose folders"
+            return
+        }
+
         let shownCount = results.count
         let indexed = indexStats.indexedCount.formatted()
         let total = totalMatches.formatted()
         let milliseconds = Int((queryElapsed * 1_000).rounded())
         countLabel.stringValue = "\(shownCount.formatted()) shown / \(total) matches • \(indexed) indexed • \(milliseconds) ms"
 
-        let indexingText = indexStats.isLoadingSnapshot ? "Loading" : (indexStats.isIndexing ? "Indexing" : "Ready")
+        let indexingText: String
+        if indexedRoots.isEmpty {
+            indexingText = "No folders"
+        } else {
+            indexingText = indexStats.isLoadingSnapshot ? "Loading" : (indexStats.isIndexing ? "Indexing" : "Ready")
+        }
         statusLabel.stringValue = "\(indexingText) • \(indexStats.status)"
     }
 
@@ -991,6 +1065,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         openButton.isEnabled = enabled
         revealButton.isEnabled = enabled
         copyButton.isEnabled = enabled
+        reindexButton.isEnabled = AppSettings.indexedRootsConfigured(defaults: defaults) && !indexedRoots.isEmpty
     }
 
     private func selectedRecord() -> FileRecord? {
@@ -1085,11 +1160,15 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     @objc private func addScope(_ sender: Any?) {
+        presentIndexedFolderChooser(prompt: "Index")
+    }
+
+    private func presentIndexedFolderChooser(prompt: String) {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = true
-        panel.prompt = "Index"
+        panel.prompt = prompt
 
         guard panel.runModal() == .OK else { return }
 
@@ -1101,11 +1180,17 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         guard !additions.isEmpty else { return }
         indexedRoots.append(contentsOf: additions)
         saveRoots()
-        startWatching()
+        didRequestInitialSnapshotLoad = true
+        didRequestInitialRebuild = true
+        startWatchingIfNeeded()
         index.replaceRootsAndRebuild(indexedRoots)
+        updateSetupSuggestions()
     }
 
     @objc private func reindex(_ sender: Any?) {
+        guard AppSettings.indexedRootsConfigured(defaults: defaults), !indexedRoots.isEmpty else { return }
+        didRequestInitialSnapshotLoad = true
+        didRequestInitialRebuild = true
         index.replaceRootsAndRebuild(indexedRoots)
     }
 
@@ -1436,24 +1521,42 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 }
 
 private final class SetupSuggestionPanelView: NSView {
+    let startIndexingButton = NSButton()
+    let chooseIndexedFoldersButton = NSButton()
     let enableGlobalHotKeyButton = NSButton()
     let chooseGlobalHotKeyButton = NSButton()
     let openFullDiskAccessButton = NSButton()
     let dismissGlobalHotKeyButton = NSButton()
     let dismissFullDiskAccessButton = NSButton()
 
+    private let indexingRow = NSView()
     private let globalHotKeyRow = NSView()
     private let fullDiskAccessRow = NSView()
-    private let rowSeparator = SetupSuggestionSeparatorView()
+    private let indexingSeparator = SetupSuggestionSeparatorView()
+    private let globalHotKeySeparator = SetupSuggestionSeparatorView()
     private let globalHotKeyDetailLabel = NSTextField(labelWithString: "")
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
 
+        let indexingTitleLabel = Self.makeTitleLabel("Start indexing")
+        let indexingDetailLabel = Self.makeDetailLabel(
+            "AllTheThings can index Desktop, Documents, Downloads, Developer, and Applications by default. You can change these folders later in Settings."
+        )
         let globalHotKeyTitleLabel = Self.makeTitleLabel("Global search hotkey")
         let fullDiskAccessTitleLabel = Self.makeTitleLabel("Full Disk Access")
         let fullDiskAccessDetailLabel = Self.makeDetailLabel(
-            "Avoid macOS folder prompts when indexing protected locations."
+            "Grant access before indexing protected folders to avoid macOS prompts."
+        )
+        Self.configureSuggestionRow(
+            indexingRow,
+            symbolName: "folder.badge.plus",
+            titleLabel: indexingTitleLabel,
+            detailLabel: indexingDetailLabel,
+            buttons: [
+                Self.configureActionButton(startIndexingButton, title: "Start Indexing", symbolName: "play.circle"),
+                Self.configureActionButton(chooseIndexedFoldersButton, title: "Choose Folders...", symbolName: "folder")
+            ]
         )
         Self.configureSuggestionRow(
             globalHotKeyRow,
@@ -1483,7 +1586,13 @@ private final class SetupSuggestionPanelView: NSView {
         layer?.borderWidth = 1
         updateThemeColors()
 
-        let rowsStack = NSStackView(views: [globalHotKeyRow, rowSeparator, fullDiskAccessRow])
+        let rowsStack = NSStackView(views: [
+            indexingRow,
+            indexingSeparator,
+            globalHotKeyRow,
+            globalHotKeySeparator,
+            fullDiskAccessRow
+        ])
         rowsStack.translatesAutoresizingMaskIntoConstraints = false
         rowsStack.orientation = .vertical
         rowsStack.alignment = .width
@@ -1496,7 +1605,8 @@ private final class SetupSuggestionPanelView: NSView {
             rowsStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
             rowsStack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
             rowsStack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
-            rowSeparator.heightAnchor.constraint(equalToConstant: 2)
+            indexingSeparator.heightAnchor.constraint(equalToConstant: 2),
+            globalHotKeySeparator.heightAnchor.constraint(equalToConstant: 2)
         ])
     }
 
@@ -1510,12 +1620,19 @@ private final class SetupSuggestionPanelView: NSView {
         updateThemeColors()
     }
 
-    func update(hotKey: GlobalHotKey, needsGlobalHotKey: Bool, needsFullDiskAccess: Bool) {
+    func update(
+        hotKey: GlobalHotKey,
+        needsIndexingSetup: Bool,
+        needsGlobalHotKey: Bool,
+        needsFullDiskAccess: Bool
+    ) {
         globalHotKeyDetailLabel.stringValue = "Use \(hotKey.displayString) to open search from anywhere."
+        indexingRow.isHidden = !needsIndexingSetup
         globalHotKeyRow.isHidden = !needsGlobalHotKey
         fullDiskAccessRow.isHidden = !needsFullDiskAccess
-        rowSeparator.isHidden = !needsGlobalHotKey || !needsFullDiskAccess
-        isHidden = !needsGlobalHotKey && !needsFullDiskAccess
+        indexingSeparator.isHidden = !needsIndexingSetup || (!needsGlobalHotKey && !needsFullDiskAccess)
+        globalHotKeySeparator.isHidden = !needsGlobalHotKey || !needsFullDiskAccess
+        isHidden = !needsIndexingSetup && !needsGlobalHotKey && !needsFullDiskAccess
     }
 
     private func updateThemeColors() {
@@ -1554,7 +1671,7 @@ private final class SetupSuggestionPanelView: NSView {
         row.addSubview(buttonStack)
 
         NSLayoutConstraint.activate([
-            row.heightAnchor.constraint(greaterThanOrEqualToConstant: 30),
+            row.heightAnchor.constraint(greaterThanOrEqualToConstant: 46),
 
             iconView.leadingAnchor.constraint(equalTo: row.leadingAnchor),
             iconView.centerYAnchor.constraint(equalTo: row.centerYAnchor),
@@ -1586,7 +1703,7 @@ private final class SetupSuggestionPanelView: NSView {
         label.font = .systemFont(ofSize: 12, weight: .regular)
         label.textColor = .secondaryLabelColor
         label.lineBreakMode = .byTruncatingTail
-        label.maximumNumberOfLines = 1
+        label.maximumNumberOfLines = 2
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         return label
     }

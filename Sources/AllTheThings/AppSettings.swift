@@ -142,15 +142,16 @@ enum AppSettings {
     }
 
     static func indexedRoots(defaults: UserDefaults = .standard) -> [URL] {
-        let saved = defaults.array(forKey: indexedRootsKey) as? [String] ?? []
-        if defaults.bool(forKey: indexedRootsInitializedKey) {
-            return saved.map { URL(fileURLWithPath: $0, isDirectory: true) }
+        guard indexedRootsConfigured(defaults: defaults) else {
+            return []
         }
 
-        let roots = uniqueRoots(defaultIndexedRoots() + saved.map { URL(fileURLWithPath: $0, isDirectory: true) })
-        defaults.set(roots.map(\.path), forKey: indexedRootsKey)
-        defaults.set(true, forKey: indexedRootsInitializedKey)
-        return roots
+        return uniqueRoots(savedIndexedRootURLs(defaults: defaults))
+    }
+
+    static func indexedRootsConfigured(defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: indexedRootsInitializedKey)
+            || !(defaults.array(forKey: indexedRootsKey) as? [String] ?? []).isEmpty
     }
 
     static func saveIndexedRoots(_ roots: [URL], defaults: UserDefaults = .standard) {
@@ -162,7 +163,7 @@ enum AppSettings {
     }
 
     static func resetIndexedRoots(defaults: UserDefaults = .standard) {
-        saveIndexedRoots(defaultIndexedRoots(), defaults: defaults)
+        saveIndexedRoots(suggestedDefaultIndexedRoots(), defaults: defaults)
     }
 
     static func exclusionPatterns(defaults: UserDefaults = .standard) -> [String] {
@@ -188,6 +189,10 @@ enum AppSettings {
     }
 
     static func defaultIndexedRoots() -> [URL] {
+        suggestedDefaultIndexedRoots()
+    }
+
+    static func suggestedDefaultIndexedRoots() -> [URL] {
         let fileManager = FileManager.default
         let home = fileManager.homeDirectoryForCurrentUser
         let candidates = [
@@ -199,6 +204,11 @@ enum AppSettings {
         ]
 
         return candidates.filter { fileManager.fileExists(atPath: $0.path) }
+    }
+
+    private static func savedIndexedRootURLs(defaults: UserDefaults) -> [URL] {
+        (defaults.array(forKey: indexedRootsKey) as? [String] ?? [])
+            .map { URL(fileURLWithPath: $0, isDirectory: true) }
     }
 
     private static func uniqueRoots(_ roots: [URL]) -> [URL] {
