@@ -492,7 +492,7 @@ final class MascotSpriteSheet {
 @MainActor
 final class OperationMascotCoordinator {
     static let layoutSize: CGFloat = 40
-    static let statusDisplaySize: CGFloat = 46
+    static let statusDisplaySize: CGFloat = layoutSize
     static let heroDisplaySize: CGFloat = 86
     static let expandedDisplaySize: CGFloat = layoutSize * 4
 
@@ -510,7 +510,7 @@ final class OperationMascotCoordinator {
     init(
         imageView: NSImageView,
         spriteSheet: MascotSpriteSheet = .shared,
-        displaySize: CGFloat = 46
+        displaySize: CGFloat = 40
     ) {
         self.imageView = imageView
         self.spriteSheet = spriteSheet
