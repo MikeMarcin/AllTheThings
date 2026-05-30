@@ -82,7 +82,7 @@ python3 .codex/skills/sprite-sheet-animation-updater/scripts/validate_sprite_she
   --cell-height 96 \
   --columns 16 \
   --rows 7 \
-  --animations idle:8,indexing:16,searching:10,optimizing:16,file_changed:6,success:8,error:6 \
+  --animations idle:8,indexing:16,searching:16,optimizing:16,file_changed:6,success:8,error:6 \
   --body-color mascot-blue \
   --min-gutter 1 \
   --body-width-range 69:78 \
@@ -116,7 +116,7 @@ For this repository's Nib mascot, use:
 - rows/frame counts:
   - `idle`: row 0, 8 frames, loops
   - `indexing`: row 1, 16 frames, loops
-  - `searching`: row 2, 10 frames, loops
+  - `searching`: row 2, 16 frames, loops
   - `optimizing`: row 3, 16 frames, loops
   - `file_changed`: row 4, 6 frames, one-shot
   - `success`: row 5, 8 frames, one-shot

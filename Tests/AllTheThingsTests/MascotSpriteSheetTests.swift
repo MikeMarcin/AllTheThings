@@ -18,7 +18,7 @@ struct MascotSpriteSheetTests {
 
         #expect(OperationMascotAnimation.idle.frameCount == 8)
         #expect(OperationMascotAnimation.indexing.frameCount == 16)
-        #expect(OperationMascotAnimation.searching.frameCount == 10)
+        #expect(OperationMascotAnimation.searching.frameCount == 16)
         #expect(OperationMascotAnimation.optimizing.frameCount == 16)
         #expect(OperationMascotAnimation.fileChanged.frameCount == 6)
         #expect(OperationMascotAnimation.success.frameCount == 8)
@@ -26,7 +26,7 @@ struct MascotSpriteSheetTests {
 
         #expect(OperationMascotAnimation.idle.framesPerSecond == 4)
         #expect(OperationMascotAnimation.indexing.framesPerSecond == 5)
-        #expect(OperationMascotAnimation.searching.framesPerSecond == 5)
+        #expect(OperationMascotAnimation.searching.framesPerSecond == 8)
         #expect(OperationMascotAnimation.optimizing.framesPerSecond == 5)
         #expect(OperationMascotAnimation.fileChanged.framesPerSecond == 6)
         #expect(OperationMascotAnimation.success.framesPerSecond == 6)
@@ -35,7 +35,7 @@ struct MascotSpriteSheetTests {
         for animation in OperationMascotAnimation.allCases {
             #expect(!animation.accessibilityLabel.isEmpty)
             #expect(animation.framesPerSecond > 0)
-            #expect(animation.framesPerSecond <= 6)
+            #expect(animation.framesPerSecond <= 8)
         }
 
         #expect(OperationMascotCoordinator.layoutSize == 40)

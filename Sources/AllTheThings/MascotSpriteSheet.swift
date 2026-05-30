@@ -26,7 +26,7 @@ enum OperationMascotAnimation: String, CaseIterable {
         switch self {
         case .idle: 8
         case .indexing: 16
-        case .searching: 10
+        case .searching: 16
         case .optimizing: 16
         case .fileChanged: 6
         case .success: 8
@@ -38,7 +38,7 @@ enum OperationMascotAnimation: String, CaseIterable {
         switch self {
         case .idle: 4
         case .indexing: 5
-        case .searching: 5
+        case .searching: 8
         case .optimizing: 5
         case .fileChanged: 6
         case .success: 6

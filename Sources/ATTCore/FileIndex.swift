@@ -399,9 +399,16 @@ public final class FileIndex: @unchecked Sendable {
         let gramIndex: MappedIntPostingIndex?
         let nameGramIndex: MappedIntPostingIndex?
         let extensionIndex: [String: [Int32]]
+        private let childLinks: ChildLinks?
         let visibleCount: Int?
         let hasSortedOrder: Bool
         let diagnostics: SearchStructureDiagnostics
+
+        private struct ChildLinks {
+            let firstChild: [Int32]
+            let nextSibling: [Int32]
+            let roots: [Int32]
+        }
 
         var count: Int { store.count }
         var records: [FileRecord] { store.allRecords() }
@@ -418,6 +425,7 @@ public final class FileIndex: @unchecked Sendable {
                 self.nameGramIndex = Self.makeNameGramIndex(store: store)
                 let extensionData = Self.makeExtensionIndexAndVisibleCount(store: store)
                 self.extensionIndex = extensionData.extensionIndex
+                self.childLinks = Self.makeChildLinks(store: store)
                 self.visibleCount = extensionData.visibleCount
                 let sortedByModified = Self.makeModifiedDescending(store: store)
                 self.modifiedDescending = sortedByModified
@@ -439,6 +447,7 @@ public final class FileIndex: @unchecked Sendable {
                 self.gramIndex = nil
                 self.nameGramIndex = nil
                 self.extensionIndex = [:]
+                self.childLinks = nil
                 self.visibleCount = Self.makeVisibleCount(store: store)
                 self.modifiedDescending = []
                 self.modifiedAscending = []
@@ -463,6 +472,7 @@ public final class FileIndex: @unchecked Sendable {
                 self.nameGramIndex = Self.makeNameGramIndex(store: store)
                 let extensionData = Self.makeExtensionIndexAndVisibleCount(store: store)
                 self.extensionIndex = extensionData.extensionIndex
+                self.childLinks = Self.makeChildLinks(store: store)
                 self.visibleCount = extensionData.visibleCount
                 let sortedByModified = Self.makeModifiedDescending(store: store)
                 self.modifiedDescending = sortedByModified
@@ -484,6 +494,7 @@ public final class FileIndex: @unchecked Sendable {
                 self.gramIndex = nil
                 self.nameGramIndex = nil
                 self.extensionIndex = [:]
+                self.childLinks = nil
                 self.visibleCount = nil
                 self.modifiedDescending = []
                 self.modifiedAscending = []
@@ -505,6 +516,7 @@ public final class FileIndex: @unchecked Sendable {
             self.nameGramIndex = persistedStructures.nameGramIndex
             let extensionData = Self.makeExtensionIndexAndVisibleCount(store: store)
             self.extensionIndex = extensionData.extensionIndex
+            self.childLinks = Self.makeChildLinks(store: store)
             self.visibleCount = extensionData.visibleCount
 
             if let modifiedDescending = persistedStructures.modifiedDescending, modifiedDescending.count == store.count {
@@ -537,6 +549,7 @@ public final class FileIndex: @unchecked Sendable {
             gramIndex: MappedIntPostingIndex?,
             nameGramIndex: MappedIntPostingIndex?,
             extensionIndex: [String: [Int32]],
+            childLinks: ChildLinks? = nil,
             visibleCount: Int?,
             hasSortedOrder: Bool
         ) {
@@ -552,6 +565,7 @@ public final class FileIndex: @unchecked Sendable {
             self.gramIndex = gramIndex
             self.nameGramIndex = nameGramIndex
             self.extensionIndex = extensionIndex
+            self.childLinks = childLinks ?? Self.makeChildLinks(store: store)
             self.visibleCount = visibleCount
             self.hasSortedOrder = hasSortedOrder
             self.diagnostics = Self.makeDiagnostics(
@@ -565,31 +579,20 @@ public final class FileIndex: @unchecked Sendable {
         func updatingMetadata(for upserts: [String: FileRecord]) -> SearchSnapshot? {
             guard hasSortedOrder, !upserts.isEmpty else { return nil }
 
-            var existingIndices: [String: Int] = [:]
-            existingIndices.reserveCapacity(upserts.count)
-            for path in upserts.keys {
-                if let rowID = store.rowID(forPath: path) {
-                    existingIndices[path] = rowID
-                }
-            }
-
-            guard existingIndices.count == upserts.count else {
-                return nil
-            }
-
-            var updatedRecords = records
+            var replacements: [Int: FileRecord] = [:]
+            replacements.reserveCapacity(upserts.count)
             var changedIndices: [Int] = []
             changedIndices.reserveCapacity(upserts.count)
 
             for (path, record) in upserts {
-                guard let index = existingIndices[path] else {
+                guard let index = store.rowID(forPath: path), searchKeysMatch(rowID: index, replacement: record) else {
                     return nil
                 }
-                updatedRecords[index] = record
+                replacements[index] = record
                 changedIndices.append(index)
             }
 
-            let updatedStore = HeapPagedRecordStore(records: updatedRecords)
+            let updatedStore = ReplacingRecordStore(base: store, replacements: replacements)
             let changed = Set(changedIndices)
             let unchangedDescending = modifiedDescending.filter { !changed.contains($0) }
             let changedDescending = changedIndices.sorted {
@@ -607,9 +610,20 @@ public final class FileIndex: @unchecked Sendable {
                 gramIndex: gramIndex,
                 nameGramIndex: nameGramIndex,
                 extensionIndex: extensionIndex,
+                childLinks: childLinks,
                 visibleCount: Self.makeVisibleCount(store: updatedStore),
                 hasSortedOrder: true
             )
+        }
+
+        private func searchKeysMatch(rowID: Int, replacement: FileRecord) -> Bool {
+            let existing = store.view(at: rowID)
+            return existing.path == replacement.path
+                && existing.name == replacement.name
+                && existing.directoryPath == replacement.directoryPath
+                && existing.fileExtension == replacement.fileExtension
+                && existing.normalizedName == replacement.normalizedName
+                && existing.normalizedPath == replacement.normalizedPath
         }
 
         func addingNameGramIndex() -> SearchSnapshot {
@@ -620,6 +634,7 @@ public final class FileIndex: @unchecked Sendable {
                 gramIndex: gramIndex,
                 nameGramIndex: Self.makeNameGramIndex(store: store),
                 extensionIndex: extensionIndex,
+                childLinks: childLinks,
                 visibleCount: visibleCount,
                 hasSortedOrder: hasSortedOrder
             )
@@ -634,6 +649,7 @@ public final class FileIndex: @unchecked Sendable {
                 gramIndex: gramIndex,
                 nameGramIndex: nameGramIndex,
                 extensionIndex: extensionIndex.isEmpty ? extensionData.extensionIndex : extensionIndex,
+                childLinks: childLinks,
                 visibleCount: visibleCount ?? extensionData.visibleCount,
                 hasSortedOrder: hasSortedOrder
             )
@@ -647,6 +663,7 @@ public final class FileIndex: @unchecked Sendable {
                 gramIndex: gramIndex,
                 nameGramIndex: nameGramIndex,
                 extensionIndex: extensionIndex,
+                childLinks: childLinks,
                 visibleCount: visibleCount,
                 hasSortedOrder: true
             )
@@ -664,6 +681,7 @@ public final class FileIndex: @unchecked Sendable {
                 gramIndex: Self.makePathGramIndex(store: store),
                 nameGramIndex: nameGramIndex,
                 extensionIndex: extensionIndex,
+                childLinks: childLinks,
                 visibleCount: visibleCount,
                 hasSortedOrder: hasSortedOrder
             )
@@ -804,6 +822,73 @@ public final class FileIndex: @unchecked Sendable {
             return candidates
         }
 
+        private func expandedPathComponentCandidates(
+            directRows: [Int32],
+            rootMatches: (Int) -> Bool,
+            shouldCancel: @Sendable () -> Bool
+        ) -> [Int32]? {
+            guard let childLinks else { return nil }
+
+            var included = Array(repeating: UInt8(0), count: count)
+            var candidates: [Int32] = []
+            var stack: [Int] = []
+            var visited = 0
+
+            func includeSubtree(startingAt start: Int) -> Bool {
+                guard start >= 0, start < count, included[start] == 0 else {
+                    return true
+                }
+
+                stack.append(start)
+                while let rowID = stack.popLast() {
+                    guard rowID >= 0, rowID < count, included[rowID] == 0 else {
+                        continue
+                    }
+
+                    visited += 1
+                    if visited & 511 == 0, shouldCancel() {
+                        return false
+                    }
+
+                    included[rowID] = 1
+                    candidates.append(Int32(rowID))
+
+                    var child = childLinks.firstChild[rowID]
+                    while child >= 0 {
+                        let childRow = Int(child)
+                        stack.append(childRow)
+                        child = childLinks.nextSibling[childRow]
+                    }
+                }
+
+                return true
+            }
+
+            for (offset, row) in directRows.enumerated() {
+                if offset & 511 == 0, shouldCancel() {
+                    return nil
+                }
+                guard includeSubtree(startingAt: Int(row)) else {
+                    return nil
+                }
+            }
+
+            for (offset, row) in childLinks.roots.enumerated() {
+                if offset & 511 == 0, shouldCancel() {
+                    return nil
+                }
+
+                let rowID = Int(row)
+                guard included[rowID] == 0, rootMatches(rowID) else { continue }
+                guard includeSubtree(startingAt: rowID) else {
+                    return nil
+                }
+            }
+
+            candidates.sort()
+            return candidates
+        }
+
         func candidatePathIndicesByComponentExpansion(
             containing token: String,
             shouldCancel: @Sendable () -> Bool
@@ -818,16 +903,27 @@ public final class FileIndex: @unchecked Sendable {
             }
 
             let componentCandidates = candidateNameIndices(containing: Array(token.utf8)) ?? []
-            var directMatches = Set<Int>()
-            directMatches.reserveCapacity(componentCandidates.count)
+            var directRows: [Int32] = []
+            directRows.reserveCapacity(componentCandidates.count)
             for candidate in componentCandidates {
                 let rowID = Int(candidate)
                 guard rowID >= 0, rowID < count else { continue }
                 if store.normalizedName(at: rowID, contains: token) {
-                    directMatches.insert(rowID)
+                    directRows.append(candidate)
                 }
             }
 
+            if let candidates = expandedPathComponentCandidates(
+                directRows: directRows,
+                rootMatches: { rowID in
+                    store.normalizedPath(at: rowID).contains(token)
+                },
+                shouldCancel: shouldCancel
+            ) {
+                return candidates
+            }
+
+            let directMatches = Set(directRows.map(Int.init))
             var memo = Array(repeating: Int8(-1), count: count)
             var pathContainsCache: [Int: Bool] = [:]
 
@@ -865,6 +961,116 @@ public final class FileIndex: @unchecked Sendable {
             var candidates: [Int32] = []
             for rowID in 0..<count {
                 if rowID.isMultiple(of: 512), shouldCancel() {
+                    return nil
+                }
+                if pathMatches(at: rowID) {
+                    candidates.append(Int32(rowID))
+                }
+            }
+            return candidates
+        }
+
+        func candidatePathIndicesByShortFuzzyComponentExpansion(
+            containing tokenBytes: [UInt8],
+            shouldCancel: @Sendable () -> Bool
+        ) -> [Int32]? {
+            guard
+                gramIndex == nil,
+                nameGramIndex != nil,
+                !tokenBytes.isEmpty,
+                tokenBytes.count <= 3
+            else {
+                return nil
+            }
+
+            let distinctBytes = FileIndex.distinctBytes(in: tokenBytes)
+            guard let componentCandidates = candidateNameIndices(containingAllBytes: distinctBytes) else {
+                return nil
+            }
+
+            var directRows: [Int32] = []
+            directRows.reserveCapacity(componentCandidates.count)
+            var directMatches = Array(repeating: false, count: count)
+            for candidate in componentCandidates {
+                let rowID = Int(candidate)
+                guard rowID >= 0, rowID < count else { continue }
+                if FileIndex.shortFuzzyPathComponentMatches(store.normalizedName(at: rowID), tokenBytes: tokenBytes) {
+                    directMatches[rowID] = true
+                    directRows.append(candidate)
+                }
+            }
+
+            if let candidates = expandedPathComponentCandidates(
+                directRows: directRows,
+                rootMatches: { rowID in
+                    FileIndex.shortFuzzyPathComponentMatches(store.normalizedPath(at: rowID), tokenBytes: tokenBytes)
+                },
+                shouldCancel: shouldCancel
+            ) {
+                return candidates
+            }
+
+            var memo = Array(repeating: Int8(-1), count: count)
+            var resolutionStack: [Int] = []
+            resolutionStack.reserveCapacity(64)
+
+            func pathMatches(at rowID: Int) -> Bool {
+                if directMatches[rowID] {
+                    memo[rowID] = 1
+                    return true
+                }
+
+                let existing = memo[rowID]
+                if existing != -1 {
+                    return existing == 1
+                }
+
+                resolutionStack.removeAll(keepingCapacity: true)
+                var current = rowID
+                var matches = false
+
+                while true {
+                    if directMatches[current] {
+                        matches = true
+                        memo[current] = 1
+                        break
+                    }
+
+                    let known = memo[current]
+                    if known != -1 {
+                        matches = known == 1
+                        break
+                    }
+
+                    guard let parent = store.parentRowID(at: current) else {
+                        matches = FileIndex.shortFuzzyPathComponentMatches(
+                            store.normalizedPath(at: current),
+                            tokenBytes: tokenBytes
+                        )
+                        memo[current] = matches ? 1 : 0
+                        break
+                    }
+
+                    guard parent >= 0, parent < count, parent != current else {
+                        matches = false
+                        memo[current] = 0
+                        break
+                    }
+
+                    resolutionStack.append(current)
+                    current = parent
+                }
+
+                let value: Int8 = matches ? 1 : 0
+                for row in resolutionStack {
+                    memo[row] = value
+                }
+                return matches
+            }
+
+            var candidates: [Int32] = []
+            for rowID in 0..<count {
+                if rowID & 511 == 0, shouldCancel() {
                     return nil
                 }
                 if pathMatches(at: rowID) {
@@ -1021,6 +1227,32 @@ public final class FileIndex: @unchecked Sendable {
             }
 
             return try? MappedIntPostingIndex.build(from: index, temporaryName: "att-name-postings")
+        }
+
+        private static func makeChildLinks(store: RecordStore) -> ChildLinks? {
+            guard store.count > 0 else { return nil }
+
+            var firstChild = Array(repeating: Int32(-1), count: store.count)
+            var nextSibling = Array(repeating: Int32(-1), count: store.count)
+            var roots: [Int32] = []
+            roots.reserveCapacity(16)
+
+            for rowID in 0..<store.count {
+                guard
+                    let parent = store.parentRowID(at: rowID),
+                    parent >= 0,
+                    parent < store.count,
+                    parent != rowID
+                else {
+                    roots.append(Int32(rowID))
+                    continue
+                }
+
+                nextSibling[rowID] = firstChild[parent]
+                firstChild[parent] = Int32(rowID)
+            }
+
+            return ChildLinks(firstChild: firstChild, nextSibling: nextSibling, roots: roots)
         }
 
         private static func makeVisibleCount(store: RecordStore) -> Int {
@@ -1199,13 +1431,13 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
-    public func search(_ request: SearchRequest, maxResults: Int = 20_000) -> SearchResponse {
+    public func search(_ request: SearchRequest, maxResults: Int = 2_000) -> SearchResponse {
         search(request, maxResults: maxResults, shouldCancel: { false }) ?? SearchResponse(results: [], totalMatches: 0, elapsed: 0)
     }
 
     public func search(
         _ request: SearchRequest,
-        maxResults: Int = 20_000,
+        maxResults: Int = 2_000,
         shouldCancel: @Sendable () -> Bool
     ) -> SearchResponse? {
         let started = Date()
@@ -1294,6 +1526,18 @@ public final class FileIndex: @unchecked Sendable {
                 }
             }
         } else {
+            if let fastResponse = Self.fastLargeShortFuzzyComponentSearch(
+                snapshot: snapshot,
+                request: request,
+                parsedQuery: parsedQuery,
+                maxResults: boundedMaxResults,
+                started: started,
+                snapshotRevision: snapshotRevision,
+                shouldCancel: shouldCancel
+            ) {
+                return fastResponse
+            }
+
             if let fastResponse = Self.fastLargePathSubstringSearch(
                 snapshot: snapshot,
                 request: request,
@@ -1347,6 +1591,119 @@ public final class FileIndex: @unchecked Sendable {
 
     private static func materialize(_ matches: [SearchMatch], from snapshot: SearchSnapshot) -> [SearchResult] {
         matches.map { SearchResult(record: snapshot.record(at: $0.rowID), score: $0.score) }
+    }
+
+    private static func fastLargeShortFuzzyComponentSearch(
+        snapshot: SearchSnapshot,
+        request: SearchRequest,
+        parsedQuery: FuzzyMatcher.ParsedQuery,
+        maxResults: Int,
+        started: Date,
+        snapshotRevision: UInt64,
+        shouldCancel: @Sendable () -> Bool
+    ) -> SearchResponse? {
+        guard
+            request.sort.column == .name,
+            maxResults > 0,
+            parsedQuery.negative.isEmpty,
+            parsedQuery.positive.count == 1,
+            let clause = parsedQuery.positive.first,
+            clause.alternatives.count == 1,
+            let part = clause.alternatives.first,
+            case .text(let field, let pattern, let mode) = part,
+            mode == .fuzzy,
+            !tokenContainsPathSeparator(pattern.token)
+        else {
+            return nil
+        }
+
+        let tokenBytes = Array(pattern.token.utf8)
+        guard !tokenBytes.isEmpty, tokenBytes.count <= 3, tokenBytes.allSatisfy({ $0 < 128 }) else {
+            return nil
+        }
+
+        let nameCandidates: [Int32]
+        switch field {
+        case .path:
+            nameCandidates = []
+        case .name, .any:
+            guard let candidates = shortFuzzyNameCandidateIndices(
+                snapshot: snapshot,
+                tokenBytes: tokenBytes,
+                shouldCancel: shouldCancel
+            ) else {
+                return nil
+            }
+            nameCandidates = candidates
+        }
+
+        let pathCandidates: [Int32]
+        switch field {
+        case .name:
+            pathCandidates = []
+        case .path, .any:
+            guard let candidates = snapshot.candidatePathIndicesByShortFuzzyComponentExpansion(
+                containing: tokenBytes,
+                shouldCancel: shouldCancel
+            ) else {
+                return nil
+            }
+            pathCandidates = candidates
+        }
+
+        let candidates = unionPostingLists(pathCandidates, nameCandidates)
+        guard !candidates.isEmpty else {
+            return SearchResponse(
+                results: [],
+                totalMatches: 0,
+                elapsed: Date().timeIntervalSince(started),
+                snapshotRevision: snapshotRevision,
+                usesIndexedCandidates: true
+            )
+        }
+
+        guard let selected = nameSortedPathSubstringMatches(
+            snapshot: snapshot,
+            candidates: candidates,
+            request: request,
+            maxResults: maxResults,
+            shouldCancel: shouldCancel
+        ) else {
+            return nil
+        }
+
+        return SearchResponse(
+            results: materialize(selected.matches, from: snapshot),
+            totalMatches: selected.total,
+            elapsed: Date().timeIntervalSince(started),
+            snapshotRevision: snapshotRevision,
+            usesIndexedCandidates: true
+        )
+    }
+
+    private static func shortFuzzyNameCandidateIndices(
+        snapshot: SearchSnapshot,
+        tokenBytes: [UInt8],
+        shouldCancel: @Sendable () -> Bool
+    ) -> [Int32]? {
+        guard let candidates = fuzzyNameCandidateIndices(snapshot: snapshot, tokenBytes: tokenBytes) else {
+            return nil
+        }
+
+        var matches: [Int32] = []
+        matches.reserveCapacity(candidates.count)
+        for (offset, candidate) in candidates.enumerated() {
+            if offset.isMultiple(of: 512), shouldCancel() {
+                return nil
+            }
+
+            let rowID = Int(candidate)
+            guard rowID >= 0, rowID < snapshot.count else { continue }
+            if shortFuzzyNameMatches(snapshot.store.normalizedName(at: rowID), tokenBytes: tokenBytes) {
+                matches.append(candidate)
+            }
+        }
+        return matches
     }
 
     private static func fastLargePathSubstringSearch(
@@ -1441,6 +1798,30 @@ public final class FileIndex: @unchecked Sendable {
             )
         }
 
+        if request.sort.column == .name, maxResults > 0 {
+            guard let selected = nameSortedPathSubstringMatches(
+                snapshot: snapshot,
+                candidates: exactPathCandidates,
+                request: request,
+                maxResults: maxResults,
+                shouldCancel: shouldCancel
+            ) else {
+                return nil
+            }
+
+            guard selected.total >= max(maxResults, 1) || selected.total > 1_000 else {
+                return nil
+            }
+
+            return SearchResponse(
+                results: materialize(selected.matches, from: snapshot),
+                totalMatches: selected.total,
+                elapsed: Date().timeIntervalSince(started),
+                snapshotRevision: snapshotRevision,
+                usesIndexedCandidates: true
+            )
+        }
+
         var matches: [SearchMatch] = []
         matches.reserveCapacity(min(exactPathCandidates.count, maxResults))
         let trimThreshold = maxResults > 0 ? maxResults * 5 : 0
@@ -1489,6 +1870,138 @@ public final class FileIndex: @unchecked Sendable {
             snapshotRevision: snapshotRevision,
             usesIndexedCandidates: true
         )
+    }
+
+    private struct NameSortedSelection {
+        let matches: [SearchMatch]
+        let total: Int
+    }
+
+    private struct NameSortCandidate {
+        let rowID: Int
+        let normalizedName: String
+    }
+
+    private struct NamePathSortCandidate {
+        let rowID: Int
+        let normalizedName: String
+        let path: String
+    }
+
+    private static func nameSortedPathSubstringMatches(
+        snapshot: SearchSnapshot,
+        candidates: [Int32],
+        request: SearchRequest,
+        maxResults: Int,
+        shouldCancel: @Sendable () -> Bool
+    ) -> NameSortedSelection? {
+        let ascending = request.sort.ascending
+        var heap: [NameSortCandidate] = []
+        heap.reserveCapacity(maxResults)
+        var total = 0
+
+        func precedes(_ lhs: NameSortCandidate, _ rhs: NameSortCandidate) -> Bool {
+            if lhs.normalizedName != rhs.normalizedName {
+                return ascending ? lhs.normalizedName < rhs.normalizedName : lhs.normalizedName > rhs.normalizedName
+            }
+            return lhs.rowID < rhs.rowID
+        }
+
+        func isWorse(_ lhs: NameSortCandidate, than rhs: NameSortCandidate) -> Bool {
+            precedes(rhs, lhs)
+        }
+
+        func siftUp(_ startIndex: Int) {
+            var child = startIndex
+            while child > 0 {
+                let parent = (child - 1) / 2
+                guard isWorse(heap[child], than: heap[parent]) else { break }
+                heap.swapAt(child, parent)
+                child = parent
+            }
+        }
+
+        func siftDown(_ startIndex: Int) {
+            var parent = startIndex
+            while true {
+                let left = parent * 2 + 1
+                let right = left + 1
+                var candidate = parent
+
+                if left < heap.count, isWorse(heap[left], than: heap[candidate]) {
+                    candidate = left
+                }
+                if right < heap.count, isWorse(heap[right], than: heap[candidate]) {
+                    candidate = right
+                }
+                guard candidate != parent else { break }
+                heap.swapAt(parent, candidate)
+                parent = candidate
+            }
+        }
+
+        func appendToHeap(_ candidate: NameSortCandidate) {
+            if heap.count < maxResults {
+                heap.append(candidate)
+                siftUp(heap.count - 1)
+            } else if let worst = heap.first, precedes(candidate, worst) {
+                heap[0] = candidate
+                siftDown(0)
+            }
+        }
+
+        for (offset, candidate) in candidates.enumerated() {
+            if offset.isMultiple(of: 512), shouldCancel() {
+                return nil
+            }
+
+            let rowID = Int(candidate)
+            guard rowID >= 0, rowID < snapshot.count else { continue }
+            guard request.includeHidden || snapshot.isVisible(at: rowID) else { continue }
+
+            total += 1
+            appendToHeap(NameSortCandidate(
+                rowID: rowID,
+                normalizedName: snapshot.store.normalizedName(at: rowID)
+            ))
+        }
+
+        guard total > 0 else {
+            return NameSortedSelection(matches: [], total: 0)
+        }
+
+        return NameSortedSelection(
+            matches: sortNamePathCandidates(
+                heap.map {
+                    NamePathSortCandidate(
+                        rowID: $0.rowID,
+                        normalizedName: $0.normalizedName,
+                        path: snapshot.store.path(at: $0.rowID)
+                    )
+                },
+                ascending: ascending,
+                maxResults: maxResults
+            ),
+            total: total
+        )
+    }
+
+    private static func sortNamePathCandidates(
+        _ candidates: [NamePathSortCandidate],
+        ascending: Bool,
+        maxResults: Int
+    ) -> [SearchMatch] {
+        var candidates = candidates
+        candidates.sort {
+            if $0.normalizedName != $1.normalizedName {
+                return ascending ? $0.normalizedName < $1.normalizedName : $0.normalizedName > $1.normalizedName
+            }
+            return $0.path < $1.path
+        }
+        if candidates.count > maxResults {
+            candidates.removeSubrange(maxResults..<candidates.count)
+        }
+        return candidates.map { SearchMatch(rowID: $0.rowID, score: 0) }
     }
 
     private static func indexedCandidateSearch(
@@ -1938,7 +2451,13 @@ public final class FileIndex: @unchecked Sendable {
             guard !distinctBytes.isEmpty else {
                 return nil
             }
-            return snapshot.candidatePathIndices(containingAllBytes: distinctBytes)
+            if let candidates = snapshot.candidatePathIndices(containingAllBytes: distinctBytes) {
+                return candidates
+            }
+            return snapshot.candidatePathIndicesByShortFuzzyComponentExpansion(
+                containing: tokenBytes,
+                shouldCancel: shouldCancel
+            )
         }
 
         return pathSubstringCandidateIndices(
@@ -1958,6 +2477,99 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         return result
+    }
+
+    private static func shortFuzzyPathComponentMatches(_ text: String, tokenBytes: [UInt8]) -> Bool {
+        guard !tokenBytes.isEmpty else { return false }
+
+        var tokenIndex = 0
+        for byte in text.utf8 {
+            if isBoundaryByte(byte) {
+                tokenIndex = 0
+                continue
+            }
+
+            if byte == tokenBytes[tokenIndex] {
+                tokenIndex += 1
+                if tokenIndex == tokenBytes.count {
+                    return true
+                }
+            }
+        }
+
+        return false
+    }
+
+    private static func shortFuzzyNameMatches(_ text: String, tokenBytes: [UInt8]) -> Bool {
+        guard !tokenBytes.isEmpty else { return false }
+        if bytesContainSubsequence(text.utf8, tokenBytes: tokenBytes) {
+            return true
+        }
+
+        var component: [UInt8] = []
+        component.reserveCapacity(min(text.utf8.count, 32))
+
+        func componentHasTypoMatch() -> Bool {
+            guard abs(component.count - tokenBytes.count) <= 1 else {
+                return false
+            }
+            return boundedByteLevenshtein(component, tokenBytes, limit: 1) != nil
+        }
+
+        for byte in text.utf8 {
+            if isBoundaryByte(byte) {
+                if componentHasTypoMatch() {
+                    return true
+                }
+                component.removeAll(keepingCapacity: true)
+            } else {
+                component.append(byte)
+            }
+        }
+
+        return componentHasTypoMatch()
+    }
+
+    private static func bytesContainSubsequence(_ bytes: String.UTF8View, tokenBytes: [UInt8]) -> Bool {
+        var tokenIndex = 0
+        for byte in bytes where byte == tokenBytes[tokenIndex] {
+            tokenIndex += 1
+            if tokenIndex == tokenBytes.count {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func boundedByteLevenshtein(_ lhs: [UInt8], _ rhs: [UInt8], limit: Int) -> Int? {
+        guard abs(lhs.count - rhs.count) <= limit else { return nil }
+
+        var previous = Array(0...rhs.count)
+        var current = Array(repeating: 0, count: rhs.count + 1)
+
+        for row in 1...lhs.count {
+            current[0] = row
+            var rowMinimum = current[0]
+
+            for column in 1...rhs.count {
+                let cost = lhs[row - 1] == rhs[column - 1] ? 0 : 1
+                current[column] = min(
+                    previous[column] + 1,
+                    current[column - 1] + 1,
+                    previous[column - 1] + cost
+                )
+                rowMinimum = min(rowMinimum, current[column])
+            }
+
+            if rowMinimum > limit {
+                return nil
+            }
+
+            swap(&previous, &current)
+        }
+
+        let distance = previous[rhs.count]
+        return distance <= limit ? distance : nil
     }
 
     private static func byteSubsets(_ bytes: [UInt8], count: Int) -> [[UInt8]] {
@@ -2845,6 +3457,38 @@ public final class FileIndex: @unchecked Sendable {
         let previousSnapshot = lock.withLock { searchSnapshot }
         var deletedRows = Set<Int>()
 
+        if
+            deletedPrefixes.isEmpty,
+            shallowDirectoryChildren.isEmpty,
+            let updatedSnapshot = previousSnapshot.updatingMetadata(for: upserts)
+        {
+            let changedPathCount = upserts.count
+            lock.withLock {
+                searchSnapshot = updatedSnapshot
+                searchSnapshotRevision &+= 1
+                status = "Updated \(changedPathCount) changed path\(changedPathCount == 1 ? "" : "s")"
+                phase = .ready
+                indexing = false
+                discoveredCount = updatedSnapshot.count
+                searchableCount = updatedSnapshot.count
+                optimizedCount = updatedSnapshot.isOptimizedForSearch ? updatedSnapshot.count : 0
+                recordsByPath.removeAll(keepingCapacity: false)
+                lastUpdated = Date()
+                completedRefreshBatches &+= 1
+            }
+
+            publishStats()
+            schedulePersist()
+            MemoryTelemetry.log(
+                "refresh.metadataApplied",
+                records: RecordCollectionMetrics(recordCount: updatedSnapshot.count, totalPathBytes: 0, maxPathBytes: 0),
+                structures: updatedSnapshot.diagnostics,
+                refreshBatchSize: paths.count,
+                activeIndexJobs: currentActiveIndexJobCount()
+            )
+            return
+        }
+
         for path in upserts.keys {
             if let rowID = previousSnapshot.store.rowID(forPath: path) {
                 deletedRows.insert(rowID)
@@ -2893,7 +3537,7 @@ public final class FileIndex: @unchecked Sendable {
         schedulePersist()
         MemoryTelemetry.log(
             "refresh.overlayApplied",
-            records: Self.metrics(for: snapshot.store),
+            records: RecordCollectionMetrics(recordCount: snapshot.count, totalPathBytes: 0, maxPathBytes: 0),
             structures: snapshot.diagnostics,
             refreshBatchSize: paths.count,
             activeIndexJobs: currentActiveIndexJobCount()
