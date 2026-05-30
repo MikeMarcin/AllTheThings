@@ -47,6 +47,10 @@ Add project tests for standalone strips, not just the master sheet:
 - body center and foot baseline are exact or near-exact for body-locked fidgets
 - baseline drift is allowed only for clips that intentionally bounce or travel
 
+For operation loops that are part of first-run or long-running work, do not optimize only for static registration. Keep the mascot on model, but preserve character beats: antenna glow, small hands, expressive mouth/cheek moments, prop payoff, and readable foreground action. Use approved idle/fidget strips as the body source when possible, then draw props and expression overlays around that body. Check the loop seam explicitly; the last-to-first visual change should be comparable to ordinary adjacent-frame changes.
+
+Avoid prop colors that match the mascot body detector. Gray papers, gears, shadows, hands, and outlines should use neutral or warm grays rather than blue-gray values, especially when those props touch the mascot body, or body width/center validation can report false drift.
+
 ## Validator
 
 Run the bundled validator from the repo skill directory:
@@ -56,9 +60,9 @@ python3 .codex/skills/sprite-sheet-animation-updater/scripts/validate_sprite_she
   --sheet Resources/NibGeneratedMasterSheet.png \
   --cell-width 160 \
   --cell-height 96 \
-  --columns 10 \
+  --columns 16 \
   --rows 7 \
-  --animations idle:8,indexing:10,searching:10,optimizing:10,file_changed:6,success:8,error:6 \
+  --animations idle:8,indexing:16,searching:10,optimizing:16,file_changed:6,success:8,error:6 \
   --body-color mascot-blue \
   --min-gutter 1 \
   --body-width-range 69:78 \
@@ -84,17 +88,23 @@ The validator checks:
 For this repository's Nib mascot, use:
 
 - runtime asset: `Resources/NibGeneratedMasterSheet.png`
-- sheet size: `1600 x 672`
+- sheet size: `2560 x 672`
 - cell size: `160 x 96`
-- columns: `10`
+- columns: `16`
 - rows/frame counts:
   - `idle`: row 0, 8 frames, loops
-  - `indexing`: row 1, 10 frames, loops
+  - `indexing`: row 1, 16 frames, loops
   - `searching`: row 2, 10 frames, loops
-  - `optimizing`: row 3, 10 frames, loops
+  - `optimizing`: row 3, 16 frames, loops
   - `file_changed`: row 4, 6 frames, one-shot
   - `success`: row 5, 8 frames, one-shot
   - `error`: row 6, 6 frames, one-shot
+
+To regenerate the smoother first-impression operation rows, keep the approved idle body locked and redraw only the props:
+
+```bash
+python3 .codex/skills/sprite-sheet-animation-updater/scripts/generate_allthethings_operation_rows.py --repo-root . --frames 16 --columns 16
+```
 
 After changing the sheet in AllTheThings, run:
 

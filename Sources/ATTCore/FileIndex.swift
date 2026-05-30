@@ -125,6 +125,10 @@ struct FileIndexDiagnostics: Sendable {
     let mappedByteSize: Int
     let heapPageCount: Int
     let overlayCount: Int
+    let columnarSidecarsLoaded: Bool
+    let visibleCount: Int?
+    let visibleModifiedOrderCount: Int
+    let simdTextVerificationEnabled: Bool
     let pathGramIndexEnabled: Bool
     let pathGramKeyCount: Int
     let pathGramPostingCount: Int
@@ -138,7 +142,7 @@ struct FileIndexDiagnostics: Sendable {
 }
 
 public final class FileIndex: @unchecked Sendable {
-    private static let snapshotSchemaVersion = 4
+    private static let snapshotSchemaVersion = 5
     private static let maximumRefreshBatchPaths = 512
     private static let primaryPublishRecordInterval = 25_000
     private static let primaryPublishTimeInterval: TimeInterval = 1
@@ -182,6 +186,7 @@ public final class FileIndex: @unchecked Sendable {
 
     private struct PersistedSearchStructures {
         let modifiedDescending: [Int]?
+        let visibleModifiedDescending: [Int]?
         let nameGramIndex: MappedIntPostingIndex?
         let pathGramIndex: MappedIntPostingIndex?
     }
@@ -200,6 +205,7 @@ public final class FileIndex: @unchecked Sendable {
         let nameGramPostingCount: Int
         let extensionKeyCount: Int
         let extensionPostingCount: Int
+        let simdTextVerificationEnabled: Bool
     }
 
     private enum MemoryTelemetry {
@@ -388,6 +394,8 @@ public final class FileIndex: @unchecked Sendable {
         let store: RecordStore
         let modifiedDescending: [Int]
         let modifiedAscending: [Int]
+        let visibleModifiedDescending: [Int]
+        let visibleModifiedAscending: [Int]
         let gramIndex: MappedIntPostingIndex?
         let nameGramIndex: MappedIntPostingIndex?
         let extensionIndex: [String: [Int32]]
@@ -414,6 +422,12 @@ public final class FileIndex: @unchecked Sendable {
                 let sortedByModified = Self.makeModifiedDescending(store: store)
                 self.modifiedDescending = sortedByModified
                 self.modifiedAscending = Array(sortedByModified.reversed())
+                let visibleSortedByModified = Self.makeVisibleModifiedDescending(
+                    modifiedDescending: sortedByModified,
+                    store: store
+                )
+                self.visibleModifiedDescending = visibleSortedByModified
+                self.visibleModifiedAscending = Array(visibleSortedByModified.reversed())
                 self.hasSortedOrder = true
                 self.diagnostics = Self.makeDiagnostics(
                     pathGramIndexEnabled: buildsPathGramIndex,
@@ -425,11 +439,11 @@ public final class FileIndex: @unchecked Sendable {
                 self.gramIndex = nil
                 self.nameGramIndex = nil
                 self.extensionIndex = [:]
-                self.visibleCount = records.reduce(0) { partial, record in
-                    partial + (record.isHidden ? 0 : 1)
-                }
+                self.visibleCount = Self.makeVisibleCount(store: store)
                 self.modifiedDescending = []
                 self.modifiedAscending = []
+                self.visibleModifiedDescending = []
+                self.visibleModifiedAscending = []
                 self.hasSortedOrder = false
                 self.diagnostics = Self.makeDiagnostics(
                     pathGramIndexEnabled: false,
@@ -453,6 +467,12 @@ public final class FileIndex: @unchecked Sendable {
                 let sortedByModified = Self.makeModifiedDescending(store: store)
                 self.modifiedDescending = sortedByModified
                 self.modifiedAscending = Array(sortedByModified.reversed())
+                let visibleSortedByModified = Self.makeVisibleModifiedDescending(
+                    modifiedDescending: sortedByModified,
+                    store: store
+                )
+                self.visibleModifiedDescending = visibleSortedByModified
+                self.visibleModifiedAscending = Array(visibleSortedByModified.reversed())
                 self.hasSortedOrder = true
                 self.diagnostics = Self.makeDiagnostics(
                     pathGramIndexEnabled: buildsPathGramIndex,
@@ -467,6 +487,8 @@ public final class FileIndex: @unchecked Sendable {
                 self.visibleCount = nil
                 self.modifiedDescending = []
                 self.modifiedAscending = []
+                self.visibleModifiedDescending = []
+                self.visibleModifiedAscending = []
                 self.hasSortedOrder = false
                 self.diagnostics = Self.makeDiagnostics(
                     pathGramIndexEnabled: false,
@@ -488,10 +510,16 @@ public final class FileIndex: @unchecked Sendable {
             if let modifiedDescending = persistedStructures.modifiedDescending, modifiedDescending.count == store.count {
                 self.modifiedDescending = modifiedDescending
                 self.modifiedAscending = Array(modifiedDescending.reversed())
+                let visibleModifiedDescending = persistedStructures.visibleModifiedDescending
+                    ?? Self.makeVisibleModifiedDescending(modifiedDescending: modifiedDescending, store: store)
+                self.visibleModifiedDescending = visibleModifiedDescending
+                self.visibleModifiedAscending = Array(visibleModifiedDescending.reversed())
                 self.hasSortedOrder = true
             } else {
                 self.modifiedDescending = []
                 self.modifiedAscending = []
+                self.visibleModifiedDescending = []
+                self.visibleModifiedAscending = []
                 self.hasSortedOrder = false
             }
 
@@ -515,6 +543,12 @@ public final class FileIndex: @unchecked Sendable {
             self.store = store
             self.modifiedDescending = modifiedDescending
             self.modifiedAscending = Array(modifiedDescending.reversed())
+            let visibleModifiedDescending = Self.makeVisibleModifiedDescending(
+                modifiedDescending: modifiedDescending,
+                store: store
+            )
+            self.visibleModifiedDescending = visibleModifiedDescending
+            self.visibleModifiedAscending = Array(visibleModifiedDescending.reversed())
             self.gramIndex = gramIndex
             self.nameGramIndex = nameGramIndex
             self.extensionIndex = extensionIndex
@@ -647,14 +681,21 @@ public final class FileIndex: @unchecked Sendable {
             store.isHiddenInPath(at: index, cache: &cache)
         }
 
-        func orderedIndices(for sort: SortSpec, queryIsEmpty: Bool) -> [Int]? {
+        func isVisible(at index: Int) -> Bool {
+            store.isVisible(at: index)
+        }
+
+        func orderedIndices(for sort: SortSpec, queryIsEmpty: Bool, includeHidden: Bool) -> [Int]? {
             guard hasSortedOrder else { return nil }
 
             switch sort.column {
             case .modified:
-                return sort.ascending ? modifiedAscending : modifiedDescending
+                if includeHidden {
+                    return sort.ascending ? modifiedAscending : modifiedDescending
+                }
+                return sort.ascending ? visibleModifiedAscending : visibleModifiedDescending
             case .relevance where queryIsEmpty:
-                return modifiedDescending
+                return includeHidden ? modifiedDescending : visibleModifiedDescending
             case .relevance, .name, .path, .created, .size, .fileExtension, .kind, .volume:
                 return nil
             }
@@ -771,25 +812,24 @@ public final class FileIndex: @unchecked Sendable {
                 gramIndex == nil,
                 nameGramIndex != nil,
                 !token.isEmpty,
-                !FileIndex.tokenContainsPathSeparator(token),
-                let componentCandidates = candidateNameIndices(containing: Array(token.utf8))
+                !FileIndex.tokenContainsPathSeparator(token)
             else {
                 return nil
             }
 
+            let componentCandidates = candidateNameIndices(containing: Array(token.utf8)) ?? []
             var directMatches = Set<Int>()
             directMatches.reserveCapacity(componentCandidates.count)
             for candidate in componentCandidates {
                 let rowID = Int(candidate)
                 guard rowID >= 0, rowID < count else { continue }
-                if store.normalizedName(at: rowID).contains(token) {
+                if store.normalizedName(at: rowID, contains: token) {
                     directMatches.insert(rowID)
                 }
             }
 
-            guard !directMatches.isEmpty else { return nil }
-
             var memo = Array(repeating: Int8(-1), count: count)
+            var pathContainsCache: [Int: Bool] = [:]
 
             func pathMatches(at rowID: Int) -> Bool {
                 if directMatches.contains(rowID) {
@@ -806,12 +846,13 @@ public final class FileIndex: @unchecked Sendable {
                     break
                 }
 
-                guard
-                    let parent = store.parentRowID(at: rowID),
-                    parent >= 0,
-                    parent < count,
-                    parent != rowID
-                else {
+                guard let parent = store.parentRowID(at: rowID) else {
+                    let matches = store.normalizedPath(at: rowID, contains: token, cache: &pathContainsCache)
+                    memo[rowID] = matches ? 1 : 0
+                    return matches
+                }
+
+                guard parent >= 0, parent < count, parent != rowID else {
                     memo[rowID] = 0
                     return false
                 }
@@ -960,7 +1001,8 @@ public final class FileIndex: @unchecked Sendable {
                 nameGramKeyCount: nameGramIndex?.keyCount ?? 0,
                 nameGramPostingCount: nameGramIndex?.postingCount ?? 0,
                 extensionKeyCount: extensionIndex.count,
-                extensionPostingCount: extensionIndex.values.reduce(0) { $0 + $1.count }
+                extensionPostingCount: extensionIndex.values.reduce(0) { $0 + $1.count },
+                simdTextVerificationEnabled: true
             )
         }
 
@@ -982,13 +1024,21 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         private static func makeVisibleCount(store: RecordStore) -> Int {
+            if let visibleCount = store.storedVisibleCount {
+                return visibleCount
+            }
+
             var count = 0
 
-            for recordIndex in 0..<store.count where !store.isHidden(at: recordIndex) {
+            for recordIndex in 0..<store.count where store.isVisible(at: recordIndex) {
                 count += 1
             }
 
             return count
+        }
+
+        private static func makeVisibleModifiedDescending(modifiedDescending: [Int], store: RecordStore) -> [Int] {
+            modifiedDescending.filter { store.isVisible(at: $0) }
         }
 
         private static func makeExtensionIndexAndVisibleCount(store: RecordStore) -> (extensionIndex: [String: [Int32]], visibleCount: Int) {
@@ -996,7 +1046,7 @@ public final class FileIndex: @unchecked Sendable {
             var visibleCount = 0
 
             for recordIndex in 0..<store.count {
-                if !store.isHidden(at: recordIndex) {
+                if store.isVisible(at: recordIndex) {
                     visibleCount += 1
                 }
 
@@ -1052,7 +1102,7 @@ public final class FileIndex: @unchecked Sendable {
         let supportDirectory = supportRoot.appendingPathComponent(applicationName, isDirectory: true)
         try? fileManager.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
         self.supportDirectory = supportDirectory
-        self.snapshotURL = supportDirectory.appendingPathComponent("filename-index-v4.attindex", isDirectory: true)
+        self.snapshotURL = supportDirectory.appendingPathComponent("filename-index-v5.attindex", isDirectory: true)
         self.legacyStreamingSnapshotURL = supportDirectory.appendingPathComponent("filename-index-v2.jsonl", isDirectory: false)
         self.legacySnapshotURL = supportDirectory.appendingPathComponent("filename-index.json", isDirectory: false)
         cleanupStaleTemporaryFiles()
@@ -1192,8 +1242,7 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         func appendMatch(rowID: Int, score: Int) {
-            let record = snapshot.view(at: rowID)
-            guard request.includeHidden || !Self.recordIsHidden(record) else { return }
+            guard request.includeHidden || snapshot.isVisible(at: rowID) else { return }
             total += 1
             guard boundedMaxResults > 0 else { return }
             matches.append(SearchMatch(rowID: rowID, score: score))
@@ -1203,7 +1252,11 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         if parsedQuery.isEmpty {
-            if let orderedRecords = snapshot.orderedIndices(for: request.sort, queryIsEmpty: true) {
+            if let orderedRecords = snapshot.orderedIndices(
+                for: request.sort,
+                queryIsEmpty: true,
+                includeHidden: request.includeHidden
+            ) {
                 for (offset, index) in orderedRecords.enumerated() {
                     if offset.isMultiple(of: 512), shouldCancel() {
                         return nil
@@ -1219,8 +1272,7 @@ public final class FileIndex: @unchecked Sendable {
                         return nil
                     }
 
-                    let record = snapshot.view(at: index)
-                    guard request.includeHidden || !record.isHidden else {
+                    guard request.includeHidden || snapshot.isVisible(at: index) else {
                         continue
                     }
 
@@ -1353,62 +1405,36 @@ public final class FileIndex: @unchecked Sendable {
                 candidateSet.insert(rowID)
             }
 
-            let orderedRows = request.sort.ascending ? snapshot.modifiedAscending : snapshot.modifiedDescending
+            let orderedRows: [Int]
+            if request.includeHidden {
+                orderedRows = request.sort.ascending ? snapshot.modifiedAscending : snapshot.modifiedDescending
+            } else {
+                orderedRows = request.sort.ascending ? snapshot.visibleModifiedAscending : snapshot.visibleModifiedDescending
+            }
             var matches: [SearchMatch] = []
             matches.reserveCapacity(min(candidateSet.count, maxResults))
+            var total = 0
 
-            if request.includeHidden {
-                if maxResults > 0 {
-                    for (offset, rowID) in orderedRows.enumerated() {
-                        if offset.isMultiple(of: 512), shouldCancel() {
-                            return nil
-                        }
-                        guard candidateSet.contains(rowID) else { continue }
-                        matches.append(SearchMatch(rowID: rowID, score: 0))
-                        if matches.count >= maxResults {
-                            break
-                        }
-                    }
-                }
-
-                guard candidateSet.count >= max(maxResults, 1) || candidateSet.count > 1_000 else {
+            for (offset, rowID) in orderedRows.enumerated() {
+                if offset.isMultiple(of: 512), shouldCancel() {
                     return nil
                 }
-            } else {
-                var total = 0
-                var hiddenCache: [Int: Bool] = [:]
-                for (offset, rowID) in orderedRows.enumerated() {
-                    if offset.isMultiple(of: 512), shouldCancel() {
-                        return nil
-                    }
-                    guard candidateSet.contains(rowID) else { continue }
+                guard candidateSet.contains(rowID) else { continue }
 
-                    guard !snapshot.isHiddenInPath(at: rowID, cache: &hiddenCache) else { continue }
-
-                    total += 1
-                    if maxResults > 0, matches.count < maxResults {
-                        matches.append(SearchMatch(rowID: rowID, score: 0))
-                    }
+                total += 1
+                if maxResults > 0, matches.count < maxResults {
+                    matches.append(SearchMatch(rowID: rowID, score: 0))
                 }
+            }
 
-                guard total >= max(maxResults, 1) || total > 1_000 else {
-                    return nil
-                }
-
-                guard !shouldCancel() else { return nil }
-                return SearchResponse(
-                    results: materialize(matches, from: snapshot),
-                    totalMatches: total,
-                    elapsed: Date().timeIntervalSince(started),
-                    snapshotRevision: snapshotRevision,
-                    usesIndexedCandidates: true
-                )
+            guard total >= max(maxResults, 1) || total > 1_000 else {
+                return nil
             }
 
             guard !shouldCancel() else { return nil }
             return SearchResponse(
                 results: materialize(matches, from: snapshot),
-                totalMatches: candidateSet.count,
+                totalMatches: total,
                 elapsed: Date().timeIntervalSince(started),
                 snapshotRevision: snapshotRevision,
                 usesIndexedCandidates: true
@@ -1430,7 +1456,6 @@ public final class FileIndex: @unchecked Sendable {
             }
         }
 
-        var hiddenCache: [Int: Bool] = [:]
         for (offset, candidate) in exactPathCandidates.enumerated() {
             if offset.isMultiple(of: 512), shouldCancel() {
                 return nil
@@ -1438,7 +1463,7 @@ public final class FileIndex: @unchecked Sendable {
 
             let rowID = Int(candidate)
             guard rowID >= 0, rowID < snapshot.count else { continue }
-            guard request.includeHidden || !snapshot.isHiddenInPath(at: rowID, cache: &hiddenCache) else { continue }
+            guard request.includeHidden || snapshot.isVisible(at: rowID) else { continue }
 
             total += 1
             guard maxResults > 0 else { continue }
@@ -1528,7 +1553,7 @@ public final class FileIndex: @unchecked Sendable {
             }
 
             let record = snapshot.view(at: index)
-            guard request.includeHidden || !recordIsHidden(record) else {
+            guard request.includeHidden || snapshot.isVisible(at: index) else {
                 continue
             }
             guard let score = FuzzyMatcher.score(record: record, parsedQuery: parsedQuery) else {
@@ -2439,7 +2464,7 @@ public final class FileIndex: @unchecked Sendable {
         )
 
         do {
-            let packageURL = supportDirectory.appendingPathComponent("filename-index-v4-\(UUID().uuidString).attindex.tmp", isDirectory: true)
+            let packageURL = supportDirectory.appendingPathComponent("filename-index-v5-\(UUID().uuidString).attindex.tmp", isDirectory: true)
             let snapshotSettings = lock.withLock {
                 (
                     roots: roots,
@@ -2666,6 +2691,7 @@ public final class FileIndex: @unchecked Sendable {
                 try fileManager.removeItem(at: snapshotURL)
             }
             try fileManager.moveItem(at: packageURL, to: snapshotURL)
+            cleanupLegacySnapshotFiles()
             return true
         } catch {
             failIndexing("Could not install compact index: \(error.localizedDescription)", generation: currentGeneration)
@@ -3018,7 +3044,7 @@ public final class FileIndex: @unchecked Sendable {
 
     private func persistMappedSnapshot(roots: [String], exclusionPatterns: [String], store: RecordStore) throws {
         cleanupStaleTemporaryFiles()
-        let temporaryURL = supportDirectory.appendingPathComponent("filename-index-v4-\(UUID().uuidString).attindex.tmp", isDirectory: true)
+        let temporaryURL = supportDirectory.appendingPathComponent("filename-index-v5-\(UUID().uuidString).attindex.tmp", isDirectory: true)
         defer {
             if fileManager.fileExists(atPath: temporaryURL.path) {
                 try? fileManager.removeItem(at: temporaryURL)
@@ -3037,6 +3063,7 @@ public final class FileIndex: @unchecked Sendable {
             try fileManager.removeItem(at: snapshotURL)
         }
         try fileManager.moveItem(at: temporaryURL, to: snapshotURL)
+        cleanupLegacySnapshotFiles()
     }
 
     private func persistSearchStructures(for snapshot: SearchSnapshot, packageURL: URL) throws {
@@ -3048,6 +3075,16 @@ public final class FileIndex: @unchecked Sendable {
             )
         } else {
             try Data().write(to: modifiedOrderURL, options: .atomic)
+        }
+
+        let visibleModifiedOrderURL = packageURL.appendingPathComponent("visibleModifiedOrder.i32", isDirectory: false)
+        if snapshot.hasSortedOrder {
+            try CompactSearchStructureFiles.writeModifiedOrder(
+                snapshot.visibleModifiedDescending,
+                to: visibleModifiedOrderURL
+            )
+        } else {
+            try Data().write(to: visibleModifiedOrderURL, options: .atomic)
         }
 
         let namePostingsURL = packageURL.appendingPathComponent("namePostings.bin", isDirectory: false)
@@ -3080,24 +3117,37 @@ public final class FileIndex: @unchecked Sendable {
             guard store.count == manifest.recordCount else {
                 throw CocoaError(.fileReadCorruptFile)
             }
+            guard let searchStructures = loadPersistedSearchStructures(packageURL: snapshotURL, store: store) else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
             return LoadedMappedSnapshot(
                 manifest: manifest,
                 store: store,
-                searchStructures: loadPersistedSearchStructures(packageURL: snapshotURL, recordCount: store.count)
+                searchStructures: searchStructures
             )
         } catch {
             try? fileManager.removeItem(at: snapshotURL)
-            MemoryTelemetry.log("snapshot.load.v4Failed", activeIndexJobs: currentActiveIndexJobCount())
+            MemoryTelemetry.log("snapshot.load.v5Failed", activeIndexJobs: currentActiveIndexJobCount())
             return nil
         }
     }
 
-    private func loadPersistedSearchStructures(packageURL: URL, recordCount: Int) -> PersistedSearchStructures {
-        let modifiedDescending = CompactSearchStructureFiles.loadModifiedOrder(
+    private func loadPersistedSearchStructures(packageURL: URL, store: MappedRecordStore) -> PersistedSearchStructures? {
+        guard let modifiedDescending = CompactSearchStructureFiles.loadModifiedOrder(
             from: packageURL.appendingPathComponent("modifiedOrder.bin", isDirectory: false),
-            expectedCount: recordCount,
+            expectedCount: store.count,
             fileManager: fileManager
-        )
+        ) else {
+            return nil
+        }
+        guard let visibleModifiedDescending = CompactSearchStructureFiles.loadModifiedOrder(
+            from: packageURL.appendingPathComponent("visibleModifiedOrder.i32", isDirectory: false),
+            expectedCount: store.storedVisibleCount ?? 0,
+            rowIDUpperBound: store.count,
+            fileManager: fileManager
+        ) else {
+            return nil
+        }
         let nameGramIndex = try? MappedIntPostingIndex.load(
             from: packageURL.appendingPathComponent("namePostings.bin", isDirectory: false),
             fileManager: fileManager
@@ -3109,6 +3159,7 @@ public final class FileIndex: @unchecked Sendable {
 
         return PersistedSearchStructures(
             modifiedDescending: modifiedDescending,
+            visibleModifiedDescending: visibleModifiedDescending,
             nameGramIndex: nameGramIndex ?? nil,
             pathGramIndex: pathGramIndex ?? nil
         )
@@ -3131,6 +3182,7 @@ public final class FileIndex: @unchecked Sendable {
             let isTemporary = name.hasPrefix(".dat.nosync")
                 || (name.hasPrefix("filename-index-v2-") && name.hasSuffix(".jsonl.tmp"))
                 || (name.hasPrefix("filename-index-v4-") && name.hasSuffix(".attindex.tmp"))
+                || (name.hasPrefix("filename-index-v5-") && name.hasSuffix(".attindex.tmp"))
                 || name == "filename-index.json.tmp"
             guard isTemporary else { continue }
 
@@ -3143,6 +3195,20 @@ public final class FileIndex: @unchecked Sendable {
     private func cleanupLegacySnapshotFiles() {
         try? fileManager.removeItem(at: legacyStreamingSnapshotURL)
         try? fileManager.removeItem(at: legacySnapshotURL)
+        try? fileManager.removeItem(at: supportDirectory.appendingPathComponent("filename-index-v4.attindex", isDirectory: true))
+
+        guard let contents = try? fileManager.contentsOfDirectory(
+            at: supportDirectory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsSubdirectoryDescendants]
+        ) else {
+            return
+        }
+
+        for url in contents where url.lastPathComponent.hasPrefix("filename-index-v4-")
+            && url.lastPathComponent.hasSuffix(".attindex.tmp") {
+            try? fileManager.removeItem(at: url)
+        }
     }
 
     private static func shouldBuildPathGramIndex(recordCount: Int, totalPathBytes: Int) -> Bool {
@@ -3211,6 +3277,10 @@ public final class FileIndex: @unchecked Sendable {
                 mappedByteSize: searchSnapshot.store.mappedByteSize,
                 heapPageCount: searchSnapshot.store.heapPageCount,
                 overlayCount: searchSnapshot.store.overlayCount,
+                columnarSidecarsLoaded: searchSnapshot.store.hasColumnarSidecars,
+                visibleCount: searchSnapshot.visibleCount,
+                visibleModifiedOrderCount: searchSnapshot.visibleModifiedDescending.count,
+                simdTextVerificationEnabled: searchSnapshot.diagnostics.simdTextVerificationEnabled,
                 pathGramIndexEnabled: searchSnapshot.diagnostics.pathGramIndexEnabled,
                 pathGramKeyCount: searchSnapshot.diagnostics.pathGramKeyCount,
                 pathGramPostingCount: searchSnapshot.diagnostics.pathGramPostingCount,
