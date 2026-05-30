@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Regenerate AllTheThings Nib operation animation rows.
+"""Regenerate AllTheThings Nib operation animations and intro strip.
 
 This script keeps Nib's approved idle/fidget bodies on model and redraws the
 indexing/optimizing props as longer, smoother loops inside the fixed cell grid.
+It also builds the first-run standalone welcome strip from those same approved
+body frames plus deterministic overlays.
 """
 
 from __future__ import annotations
@@ -21,6 +23,8 @@ ROWS = {
     "optimizing": 3,
 }
 SCALE = 4
+INTRO_FRAME_COUNT = 32
+FLYDOWN_FRAME_COUNT = 10
 
 
 def load_strip(path: Path) -> list[Image.Image]:
@@ -415,6 +419,132 @@ def draw_optimizing_frame(strips: dict[str, list[Image.Image]], frame_index: int
     return canvas
 
 
+def draw_surprised_mouth(canvas: Image.Image, center: tuple[int, int], alpha: float = 1.0) -> None:
+    draw = ImageDraw.Draw(canvas)
+    cx, cy = center
+    draw.ellipse(
+        [cx - 3, cy - 3, cx + 3, cy + 4],
+        fill=(74, 42, 52, int(220 * alpha)),
+    )
+    draw.ellipse(
+        [cx - 1, cy - 1, cx + 1, cy + 2],
+        fill=(120, 62, 74, int(160 * alpha)),
+    )
+
+
+def draw_intro_wave(canvas: Image.Image, phase: float, side: str = "right", alpha: float = 1.0) -> None:
+    wave = sin(phase * 2 * pi)
+    if side == "right":
+        center = (112 + int(round(wave * 2)), 61 + int(round(cos(phase * 2 * pi) * 2)))
+        angle = 20 + wave * 28
+        line_side = "right"
+    else:
+        center = (51 + int(round(wave * 2)), 61 + int(round(cos(phase * 2 * pi) * 2)))
+        angle = -20 - wave * 28
+        line_side = "left"
+
+    draw_mitten(canvas, center, angle=angle, alpha=alpha)
+    draw_motion_lines(canvas, line_side, 0.55 * alpha)
+
+
+def draw_intro_frame(strips: dict[str, list[Image.Image]], frame_index: int, frame_count: int) -> Image.Image:
+    canvas = Image.new("RGBA", (CELL_WIDTH, CELL_HEIGHT), (0, 0, 0, 0))
+    phase = frame_index / frame_count
+    theta = phase * 2 * pi
+    body = strips["idle"][frame_index % len(strips["idle"])]
+
+    paste_alpha(canvas, body, (0, 0))
+    draw_antenna_glow(canvas, 0.22 + 0.28 * smoothstep(sin(theta - pi / 2) * 0.5 + 0.5))
+
+    # The document starts and ends tucked in Nib's hand so the 32-frame strip
+    # loops cleanly after the second wave.
+    if frame_index <= 5:
+        doc_t = 0.0
+    elif frame_index <= 12:
+        doc_t = smoothstep((frame_index - 5) / 7)
+    elif frame_index <= 17:
+        doc_t = 1.0
+    elif frame_index <= 24:
+        doc_t = 1 - smoothstep((frame_index - 17) / 7)
+    else:
+        doc_t = 0.0
+
+    drop_arc = sin(doc_t * pi)
+    doc_x = 95 + 16 * doc_t + 4 * drop_arc
+    doc_y = 58 + 25 * doc_t - 4 * drop_arc
+    doc_angle = -5 + 68 * doc_t + 8 * sin(theta)
+    document = draw_shadowed_document(size=(14, 18), angle=doc_angle, alpha=0.96)
+
+    if frame_index in range(0, 6) or frame_index >= 24:
+        draw_intro_wave(canvas, (frame_index % 8) / 8, side="right", alpha=0.95)
+        draw_mouth(canvas, (82, 65), smile=1.0, alpha=0.9)
+        draw_cheeks(canvas, 0.8)
+        paste_alpha(canvas, document, (int(doc_x - document.width / 2), int(doc_y - document.height / 2)))
+        draw_mitten(canvas, (60, 70), angle=-20, alpha=0.9)
+    elif frame_index <= 13:
+        paste_alpha(canvas, document, (int(doc_x - document.width / 2), int(doc_y - document.height / 2)))
+        draw_surprised_mouth(canvas, (82, 65), alpha=0.85)
+        draw_mitten(canvas, (104, 68 + int(round(doc_t * 6))), angle=35 + doc_t * 20, alpha=0.9)
+        draw_motion_lines(canvas, "right", 0.25)
+    elif frame_index <= 23:
+        paste_alpha(canvas, document, (int(doc_x - document.width / 2), int(doc_y - document.height / 2)))
+        reach = smoothstep((frame_index - 13) / 10)
+        draw_mitten(canvas, (105 + int(round(6 * reach)), 72 + int(round(8 * (1 - doc_t)))), angle=28, alpha=0.95)
+        draw_mitten(canvas, (58, 70), angle=-18, alpha=0.9)
+        if frame_index <= 18:
+            draw_surprised_mouth(canvas, (82, 65), alpha=0.65)
+        else:
+            draw_mouth(canvas, (82, 65), smile=1.0, alpha=0.9)
+            draw_cheeks(canvas, 0.7)
+
+    if frame_index in (4, 5, 24, 25, 26, 27):
+        draw_sparkle(canvas, (124, 42), (frame_index % 8) / 8, max_radius=4)
+        draw_sparkle(canvas, (44, 43), ((frame_index + 4) % 8) / 8, max_radius=3)
+
+    return canvas
+
+
+def draw_flydown_frame(strips: dict[str, list[Image.Image]], frame_index: int, frame_count: int) -> Image.Image:
+    canvas = Image.new("RGBA", (CELL_WIDTH, CELL_HEIGHT), (0, 0, 0, 0))
+    phase = frame_index / max(1, frame_count - 1)
+    flutter = sin(phase * 2 * pi)
+    antenna_cycle = [0, 1, 3, 5, 7, 6, 4, 2, 1, 0]
+    body = strips["antenna"][antenna_cycle[frame_index % len(antenna_cycle)]]
+
+    draw_motion_lines(canvas, "left", 0.35 + 0.25 * smoothstep(phase))
+    draw_motion_lines(canvas, "right", 0.45 + 0.25 * smoothstep(phase))
+    draw_antenna_glow(canvas, 0.35 + 0.35 * smoothstep(sin(phase * pi) * 0.5 + 0.5))
+
+    for index, (base_x, base_y, angle_offset, alpha) in enumerate((
+        (43, 37, -18, 0.46),
+        (119, 35, 15, 0.52),
+        (35, 57, 24, 0.34),
+    )):
+        trail = phase * (9 + index * 4)
+        document = draw_shadowed_document(
+            size=(10 + index * 2, 13 + index * 2),
+            angle=angle_offset + 18 * flutter,
+            alpha=alpha * (1 - 0.25 * phase),
+        )
+        x = base_x + sin(phase * pi * 2 + index) * 4
+        y = base_y - trail
+        paste_alpha(canvas, document, (int(x - document.width / 2), int(y - document.height / 2)))
+
+    paste_alpha(canvas, body, (0, 0))
+    draw_mitten(canvas, (54 + int(round(2 * flutter)), 68), angle=-38 - 12 * smoothstep(phase), alpha=0.95)
+    draw_mitten(canvas, (107 + int(round(2 * flutter)), 68), angle=38 + 12 * smoothstep(phase), alpha=0.95)
+
+    if frame_index < 2:
+        draw_surprised_mouth(canvas, (82, 65), alpha=0.65)
+    else:
+        draw_mouth(canvas, (82, 65), smile=1.0, alpha=0.9)
+        draw_cheeks(canvas, 0.6)
+
+    if frame_index in (2, 3, 6, 7):
+        draw_sparkle(canvas, (127, 43), (frame_index % frame_count) / frame_count, max_radius=3)
+    return canvas
+
+
 def save_contact_sheet(output_path: Path, frames: list[Image.Image]) -> None:
     scale = 2
     gap = 8
@@ -439,13 +569,13 @@ def save_contact_sheet(output_path: Path, frames: list[Image.Image]) -> None:
     background.convert("RGB").save(output_path)
 
 
-def save_preview_gif(output_path: Path, frames: list[Image.Image]) -> None:
+def save_preview_gif(output_path: Path, frames: list[Image.Image], duration_ms: int = 170) -> None:
     preview_frames = []
     for frame in frames:
         background = Image.new("RGBA", (CELL_WIDTH, CELL_HEIGHT), (30, 30, 30, 255))
         background.alpha_composite(frame)
         preview_frames.append(background.convert("P", palette=Image.Palette.ADAPTIVE))
-    preview_frames[0].save(output_path, save_all=True, append_images=preview_frames[1:], duration=170, loop=0, disposal=2)
+    preview_frames[0].save(output_path, save_all=True, append_images=preview_frames[1:], duration=duration_ms, loop=0, disposal=2)
 
 
 def generate(repo_root: Path, frame_count: int, columns: int, write_artifacts: bool) -> None:
@@ -469,6 +599,14 @@ def generate(repo_root: Path, frame_count: int, columns: int, write_artifacts: b
         "indexing": [draw_indexing_frame(strips, index, frame_count) for index in range(frame_count)],
         "optimizing": [draw_optimizing_frame(strips, index, frame_count) for index in range(frame_count)],
     }
+    intro_frames = [
+        draw_intro_frame(strips, index, INTRO_FRAME_COUNT)
+        for index in range(INTRO_FRAME_COUNT)
+    ]
+    flydown_frames = [
+        draw_flydown_frame(strips, index, FLYDOWN_FRAME_COUNT)
+        for index in range(FLYDOWN_FRAME_COUNT)
+    ]
 
     artifact_dir = repo_root / "artifacts" / "mascot-animation" / "operation-row-previews"
     frame_dir = repo_root / "artifacts" / "mascot-animation" / "reference-frames"
@@ -497,9 +635,39 @@ def generate(repo_root: Path, frame_count: int, columns: int, write_artifacts: b
         if write_artifacts:
             strip.save(artifact_dir / f"{name}-strip.png")
             save_contact_sheet(artifact_dir / f"{name}-contact-sheet.png", frames)
-            save_preview_gif(artifact_dir / f"{name}.gif", frames)
+        save_preview_gif(artifact_dir / f"{name}.gif", frames)
 
     updated_sheet.save(sheet_path)
+
+    intro_strip = Image.new("RGBA", (INTRO_FRAME_COUNT * CELL_WIDTH, CELL_HEIGHT), (0, 0, 0, 0))
+    intro_frame_dir = frame_dir / "NibIntroWelcomeStrip"
+    if write_artifacts:
+        intro_frame_dir.mkdir(parents=True, exist_ok=True)
+    for index, frame in enumerate(intro_frames):
+        intro_strip.alpha_composite(frame, (index * CELL_WIDTH, 0))
+        if write_artifacts:
+            frame.save(intro_frame_dir / f"frame-{index:02d}.png")
+    intro_strip.save(resources / "NibIntroWelcomeStrip.png")
+
+    if write_artifacts:
+        intro_strip.save(artifact_dir / "intro-welcome-strip.png")
+        save_contact_sheet(artifact_dir / "intro-welcome-contact-sheet.png", intro_frames)
+        save_preview_gif(artifact_dir / "intro-welcome.gif", intro_frames, duration_ms=250)
+
+    flydown_strip = Image.new("RGBA", (FLYDOWN_FRAME_COUNT * CELL_WIDTH, CELL_HEIGHT), (0, 0, 0, 0))
+    flydown_frame_dir = frame_dir / "NibFlydownStrip"
+    if write_artifacts:
+        flydown_frame_dir.mkdir(parents=True, exist_ok=True)
+    for index, frame in enumerate(flydown_frames):
+        flydown_strip.alpha_composite(frame, (index * CELL_WIDTH, 0))
+        if write_artifacts:
+            frame.save(flydown_frame_dir / f"frame-{index:02d}.png")
+    flydown_strip.save(resources / "NibFlydownStrip.png")
+
+    if write_artifacts:
+        flydown_strip.save(artifact_dir / "flydown-strip.png")
+        save_contact_sheet(artifact_dir / "flydown-contact-sheet.png", flydown_frames)
+        save_preview_gif(artifact_dir / "flydown.gif", flydown_frames, duration_ms=72)
 
 
 def main() -> None:

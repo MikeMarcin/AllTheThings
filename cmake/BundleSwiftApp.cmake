@@ -73,6 +73,8 @@ file(COPY "${SOURCE_DIR}/Resources/NibIdleBlinkFidgetStrip.png" DESTINATION "${A
 file(COPY "${SOURCE_DIR}/Resources/NibIdleAntennaFidgetStrip.png" DESTINATION "${APP_BUNDLE_DIR}/Contents/Resources")
 file(COPY "${SOURCE_DIR}/Resources/NibIdleFileFinderSparkStrip.png" DESTINATION "${APP_BUNDLE_DIR}/Contents/Resources")
 file(COPY "${SOURCE_DIR}/Resources/NibIdleVictoryBounceStrip.png" DESTINATION "${APP_BUNDLE_DIR}/Contents/Resources")
+file(COPY "${SOURCE_DIR}/Resources/NibIntroWelcomeStrip.png" DESTINATION "${APP_BUNDLE_DIR}/Contents/Resources")
+file(COPY "${SOURCE_DIR}/Resources/NibFlydownStrip.png" DESTINATION "${APP_BUNDLE_DIR}/Contents/Resources")
 file(WRITE "${APP_BUNDLE_DIR}/Contents/PkgInfo" "APPL????")
 
 find_program(CODESIGN_EXECUTABLE codesign)
