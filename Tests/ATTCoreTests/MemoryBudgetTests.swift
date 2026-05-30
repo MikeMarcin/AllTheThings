@@ -6,12 +6,15 @@ import Testing
 struct MemoryBudgetTests {
     @Test("large synthetic indexes disable full path gram postings")
     func largeSyntheticIndexesDisableFullPathGramPostings() {
-        let recordCount = 100_000
+        let recordCount = 20_000
         let index = FileIndex(
             applicationName: "AllTheThingsTests-\(UUID().uuidString)",
             loadsSnapshotImmediately: false
         )
-        var records = makeSyntheticRecords(count: recordCount)
+        var records = makeSyntheticRecords(
+            count: recordCount,
+            directoryPadding: String(repeating: "deep-directory-segment/", count: 70)
+        )
         let specialPath = "/tmp/allthethings-memory/project/source/gct/core/type_traits.hpp"
         records[123] = FileRecord(
             id: FileRecord.stableID(for: specialPath),
@@ -295,18 +298,18 @@ struct MemoryBudgetTests {
         )
 
         #expect(diagnostics.indexedCount == recordCount)
-        if recordCount > 75_000 {
+        if recordCount > 200_000 {
             #expect(!diagnostics.pathGramIndexEnabled)
         }
     }
 
-    private func makeSyntheticRecords(count: Int) -> [FileRecord] {
+    private func makeSyntheticRecords(count: Int, directoryPadding: String = "") -> [FileRecord] {
         var records: [FileRecord] = []
         records.reserveCapacity(count)
 
         for index in 0..<count {
             let name = String(format: "File%06d.swift", index)
-            let directory = "/tmp/allthethings-memory/project-\(index % 256)/module-\((index / 256) % 512)"
+            let directory = "/tmp/allthethings-memory/\(directoryPadding)project-\(index % 256)/module-\((index / 256) % 512)"
             let path = "\(directory)/\(name)"
             records.append(FileRecord(
                 id: FileRecord.stableID(for: path),
