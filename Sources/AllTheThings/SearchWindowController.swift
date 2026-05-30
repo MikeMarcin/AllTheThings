@@ -190,6 +190,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private let tableView = FileTableView()
     private let headerMenu = NSMenu()
     private let scrollView = NSScrollView()
+    private let mascotSlotView = NSView()
+    private let mascotImageView = NSImageView()
     private let statusLabel = NSTextField(labelWithString: "")
     private let countLabel = NSTextField(labelWithString: "")
     private let openButton = NSButton()
@@ -200,6 +202,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private let loadingOverlay = ThemedBackgroundView(backgroundColor: NSColor.windowBackgroundColor.withAlphaComponent(0.92))
     private let loadingIndicator = NSProgressIndicator()
     private let loadingLabel = NSTextField(labelWithString: "Loading file list...")
+    private let indexingSetupOverlay = IndexingSetupOverlayView()
 
     private var results: [SearchResult] = []
     private var indexStats: IndexStats
@@ -215,6 +218,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var eventDebounce: DispatchWorkItem?
     private var memoryStatusTask: Task<Void, Never>?
     private var memoryStatusText = ProcessMemoryFormatter.label(for: ProcessMemorySampler.currentUsage())
+    private var mascotCoordinator: OperationMascotCoordinator?
     private var didRequestInitialSnapshotLoad = false
     private var didRequestInitialRebuild = false
     private var highlightsSearchText: Bool
@@ -522,14 +526,19 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         statusLabel.lineBreakMode = .byTruncatingMiddle
         statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
+        configureMascotSlotView()
+        mascotCoordinator = OperationMascotCoordinator(imageView: mascotImageView)
+        footer.addArrangedSubview(mascotSlotView)
         footer.addArrangedSubview(countLabel)
         footer.addArrangedSubview(statusLabel)
+        updateMascotPersistentAnimation()
 
         rootStack.addArrangedSubview(topBar)
         rootStack.addArrangedSubview(setupSuggestionPanel)
         rootStack.addArrangedSubview(scrollView)
         rootStack.addArrangedSubview(footer)
         view.addSubview(rootStack)
+        configureIndexingSetupOverlay()
         configureLoadingOverlay()
 
         NSLayoutConstraint.activate([
@@ -563,22 +572,51 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         updateLoadingOverlay()
     }
 
+    private func configureMascotSlotView() {
+        mascotSlotView.translatesAutoresizingMaskIntoConstraints = false
+        mascotSlotView.wantsLayer = true
+        mascotSlotView.layer?.masksToBounds = false
+        mascotSlotView.setContentHuggingPriority(.required, for: .horizontal)
+        mascotSlotView.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        mascotSlotView.addSubview(mascotImageView)
+        mascotImageView.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            mascotSlotView.widthAnchor.constraint(equalToConstant: OperationMascotCoordinator.layoutSize),
+            mascotSlotView.heightAnchor.constraint(equalToConstant: OperationMascotCoordinator.layoutSize),
+            mascotImageView.centerXAnchor.constraint(equalTo: mascotSlotView.centerXAnchor),
+            mascotImageView.centerYAnchor.constraint(equalTo: mascotSlotView.centerYAnchor)
+        ])
+    }
+
     private func configureSetupSuggestionPanel() {
         setupSuggestionPanel.translatesAutoresizingMaskIntoConstraints = false
+        setupSuggestionPanel.openFullDiskAccessButton.target = self
+        setupSuggestionPanel.openFullDiskAccessButton.action = #selector(openSuggestedFullDiskAccessSettings(_:))
         setupSuggestionPanel.enableGlobalHotKeyButton.target = self
         setupSuggestionPanel.enableGlobalHotKeyButton.action = #selector(enableSuggestedGlobalHotKey(_:))
         setupSuggestionPanel.chooseGlobalHotKeyButton.target = self
         setupSuggestionPanel.chooseGlobalHotKeyButton.action = #selector(chooseSuggestedGlobalHotKey(_:))
-        setupSuggestionPanel.openFullDiskAccessButton.target = self
-        setupSuggestionPanel.openFullDiskAccessButton.action = #selector(openSuggestedFullDiskAccessSettings(_:))
-        setupSuggestionPanel.startIndexingButton.target = self
-        setupSuggestionPanel.startIndexingButton.action = #selector(startSuggestedIndexing(_:))
-        setupSuggestionPanel.chooseIndexedFoldersButton.target = self
-        setupSuggestionPanel.chooseIndexedFoldersButton.action = #selector(chooseSuggestedIndexedFolders(_:))
         setupSuggestionPanel.dismissGlobalHotKeyButton.target = self
         setupSuggestionPanel.dismissGlobalHotKeyButton.action = #selector(dismissSuggestedGlobalHotKey(_:))
         setupSuggestionPanel.dismissFullDiskAccessButton.target = self
         setupSuggestionPanel.dismissFullDiskAccessButton.action = #selector(dismissSuggestedFullDiskAccess(_:))
+    }
+
+    private func configureIndexingSetupOverlay() {
+        indexingSetupOverlay.translatesAutoresizingMaskIntoConstraints = false
+        indexingSetupOverlay.startIndexingButton.target = self
+        indexingSetupOverlay.startIndexingButton.action = #selector(startSuggestedIndexing(_:))
+        indexingSetupOverlay.chooseIndexedFoldersButton.target = self
+        indexingSetupOverlay.chooseIndexedFoldersButton.action = #selector(chooseSuggestedIndexedFolders(_:))
+
+        view.addSubview(indexingSetupOverlay)
+        NSLayoutConstraint.activate([
+            indexingSetupOverlay.topAnchor.constraint(equalTo: scrollView.topAnchor),
+            indexingSetupOverlay.leadingAnchor.constraint(equalTo: scrollView.leadingAnchor),
+            indexingSetupOverlay.trailingAnchor.constraint(equalTo: scrollView.trailingAnchor),
+            indexingSetupOverlay.bottomAnchor.constraint(equalTo: scrollView.bottomAnchor)
+        ])
     }
 
     private func updateSetupSuggestions() {
@@ -587,9 +625,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let needsFullDiskAccess = !defaults.bool(forKey: AppSettings.fullDiskAccessOnboardingShownKey)
             && (needsIndexingSetup || !FullDiskAccessController.protectedDefaultFoldersCovered(by: indexedRoots).isEmpty)
 
+        indexingSetupOverlay.isHidden = !needsIndexingSetup
         setupSuggestionPanel.update(
             hotKey: AppSettings.globalSearchHotKey(defaults: defaults),
-            needsIndexingSetup: needsIndexingSetup,
             needsGlobalHotKey: needsGlobalHotKey,
             needsFullDiskAccess: needsFullDiskAccess
         )
@@ -818,6 +856,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         activeSearchToken?.cancel()
         let token = SearchCancellationToken()
         activeSearchToken = token
+        updateMascotPersistentAnimation()
 
         queryGeneration &+= 1
         let generation = queryGeneration
@@ -829,6 +868,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.queryGeneration == generation, self.activeSearchToken === token else { return }
+                self.activeSearchToken = nil
                 self.results = response.results
                 self.totalMatches = response.totalMatches
                 self.queryElapsed = response.elapsed
@@ -836,12 +876,15 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                 self.updateStatus(refreshesMemory: true)
                 self.updateLoadingOverlay()
                 self.updateActionButtons()
+                self.updateMascotPersistentAnimation()
             }
         }
     }
 
     private func handleStatsChanged(_ stats: IndexStats) {
+        let previousPhase = indexStats.phase
         indexStats = stats
+        handleMascotTransition(from: previousPhase, to: stats.phase)
         updateStatus(refreshesMemory: true)
         updateLoadingOverlay()
 
@@ -928,6 +971,41 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
     }
 
+    private func handleMascotTransition(from previousPhase: IndexPhase, to nextPhase: IndexPhase) {
+        updateMascotPersistentAnimation()
+
+        if nextPhase == .failed {
+            playMascotTransient(.error)
+            return
+        }
+
+        let completedPhases: Set<IndexPhase> = [.scanning, .optimizing, .saving]
+        if completedPhases.contains(previousPhase), nextPhase == .ready {
+            playMascotTransient(.success)
+        }
+    }
+
+    private func updateMascotPersistentAnimation() {
+        mascotCoordinator?.setPersistentAnimation(persistentMascotAnimation())
+    }
+
+    private func playMascotTransient(_ animation: OperationMascotAnimation) {
+        mascotCoordinator?.playTransient(animation)
+    }
+
+    private func persistentMascotAnimation() -> OperationMascotAnimation {
+        switch indexStats.phase {
+        case .loading, .scanning:
+            return .indexing
+        case .optimizing, .saving:
+            return .optimizing
+        case .idle, .ready, .failed:
+            break
+        }
+
+        return activeSearchToken == nil ? .idle : .searching
+    }
+
     private func currentSearchText() -> String {
         searchField.currentEditor()?.string ?? searchField.stringValue
     }
@@ -981,6 +1059,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     private func rebuildIndexForCurrentSettings() {
         activeSearchToken?.cancel()
+        activeSearchToken = nil
         scheduledSearchSignature = nil
         results.removeAll(keepingCapacity: true)
         totalMatches = 0
@@ -989,6 +1068,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         updateStatus()
         updateLoadingOverlay()
         updateActionButtons()
+        updateMascotPersistentAnimation()
 
         guard AppSettings.indexedRootsConfigured(defaults: defaults) else {
             updateStatus()
@@ -1038,6 +1118,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             guard let self else { return }
             let paths = Array(self.pendingEventPaths)
             self.pendingEventPaths.removeAll(keepingCapacity: false)
+            guard !paths.isEmpty else { return }
+            self.playMascotTransient(.fileChanged)
             self.index.refresh(paths: paths)
         }
 
@@ -1074,7 +1156,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         guard AppSettings.indexedRootsConfigured(defaults: defaults) else {
             countLabel.stringValue = "0 shown / 0 matches • 0 indexed • 0 ms"
-            statusLabel.stringValue = "Setup needed • Start indexing or choose folders • \(memoryStatusText)"
+            statusLabel.stringValue = "Setup needed • Choose what AllTheThings can search • \(memoryStatusText)"
             return
         }
 
@@ -1347,6 +1429,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
 
         if !changedPaths.isEmpty {
+            playMascotTransient(.fileChanged)
             index.refresh(paths: changedPaths)
             scheduleSearch(force: true)
         }
@@ -1411,6 +1494,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         do {
             try FileManager.default.moveItem(at: record.url, to: destination)
+            playMascotTransient(.fileChanged)
             index.refresh(paths: [record.path, destination.path])
             scheduleSearch(force: true)
         } catch {
@@ -1508,6 +1592,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func presentError(_ message: String, informativeText: String) {
+        playMascotTransient(.error)
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = message
@@ -1570,43 +1655,105 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 }
 
-private final class SetupSuggestionPanelView: NSView {
+private final class IndexingSetupOverlayView: NSView {
     let startIndexingButton = NSButton()
     let chooseIndexedFoldersButton = NSButton()
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+
+        isHidden = true
+
+        let iconView = NSImageView()
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+        iconView.image = NSImage(systemSymbolName: "folder.badge.plus", accessibilityDescription: "Get started")
+        iconView.contentTintColor = .secondaryLabelColor
+
+        let titleLabel = NSTextField(labelWithString: "Get Started")
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        titleLabel.font = .systemFont(ofSize: 17, weight: .semibold)
+        titleLabel.textColor = .labelColor
+        titleLabel.alignment = .center
+
+        let detailLabel = NSTextField(labelWithString: """
+        Indexing lets AllTheThings discover files in selected folders,
+        so filename and path searches can show results.
+        Start with the default folders, or choose your own.
+        """)
+        detailLabel.translatesAutoresizingMaskIntoConstraints = false
+        detailLabel.font = .systemFont(ofSize: 13)
+        detailLabel.textColor = .secondaryLabelColor
+        detailLabel.alignment = .center
+        detailLabel.lineBreakMode = .byWordWrapping
+        detailLabel.maximumNumberOfLines = 3
+
+        let buttonStack = NSStackView(views: [
+            Self.configureActionButton(startIndexingButton, title: "Start Indexing", symbolName: "play.circle"),
+            Self.configureActionButton(chooseIndexedFoldersButton, title: "Choose Folders...", symbolName: "folder")
+        ])
+        buttonStack.translatesAutoresizingMaskIntoConstraints = false
+        buttonStack.orientation = .horizontal
+        buttonStack.alignment = .centerY
+        buttonStack.spacing = 8
+
+        let stack = NSStackView(views: [iconView, titleLabel, detailLabel, buttonStack])
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = 10
+
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.centerXAnchor.constraint(equalTo: centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: centerYAnchor),
+            stack.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 32),
+            stack.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -32),
+
+            iconView.widthAnchor.constraint(equalToConstant: 34),
+            iconView.heightAnchor.constraint(equalToConstant: 34),
+            detailLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 620)
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    @discardableResult
+    private static func configureActionButton(_ button: NSButton, title: String, symbolName: String) -> NSButton {
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.title = title
+        button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: title)
+        button.imagePosition = .imageLeading
+        button.bezelStyle = .rounded
+        button.controlSize = .regular
+        button.font = .systemFont(ofSize: 13, weight: .regular)
+        button.setContentHuggingPriority(.required, for: .horizontal)
+        button.setContentCompressionResistancePriority(.required, for: .horizontal)
+        return button
+    }
+}
+
+private final class SetupSuggestionPanelView: NSView {
     let enableGlobalHotKeyButton = NSButton()
     let chooseGlobalHotKeyButton = NSButton()
     let openFullDiskAccessButton = NSButton()
     let dismissGlobalHotKeyButton = NSButton()
     let dismissFullDiskAccessButton = NSButton()
 
-    private let indexingRow = NSView()
     private let globalHotKeyRow = NSView()
     private let fullDiskAccessRow = NSView()
-    private let indexingSeparator = SetupSuggestionSeparatorView()
     private let globalHotKeySeparator = SetupSuggestionSeparatorView()
     private let globalHotKeyDetailLabel = NSTextField(labelWithString: "")
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
 
-        let indexingTitleLabel = Self.makeTitleLabel("Start indexing")
-        let indexingDetailLabel = Self.makeDetailLabel(
-            "AllTheThings can index Desktop, Documents, Downloads, Developer, and Applications by default. You can change these folders later in Settings."
-        )
         let globalHotKeyTitleLabel = Self.makeTitleLabel("Global search hotkey")
         let fullDiskAccessTitleLabel = Self.makeTitleLabel("Full Disk Access")
         let fullDiskAccessDetailLabel = Self.makeDetailLabel(
             "Grant access before indexing protected folders to avoid macOS prompts."
-        )
-        Self.configureSuggestionRow(
-            indexingRow,
-            symbolName: "folder.badge.plus",
-            titleLabel: indexingTitleLabel,
-            detailLabel: indexingDetailLabel,
-            buttons: [
-                Self.configureActionButton(startIndexingButton, title: "Start Indexing", symbolName: "play.circle"),
-                Self.configureActionButton(chooseIndexedFoldersButton, title: "Choose Folders...", symbolName: "folder")
-            ]
         )
         Self.configureSuggestionRow(
             globalHotKeyRow,
@@ -1637,8 +1784,6 @@ private final class SetupSuggestionPanelView: NSView {
         updateThemeColors()
 
         let rowsStack = NSStackView(views: [
-            indexingRow,
-            indexingSeparator,
             globalHotKeyRow,
             globalHotKeySeparator,
             fullDiskAccessRow
@@ -1655,7 +1800,6 @@ private final class SetupSuggestionPanelView: NSView {
             rowsStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
             rowsStack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
             rowsStack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
-            indexingSeparator.heightAnchor.constraint(equalToConstant: 2),
             globalHotKeySeparator.heightAnchor.constraint(equalToConstant: 2)
         ])
     }
@@ -1672,17 +1816,14 @@ private final class SetupSuggestionPanelView: NSView {
 
     func update(
         hotKey: GlobalHotKey,
-        needsIndexingSetup: Bool,
         needsGlobalHotKey: Bool,
         needsFullDiskAccess: Bool
     ) {
         globalHotKeyDetailLabel.stringValue = "Use \(hotKey.displayString) to open search from anywhere."
-        indexingRow.isHidden = !needsIndexingSetup
         globalHotKeyRow.isHidden = !needsGlobalHotKey
         fullDiskAccessRow.isHidden = !needsFullDiskAccess
-        indexingSeparator.isHidden = !needsIndexingSetup || (!needsGlobalHotKey && !needsFullDiskAccess)
         globalHotKeySeparator.isHidden = !needsGlobalHotKey || !needsFullDiskAccess
-        isHidden = !needsIndexingSetup && !needsGlobalHotKey && !needsFullDiskAccess
+        isHidden = !needsGlobalHotKey && !needsFullDiskAccess
     }
 
     private func updateThemeColors() {
