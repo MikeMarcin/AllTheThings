@@ -25,9 +25,9 @@ enum OperationMascotAnimation: String, CaseIterable {
     var frameCount: Int {
         switch self {
         case .idle: 8
-        case .indexing: 10
+        case .indexing: 16
         case .searching: 10
-        case .optimizing: 10
+        case .optimizing: 16
         case .fileChanged: 6
         case .success: 8
         case .error: 6
@@ -318,7 +318,7 @@ struct OperationMascotAnimationController {
 final class MascotSpriteSheet {
     static let shared = MascotSpriteSheet()
 
-    private static let columnCount = 10
+    private static let columnCount = 16
     private static let rowCount = 7
 
     private let frames: [OperationMascotAnimation: [NSImage]]
@@ -353,6 +353,10 @@ final class MascotSpriteSheet {
 
         let wrappedIndex = ((index % animationFrames.count) + animationFrames.count) % animationFrames.count
         return animationFrames[wrappedIndex]
+    }
+
+    func loadedFrameCount(for animation: OperationMascotAnimation) -> Int {
+        frames[animation]?.count ?? 0
     }
 
     func frame(for idleClip: OperationMascotIdleClip, index: Int) -> NSImage? {

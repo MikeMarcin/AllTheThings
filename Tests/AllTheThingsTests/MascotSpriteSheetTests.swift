@@ -17,9 +17,9 @@ struct MascotSpriteSheetTests {
         #expect(OperationMascotAnimation.error.row == 6)
 
         #expect(OperationMascotAnimation.idle.frameCount == 8)
-        #expect(OperationMascotAnimation.indexing.frameCount == 10)
+        #expect(OperationMascotAnimation.indexing.frameCount == 16)
         #expect(OperationMascotAnimation.searching.frameCount == 10)
-        #expect(OperationMascotAnimation.optimizing.frameCount == 10)
+        #expect(OperationMascotAnimation.optimizing.frameCount == 16)
         #expect(OperationMascotAnimation.fileChanged.frameCount == 6)
         #expect(OperationMascotAnimation.success.frameCount == 8)
         #expect(OperationMascotAnimation.error.frameCount == 6)
@@ -174,8 +174,11 @@ struct MascotSpriteSheetTests {
     func spriteSheetSlicesAllAnimationFrames() throws {
         let url = try #require(spriteSheetURL())
         let sheet = MascotSpriteSheet(imageURL: url)
+        let expectedFrameSize = NSSize(width: 160, height: 96)
 
         for animation in OperationMascotAnimation.allCases {
+            #expect(sheet.loadedFrameCount(for: animation) == animation.frameCount)
+
             let first = try #require(sheet.frame(for: animation, index: 0))
             let wrapped = try #require(sheet.frame(for: animation, index: animation.frameCount))
             let negative = try #require(sheet.frame(for: animation, index: -1))
@@ -183,8 +186,9 @@ struct MascotSpriteSheetTests {
             #expect(first.isValid)
             #expect(wrapped.isValid)
             #expect(negative.isValid)
-            #expect(first.size.width > 0)
-            #expect(first.size.height > 0)
+            #expect(first.size == expectedFrameSize)
+            #expect(wrapped.size == expectedFrameSize)
+            #expect(negative.size == expectedFrameSize)
         }
     }
 
@@ -249,7 +253,7 @@ struct MascotSpriteSheetTests {
 
         let cellWidth = 160
         let cellHeight = 96
-        #expect(bitmap.pixelsWide == cellWidth * 10)
+        #expect(bitmap.pixelsWide == cellWidth * 16)
         #expect(bitmap.pixelsHigh == cellHeight * 7)
 
         for animation in OperationMascotAnimation.allCases {

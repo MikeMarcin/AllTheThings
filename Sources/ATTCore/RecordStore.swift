@@ -13,6 +13,8 @@ protocol RecordStore: AnyObject, Sendable {
     var mappedByteSize: Int { get }
     var heapPageCount: Int { get }
     var overlayCount: Int { get }
+    var hasColumnarSidecars: Bool { get }
+    var storedVisibleCount: Int? { get }
 
     func record(at index: Int) -> FileRecord
     func view(at index: Int) -> RecordSearchView
@@ -32,7 +34,9 @@ protocol RecordStore: AnyObject, Sendable {
     func normalizedName(at index: Int) -> String
     func normalizedPath(at index: Int) -> String
     func parentRowID(at index: Int) -> Int?
+    func isVisible(at index: Int) -> Bool
     func normalizedPath(at index: Int, contains token: String, cache: inout [Int: Bool]) -> Bool
+    func normalizedName(at index: Int, contains token: String) -> Bool
     func isHiddenInPath(at index: Int, cache: inout [Int: Bool]) -> Bool
 }
 
@@ -63,6 +67,8 @@ extension RecordStore {
     var mappedByteSize: Int { 0 }
     var heapPageCount: Int { 0 }
     var overlayCount: Int { 0 }
+    var hasColumnarSidecars: Bool { false }
+    var storedVisibleCount: Int? { nil }
 
     func view(at index: Int) -> RecordSearchView {
         RecordSearchView(store: self, rowID: index)
@@ -91,6 +97,11 @@ extension RecordStore {
         return rowID(forPath: record.directoryPath)
     }
 
+    func isVisible(at index: Int) -> Bool {
+        var cache: [Int: Bool] = [:]
+        return !isHiddenInPath(at: index, cache: &cache)
+    }
+
     func normalizedPath(at index: Int, contains token: String, cache: inout [Int: Bool]) -> Bool {
         if let cached = cache[index] {
             return cached
@@ -103,14 +114,20 @@ extension RecordStore {
         return containsToken
     }
 
+    func normalizedName(at index: Int, contains token: String) -> Bool {
+        normalizedName(at: index).contains(token)
+    }
+
     func isHiddenInPath(at index: Int, cache: inout [Int: Bool]) -> Bool {
         if let cached = cache[index] {
             return cached
         }
 
         let record = record(at: index)
-        let hidden = record.isHidden || FileRecord.pathIsHidden(record.path)
-        if record.isDirectory {
+        let parent = parentRowID(at: index)
+        let hidden = record.isHidden
+            || (parent.map { $0 != index && isHiddenInPath(at: $0, cache: &cache) } ?? false)
+        if record.isDirectory || parent == nil {
             cache[index] = hidden
         }
         return hidden
@@ -415,23 +432,36 @@ final class MappedRecordStore: RecordStore {
     private let recordsData: Data
     private let stringsData: Data
     private let pathLookupData: Data
+    private let parentData: Data
+    private let flagsData: Data
+    private let visibleData: Data
     private let extensions: [String]
     private let volumes: [String]
+    private let visibleCount: Int
     private let cache = PathMaterializationCache(limit: 16_384)
 
     var mappedByteSize: Int {
         recordsData.count + stringsData.count + pathLookupData.count
+            + parentData.count + flagsData.count + visibleData.count
     }
+    var hasColumnarSidecars: Bool { true }
+    var storedVisibleCount: Int? { visibleCount }
 
     init(packageURL: URL) throws {
         let recordsURL = packageURL.appendingPathComponent("records.bin", isDirectory: false)
         let stringsURL = packageURL.appendingPathComponent("strings.bin", isDirectory: false)
         let internsURL = packageURL.appendingPathComponent("interns.bin", isDirectory: false)
         let lookupURL = packageURL.appendingPathComponent("pathLookup.bin", isDirectory: false)
+        let parentURL = packageURL.appendingPathComponent("parent.i32", isDirectory: false)
+        let flagsURL = packageURL.appendingPathComponent("flags.u8", isDirectory: false)
+        let visibleURL = packageURL.appendingPathComponent("visible.bitset", isDirectory: false)
 
         self.recordsData = try Data(contentsOf: recordsURL, options: [.mappedIfSafe])
         self.stringsData = try Data(contentsOf: stringsURL, options: [.mappedIfSafe])
         self.pathLookupData = try Data(contentsOf: lookupURL, options: [.mappedIfSafe])
+        self.parentData = try Data(contentsOf: parentURL, options: [.mappedIfSafe])
+        self.flagsData = try Data(contentsOf: flagsURL, options: [.mappedIfSafe])
+        self.visibleData = try Data(contentsOf: visibleURL, options: [.mappedIfSafe])
 
         guard
             recordsData.count >= Self.recordsHeaderSize,
@@ -446,6 +476,14 @@ final class MappedRecordStore: RecordStore {
             throw CocoaError(.fileReadCorruptFile)
         }
         self.count = rowCount
+        guard
+            parentData.count == rowCount * 4,
+            flagsData.count == rowCount,
+            visibleData.count == Self.bitsetByteCount(for: rowCount)
+        else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        self.visibleCount = Self.countVisibleRows(in: visibleData, rowCount: rowCount)
 
         guard
             pathLookupData.count >= Self.pathLookupHeaderSize,
@@ -519,7 +557,7 @@ final class MappedRecordStore: RecordStore {
 
     func recordID(at index: Int) -> UInt64 { readRow(index).id }
     func parentRowID(at index: Int) -> Int? {
-        let parent = recordsData.readInt32LE(at: rowOffset(for: index) + 8)
+        let parent = parentData.readInt32LE(at: columnOffset(for: index, stride: 4))
         return parent >= 0 ? Int(parent) : nil
     }
 
@@ -569,12 +607,23 @@ final class MappedRecordStore: RecordStore {
         let row = readRow(index)
         return row.flags & 4 == 0 ? nil : TimeInterval(bitPattern: row.createdBits)
     }
-    func isDirectory(at index: Int) -> Bool { readRow(index).flags & 1 != 0 }
-    func isHidden(at index: Int) -> Bool { readRow(index).flags & 2 != 0 }
+    func isDirectory(at index: Int) -> Bool { flagsByte(at: index) & 1 != 0 }
+    func isHidden(at index: Int) -> Bool { flagsByte(at: index) & 2 != 0 }
+    func isVisible(at index: Int) -> Bool {
+        precondition(index >= 0 && index < count, "Record index \(index) is out of bounds")
+        return Self.bitsetValue(in: visibleData, at: index)
+    }
     func volumeName(at index: Int) -> String { intern(volumes, id: readRow(index).volumeID) }
     func normalizedName(at index: Int) -> String {
         let row = readRow(index)
         return string(offset: row.normalizedNameOffset, length: row.normalizedNameLength)
+    }
+    func normalizedName(at index: Int, contains token: String) -> Bool {
+        guard !token.isEmpty else { return false }
+        let offset = rowOffset(for: index)
+        let lower = Int(recordsData.readUInt64LE(at: offset + 52))
+        let length = Int(recordsData.readUInt32LE(at: offset + 60))
+        return stringsData.containsBytes(Array(token.utf8), in: lower..<(lower + length))
     }
     func normalizedPath(at index: Int) -> String {
         if let cached = cache.normalizedPath(for: index) {
@@ -625,19 +674,7 @@ final class MappedRecordStore: RecordStore {
     }
 
     func isHiddenInPath(at index: Int, cache: inout [Int: Bool]) -> Bool {
-        if let cached = cache[index] {
-            return cached
-        }
-
-        let offset = rowOffset(for: index)
-        let parent = recordsData.readInt32LE(at: offset + 8)
-        let flags = recordsData.readUInt32LE(at: offset + 12)
-        let hidden = flags & 2 != 0 || (parent >= 0 && isHiddenInPath(at: Int(parent), cache: &cache))
-
-        if flags & 1 != 0 || parent < 0 {
-            cache[index] = hidden
-        }
-        return hidden
+        !isVisible(at: index)
     }
 
     private func readRow(_ index: Int) -> Row {
@@ -665,6 +702,15 @@ final class MappedRecordStore: RecordStore {
     private func rowOffset(for index: Int) -> Int {
         precondition(index >= 0 && index < count, "Record index \(index) is out of bounds")
         return Self.recordsHeaderSize + index * Self.rowSize
+    }
+
+    private func columnOffset(for index: Int, stride: Int) -> Int {
+        precondition(index >= 0 && index < count, "Record index \(index) is out of bounds")
+        return index * stride
+    }
+
+    private func flagsByte(at index: Int) -> UInt8 {
+        flagsData[columnOffset(for: index, stride: 1)]
     }
 
     private func readLookupEntry(_ index: Int) -> PathLookupEntry {
@@ -734,7 +780,7 @@ final class MappedRecordStore: RecordStore {
         try fileManager.createDirectory(at: packageURL, withIntermediateDirectories: true)
 
         let manifest = CompactSnapshotManifest(
-            schemaVersion: 4,
+            schemaVersion: 5,
             savedAt: savedAt,
             roots: roots,
             exclusionPatterns: exclusionPatterns,
@@ -763,6 +809,9 @@ final class MappedRecordStore: RecordStore {
         let stringsURL = packageURL.appendingPathComponent("strings.bin", isDirectory: false)
         let recordsURL = packageURL.appendingPathComponent("records.bin", isDirectory: false)
         let lookupURL = packageURL.appendingPathComponent("pathLookup.bin", isDirectory: false)
+        let parentURL = packageURL.appendingPathComponent("parent.i32", isDirectory: false)
+        let flagsURL = packageURL.appendingPathComponent("flags.u8", isDirectory: false)
+        let visibleURL = packageURL.appendingPathComponent("visible.bitset", isDirectory: false)
 
         guard
             fileManager.createFile(atPath: stringsURL.path, contents: nil),
@@ -806,6 +855,14 @@ final class MappedRecordStore: RecordStore {
 
         var lookupEntries: [(hash: UInt64, rowID: Int32)] = []
         lookupEntries.reserveCapacity(records.count)
+        var parentColumn = Data()
+        parentColumn.reserveCapacity(records.count * 4)
+        var flagColumn = Data()
+        flagColumn.reserveCapacity(records.count)
+        var parents: [Int32] = []
+        parents.reserveCapacity(records.count)
+        var flagBytes: [UInt8] = []
+        flagBytes.reserveCapacity(records.count)
 
         for (index, record) in records.enumerated() {
             try autoreleasepool {
@@ -815,15 +872,16 @@ final class MappedRecordStore: RecordStore {
                 let baseDirectory: (offset: UInt64, length: UInt32) = parent >= 0 ? (0, 0) : try appendString(record.directoryPath)
                 let normalizedDirectory: (offset: UInt64, length: UInt32) = parent >= 0 ? (0, 0) : try appendString(FuzzyMatcher.normalize(record.directoryPath))
 
-                var flags: UInt32 = 0
-                if record.isDirectory { flags |= 1 }
-                if record.isHidden { flags |= 2 }
-                if record.createdTime != nil { flags |= 4 }
+                var rowFlags: UInt32 = 0
+                if record.isDirectory { rowFlags |= 1 }
+                if record.isHidden { rowFlags |= 2 }
+                if record.createdTime != nil { rowFlags |= 4 }
+                let packedFlags = UInt8(truncatingIfNeeded: rowFlags)
 
                 var row = Data()
                 row.appendUInt64LE(record.id)
                 row.appendInt32LE(parent)
-                row.appendUInt32LE(flags)
+                row.appendUInt32LE(rowFlags)
                 row.appendUInt64LE(record.sizeBytes)
                 row.appendUInt64LE(record.modifiedTime.bitPattern)
                 row.appendUInt64LE((record.createdTime ?? 0).bitPattern)
@@ -842,8 +900,16 @@ final class MappedRecordStore: RecordStore {
                 precondition(row.count == Self.rowSize)
                 try recordsHandle.write(contentsOf: row)
                 lookupEntries.append((FileRecord.stableID(for: record.path), Int32(index)))
+                parentColumn.appendInt32LE(parent)
+                flagColumn.append(packedFlags)
+                parents.append(parent)
+                flagBytes.append(packedFlags)
             }
         }
+
+        try parentColumn.write(to: parentURL, options: .atomic)
+        try flagColumn.write(to: flagsURL, options: .atomic)
+        try makeVisibleBitset(parents: parents, flags: flagBytes).write(to: visibleURL, options: .atomic)
 
         lookupEntries.sort {
             if $0.hash != $1.hash { return $0.hash < $1.hash }
@@ -869,6 +935,59 @@ final class MappedRecordStore: RecordStore {
         try Data().write(to: packageURL.appendingPathComponent("namePostings.bin", isDirectory: false))
         try Data().write(to: packageURL.appendingPathComponent("pathPostings.bin", isDirectory: false))
         try Data().write(to: packageURL.appendingPathComponent("extensionPostings.bin", isDirectory: false))
+    }
+
+    private static func bitsetByteCount(for bitCount: Int) -> Int {
+        (bitCount + 7) / 8
+    }
+
+    private static func bitsetValue(in data: Data, at index: Int) -> Bool {
+        let byte = data[index / 8]
+        return byte & (UInt8(1) << UInt8(index % 8)) != 0
+    }
+
+    private static func setBit(in data: inout Data, at index: Int) {
+        let byteIndex = index / 8
+        let mask = UInt8(1) << UInt8(index % 8)
+        data[byteIndex] |= mask
+    }
+
+    private static func countVisibleRows(in data: Data, rowCount: Int) -> Int {
+        guard rowCount > 0 else { return 0 }
+
+        var count = 0
+        for rowID in 0..<rowCount where bitsetValue(in: data, at: rowID) {
+            count += 1
+        }
+        return count
+    }
+
+    private static func makeVisibleBitset(parents: [Int32], flags: [UInt8]) -> Data {
+        precondition(parents.count == flags.count)
+
+        var memo = Array(repeating: Int8(-1), count: parents.count)
+        func isHiddenInPath(_ rowID: Int) -> Bool {
+            switch memo[rowID] {
+            case 0:
+                return false
+            case 1:
+                return true
+            default:
+                break
+            }
+
+            let parent = parents[rowID]
+            let hidden = flags[rowID] & 2 != 0
+                || (parent >= 0 && Int(parent) != rowID && isHiddenInPath(Int(parent)))
+            memo[rowID] = hidden ? 1 : 0
+            return hidden
+        }
+
+        var data = Data(repeating: 0, count: bitsetByteCount(for: parents.count))
+        for rowID in 0..<parents.count where !isHiddenInPath(rowID) {
+            setBit(in: &data, at: rowID)
+        }
+        return data
     }
 
     private static func sortedInterns(_ ids: [String: UInt32]) -> [String] {
@@ -1033,8 +1152,14 @@ enum CompactSearchStructureFiles {
     private static let modifiedOrderVersion: UInt32 = 1
     private static let modifiedOrderHeaderSize = 24
 
-    static func loadModifiedOrder(from url: URL, expectedCount: Int, fileManager: FileManager = .default) -> [Int]? {
-        guard expectedCount >= 0, fileManager.fileExists(atPath: url.path) else {
+    static func loadModifiedOrder(
+        from url: URL,
+        expectedCount: Int,
+        rowIDUpperBound: Int? = nil,
+        fileManager: FileManager = .default
+    ) -> [Int]? {
+        let rowIDUpperBound = rowIDUpperBound ?? expectedCount
+        guard expectedCount >= 0, rowIDUpperBound >= expectedCount, fileManager.fileExists(atPath: url.path) else {
             return nil
         }
 
@@ -1057,7 +1182,7 @@ enum CompactSearchStructureFiles {
 
         for index in 0..<expectedCount {
             let rowID = Int(data.readInt32LE(at: modifiedOrderHeaderSize + index * 4))
-            guard rowID >= 0, rowID < expectedCount, seen.insert(rowID).inserted else {
+            guard rowID >= 0, rowID < rowIDUpperBound, seen.insert(rowID).inserted else {
                 return nil
             }
             order.append(rowID)
@@ -1196,5 +1321,73 @@ private extension Data {
             result |= UInt64(self[offset + index]) << UInt64(index * 8)
         }
         return result
+    }
+
+    func containsBytes(_ needle: [UInt8], in range: Range<Int>) -> Bool {
+        guard !needle.isEmpty else { return true }
+        guard range.lowerBound >= 0, range.upperBound <= count, needle.count <= range.count else {
+            return false
+        }
+
+        return withUnsafeBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.bindMemory(to: UInt8.self).baseAddress else {
+                return false
+            }
+            return needle.withUnsafeBufferPointer { needleBuffer in
+                guard let needleAddress = needleBuffer.baseAddress else {
+                    return false
+                }
+                return Self.containsBytes(
+                    haystack: baseAddress.advanced(by: range.lowerBound),
+                    haystackCount: range.count,
+                    needle: needleAddress,
+                    needleCount: needle.count
+                )
+            }
+        }
+    }
+
+    private static func containsBytes(
+        haystack: UnsafePointer<UInt8>,
+        haystackCount: Int,
+        needle: UnsafePointer<UInt8>,
+        needleCount: Int
+    ) -> Bool {
+        guard needleCount <= haystackCount else { return false }
+
+        let first = needle[0]
+        let firstVector = SIMD16<UInt8>(repeating: first)
+        let lastStart = haystackCount - needleCount
+        var offset = 0
+
+        while offset + 16 <= haystackCount {
+            let chunk = SIMD16<UInt8>(UnsafeBufferPointer(start: haystack.advanced(by: offset), count: 16))
+            let matches = chunk .== firstVector
+            for lane in 0..<16 {
+                let candidate = offset + lane
+                if candidate > lastStart {
+                    break
+                }
+                if matches[lane], bytesMatch(haystack.advanced(by: candidate), needle, count: needleCount) {
+                    return true
+                }
+            }
+            offset += 16
+        }
+
+        guard offset <= lastStart else { return false }
+        for candidate in offset...lastStart where haystack[candidate] == first {
+            if bytesMatch(haystack.advanced(by: candidate), needle, count: needleCount) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func bytesMatch(_ lhs: UnsafePointer<UInt8>, _ rhs: UnsafePointer<UInt8>, count: Int) -> Bool {
+        for index in 0..<count where lhs[index] != rhs[index] {
+            return false
+        }
+        return true
     }
 }

@@ -62,6 +62,52 @@ struct MemoryBudgetTests {
         #expect(extensionResponse.totalMatches == recordCount - 1)
     }
 
+    @Test("path component expansion covers root base directory matches without path postings")
+    func pathComponentExpansionCoversRootBaseDirectoryMatchesWithoutPathPostings() {
+        let rootDirectory = "/tmp/allthethings-memory/"
+            + String(repeating: "wide-directory-segment/", count: 120)
+            + "aito/project"
+        let hiddenPath = "/tmp/allthethings-memory/.hidden/AitoThing.swift"
+        var records = [
+            makeRecord(path: rootDirectory, isDirectory: true, modifiedTime: 0)
+        ]
+
+        for index in 0..<12_000 {
+            records.append(makeRecord(
+                path: "\(rootDirectory)/File\(String(format: "%06d", index)).swift",
+                modifiedTime: TimeInterval(index + 1)
+            ))
+        }
+        records.append(makeRecord(path: hiddenPath, isHidden: true, modifiedTime: 20_000))
+        for index in 0..<100 {
+            records.append(makeRecord(
+                path: "/tmp/allthethings-memory/unrelated/Xxx\(String(format: "%06d", index)).swift",
+                modifiedTime: TimeInterval(30_000 + index)
+            ))
+        }
+
+        let index = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        index.replaceRecordsForTesting(records)
+
+        let diagnostics = index.currentDiagnostics()
+        #expect(!diagnostics.pathGramIndexEnabled)
+        #expect(diagnostics.nameGramPostingCount > 0)
+
+        let response = index.search(SearchRequest(
+            query: "aito",
+            sort: SortSpec(column: .relevance, ascending: false),
+            includeHidden: false
+        ), maxResults: 10)
+
+        #expect(response.usesIndexedCandidates)
+        #expect(response.totalMatches == 12_001)
+        #expect(response.results.contains { $0.record.path.hasPrefix(rootDirectory) })
+        #expect(!response.results.contains { $0.record.path == hiddenPath })
+    }
+
     @Test("old streaming snapshots are ignored")
     func oldStreamingSnapshotsAreIgnored() throws {
         let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
@@ -148,10 +194,10 @@ struct MemoryBudgetTests {
     func corruptMmapSnapshotsAreIgnored() throws {
         let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
         let supportDirectory = try applicationSupportDirectory(for: applicationName)
-        let packageURL = supportDirectory.appendingPathComponent("filename-index-v4.attindex", isDirectory: true)
+        let packageURL = supportDirectory.appendingPathComponent("filename-index-v5.attindex", isDirectory: true)
         try FileManager.default.createDirectory(at: packageURL, withIntermediateDirectories: true)
         let manifest = CompactSnapshotManifest(
-            schemaVersion: 4,
+            schemaVersion: 5,
             savedAt: Date(),
             roots: [],
             exclusionPatterns: FileExclusionRules.defaultPatterns,
@@ -355,6 +401,32 @@ struct MemoryBudgetTests {
         }
 
         return records
+    }
+
+    private func makeRecord(
+        path: String,
+        isDirectory: Bool = false,
+        isHidden: Bool? = nil,
+        modifiedTime: TimeInterval = Date().timeIntervalSinceReferenceDate
+    ) -> FileRecord {
+        let url = URL(fileURLWithPath: path)
+        let name = url.lastPathComponent
+        let directory = url.deletingLastPathComponent().path
+        return FileRecord(
+            id: FileRecord.stableID(for: path),
+            path: path,
+            name: name,
+            directoryPath: directory,
+            fileExtension: url.pathExtension.lowercased(),
+            sizeBytes: isDirectory ? 0 : 128,
+            modifiedTime: modifiedTime,
+            createdTime: nil,
+            isDirectory: isDirectory,
+            isHidden: isHidden ?? FileRecord.pathIsHidden(path),
+            volumeName: "Synthetic",
+            normalizedName: FuzzyMatcher.normalize(name),
+            normalizedPath: FuzzyMatcher.normalize(path)
+        )
     }
 
     private func applicationSupportDirectory(for applicationName: String) throws -> URL {

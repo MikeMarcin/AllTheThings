@@ -239,10 +239,123 @@ struct FileIndexTests {
         #expect(diagnostics.nameGramPostingCount > 0)
         #expect(diagnostics.pathGramIndexEnabled)
         #expect(diagnostics.pathGramPostingCount > 0)
+        #expect(diagnostics.columnarSidecarsLoaded)
+        #expect(diagnostics.visibleCount == diagnostics.indexedCount)
+        #expect(diagnostics.visibleModifiedOrderCount == diagnostics.indexedCount)
+        #expect(diagnostics.simdTextVerificationEnabled)
+        let packageURL = supportDirectory(applicationName: applicationName)
+            .appendingPathComponent("filename-index-v5.attindex", isDirectory: true)
+        #expect(FileManager.default.fileExists(atPath: packageURL.appendingPathComponent("parent.i32").path))
+        #expect(FileManager.default.fileExists(atPath: packageURL.appendingPathComponent("flags.u8").path))
+        #expect(FileManager.default.fileExists(atPath: packageURL.appendingPathComponent("visible.bitset").path))
+        #expect(FileManager.default.fileExists(atPath: packageURL.appendingPathComponent("visibleModifiedOrder.i32").path))
         #expect(reloaded.search(SearchRequest(
             query: "swc",
             sort: SortSpec(column: .relevance, ascending: false)
         ), maxResults: 5).results.contains { $0.record.name == "SearchWindowController.swift" })
+    }
+
+    @Test("v5 hard cut removes lingering v4 packages")
+    func v5HardCutRemovesLingeringV4Packages() throws {
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let supportDirectory = supportDirectory(applicationName: applicationName)
+        try FileManager.default.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: supportDirectory)
+        }
+
+        let oldPackage = supportDirectory.appendingPathComponent("filename-index-v4.attindex", isDirectory: true)
+        let oldTemporaryPackage = supportDirectory
+            .appendingPathComponent("filename-index-v4-\(UUID().uuidString).attindex.tmp", isDirectory: true)
+        try FileManager.default.createDirectory(at: oldPackage, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: oldTemporaryPackage, withIntermediateDirectories: true)
+
+        _ = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+
+        #expect(!FileManager.default.fileExists(atPath: oldPackage.path))
+        #expect(!FileManager.default.fileExists(atPath: oldTemporaryPackage.path))
+    }
+
+    @Test("missing v5 sidecars invalidate persisted snapshots")
+    func missingV5SidecarsInvalidatePersistedSnapshots() throws {
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let supportDirectory = supportDirectory(applicationName: applicationName)
+        defer {
+            try? FileManager.default.removeItem(at: supportDirectory)
+        }
+
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        index.replaceRecordsForTesting([
+            makeRecord(path: "/tmp/allthethings-tests/project/Alpha.swift")
+        ])
+        index.persistSnapshotForTesting()
+
+        let packageURL = supportDirectory.appendingPathComponent("filename-index-v5.attindex", isDirectory: true)
+        try FileManager.default.removeItem(at: packageURL.appendingPathComponent("visible.bitset"))
+
+        let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
+        let diagnostics = reloaded.currentDiagnostics()
+        #expect(diagnostics.indexedCount == 0)
+        #expect(diagnostics.recordStoreKind == .empty)
+        #expect(!FileManager.default.fileExists(atPath: packageURL.path))
+    }
+
+    @Test("visible bitset hides descendants of hidden parent rows")
+    func visibleBitsetHidesDescendantsOfHiddenParentRows() throws {
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let supportDirectory = supportDirectory(applicationName: applicationName)
+        defer {
+            try? FileManager.default.removeItem(at: supportDirectory)
+        }
+
+        let hiddenParent = makeRecord(
+            path: "/tmp/allthethings-tests/project/HiddenParent",
+            isDirectory: true,
+            isHidden: true,
+            modifiedTime: 3_000
+        )
+        let hiddenChild = makeRecord(
+            path: "/tmp/allthethings-tests/project/HiddenParent/Child.swift",
+            isHidden: false,
+            modifiedTime: 4_000
+        )
+        let visibleChild = makeRecord(
+            path: "/tmp/allthethings-tests/project/Visible.swift",
+            modifiedTime: 1_000
+        )
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        index.replaceRecordsForTesting([hiddenParent, hiddenChild, visibleChild])
+        index.persistSnapshotForTesting()
+
+        let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
+
+        var response = reloaded.search(SearchRequest(
+            query: "Child",
+            sort: SortSpec(column: .relevance, ascending: false),
+            includeHidden: false
+        ), maxResults: 10)
+        #expect(response.results.isEmpty)
+
+        response = reloaded.search(SearchRequest(
+            query: "Child",
+            sort: SortSpec(column: .relevance, ascending: false),
+            includeHidden: true
+        ), maxResults: 10)
+        #expect(response.results.map(\.record.path) == [hiddenChild.path])
+
+        response = reloaded.search(SearchRequest(
+            query: "",
+            sort: SortSpec(column: .modified, ascending: false),
+            includeHidden: false
+        ), maxResults: 1)
+        #expect(response.results.map(\.record.path) == [visibleChild.path])
+
+        response = reloaded.search(SearchRequest(
+            query: "",
+            sort: SortSpec(column: .modified, ascending: false),
+            includeHidden: true
+        ), maxResults: 1)
+        #expect(response.results.map(\.record.path) == [hiddenChild.path])
     }
 
     @Test("custom exclusions apply during scan and refresh")
@@ -381,7 +494,18 @@ struct FileIndexTests {
         Issue.record("Timed out waiting for condition")
     }
 
-    private func makeRecord(path: String, isDirectory: Bool = false) -> FileRecord {
+    private func supportDirectory(applicationName: String) -> URL {
+        let supportRoot = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        return supportRoot.appendingPathComponent(applicationName, isDirectory: true)
+    }
+
+    private func makeRecord(
+        path: String,
+        isDirectory: Bool = false,
+        isHidden: Bool? = nil,
+        modifiedTime: TimeInterval = Date().timeIntervalSinceReferenceDate
+    ) -> FileRecord {
         let url = URL(fileURLWithPath: path)
         let name = url.lastPathComponent
         let directory = url.deletingLastPathComponent().path
@@ -392,10 +516,10 @@ struct FileIndexTests {
             directoryPath: directory,
             fileExtension: url.pathExtension.lowercased(),
             sizeBytes: isDirectory ? 0 : 128,
-            modifiedTime: Date().timeIntervalSinceReferenceDate,
+            modifiedTime: modifiedTime,
             createdTime: nil,
             isDirectory: isDirectory,
-            isHidden: FileRecord.pathIsHidden(path),
+            isHidden: isHidden ?? FileRecord.pathIsHidden(path),
             volumeName: "Test",
             normalizedName: FuzzyMatcher.normalize(name),
             normalizedPath: FuzzyMatcher.normalize(path)

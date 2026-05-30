@@ -10,9 +10,9 @@ python3 "${skill_root}/scripts/validate_sprite_sheet.py" \
   --sheet Resources/NibGeneratedMasterSheet.png \
   --cell-width 160 \
   --cell-height 96 \
-  --columns 10 \
+  --columns 16 \
   --rows 7 \
-  --animations idle:8,indexing:10,searching:10,optimizing:10,file_changed:6,success:8,error:6 \
+  --animations idle:8,indexing:16,searching:10,optimizing:16,file_changed:6,success:8,error:6 \
   --body-color mascot-blue \
   --min-gutter 1 \
   --body-width-range 69:78 \
