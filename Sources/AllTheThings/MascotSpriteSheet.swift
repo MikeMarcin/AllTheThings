@@ -144,6 +144,46 @@ enum OperationMascotIdleClip: String, CaseIterable {
     }
 }
 
+enum OperationMascotStandaloneClip: String, CaseIterable {
+    case introWelcome
+    case flydown
+
+    var resourceName: String {
+        switch self {
+        case .introWelcome: "NibIntroWelcomeStrip"
+        case .flydown: "NibFlydownStrip"
+        }
+    }
+
+    var frameCount: Int {
+        switch self {
+        case .introWelcome: 32
+        case .flydown: 10
+        }
+    }
+
+    var framesPerSecond: Double {
+        switch self {
+        case .introWelcome: 4
+        case .flydown: 14
+        }
+    }
+
+    var loops: Bool {
+        switch self {
+        case .introWelcome: true
+        case .flydown: false
+        }
+    }
+
+    var accessibilityLabel: String {
+        switch self {
+        case .introWelcome: "Nib says hello"
+        case .flydown: "Nib flies into place"
+        }
+    }
+}
+
 struct OperationMascotAnimationController {
     enum Frame: Equatable {
         case animation(OperationMascotAnimation, index: Int)
@@ -323,6 +363,7 @@ final class MascotSpriteSheet {
 
     private let frames: [OperationMascotAnimation: [NSImage]]
     private let idleClipFrames: [OperationMascotIdleClip: [NSImage]]
+    private let standaloneClipFrames: [OperationMascotStandaloneClip: [NSImage]]
 
     convenience init() {
         self.init(
@@ -344,6 +385,7 @@ final class MascotSpriteSheet {
             from: idleClipDirectoryURL,
             fallbackFrames: slicedFrames[.idle] ?? []
         )
+        self.standaloneClipFrames = Self.loadStandaloneClipFrames(from: idleClipDirectoryURL)
     }
 
     func frame(for animation: OperationMascotAnimation, index: Int) -> NSImage? {
@@ -366,6 +408,19 @@ final class MascotSpriteSheet {
 
         let wrappedIndex = ((index % frames.count) + frames.count) % frames.count
         return frames[wrappedIndex]
+    }
+
+    func frame(for standaloneClip: OperationMascotStandaloneClip, index: Int) -> NSImage? {
+        guard let frames = standaloneClipFrames[standaloneClip], !frames.isEmpty else {
+            return frame(for: .idle, index: index)
+        }
+
+        let wrappedIndex = ((index % frames.count) + frames.count) % frames.count
+        return frames[wrappedIndex]
+    }
+
+    func loadedFrameCount(for standaloneClip: OperationMascotStandaloneClip) -> Int {
+        standaloneClipFrames[standaloneClip]?.count ?? 0
     }
 
     private static func bundledSpriteSheetURL() -> URL? {
@@ -438,6 +493,26 @@ final class MascotSpriteSheet {
         return result
     }
 
+    private static func loadStandaloneClipFrames(from directoryURL: URL?) -> [OperationMascotStandaloneClip: [NSImage]] {
+        var result: [OperationMascotStandaloneClip: [NSImage]] = [:]
+
+        for clip in OperationMascotStandaloneClip.allCases {
+            if
+                let directoryURL,
+                let stripFrames = sliceStripFrames(
+                    from: directoryURL
+                        .appendingPathComponent(clip.resourceName, isDirectory: false)
+                        .appendingPathExtension("png"),
+                    frameCount: clip.frameCount
+                )
+            {
+                result[clip] = stripFrames
+            }
+        }
+
+        return result
+    }
+
     private static func sliceStripFrames(from url: URL, frameCount: Int) -> [NSImage]? {
         guard let image = NSImage(contentsOf: url) else {
             return nil
@@ -490,6 +565,116 @@ final class MascotSpriteSheet {
             width: max(1, x1 - x0),
             height: max(1, y1 - y0)
         )
+    }
+}
+
+@MainActor
+final class StandaloneMascotCoordinator {
+    private let imageView: NSImageView
+    private let spriteSheet: MascotSpriteSheet
+    private let clip: OperationMascotStandaloneClip
+    private let displaySize: CGFloat
+    private var frameIndex = 0
+    private var isActive = false
+    private nonisolated(unsafe) var frameTimer: Timer?
+    private var reduceMotion: Bool {
+        NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    }
+
+    init(
+        imageView: NSImageView,
+        spriteSheet: MascotSpriteSheet = .shared,
+        clip: OperationMascotStandaloneClip,
+        displaySize: CGFloat
+    ) {
+        self.imageView = imageView
+        self.spriteSheet = spriteSheet
+        self.clip = clip
+        self.displaySize = displaySize
+        configureImageView()
+        renderCurrentFrame()
+    }
+
+    deinit {
+        frameTimer?.invalidate()
+    }
+
+    func setActive(_ active: Bool) {
+        guard isActive != active else { return }
+
+        isActive = active
+        if active {
+            start()
+        } else {
+            stop()
+        }
+    }
+
+    func restart() {
+        frameIndex = 0
+        renderCurrentFrame()
+        if isActive {
+            configureTimer()
+        }
+    }
+
+    private func configureImageView() {
+        imageView.imageScaling = .scaleProportionallyUpOrDown
+        imageView.translatesAutoresizingMaskIntoConstraints = false
+        imageView.wantsLayer = true
+        imageView.layer?.masksToBounds = false
+        imageView.setAccessibilityRole(.image)
+        imageView.setAccessibilityLabel(clip.accessibilityLabel)
+
+        let widthConstraint = imageView.widthAnchor.constraint(equalToConstant: displaySize)
+        let heightConstraint = imageView.heightAnchor.constraint(equalToConstant: displaySize)
+        NSLayoutConstraint.activate([widthConstraint, heightConstraint])
+    }
+
+    private func start() {
+        frameIndex = 0
+        renderCurrentFrame()
+        configureTimer()
+    }
+
+    private func stop() {
+        frameTimer?.invalidate()
+        frameTimer = nil
+    }
+
+    private func configureTimer() {
+        frameTimer?.invalidate()
+        frameTimer = nil
+
+        guard !reduceMotion, clip.frameCount > 1 else { return }
+
+        let frameInterval = 1 / clip.framesPerSecond
+        let timer = Timer(timeInterval: frameInterval, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.advanceFrame()
+            }
+        }
+        timer.tolerance = min(0.04, frameInterval * 0.2)
+        RunLoop.main.add(timer, forMode: .common)
+        frameTimer = timer
+    }
+
+    private func advanceFrame() {
+        frameIndex = (frameIndex + 1) % clip.frameCount
+        renderCurrentFrame()
+    }
+
+    private func renderCurrentFrame() {
+        if !reduceMotion, imageView.image != nil {
+            let transition = CATransition()
+            transition.type = .fade
+            transition.duration = min(0.08, 0.4 / clip.framesPerSecond)
+            transition.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            imageView.layer?.add(transition, forKey: "standaloneMascotFrameBlend")
+        }
+
+        let frame = reduceMotion ? 0 : frameIndex
+        imageView.image = spriteSheet.frame(for: clip, index: frame)
     }
 }
 

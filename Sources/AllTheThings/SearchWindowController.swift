@@ -1,5 +1,6 @@
 import AppKit
 import ATTCore
+import QuartzCore
 import UniformTypeIdentifiers
 
 final class SearchWindowController: NSWindowController {
@@ -180,6 +181,49 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let includeHidden: Bool
     }
 
+    private enum MascotFlightPlayback {
+        case animation(OperationMascotAnimation)
+        case standalone(OperationMascotStandaloneClip)
+
+        var frameCount: Int {
+            switch self {
+            case let .animation(animation): animation.frameCount
+            case let .standalone(clip): clip.frameCount
+            }
+        }
+
+        var framesPerSecond: Double {
+            switch self {
+            case let .animation(animation): animation.framesPerSecond
+            case let .standalone(clip): clip.framesPerSecond
+            }
+        }
+
+        var loops: Bool {
+            switch self {
+            case let .animation(animation): animation.loops
+            case let .standalone(clip): clip.loops
+            }
+        }
+
+        var startsFromFirstFrame: Bool {
+            switch self {
+            case .animation: false
+            case .standalone: true
+            }
+        }
+
+        @MainActor
+        func frame(from spriteSheet: MascotSpriteSheet, index: Int) -> NSImage? {
+            switch self {
+            case let .animation(animation):
+                return spriteSheet.frame(for: animation, index: index)
+            case let .standalone(clip):
+                return spriteSheet.frame(for: clip, index: index)
+            }
+        }
+    }
+
     private let index: FileIndex
     private let watcher = FileSystemWatcher()
     private let searchQueue = DispatchQueue(label: "att.search", qos: .userInitiated)
@@ -205,6 +249,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private let loadingMascotImageView = NSImageView()
     private let loadingLabel = NSTextField(labelWithString: "Loading file list...")
     private let indexingSetupOverlay = IndexingSetupOverlayView()
+    private let mascotFlightImageView = NSImageView()
 
     private var results: [SearchResult] = []
     private var indexStats: IndexStats
@@ -224,9 +269,17 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var mascotCoordinator: OperationMascotCoordinator?
     private var expandedMascotCoordinator: OperationMascotCoordinator?
     private var loadingMascotCoordinator: OperationMascotCoordinator?
+    private var setupMascotCoordinator: StandaloneMascotCoordinator?
     private var expandedMascotLeadingConstraint: NSLayoutConstraint?
     private var expandedMascotImageBottomConstraint: NSLayoutConstraint?
+    private var mascotFlightPlayback: MascotFlightPlayback?
+    private var mascotFlightFallbackImage: NSImage?
+    private var mascotFlightFrameIndex = 0
+    private nonisolated(unsafe) var mascotFlightFrameTimer: Timer?
     private var isExpandedMascotVisible = false
+    private var isMascotFlightInProgress = false
+    private var isSetupMascotTuckInProgress = false
+    private var loadingOverlaySawActiveLoad = false
     private var userExpandedMascot = false
     private var userCollapsedExpandedMascotDuringOperation = false
     private var wasImportantMascotOperationActive = false
@@ -670,8 +723,22 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         indexingSetupOverlay.startIndexingButton.action = #selector(startSuggestedIndexing(_:))
         indexingSetupOverlay.chooseIndexedFoldersButton.target = self
         indexingSetupOverlay.chooseIndexedFoldersButton.action = #selector(chooseSuggestedIndexedFolders(_:))
+        setupMascotCoordinator = StandaloneMascotCoordinator(
+            imageView: indexingSetupOverlay.mascotImageView,
+            clip: .introWelcome,
+            displaySize: OperationMascotCoordinator.heroDisplaySize
+        )
+
+        mascotFlightImageView.imageScaling = .scaleProportionallyUpOrDown
+        mascotFlightImageView.imageAlignment = .alignCenter
+        mascotFlightImageView.wantsLayer = true
+        mascotFlightImageView.layer?.masksToBounds = false
+        mascotFlightImageView.isHidden = true
+        mascotFlightImageView.setAccessibilityRole(.image)
+        mascotFlightImageView.setAccessibilityLabel("Nib moving into place")
 
         view.addSubview(indexingSetupOverlay)
+        view.addSubview(mascotFlightImageView)
         NSLayoutConstraint.activate([
             indexingSetupOverlay.topAnchor.constraint(equalTo: scrollView.topAnchor),
             indexingSetupOverlay.leadingAnchor.constraint(equalTo: scrollView.leadingAnchor),
@@ -686,12 +753,16 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let needsFullDiskAccess = !defaults.bool(forKey: AppSettings.fullDiskAccessOnboardingShownKey)
             && (needsIndexingSetup || !FullDiskAccessController.protectedDefaultFoldersCovered(by: indexedRoots).isEmpty)
 
-        indexingSetupOverlay.isHidden = !needsIndexingSetup
+        let setupOverlayVisible = needsIndexingSetup || isSetupMascotTuckInProgress
+        indexingSetupOverlay.isHidden = !setupOverlayVisible
+        indexingSetupOverlay.setMascotVisible(setupOverlayVisible && !isSetupMascotTuckInProgress)
+        setupMascotCoordinator?.setActive(setupOverlayVisible && !isSetupMascotTuckInProgress)
         setupSuggestionPanel.update(
             hotKey: AppSettings.globalSearchHotKey(defaults: defaults),
             needsGlobalHotKey: needsGlobalHotKey,
             needsFullDiskAccess: needsFullDiskAccess
         )
+        updateMascotPlacementVisibility()
     }
 
     @objc private func enableSuggestedGlobalHotKey(_ sender: NSButton) {
@@ -742,6 +813,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     @objc private func startSuggestedIndexing(_ sender: NSButton) {
         let roots = AppSettings.suggestedDefaultIndexedRoots()
+        beginSetupMascotTuckAwayIfPossible()
         indexedRoots = roots
         saveRoots()
         startWatchingIfNeeded()
@@ -756,6 +828,192 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private func markFullDiskAccessOnboardingShown() {
         defaults.set(true, forKey: AppSettings.fullDiskAccessOnboardingShownKey)
         defaults.synchronize()
+    }
+
+    @discardableResult
+    private func beginSetupMascotTuckAwayIfPossible() -> Bool {
+        guard
+            !indexingSetupOverlay.isHidden,
+            !isMascotFlightInProgress,
+            !isSetupMascotTuckInProgress,
+            !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        else {
+            return false
+        }
+
+        view.layoutSubtreeIfNeeded()
+        guard let currentImage = indexingSetupOverlay.mascotImageView.image else {
+            return false
+        }
+
+        let startFrame = indexingSetupOverlay.mascotImageView.convert(indexingSetupOverlay.mascotImageView.bounds, to: view)
+        let targetFrame = setupMascotTuckTargetFrame()
+        guard !startFrame.isEmpty, !targetFrame.isEmpty else {
+            return false
+        }
+
+        isSetupMascotTuckInProgress = true
+        setupMascotCoordinator?.setActive(false)
+        indexingSetupOverlay.setMascotVisible(false)
+
+        return beginMascotFlight(
+            image: currentImage,
+            startFrame: startFrame,
+            targetFrame: targetFrame,
+            duration: 0.64,
+            playback: .standalone(.flydown)
+        ) {
+            self.isSetupMascotTuckInProgress = false
+            self.indexingSetupOverlay.setMascotVisible(true)
+            self.updateSetupSuggestions()
+            self.updateExpandedMascotForOperation(animated: false)
+            self.updateMascotPlacementVisibility()
+        }
+    }
+
+    @discardableResult
+    private func beginMascotFlight(
+        image: NSImage,
+        startFrame: NSRect,
+        targetFrame: NSRect,
+        duration: TimeInterval,
+        playback: MascotFlightPlayback? = nil,
+        completion: @escaping () -> Void
+    ) -> Bool {
+        guard !isMascotFlightInProgress, !startFrame.isEmpty, !targetFrame.isEmpty else {
+            return false
+        }
+
+        isMascotFlightInProgress = true
+        mascotFlightImageView.removeFromSuperview()
+        view.addSubview(mascotFlightImageView)
+        mascotFlightImageView.image = image
+        mascotFlightImageView.frame = startFrame
+        mascotFlightImageView.alphaValue = 1
+        mascotFlightImageView.isHidden = false
+        startMascotFlightFramePlayback(playback, fallbackImage: image)
+        updateMascotPlacementVisibility()
+        view.layoutSubtreeIfNeeded()
+
+        guard let layer = mascotFlightImageView.layer else {
+            finishMascotFlight(completion: completion)
+            return true
+        }
+
+        let startPosition = layer.position
+        let startBounds = layer.bounds
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        mascotFlightImageView.frame = targetFrame
+        view.layoutSubtreeIfNeeded()
+        let targetPosition = layer.position
+        let targetBounds = layer.bounds
+        CATransaction.commit()
+
+        let positionAnimation = CABasicAnimation(keyPath: "position")
+        positionAnimation.fromValue = startPosition
+        positionAnimation.toValue = targetPosition
+
+        let boundsAnimation = CABasicAnimation(keyPath: "bounds")
+        boundsAnimation.fromValue = startBounds
+        boundsAnimation.toValue = targetBounds
+
+        let flightAnimation = CAAnimationGroup()
+        flightAnimation.animations = [positionAnimation, boundsAnimation]
+        flightAnimation.duration = duration
+        flightAnimation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        flightAnimation.fillMode = .removed
+        flightAnimation.isRemovedOnCompletion = true
+        layer.add(flightAnimation, forKey: "mascotFlight")
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak self] in
+            self?.finishMascotFlight(completion: completion)
+        }
+
+        return true
+    }
+
+    private func finishMascotFlight(completion: () -> Void) {
+        mascotFlightFrameTimer?.invalidate()
+        mascotFlightFrameTimer = nil
+        mascotFlightPlayback = nil
+        mascotFlightFallbackImage = nil
+        mascotFlightImageView.layer?.removeAnimation(forKey: "mascotFlight")
+        mascotFlightImageView.isHidden = true
+        mascotFlightImageView.image = nil
+        isMascotFlightInProgress = false
+        completion()
+    }
+
+    private func startMascotFlightFramePlayback(
+        _ playback: MascotFlightPlayback?,
+        fallbackImage: NSImage
+    ) {
+        mascotFlightFrameTimer?.invalidate()
+        mascotFlightFrameTimer = nil
+        mascotFlightPlayback = playback
+        mascotFlightFallbackImage = fallbackImage
+
+        guard
+            let playback,
+            playback.frameCount > 1,
+            !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        else {
+            mascotFlightImageView.image = fallbackImage
+            return
+        }
+
+        mascotFlightFrameIndex = playback.startsFromFirstFrame
+            ? 0
+            : Int(Date().timeIntervalSinceReferenceDate * playback.framesPerSecond) % playback.frameCount
+        renderMascotFlightFrame()
+
+        let frameInterval = 1 / playback.framesPerSecond
+        let timer = Timer(timeInterval: frameInterval, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.advanceMascotFlightFrame()
+            }
+        }
+        timer.tolerance = min(0.03, frameInterval * 0.2)
+        RunLoop.main.add(timer, forMode: .common)
+        mascotFlightFrameTimer = timer
+    }
+
+    private func advanceMascotFlightFrame() {
+        guard let playback = mascotFlightPlayback else { return }
+
+        if playback.loops {
+            mascotFlightFrameIndex = (mascotFlightFrameIndex + 1) % playback.frameCount
+        } else {
+            mascotFlightFrameIndex = min(mascotFlightFrameIndex + 1, playback.frameCount - 1)
+        }
+        renderMascotFlightFrame()
+    }
+
+    private func renderMascotFlightFrame() {
+        guard let playback = mascotFlightPlayback else {
+            mascotFlightImageView.image = mascotFlightFallbackImage
+            return
+        }
+
+        mascotFlightImageView.image = playback.frame(
+            from: MascotSpriteSheet.shared,
+            index: mascotFlightFrameIndex
+        ) ?? mascotFlightFallbackImage
+    }
+
+    private func setupMascotTuckTargetFrame() -> NSRect {
+        view.layoutSubtreeIfNeeded()
+        let footerFrame = mascotImageView.convert(mascotImageView.bounds, to: view)
+        let targetSize = OperationMascotCoordinator.expandedDisplaySize
+        let targetBottom = footerFrame.minY + expandedMascotImageBottomOffset(for: targetSize)
+        return NSRect(
+            x: ExpandedMascotLayout.leadingOffset,
+            y: targetBottom - targetSize,
+            width: targetSize,
+            height: targetSize
+        )
     }
 
     private func configureLoadingOverlay() {
@@ -1055,13 +1313,20 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     private func updateLoadingOverlay() {
         guard AppSettings.indexedRootsConfigured(defaults: defaults), !indexedRoots.isEmpty else {
+            loadingOverlaySawActiveLoad = false
             loadingOverlay.isHidden = true
             updateMascotPlacementVisibility()
             return
         }
 
+        let wasShowingLoadingOverlay = !loadingOverlay.isHidden
         let waitingForInitialLoad = !didRequestInitialSnapshotLoad && indexStats.indexedCount == 0
         let shouldShow = indexStats.isLoadingSnapshot || waitingForInitialLoad
+        let canFlyDownAfterHiding = loadingOverlaySawActiveLoad
+
+        if shouldShow, indexStats.isLoadingSnapshot {
+            loadingOverlaySawActiveLoad = true
+        }
 
         if indexStats.isLoadingSnapshot || waitingForInitialLoad {
             loadingLabel.stringValue = "Loading file list..."
@@ -1069,8 +1334,52 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             loadingLabel.stringValue = indexStats.status
         }
 
+        if wasShowingLoadingOverlay, !shouldShow, canFlyDownAfterHiding, beginLoadingMascotFlydownIfPossible() {
+            loadingOverlaySawActiveLoad = false
+            loadingOverlay.isHidden = true
+            updateMascotPlacementVisibility()
+            return
+        }
+
+        if !shouldShow {
+            loadingOverlaySawActiveLoad = false
+        }
         loadingOverlay.isHidden = !shouldShow
         updateMascotPlacementVisibility()
+    }
+
+    @discardableResult
+    private func beginLoadingMascotFlydownIfPossible() -> Bool {
+        guard
+            !isMascotFlightInProgress,
+            !isSetupMascotTuckInProgress,
+            indexingSetupOverlay.isHidden,
+            !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        else {
+            return false
+        }
+
+        view.layoutSubtreeIfNeeded()
+        guard let currentImage = loadingMascotImageView.image else {
+            return false
+        }
+
+        let startFrame = loadingMascotImageView.convert(loadingMascotImageView.bounds, to: view)
+        let targetFrame = mascotPlacementTargetFrame()
+        guard !startFrame.isEmpty, !targetFrame.isEmpty else {
+            return false
+        }
+
+        loadingMascotImageView.isHidden = true
+        return beginMascotFlight(
+            image: currentImage,
+            startFrame: startFrame,
+            targetFrame: targetFrame,
+            duration: 0.64,
+            playback: .standalone(.flydown)
+        ) {
+            self.updateMascotPlacementVisibility()
+        }
     }
 
     private func handleMascotTransition(from previousPhase: IndexPhase, to nextPhase: IndexPhase) {
@@ -1161,6 +1470,16 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         return targetPadding - visiblePadding
     }
 
+    private func mascotPlacementTargetFrame() -> NSRect {
+        view.layoutSubtreeIfNeeded()
+
+        if isExpandedMascotVisible {
+            return expandedMascotImageView.convert(expandedMascotImageView.bounds, to: view)
+        }
+
+        return mascotImageView.convert(mascotImageView.bounds, to: view)
+    }
+
     private func setExpandedMascotVisible(_ visible: Bool, animated: Bool) {
         guard isExpandedMascotVisible != visible else {
             updateMascotPlacementVisibility()
@@ -1227,11 +1546,14 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func updateMascotPlacementVisibility() {
-        let loadingMascotVisible = !loadingOverlay.isHidden
+        let setupMascotVisible = !indexingSetupOverlay.isHidden
+        let mascotFlightVisible = !mascotFlightImageView.isHidden
+        let transientMascotOwnsPlacement = setupMascotVisible || mascotFlightVisible
+        let loadingMascotVisible = !loadingOverlay.isHidden && !transientMascotOwnsPlacement
 
         loadingMascotImageView.isHidden = !loadingMascotVisible
-        expandedMascotView.isHidden = loadingMascotVisible || !isExpandedMascotVisible
-        mascotImageView.isHidden = loadingMascotVisible || isExpandedMascotVisible
+        expandedMascotView.isHidden = transientMascotOwnsPlacement || loadingMascotVisible || !isExpandedMascotVisible
+        mascotImageView.isHidden = transientMascotOwnsPlacement || loadingMascotVisible || isExpandedMascotVisible
     }
 
     private func persistentMascotAnimation() -> OperationMascotAnimation {
@@ -1553,6 +1875,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             .filter { !existing.contains($0.path) }
 
         guard !additions.isEmpty else { return }
+        beginSetupMascotTuckAwayIfPossible()
         indexedRoots.append(contentsOf: additions)
         saveRoots()
         didRequestInitialSnapshotLoad = true
@@ -1911,6 +2234,7 @@ private final class ClickableMascotView: NSView {
 }
 
 private final class IndexingSetupOverlayView: NSView {
+    let mascotImageView = NSImageView()
     let startIndexingButton = NSButton()
     let chooseIndexedFoldersButton = NSButton()
 
@@ -1919,10 +2243,11 @@ private final class IndexingSetupOverlayView: NSView {
 
         isHidden = true
 
-        let iconView = NSImageView()
-        iconView.translatesAutoresizingMaskIntoConstraints = false
-        iconView.image = NSImage(systemSymbolName: "folder.badge.plus", accessibilityDescription: "Get started")
-        iconView.contentTintColor = .secondaryLabelColor
+        mascotImageView.translatesAutoresizingMaskIntoConstraints = false
+        mascotImageView.imageAlignment = .alignCenter
+        mascotImageView.imageScaling = .scaleProportionallyUpOrDown
+        mascotImageView.setAccessibilityRole(.image)
+        mascotImageView.setAccessibilityLabel(OperationMascotStandaloneClip.introWelcome.accessibilityLabel)
 
         let titleLabel = NSTextField(labelWithString: "Get Started")
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -1951,11 +2276,11 @@ private final class IndexingSetupOverlayView: NSView {
         buttonStack.alignment = .centerY
         buttonStack.spacing = 8
 
-        let stack = NSStackView(views: [iconView, titleLabel, detailLabel, buttonStack])
+        let stack = NSStackView(views: [mascotImageView, titleLabel, detailLabel, buttonStack])
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.orientation = .vertical
         stack.alignment = .centerX
-        stack.spacing = 10
+        stack.spacing = 9
 
         addSubview(stack)
         NSLayoutConstraint.activate([
@@ -1964,8 +2289,6 @@ private final class IndexingSetupOverlayView: NSView {
             stack.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 32),
             stack.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -32),
 
-            iconView.widthAnchor.constraint(equalToConstant: 34),
-            iconView.heightAnchor.constraint(equalToConstant: 34),
             detailLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 620)
         ])
     }
@@ -1973,6 +2296,10 @@ private final class IndexingSetupOverlayView: NSView {
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    func setMascotVisible(_ visible: Bool) {
+        mascotImageView.isHidden = !visible
     }
 
     @discardableResult

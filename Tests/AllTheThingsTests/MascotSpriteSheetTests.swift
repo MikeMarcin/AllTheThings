@@ -86,6 +86,26 @@ struct MascotSpriteSheetTests {
         #expect(flourishes.allSatisfy { $0.idleSelectionWeight < OperationMascotIdleClip.blink.idleSelectionWeight })
     }
 
+    @Test("standalone clip metadata stays out of idle selection")
+    func standaloneClipMetadataStaysOutOfIdleSelection() {
+        #expect(OperationMascotStandaloneClip.introWelcome.resourceName == "NibIntroWelcomeStrip")
+        #expect(OperationMascotStandaloneClip.introWelcome.frameCount == 32)
+        #expect(OperationMascotStandaloneClip.introWelcome.framesPerSecond == 4)
+        #expect(OperationMascotStandaloneClip.introWelcome.loops)
+        #expect(!OperationMascotStandaloneClip.introWelcome.accessibilityLabel.isEmpty)
+
+        #expect(OperationMascotStandaloneClip.flydown.resourceName == "NibFlydownStrip")
+        #expect(OperationMascotStandaloneClip.flydown.frameCount == 10)
+        #expect(OperationMascotStandaloneClip.flydown.framesPerSecond == 14)
+        #expect(!OperationMascotStandaloneClip.flydown.loops)
+        #expect(!OperationMascotStandaloneClip.flydown.accessibilityLabel.isEmpty)
+
+        for clip in OperationMascotStandaloneClip.allCases {
+            #expect(!OperationMascotIdleClip.allCases.map(\.resourceName).contains(clip.resourceName))
+            #expect(!OperationMascotAnimationController.idleSelectionTable.map(\.clip.resourceName).contains(clip.resourceName))
+        }
+    }
+
     @Test("animation controller rolls weighted idle table after main loop")
     func animationControllerRollsWeightedIdleTableAfterMainLoop() {
         var controller = OperationMascotAnimationController(idleClipSelector: { .victoryBounce })
@@ -173,7 +193,7 @@ struct MascotSpriteSheetTests {
     @MainActor
     func spriteSheetSlicesAllAnimationFrames() throws {
         let url = try #require(spriteSheetURL())
-        let sheet = MascotSpriteSheet(imageURL: url)
+        let sheet = MascotSpriteSheet(imageURL: url, idleClipDirectoryURL: resourcesDirectoryURL())
         let expectedFrameSize = NSSize(width: 160, height: 96)
 
         for animation in OperationMascotAnimation.allCases {
@@ -182,6 +202,21 @@ struct MascotSpriteSheetTests {
             let first = try #require(sheet.frame(for: animation, index: 0))
             let wrapped = try #require(sheet.frame(for: animation, index: animation.frameCount))
             let negative = try #require(sheet.frame(for: animation, index: -1))
+
+            #expect(first.isValid)
+            #expect(wrapped.isValid)
+            #expect(negative.isValid)
+            #expect(first.size == expectedFrameSize)
+            #expect(wrapped.size == expectedFrameSize)
+            #expect(negative.size == expectedFrameSize)
+        }
+
+        for clip in OperationMascotStandaloneClip.allCases {
+            #expect(sheet.loadedFrameCount(for: clip) == clip.frameCount)
+
+            let first = try #require(sheet.frame(for: clip, index: 0))
+            let wrapped = try #require(sheet.frame(for: clip, index: clip.frameCount))
+            let negative = try #require(sheet.frame(for: clip, index: -1))
 
             #expect(first.isValid)
             #expect(wrapped.isValid)
@@ -241,6 +276,64 @@ struct MascotSpriteSheetTests {
                 #expect(maximumBottom == minimumBottom)
             } else if ![OperationMascotIdleClip.mainLoop, .victoryBounce].contains(clip) {
                 #expect(maximumBottom - minimumBottom <= 1)
+            }
+        }
+    }
+
+    @Test("standalone strips match fixed cell metadata")
+    func standaloneStripsMatchFixedCellMetadata() throws {
+        let cellWidth = 160
+        let cellHeight = 96
+
+        for clip in OperationMascotStandaloneClip.allCases {
+            let url = try #require(standaloneClipURL(for: clip))
+            let imageData = try Data(contentsOf: url)
+            let bitmap = try #require(NSBitmapImageRep(data: imageData))
+
+            #expect(bitmap.pixelsWide == cellWidth * clip.frameCount)
+            #expect(bitmap.pixelsHigh == cellHeight)
+
+            var bodyCenters: [Double] = []
+            var bodyWidths: [Int] = []
+            for frame in 0..<clip.frameCount {
+                let originX = frame * cellWidth
+                let xRange = originX..<(originX + cellWidth)
+                let yRange = 0..<cellHeight
+
+                let bounds = try #require(visibleBounds(in: bitmap, xRange: xRange, yRange: yRange))
+                #expect(bounds.minX > originX)
+                #expect(bounds.minY > 0)
+                #expect(bounds.maxX < originX + cellWidth - 1)
+                #expect(bounds.maxY < cellHeight - 1)
+
+                let bodyBounds = try #require(largestMascotBlueBounds(in: bitmap, xRange: xRange, yRange: yRange))
+                let bodyWidth = bodyBounds.maxX - bodyBounds.minX + 1
+                bodyWidths.append(bodyWidth)
+                bodyCenters.append(Double(bodyBounds.minX + bodyBounds.maxX) / 2 - Double(originX))
+            }
+
+            let medianWidth = try #require(median(bodyWidths))
+            #expect(medianWidth >= 69)
+            #expect(medianWidth <= 78)
+
+            let minimumCenter = try #require(bodyCenters.min())
+            let maximumCenter = try #require(bodyCenters.max())
+            #expect(minimumCenter >= 79)
+            #expect(maximumCenter <= 84)
+            #expect(maximumCenter - minimumCenter <= 3)
+
+            if clip.loops {
+                let firstBody = try #require(largestMascotBlueBounds(in: bitmap, xRange: 0..<cellWidth, yRange: 0..<cellHeight))
+                let lastOriginX = (clip.frameCount - 1) * cellWidth
+                let lastBody = try #require(largestMascotBlueBounds(
+                    in: bitmap,
+                    xRange: lastOriginX..<(lastOriginX + cellWidth),
+                    yRange: 0..<cellHeight
+                ))
+                let firstCenter = Double(firstBody.minX + firstBody.maxX) / 2
+                let lastCenter = Double(lastBody.minX + lastBody.maxX) / 2 - Double(lastOriginX)
+                #expect(abs(firstCenter - lastCenter) <= 1)
+                #expect(abs((firstBody.maxY - firstBody.minY) - (lastBody.maxY - lastBody.minY)) <= 1)
             }
         }
     }
@@ -383,6 +476,11 @@ struct MascotSpriteSheetTests {
     }
 
     private func idleClipURL(for clip: OperationMascotIdleClip) -> URL? {
+        resourcesDirectoryURL()?
+            .appendingPathComponent("\(clip.resourceName).png", isDirectory: false)
+    }
+
+    private func standaloneClipURL(for clip: OperationMascotStandaloneClip) -> URL? {
         resourcesDirectoryURL()?
             .appendingPathComponent("\(clip.resourceName).png", isDirectory: false)
     }

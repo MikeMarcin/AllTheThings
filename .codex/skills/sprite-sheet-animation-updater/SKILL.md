@@ -47,6 +47,26 @@ Add project tests for standalone strips, not just the master sheet:
 - body center and foot baseline are exact or near-exact for body-locked fidgets
 - baseline drift is allowed only for clips that intentionally bounce or travel
 
+## First-Run Intro Strips
+
+Keep first-run intro animations separate from the idle weighted table. They are app-flow clips, not idle behavior, and should be loaded as standalone strips with explicit metadata for resource name, frame count, frame rate, and accessibility label.
+
+For AllTheThings-style first-run intro clips:
+
+- Use a standalone runtime asset such as `Resources/NibIntroWelcomeStrip.png`.
+- Keep the same fixed cell contract as the main sheet: `160 x 96` cells, transparent background, and clear gutters.
+- Body-lock Nib from approved idle/fidget frames; draw only hands, props, mouth, cheeks, glows, and sparkles as overlays unless body travel is intentionally part of the story.
+- Validate the loop seam explicitly. The final frame should settle back into the opening pose, with body center, body height, and visible bounds close enough that the restart does not pop.
+- Preserve the one-Nib rule in app UI: while a setup intro mascot or tuck-away transition mascot is visible, hide footer, expanded, and loading mascot placements. Do not duplicate Nib in multiple parts of the window.
+- Respect Reduce Motion by showing a static first frame and skipping motion-heavy placement transitions.
+
+For flydown/tuck-away handoffs:
+
+- Use a dedicated one-shot standalone strip such as `Resources/NibFlydownStrip.png` rather than freezing an arbitrary runtime frame.
+- Keep the normal source animation playing until the handoff begins, then switch only the moving flight view to the flydown strip.
+- Do not loop-seam validate one-shot handoff strips, but still validate dimensions, gutters, body scale, and horizontal registration.
+- Reuse the same flydown strip for equivalent placement transitions when the body language should match, such as setup-to-operation and loading-to-footer.
+
 For operation loops that are part of first-run or long-running work, do not optimize only for static registration. Keep the mascot on model, but preserve character beats: antenna glow, small hands, expressive mouth/cheek moments, prop payoff, and readable foreground action. Use approved idle/fidget strips as the body source when possible, then draw props and expression overlays around that body. Check the loop seam explicitly; the last-to-first visual change should be comparable to ordinary adjacent-frame changes.
 
 Avoid prop colors that match the mascot body detector. Gray papers, gears, shadows, hands, and outlines should use neutral or warm grays rather than blue-gray values, especially when those props touch the mascot body, or body width/center validation can report false drift.
@@ -90,6 +110,8 @@ For this repository's Nib mascot, use:
 - runtime asset: `Resources/NibGeneratedMasterSheet.png`
 - sheet size: `2560 x 672`
 - cell size: `160 x 96`
+- standalone first-run intro strip: `Resources/NibIntroWelcomeStrip.png`, 32 frames, 4 fps
+- standalone flydown strip: `Resources/NibFlydownStrip.png`, 10 frames, 14 fps, one-shot
 - columns: `16`
 - rows/frame counts:
   - `idle`: row 0, 8 frames, loops
@@ -100,7 +122,7 @@ For this repository's Nib mascot, use:
   - `success`: row 5, 8 frames, one-shot
   - `error`: row 6, 6 frames, one-shot
 
-To regenerate the smoother first-impression operation rows, keep the approved idle body locked and redraw only the props:
+To regenerate the smoother first-impression operation rows and the first-run intro strip, keep the approved idle body locked and redraw only the props:
 
 ```bash
 python3 .codex/skills/sprite-sheet-animation-updater/scripts/generate_allthethings_operation_rows.py --repo-root . --frames 16 --columns 16
@@ -112,4 +134,4 @@ After changing the sheet in AllTheThings, run:
 .codex/skills/sprite-sheet-animation-updater/scripts/validate_allthethings_nib.sh .
 ```
 
-Also keep or update Swift regression tests that check sprite metadata, slicing, transparent gutters, body height, body width, and horizontal body registration.
+Also keep or update Swift regression tests that check sprite metadata, slicing, transparent gutters, body height, body width, horizontal body registration, standalone strip dimensions, and standalone loop seams.
