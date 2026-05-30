@@ -131,6 +131,7 @@ public final class FileIndex: @unchecked Sendable {
     private static let primaryPublishTimeInterval: TimeInterval = 1
     private static let pathGramRecordLimit = 200_000
     private static let pathGramTotalPathByteLimit = 24 * 1024 * 1024
+    private static let exactEmptyQuerySortLimit = 100_000
 
     public var onStatsChanged: (@MainActor @Sendable (IndexStats) -> Void)? {
         get {
@@ -377,6 +378,7 @@ public final class FileIndex: @unchecked Sendable {
         let gramIndex: MappedIntPostingIndex?
         let nameGramIndex: MappedIntPostingIndex?
         let extensionIndex: [String: [Int32]]
+        let visibleCount: Int?
         let hasSortedOrder: Bool
         let diagnostics: SearchStructureDiagnostics
 
@@ -393,7 +395,9 @@ public final class FileIndex: @unchecked Sendable {
                 let buildsPathGramIndex = FileIndex.shouldBuildPathGramIndex(recordCount: metrics.recordCount, totalPathBytes: metrics.totalPathBytes)
                 self.gramIndex = buildsPathGramIndex ? Self.makePathGramIndex(store: store) : nil
                 self.nameGramIndex = Self.makeNameGramIndex(store: store)
-                self.extensionIndex = Self.makeExtensionIndex(store: store)
+                let extensionData = Self.makeExtensionIndexAndVisibleCount(store: store)
+                self.extensionIndex = extensionData.extensionIndex
+                self.visibleCount = extensionData.visibleCount
                 let sortedByModified = Self.makeModifiedDescending(store: store)
                 self.modifiedDescending = sortedByModified
                 self.modifiedAscending = Array(sortedByModified.reversed())
@@ -408,6 +412,9 @@ public final class FileIndex: @unchecked Sendable {
                 self.gramIndex = nil
                 self.nameGramIndex = nil
                 self.extensionIndex = [:]
+                self.visibleCount = records.reduce(0) { partial, record in
+                    partial + (record.isHidden ? 0 : 1)
+                }
                 self.modifiedDescending = []
                 self.modifiedAscending = []
                 self.hasSortedOrder = false
@@ -427,7 +434,9 @@ public final class FileIndex: @unchecked Sendable {
                 let buildsPathGramIndex = FileIndex.shouldBuildPathGramIndex(recordCount: metrics.recordCount, totalPathBytes: metrics.totalPathBytes)
                 self.gramIndex = buildsPathGramIndex ? Self.makePathGramIndex(store: store) : nil
                 self.nameGramIndex = Self.makeNameGramIndex(store: store)
-                self.extensionIndex = Self.makeExtensionIndex(store: store)
+                let extensionData = Self.makeExtensionIndexAndVisibleCount(store: store)
+                self.extensionIndex = extensionData.extensionIndex
+                self.visibleCount = extensionData.visibleCount
                 let sortedByModified = Self.makeModifiedDescending(store: store)
                 self.modifiedDescending = sortedByModified
                 self.modifiedAscending = Array(sortedByModified.reversed())
@@ -442,6 +451,7 @@ public final class FileIndex: @unchecked Sendable {
                 self.gramIndex = nil
                 self.nameGramIndex = nil
                 self.extensionIndex = [:]
+                self.visibleCount = nil
                 self.modifiedDescending = []
                 self.modifiedAscending = []
                 self.hasSortedOrder = false
@@ -458,7 +468,9 @@ public final class FileIndex: @unchecked Sendable {
             self.store = store
             self.gramIndex = persistedStructures.pathGramIndex
             self.nameGramIndex = persistedStructures.nameGramIndex
-            self.extensionIndex = Self.makeExtensionIndex(store: store)
+            let extensionData = Self.makeExtensionIndexAndVisibleCount(store: store)
+            self.extensionIndex = extensionData.extensionIndex
+            self.visibleCount = extensionData.visibleCount
 
             if let modifiedDescending = persistedStructures.modifiedDescending, modifiedDescending.count == store.count {
                 self.modifiedDescending = modifiedDescending
@@ -484,6 +496,7 @@ public final class FileIndex: @unchecked Sendable {
             gramIndex: MappedIntPostingIndex?,
             nameGramIndex: MappedIntPostingIndex?,
             extensionIndex: [String: [Int32]],
+            visibleCount: Int?,
             hasSortedOrder: Bool
         ) {
             self.store = store
@@ -492,6 +505,7 @@ public final class FileIndex: @unchecked Sendable {
             self.gramIndex = gramIndex
             self.nameGramIndex = nameGramIndex
             self.extensionIndex = extensionIndex
+            self.visibleCount = visibleCount
             self.hasSortedOrder = hasSortedOrder
             self.diagnostics = Self.makeDiagnostics(
                 pathGramIndexEnabled: gramIndex != nil,
@@ -546,6 +560,7 @@ public final class FileIndex: @unchecked Sendable {
                 gramIndex: gramIndex,
                 nameGramIndex: nameGramIndex,
                 extensionIndex: extensionIndex,
+                visibleCount: Self.makeVisibleCount(store: updatedStore),
                 hasSortedOrder: true
             )
         }
@@ -558,18 +573,21 @@ public final class FileIndex: @unchecked Sendable {
                 gramIndex: gramIndex,
                 nameGramIndex: Self.makeNameGramIndex(store: store),
                 extensionIndex: extensionIndex,
+                visibleCount: visibleCount,
                 hasSortedOrder: hasSortedOrder
             )
         }
 
         func addingExtensionIndex() -> SearchSnapshot {
-            guard extensionIndex.isEmpty else { return self }
+            guard extensionIndex.isEmpty || visibleCount == nil else { return self }
+            let extensionData = Self.makeExtensionIndexAndVisibleCount(store: store)
             return SearchSnapshot(
                 store: store,
                 modifiedDescending: modifiedDescending,
                 gramIndex: gramIndex,
                 nameGramIndex: nameGramIndex,
-                extensionIndex: Self.makeExtensionIndex(store: store),
+                extensionIndex: extensionIndex.isEmpty ? extensionData.extensionIndex : extensionIndex,
+                visibleCount: visibleCount ?? extensionData.visibleCount,
                 hasSortedOrder: hasSortedOrder
             )
         }
@@ -582,6 +600,7 @@ public final class FileIndex: @unchecked Sendable {
                 gramIndex: gramIndex,
                 nameGramIndex: nameGramIndex,
                 extensionIndex: extensionIndex,
+                visibleCount: visibleCount,
                 hasSortedOrder: true
             )
         }
@@ -598,6 +617,7 @@ public final class FileIndex: @unchecked Sendable {
                 gramIndex: Self.makePathGramIndex(store: store),
                 nameGramIndex: nameGramIndex,
                 extensionIndex: extensionIndex,
+                visibleCount: visibleCount,
                 hasSortedOrder: hasSortedOrder
             )
         }
@@ -858,16 +878,31 @@ public final class FileIndex: @unchecked Sendable {
             return try? MappedIntPostingIndex.build(from: index, temporaryName: "att-name-postings")
         }
 
-        private static func makeExtensionIndex(store: RecordStore) -> [String: [Int32]] {
+        private static func makeVisibleCount(store: RecordStore) -> Int {
+            var count = 0
+
+            for recordIndex in 0..<store.count where !store.isHidden(at: recordIndex) {
+                count += 1
+            }
+
+            return count
+        }
+
+        private static func makeExtensionIndexAndVisibleCount(store: RecordStore) -> (extensionIndex: [String: [Int32]], visibleCount: Int) {
             var index: [String: [Int32]] = [:]
+            var visibleCount = 0
 
             for recordIndex in 0..<store.count {
+                if !store.isHidden(at: recordIndex) {
+                    visibleCount += 1
+                }
+
                 let fileExtension = store.fileExtension(at: recordIndex)
                 guard !fileExtension.isEmpty else { continue }
                 index[fileExtension, default: []].append(Int32(recordIndex))
             }
 
-            return index
+            return (index, visibleCount)
         }
     }
 
@@ -1032,6 +1067,7 @@ public final class FileIndex: @unchecked Sendable {
         matches.reserveCapacity(min(snapshot.count, boundedMaxResults))
         let trimThreshold = boundedMaxResults > 0 ? boundedMaxResults * 5 : 0
         var total = 0
+        var shouldSortMatches = true
 
         func sortAndLimitMatches() {
             guard boundedMaxResults > 0 else { return }
@@ -1060,12 +1096,43 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         if parsedQuery.isEmpty {
-            let orderedRecords = snapshot.orderedIndices(for: request.sort, queryIsEmpty: true)
-            for (offset, index) in (orderedRecords ?? Array(0..<snapshot.count)).enumerated() {
-                if offset.isMultiple(of: 512), shouldCancel() {
-                    return nil
+            if let orderedRecords = snapshot.orderedIndices(for: request.sort, queryIsEmpty: true) {
+                for (offset, index) in orderedRecords.enumerated() {
+                    if offset.isMultiple(of: 512), shouldCancel() {
+                        return nil
+                    }
+                    appendMatch(rowID: index, score: 0)
                 }
-                appendMatch(rowID: index, score: 0)
+            } else if snapshot.count > Self.exactEmptyQuerySortLimit, boundedMaxResults > 0 {
+                shouldSortMatches = false
+                let canStopAtResultLimit = request.includeHidden || snapshot.visibleCount != nil
+                var matchedVisibleCount = 0
+                for index in 0..<snapshot.count {
+                    if index.isMultiple(of: 512), shouldCancel() {
+                        return nil
+                    }
+
+                    let record = snapshot.view(at: index)
+                    guard request.includeHidden || !record.isHidden else {
+                        continue
+                    }
+
+                    matchedVisibleCount += 1
+                    if matches.count < boundedMaxResults {
+                        matches.append(SearchMatch(rowID: index, score: 0))
+                    } else if canStopAtResultLimit {
+                        break
+                    }
+                }
+
+                total = request.includeHidden ? snapshot.count : (snapshot.visibleCount ?? matchedVisibleCount)
+            } else {
+                for index in 0..<snapshot.count {
+                    if index.isMultiple(of: 512), shouldCancel() {
+                        return nil
+                    }
+                    appendMatch(rowID: index, score: 0)
+                }
             }
         } else {
             if let indexedResponse = Self.indexedCandidateSearch(
@@ -1092,7 +1159,9 @@ public final class FileIndex: @unchecked Sendable {
 
         guard !shouldCancel() else { return nil }
 
-        sortAndLimitMatches()
+        if shouldSortMatches {
+            sortAndLimitMatches()
+        }
 
         guard !shouldCancel() else { return nil }
 
@@ -2248,6 +2317,10 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     private func refreshNow(paths: [String]) {
+        guard !lock.withLock({ indexing }) else {
+            return
+        }
+
         let jobID = beginIndexJob("refresh")
         defer { endIndexJob("refresh", jobID: jobID) }
 
@@ -2305,21 +2378,25 @@ public final class FileIndex: @unchecked Sendable {
         let previousSnapshot = lock.withLock { searchSnapshot }
         var deletedRows = Set<Int>()
 
-        for rowID in 0..<previousSnapshot.count {
-            let view = previousSnapshot.view(at: rowID)
-
-            if upserts[view.path] != nil {
+        for path in upserts.keys {
+            if let rowID = previousSnapshot.store.rowID(forPath: path) {
                 deletedRows.insert(rowID)
-                continue
             }
+        }
 
-            if deletedPrefixes.contains(where: { view.path == $0 || view.path.hasPrefix($0 + "/") }) {
-                deletedRows.insert(rowID)
-                continue
-            }
+        if !deletedPrefixes.isEmpty || !shallowDirectoryChildren.isEmpty {
+            for rowID in 0..<previousSnapshot.count {
+                guard !deletedRows.contains(rowID) else { continue }
+                let view = previousSnapshot.view(at: rowID)
 
-            for (directory, currentChildren) in shallowDirectoryChildren where view.directoryPath == directory && !currentChildren.contains(view.path) {
-                deletedRows.insert(rowID)
+                if deletedPrefixes.contains(where: { view.path == $0 || view.path.hasPrefix($0 + "/") }) {
+                    deletedRows.insert(rowID)
+                    continue
+                }
+
+                for (directory, currentChildren) in shallowDirectoryChildren where view.directoryPath == directory && !currentChildren.contains(view.path) {
+                    deletedRows.insert(rowID)
+                }
             }
         }
 

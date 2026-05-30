@@ -195,6 +195,32 @@ struct MemoryBudgetTests {
         #expect(response.results.contains { $0.record.name == "File000010.swift" })
     }
 
+    @Test("large empty primary snapshots return bounded partial rows")
+    func largeEmptyPrimarySnapshotsReturnBoundedPartialRows() {
+        let records = Array(makeSyntheticRecords(count: 120_000).reversed())
+        let index = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        index.replaceRecordsForTesting(
+            records,
+            buildsSearchStructures: false,
+            phase: .scanning,
+            status: "Indexing 120,000 discovered"
+        )
+
+        let response = index.search(SearchRequest(
+            query: "",
+            sort: SortSpec(column: .name, ascending: true)
+        ), maxResults: 25)
+
+        #expect(response.totalMatches == records.count)
+        #expect(response.results.count == 25)
+        #expect(response.results.first?.record.name == "File119999.swift")
+        #expect(response.results.contains { $0.record.name == "File119999.swift" })
+        #expect(!response.results.contains { $0.record.name == "File000000.swift" })
+    }
+
     @Test("primary-only and optimized snapshots return the same matches")
     func primaryOnlyAndOptimizedSnapshotsReturnSameMatches() {
         var records = makeSyntheticRecords(count: 50_000)

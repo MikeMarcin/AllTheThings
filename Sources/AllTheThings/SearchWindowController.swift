@@ -182,7 +182,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     private let index: FileIndex
     private let watcher = FileSystemWatcher()
-    private let searchQueue = DispatchQueue(label: "att.search", qos: .userInitiated, attributes: .concurrent)
+    private let searchQueue = DispatchQueue(label: "att.search", qos: .userInitiated)
     private let defaults = UserDefaults.standard
 
     private let searchField = NSSearchField()
@@ -192,6 +192,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private let scrollView = NSScrollView()
     private let mascotSlotView = NSView()
     private let mascotImageView = NSImageView()
+    private let expandedMascotView = ClickableMascotView()
+    private let expandedMascotImageView = NSImageView()
     private let statusLabel = NSTextField(labelWithString: "")
     private let countLabel = NSTextField(labelWithString: "")
     private let openButton = NSButton()
@@ -200,7 +202,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private let addScopeButton = NSButton()
     private let reindexButton = NSButton()
     private let loadingOverlay = ThemedBackgroundView(backgroundColor: NSColor.windowBackgroundColor.withAlphaComponent(0.92))
-    private let loadingIndicator = NSProgressIndicator()
+    private let loadingMascotImageView = NSImageView()
     private let loadingLabel = NSTextField(labelWithString: "Loading file list...")
     private let indexingSetupOverlay = IndexingSetupOverlayView()
 
@@ -219,6 +221,13 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var memoryStatusTask: Task<Void, Never>?
     private var memoryStatusText = ProcessMemoryFormatter.label(for: ProcessMemorySampler.currentUsage())
     private var mascotCoordinator: OperationMascotCoordinator?
+    private var expandedMascotCoordinator: OperationMascotCoordinator?
+    private var loadingMascotCoordinator: OperationMascotCoordinator?
+    private var expandedMascotLeadingConstraint: NSLayoutConstraint?
+    private var isExpandedMascotVisible = false
+    private var userExpandedMascot = false
+    private var userCollapsedExpandedMascotDuringOperation = false
+    private var wasImportantMascotOperationActive = false
     private var didRequestInitialSnapshotLoad = false
     private var didRequestInitialRebuild = false
     private var highlightsSearchText: Bool
@@ -228,6 +237,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         static let sortColumn = "ATTSortColumn"
         static let sortAscending = "ATTSortAscending"
         static let visibleColumns = "ATTVisibleColumns"
+    }
+
+    private enum ExpandedMascotLayout {
+        static let leadingOffset: CGFloat = -24
     }
 
     private static let defaultSortSpec = SortSpec(column: .name, ascending: true)
@@ -540,6 +553,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         view.addSubview(rootStack)
         configureIndexingSetupOverlay()
         configureLoadingOverlay()
+        configureExpandedMascotOverlay()
 
         NSLayoutConstraint.activate([
             rootStack.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
@@ -570,23 +584,65 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         updateStatus()
         updateSetupSuggestions()
         updateLoadingOverlay()
+        updateExpandedMascotForOperation(animated: false)
     }
 
     private func configureMascotSlotView() {
         mascotSlotView.translatesAutoresizingMaskIntoConstraints = false
         mascotSlotView.wantsLayer = true
         mascotSlotView.layer?.masksToBounds = false
+        mascotSlotView.toolTip = "Toggle large Nib"
         mascotSlotView.setContentHuggingPriority(.required, for: .horizontal)
         mascotSlotView.setContentCompressionResistancePriority(.required, for: .horizontal)
+        mascotSlotView.addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(toggleExpandedMascot(_:))))
 
         mascotSlotView.addSubview(mascotImageView)
         mascotImageView.translatesAutoresizingMaskIntoConstraints = false
+        mascotImageView.imageAlignment = .alignBottomLeft
+        mascotImageView.toolTip = "Toggle large Nib"
         NSLayoutConstraint.activate([
             mascotSlotView.widthAnchor.constraint(equalToConstant: OperationMascotCoordinator.layoutSize),
             mascotSlotView.heightAnchor.constraint(equalToConstant: OperationMascotCoordinator.layoutSize),
             mascotImageView.centerXAnchor.constraint(equalTo: mascotSlotView.centerXAnchor),
             mascotImageView.centerYAnchor.constraint(equalTo: mascotSlotView.centerYAnchor)
         ])
+    }
+
+    private func configureExpandedMascotOverlay() {
+        expandedMascotView.translatesAutoresizingMaskIntoConstraints = false
+        expandedMascotView.wantsLayer = true
+        expandedMascotView.layer?.masksToBounds = false
+        expandedMascotView.alphaValue = 1
+        expandedMascotView.isHidden = true
+        expandedMascotView.toolTip = "Shrink Nib"
+        expandedMascotView.onClick = { [weak self] in
+            self?.toggleExpandedMascot(nil)
+        }
+
+        expandedMascotView.addSubview(expandedMascotImageView)
+        expandedMascotImageView.translatesAutoresizingMaskIntoConstraints = false
+        expandedMascotImageView.imageAlignment = .alignBottomLeft
+        expandedMascotCoordinator = OperationMascotCoordinator(
+            imageView: expandedMascotImageView,
+            displaySize: OperationMascotCoordinator.statusDisplaySize
+        )
+
+        view.addSubview(expandedMascotView)
+        let leadingConstraint = expandedMascotView.leadingAnchor.constraint(
+            equalTo: view.leadingAnchor,
+            constant: ExpandedMascotLayout.leadingOffset
+        )
+        expandedMascotLeadingConstraint = leadingConstraint
+        NSLayoutConstraint.activate([
+            leadingConstraint,
+            expandedMascotView.bottomAnchor.constraint(equalTo: mascotImageView.bottomAnchor),
+            expandedMascotView.widthAnchor.constraint(equalToConstant: OperationMascotCoordinator.expandedDisplaySize),
+            expandedMascotView.heightAnchor.constraint(equalToConstant: OperationMascotCoordinator.expandedDisplaySize),
+            expandedMascotImageView.leadingAnchor.constraint(equalTo: expandedMascotView.leadingAnchor),
+            expandedMascotImageView.bottomAnchor.constraint(equalTo: expandedMascotView.bottomAnchor)
+        ])
+
+        expandedMascotCoordinator?.setPersistentAnimation(persistentMascotAnimation())
     }
 
     private func configureSetupSuggestionPanel() {
@@ -700,21 +756,24 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private func configureLoadingOverlay() {
         loadingOverlay.translatesAutoresizingMaskIntoConstraints = false
 
-        loadingIndicator.translatesAutoresizingMaskIntoConstraints = false
-        loadingIndicator.style = .spinning
-        loadingIndicator.controlSize = .regular
-        loadingIndicator.isIndeterminate = true
+        loadingMascotImageView.translatesAutoresizingMaskIntoConstraints = false
+        loadingMascotCoordinator = OperationMascotCoordinator(
+            imageView: loadingMascotImageView,
+            displaySize: OperationMascotCoordinator.heroDisplaySize
+        )
 
         loadingLabel.translatesAutoresizingMaskIntoConstraints = false
-        loadingLabel.font = .systemFont(ofSize: 13, weight: .medium)
+        loadingLabel.font = .systemFont(ofSize: 14, weight: .medium)
         loadingLabel.textColor = .secondaryLabelColor
         loadingLabel.alignment = .center
+        loadingLabel.lineBreakMode = .byWordWrapping
+        loadingLabel.maximumNumberOfLines = 2
 
-        let stack = NSStackView(views: [loadingIndicator, loadingLabel])
+        let stack = NSStackView(views: [loadingMascotImageView, loadingLabel])
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.orientation = .vertical
         stack.alignment = .centerX
-        stack.spacing = 10
+        stack.spacing = 12
 
         loadingOverlay.addSubview(stack)
         view.addSubview(loadingOverlay)
@@ -723,6 +782,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             stack.centerXAnchor.constraint(equalTo: loadingOverlay.centerXAnchor),
             stack.centerYAnchor.constraint(equalTo: loadingOverlay.centerYAnchor)
         ])
+
+        loadingMascotCoordinator?.setPersistentAnimation(persistentMascotAnimation())
     }
 
     private func configureToolbarButton(_ button: NSButton, symbol: String, tooltip: String, action: Selector) {
@@ -863,8 +924,19 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let index = self.index
 
         searchQueue.async {
-            guard !token.isCancelled else { return }
-            guard let response = index.search(request, shouldCancel: { token.isCancelled }) else { return }
+            guard !token.isCancelled else {
+                DispatchQueue.main.async { [weak self] in
+                    self?.clearSearchTokenIfCurrent(token)
+                }
+                return
+            }
+
+            guard let response = index.search(request, shouldCancel: { token.isCancelled }) else {
+                DispatchQueue.main.async { [weak self] in
+                    self?.clearSearchTokenIfCurrent(token)
+                }
+                return
+            }
 
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.queryGeneration == generation, self.activeSearchToken === token else { return }
@@ -879,6 +951,13 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                 self.updateMascotPersistentAnimation()
             }
         }
+    }
+
+    private func clearSearchTokenIfCurrent(_ token: SearchCancellationToken) {
+        guard activeSearchToken === token else { return }
+        activeSearchToken = nil
+        updateLoadingOverlay()
+        updateMascotPersistentAnimation()
     }
 
     private func handleStatsChanged(_ stats: IndexStats) {
@@ -947,15 +1026,12 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private func updateLoadingOverlay() {
         guard AppSettings.indexedRootsConfigured(defaults: defaults), !indexedRoots.isEmpty else {
             loadingOverlay.isHidden = true
-            loadingIndicator.stopAnimation(nil)
+            updateMascotPlacementVisibility()
             return
         }
 
         let waitingForInitialLoad = !didRequestInitialSnapshotLoad && indexStats.indexedCount == 0
-        let indexingBeforeSearchableSnapshot = indexStats.phase == .scanning
-            && indexStats.searchableCount == 0
-            && results.isEmpty
-        let shouldShow = indexStats.isLoadingSnapshot || waitingForInitialLoad || indexingBeforeSearchableSnapshot
+        let shouldShow = indexStats.isLoadingSnapshot || waitingForInitialLoad
 
         if indexStats.isLoadingSnapshot || waitingForInitialLoad {
             loadingLabel.stringValue = "Loading file list..."
@@ -964,15 +1040,12 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
 
         loadingOverlay.isHidden = !shouldShow
-        if shouldShow {
-            loadingIndicator.startAnimation(nil)
-        } else {
-            loadingIndicator.stopAnimation(nil)
-        }
+        updateMascotPlacementVisibility()
     }
 
     private func handleMascotTransition(from previousPhase: IndexPhase, to nextPhase: IndexPhase) {
         updateMascotPersistentAnimation()
+        updateExpandedMascotForOperation(animated: true)
 
         if nextPhase == .failed {
             playMascotTransient(.error)
@@ -986,11 +1059,137 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func updateMascotPersistentAnimation() {
-        mascotCoordinator?.setPersistentAnimation(persistentMascotAnimation())
+        let animation = persistentMascotAnimation()
+        mascotCoordinator?.setPersistentAnimation(animation)
+        expandedMascotCoordinator?.setPersistentAnimation(animation)
+        loadingMascotCoordinator?.setPersistentAnimation(animation)
     }
 
     private func playMascotTransient(_ animation: OperationMascotAnimation) {
         mascotCoordinator?.playTransient(animation)
+        expandedMascotCoordinator?.playTransient(animation)
+        loadingMascotCoordinator?.playTransient(animation)
+    }
+
+    @objc private func toggleExpandedMascot(_ sender: Any?) {
+        let importantOperationActive = isImportantMascotOperation(indexStats.phase)
+
+        if isExpandedMascotVisible {
+            userExpandedMascot = false
+            if importantOperationActive {
+                userCollapsedExpandedMascotDuringOperation = true
+            }
+            setExpandedMascotVisible(false, animated: true)
+            return
+        }
+
+        if importantOperationActive {
+            userCollapsedExpandedMascotDuringOperation = false
+        } else {
+            userExpandedMascot = true
+        }
+        setExpandedMascotVisible(true, animated: true)
+    }
+
+    private func updateExpandedMascotForOperation(animated: Bool) {
+        let importantOperationActive = isImportantMascotOperation(indexStats.phase)
+
+        if importantOperationActive && !wasImportantMascotOperationActive {
+            userCollapsedExpandedMascotDuringOperation = false
+        }
+        wasImportantMascotOperationActive = importantOperationActive
+
+        if importantOperationActive {
+            if !userCollapsedExpandedMascotDuringOperation {
+                setExpandedMascotVisible(true, animated: animated)
+            }
+        } else {
+            userCollapsedExpandedMascotDuringOperation = false
+            if !userExpandedMascot {
+                setExpandedMascotVisible(false, animated: animated)
+            }
+        }
+    }
+
+    private func isImportantMascotOperation(_ phase: IndexPhase) -> Bool {
+        switch phase {
+        case .scanning, .optimizing, .saving:
+            return true
+        case .idle, .loading, .ready, .failed:
+            return false
+        }
+    }
+
+    private func footerMascotLeadingOffset() -> CGFloat {
+        view.layoutSubtreeIfNeeded()
+        return mascotImageView.convert(mascotImageView.bounds, to: view).minX
+    }
+
+    private func setExpandedMascotVisible(_ visible: Bool, animated: Bool) {
+        guard isExpandedMascotVisible != visible else {
+            updateMascotPlacementVisibility()
+            return
+        }
+
+        isExpandedMascotVisible = visible
+        expandedMascotView.toolTip = visible ? "Shrink Nib" : "Grow Nib"
+        mascotSlotView.toolTip = visible ? "Shrink Nib" : "Grow Nib"
+        mascotImageView.toolTip = visible ? "Shrink Nib" : "Grow Nib"
+
+        let collapsedSize = OperationMascotCoordinator.statusDisplaySize
+        let targetSize = visible ? OperationMascotCoordinator.expandedDisplaySize : collapsedSize
+        let footerLeadingOffset = footerMascotLeadingOffset()
+        let targetLeadingOffset = visible ? ExpandedMascotLayout.leadingOffset : footerLeadingOffset
+        if visible && !loadingOverlay.isHidden {
+            expandedMascotLeadingConstraint?.constant = ExpandedMascotLayout.leadingOffset
+            expandedMascotCoordinator?.setDisplaySize(targetSize)
+            updateMascotPlacementVisibility()
+            return
+        }
+
+        if visible {
+            expandedMascotLeadingConstraint?.constant = footerLeadingOffset
+            expandedMascotCoordinator?.setDisplaySize(collapsedSize)
+            expandedMascotView.isHidden = false
+            mascotImageView.isHidden = true
+            view.layoutSubtreeIfNeeded()
+        }
+
+        guard animated else {
+            expandedMascotLeadingConstraint?.constant = targetLeadingOffset
+            expandedMascotCoordinator?.setDisplaySize(targetSize)
+            updateMascotPlacementVisibility()
+            return
+        }
+
+        if !visible {
+            mascotImageView.isHidden = true
+            expandedMascotView.isHidden = false
+        }
+
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.22
+            context.allowsImplicitAnimation = true
+            self.expandedMascotLeadingConstraint?.animator().constant = targetLeadingOffset
+            self.expandedMascotCoordinator?.setDisplaySize(targetSize, animated: true)
+            self.view.layoutSubtreeIfNeeded()
+        } completionHandler: {
+            if !visible {
+                self.updateMascotPlacementVisibility()
+                self.expandedMascotCoordinator?.setDisplaySize(collapsedSize)
+                self.expandedMascotLeadingConstraint?.constant = ExpandedMascotLayout.leadingOffset
+                return
+            }
+            self.updateMascotPlacementVisibility()
+        }
+    }
+
+    private func updateMascotPlacementVisibility() {
+        let loadingMascotVisible = !loadingOverlay.isHidden
+
+        loadingMascotImageView.isHidden = !loadingMascotVisible
+        expandedMascotView.isHidden = loadingMascotVisible || !isExpandedMascotVisible
+        mascotImageView.isHidden = loadingMascotVisible || isExpandedMascotVisible
     }
 
     private func persistentMascotAnimation() -> OperationMascotAnimation {
@@ -1007,7 +1206,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func currentSearchText() -> String {
-        searchField.currentEditor()?.string ?? searchField.stringValue
+        (searchField.currentEditor()?.string ?? searchField.stringValue)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func settingsDidChange() {
@@ -1652,6 +1852,18 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
 
         return spec
+    }
+}
+
+private final class ClickableMascotView: NSView {
+    var onClick: (() -> Void)?
+
+    override func mouseDown(with event: NSEvent) {
+        onClick?()
+    }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .pointingHand)
     }
 }
 
