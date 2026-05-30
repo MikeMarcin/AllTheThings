@@ -39,6 +39,7 @@ struct MascotSpriteSheetTests {
         }
 
         #expect(OperationMascotCoordinator.layoutSize == 40)
+        #expect(OperationMascotCoordinator.statusDisplaySize == OperationMascotCoordinator.layoutSize)
         #expect(OperationMascotCoordinator.heroDisplaySize == 86)
         #expect(OperationMascotCoordinator.heroDisplaySize > OperationMascotCoordinator.layoutSize * 2)
         #expect(OperationMascotCoordinator.expandedDisplaySize == OperationMascotCoordinator.layoutSize * 4)

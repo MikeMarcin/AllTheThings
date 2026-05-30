@@ -224,6 +224,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var expandedMascotCoordinator: OperationMascotCoordinator?
     private var loadingMascotCoordinator: OperationMascotCoordinator?
     private var expandedMascotLeadingConstraint: NSLayoutConstraint?
+    private var expandedMascotImageBottomConstraint: NSLayoutConstraint?
     private var isExpandedMascotVisible = false
     private var userExpandedMascot = false
     private var userCollapsedExpandedMascotDuringOperation = false
@@ -241,6 +242,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     private enum ExpandedMascotLayout {
         static let leadingOffset: CGFloat = -24
+        static let spriteFrameAspectRatio: CGFloat = 96.0 / 160.0
     }
 
     private static let defaultSortSpec = SortSpec(column: .name, ascending: true)
@@ -598,7 +600,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         mascotSlotView.addSubview(mascotImageView)
         mascotImageView.translatesAutoresizingMaskIntoConstraints = false
-        mascotImageView.imageAlignment = .alignBottomLeft
+        mascotImageView.imageAlignment = .alignCenter
         mascotImageView.toolTip = "Toggle large Nib"
         NSLayoutConstraint.activate([
             mascotSlotView.widthAnchor.constraint(equalToConstant: OperationMascotCoordinator.layoutSize),
@@ -621,7 +623,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         expandedMascotView.addSubview(expandedMascotImageView)
         expandedMascotImageView.translatesAutoresizingMaskIntoConstraints = false
-        expandedMascotImageView.imageAlignment = .alignBottomLeft
+        expandedMascotImageView.imageAlignment = .alignCenter
         expandedMascotCoordinator = OperationMascotCoordinator(
             imageView: expandedMascotImageView,
             displaySize: OperationMascotCoordinator.statusDisplaySize
@@ -633,13 +635,15 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             constant: ExpandedMascotLayout.leadingOffset
         )
         expandedMascotLeadingConstraint = leadingConstraint
+        let imageBottomConstraint = expandedMascotImageView.bottomAnchor.constraint(equalTo: expandedMascotView.bottomAnchor)
+        expandedMascotImageBottomConstraint = imageBottomConstraint
         NSLayoutConstraint.activate([
             leadingConstraint,
             expandedMascotView.bottomAnchor.constraint(equalTo: mascotImageView.bottomAnchor),
             expandedMascotView.widthAnchor.constraint(equalToConstant: OperationMascotCoordinator.expandedDisplaySize),
             expandedMascotView.heightAnchor.constraint(equalToConstant: OperationMascotCoordinator.expandedDisplaySize),
             expandedMascotImageView.leadingAnchor.constraint(equalTo: expandedMascotView.leadingAnchor),
-            expandedMascotImageView.bottomAnchor.constraint(equalTo: expandedMascotView.bottomAnchor)
+            imageBottomConstraint
         ])
 
         expandedMascotCoordinator?.setPersistentAnimation(persistentMascotAnimation())
@@ -1125,6 +1129,12 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         return mascotImageView.convert(mascotImageView.bounds, to: view).minX
     }
 
+    private func expandedMascotImageBottomOffset(for displaySize: CGFloat) -> CGFloat {
+        let visiblePadding = (OperationMascotCoordinator.statusDisplaySize * (1 - ExpandedMascotLayout.spriteFrameAspectRatio)) / 2
+        let targetPadding = (displaySize * (1 - ExpandedMascotLayout.spriteFrameAspectRatio)) / 2
+        return targetPadding - visiblePadding
+    }
+
     private func setExpandedMascotVisible(_ visible: Bool, animated: Bool) {
         guard isExpandedMascotVisible != visible else {
             updateMascotPlacementVisibility()
@@ -1140,8 +1150,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let targetSize = visible ? OperationMascotCoordinator.expandedDisplaySize : collapsedSize
         let footerLeadingOffset = footerMascotLeadingOffset()
         let targetLeadingOffset = visible ? ExpandedMascotLayout.leadingOffset : footerLeadingOffset
+        let targetBottomOffset = expandedMascotImageBottomOffset(for: targetSize)
         if visible && !loadingOverlay.isHidden {
             expandedMascotLeadingConstraint?.constant = ExpandedMascotLayout.leadingOffset
+            expandedMascotImageBottomConstraint?.constant = targetBottomOffset
             expandedMascotCoordinator?.setDisplaySize(targetSize)
             updateMascotPlacementVisibility()
             return
@@ -1149,6 +1161,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         if visible {
             expandedMascotLeadingConstraint?.constant = footerLeadingOffset
+            expandedMascotImageBottomConstraint?.constant = expandedMascotImageBottomOffset(for: collapsedSize)
             expandedMascotCoordinator?.setDisplaySize(collapsedSize)
             expandedMascotView.isHidden = false
             mascotImageView.isHidden = true
@@ -1157,6 +1170,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         guard animated else {
             expandedMascotLeadingConstraint?.constant = targetLeadingOffset
+            expandedMascotImageBottomConstraint?.constant = targetBottomOffset
             expandedMascotCoordinator?.setDisplaySize(targetSize)
             updateMascotPlacementVisibility()
             return
@@ -1171,12 +1185,14 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             context.duration = 0.22
             context.allowsImplicitAnimation = true
             self.expandedMascotLeadingConstraint?.animator().constant = targetLeadingOffset
+            self.expandedMascotImageBottomConstraint?.animator().constant = targetBottomOffset
             self.expandedMascotCoordinator?.setDisplaySize(targetSize, animated: true)
             self.view.layoutSubtreeIfNeeded()
         } completionHandler: {
             if !visible {
                 self.updateMascotPlacementVisibility()
                 self.expandedMascotCoordinator?.setDisplaySize(collapsedSize)
+                self.expandedMascotImageBottomConstraint?.constant = self.expandedMascotImageBottomOffset(for: collapsedSize)
                 self.expandedMascotLeadingConstraint?.constant = ExpandedMascotLayout.leadingOffset
                 return
             }
