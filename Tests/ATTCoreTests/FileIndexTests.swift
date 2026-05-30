@@ -541,6 +541,58 @@ struct FileIndexTests {
         #expect(!fullScanResponse.usesIndexedCandidates)
     }
 
+    @Test("log search ranks match quality before selected column sort")
+    func logSearchRanksMatchQualityBeforeSelectedColumnSort() throws {
+        let root = "/tmp/allthethings-ranking"
+        let records = [
+            makeRecord(path: "\(root)/Arcology.md"),
+            makeRecord(path: "\(root)/YellowGlow.funhouse"),
+            makeRecord(path: "\(root)/22_ColorGradient"),
+            makeRecord(path: "\(root)/Klopfgeist", isDirectory: true),
+            makeRecord(path: "\(root)/Klopfgeist/#default.pst"),
+            makeRecord(path: "\(root)/MALogicLegacySong.framework", isDirectory: true),
+            makeRecord(path: "\(root)/MALogicLegacySong.framework/Versions", isDirectory: true),
+            makeRecord(path: "\(root)/MALogicLegacySong.framework/Versions/A", isDirectory: true),
+            makeRecord(path: "\(root)/MALoopManagement.framework", isDirectory: true),
+            makeRecord(path: "\(root)/MALoopManagement.framework/Versions", isDirectory: true),
+            makeRecord(path: "\(root)/MALoopManagement.framework/Versions/A", isDirectory: true),
+            makeRecord(path: "\(root)/ca.lproj", isDirectory: true),
+            makeRecord(path: "\(root)/ca.lproj/AlertCollector.strings")
+        ]
+        let index = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        index.replaceRecordsForTesting(records)
+
+        let response = index.search(SearchRequest(
+            query: "log",
+            sort: SortSpec(column: .name, ascending: true),
+            includeHidden: false
+        ), maxResults: 20)
+
+        let paths = response.results.map(\.record.path)
+        #expect(!paths.contains("\(root)/Klopfgeist/#default.pst"))
+        #expect(!paths.contains("\(root)/ca.lproj/AlertCollector.strings"))
+
+        let arcologyIndex = try #require(paths.firstIndex(of: "\(root)/Arcology.md"))
+        let yellowGlowIndex = try #require(paths.firstIndex(of: "\(root)/YellowGlow.funhouse"))
+        let colorGradientIndex = try #require(paths.firstIndex(of: "\(root)/22_ColorGradient"))
+        let logicChildIndex = try #require(paths.firstIndex(of: "\(root)/MALogicLegacySong.framework/Versions/A"))
+        let loopChildIndex = try #require(paths.firstIndex(of: "\(root)/MALoopManagement.framework/Versions/A"))
+
+        #expect(response.results[arcologyIndex].match?.matchClass == .substring)
+        #expect(response.results[yellowGlowIndex].match?.matchClass == .near)
+        #expect(response.results[colorGradientIndex].match?.matchClass == .near)
+        #expect(response.results[logicChildIndex].match?.matchClass == .weakPath)
+        #expect(response.results[logicChildIndex].match?.field == .ancestorPath)
+        #expect(response.results[loopChildIndex].match?.matchClass == .weakPath)
+        #expect(response.results[loopChildIndex].match?.field == .ancestorPath)
+        #expect(arcologyIndex < logicChildIndex)
+        #expect(yellowGlowIndex < logicChildIndex)
+        #expect(colorGradientIndex < logicChildIndex)
+    }
+
     private func waitUntil(
         timeout: Duration = .seconds(5),
         pollInterval: Duration = .milliseconds(25),

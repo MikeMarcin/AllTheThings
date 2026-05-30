@@ -113,14 +113,18 @@ struct MemoryBudgetTests {
         let rootDirectory = "/tmp/allthethings-memory/"
             + String(repeating: "wide-directory-segment/", count: 120)
         let klopfgeistDirectory = "\(rootDirectory)/Klopfgeist"
+        let yellowGlowDirectory = "\(rootDirectory)/YellowGlow.funhouse"
         let longDirectory = "\(rootDirectory)/Long Vibrating Springs.patch"
         let klopfgeistChild = "\(klopfgeistDirectory)/#default.pst"
+        let yellowGlowChild = "\(yellowGlowDirectory)/01B.tiff"
         let longChild = "\(longDirectory)/#Root.cst"
         var records = [
             makeRecord(path: klopfgeistDirectory, isDirectory: true, modifiedTime: 0),
-            makeRecord(path: longDirectory, isDirectory: true, modifiedTime: 1),
-            makeRecord(path: klopfgeistChild, modifiedTime: 2),
-            makeRecord(path: longChild, modifiedTime: 3)
+            makeRecord(path: yellowGlowDirectory, isDirectory: true, modifiedTime: 1),
+            makeRecord(path: longDirectory, isDirectory: true, modifiedTime: 2),
+            makeRecord(path: klopfgeistChild, modifiedTime: 3),
+            makeRecord(path: yellowGlowChild, modifiedTime: 4),
+            makeRecord(path: longChild, modifiedTime: 5)
         ]
 
         for index in 0..<12_000 {
@@ -147,7 +151,8 @@ struct MemoryBudgetTests {
         ), maxResults: 20)
 
         #expect(response.usesIndexedCandidates)
-        #expect(response.results.contains { $0.record.path == klopfgeistChild })
+        #expect(!response.results.contains { $0.record.path == klopfgeistChild })
+        #expect(response.results.contains { $0.record.path == yellowGlowChild })
         #expect(response.results.contains { $0.record.path == longChild })
     }
 

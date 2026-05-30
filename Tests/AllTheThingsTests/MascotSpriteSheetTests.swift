@@ -5,17 +5,16 @@ import Testing
 
 @Suite("Mascot sprite sheet")
 struct MascotSpriteSheetTests {
-    @Test("animation metadata matches sprite sheet rows")
+    @Test("animation metadata matches runtime strips")
     @MainActor
-    func animationMetadataMatchesSpriteSheetRows() {
-        #expect(OperationMascotAnimation.idle.row == 0)
-        #expect(OperationMascotAnimation.indexing.row == 1)
-        #expect(OperationMascotAnimation.searching.row == 2)
-        #expect(OperationMascotAnimation.optimizing.row == 3)
-        #expect(OperationMascotAnimation.fileChanged.row == 4)
-        #expect(OperationMascotAnimation.success.row == 5)
-        #expect(OperationMascotAnimation.error.row == 6)
-
+    func animationMetadataMatchesRuntimeStrips() {
+        #expect(OperationMascotAnimation.idle.resourceName == "NibOperationIdleStrip")
+        #expect(OperationMascotAnimation.indexing.resourceName == "NibOperationIndexingStrip")
+        #expect(OperationMascotAnimation.searching.resourceName == "NibOperationSearchingStrip")
+        #expect(OperationMascotAnimation.optimizing.resourceName == "NibOperationOptimizingStrip")
+        #expect(OperationMascotAnimation.fileChanged.resourceName == "NibOperationFileChangedStrip")
+        #expect(OperationMascotAnimation.success.resourceName == "NibOperationSuccessStrip")
+        #expect(OperationMascotAnimation.error.resourceName == "NibOperationErrorStrip")
         #expect(OperationMascotAnimation.idle.frameCount == 8)
         #expect(OperationMascotAnimation.indexing.frameCount == 16)
         #expect(OperationMascotAnimation.searching.frameCount == 16)
@@ -38,11 +37,12 @@ struct MascotSpriteSheetTests {
             #expect(animation.framesPerSecond <= 8)
         }
 
-        #expect(OperationMascotCoordinator.layoutSize == 40)
-        #expect(OperationMascotCoordinator.statusDisplaySize == OperationMascotCoordinator.layoutSize)
+        #expect(OperationMascotCoordinator.statusDisplaySize == 40)
+        #expect(OperationMascotCoordinator.footerSlotHeight == 28)
+        #expect(OperationMascotCoordinator.footerSlotHeight < OperationMascotCoordinator.statusDisplaySize)
         #expect(OperationMascotCoordinator.heroDisplaySize == 86)
-        #expect(OperationMascotCoordinator.heroDisplaySize > OperationMascotCoordinator.layoutSize * 2)
-        #expect(OperationMascotCoordinator.expandedDisplaySize == OperationMascotCoordinator.layoutSize * 4)
+        #expect(OperationMascotCoordinator.heroDisplaySize > OperationMascotCoordinator.statusDisplaySize * 2)
+        #expect(OperationMascotCoordinator.expandedDisplaySize == OperationMascotCoordinator.statusDisplaySize * 4)
         #expect(OperationMascotCoordinator.expandedDisplaySize > OperationMascotCoordinator.heroDisplaySize)
 
         #expect(OperationMascotAnimation.idle.loops)
@@ -70,16 +70,10 @@ struct MascotSpriteSheetTests {
 
         for clip in OperationMascotIdleClip.allCases {
             #expect(!clip.resourceName.isEmpty)
-            #expect(clip.frameCount == clip.fallbackFrameIndices.count)
             #expect(clip.framesPerSecond > 0)
             #expect(clip.framesPerSecond <= 5)
             #expect(!(clip.isFidget && clip.isFlourish))
             #expect(clip.idleSelectionWeight > 0)
-
-            for index in clip.fallbackFrameIndices {
-                #expect(index >= 0)
-                #expect(index < OperationMascotAnimation.idle.frameCount)
-            }
         }
 
         #expect(OperationMascotIdleClip.mainLoop.idleSelectionWeight > fidgets.map(\.idleSelectionWeight).reduce(0, +))
@@ -177,10 +171,7 @@ struct MascotSpriteSheetTests {
     @Test("coordinator renders first idle frame on initialization")
     @MainActor
     func coordinatorRendersFirstIdleFrameOnInitialization() throws {
-        let spriteSheet = MascotSpriteSheet(
-            imageURL: try #require(spriteSheetURL()),
-            idleClipDirectoryURL: resourcesDirectoryURL()
-        )
+        let spriteSheet = MascotSpriteSheet(resourceDirectoryURL: resourcesDirectoryURL())
         let imageView = NSImageView()
 
         _ = OperationMascotCoordinator(imageView: imageView, spriteSheet: spriteSheet)
@@ -189,11 +180,10 @@ struct MascotSpriteSheetTests {
         #expect(imageView.accessibilityLabel() == OperationMascotAnimation.idle.accessibilityLabel)
     }
 
-    @Test("sprite sheet slices all animation frames")
+    @Test("runtime strips load all animation frames")
     @MainActor
-    func spriteSheetSlicesAllAnimationFrames() throws {
-        let url = try #require(spriteSheetURL())
-        let sheet = MascotSpriteSheet(imageURL: url, idleClipDirectoryURL: resourcesDirectoryURL())
+    func runtimeStripsLoadAllAnimationFrames() throws {
+        let sheet = MascotSpriteSheet(resourceDirectoryURL: resourcesDirectoryURL())
         let expectedFrameSize = NSSize(width: 160, height: 96)
 
         for animation in OperationMascotAnimation.allCases {
@@ -202,6 +192,21 @@ struct MascotSpriteSheetTests {
             let first = try #require(sheet.frame(for: animation, index: 0))
             let wrapped = try #require(sheet.frame(for: animation, index: animation.frameCount))
             let negative = try #require(sheet.frame(for: animation, index: -1))
+
+            #expect(first.isValid)
+            #expect(wrapped.isValid)
+            #expect(negative.isValid)
+            #expect(first.size == expectedFrameSize)
+            #expect(wrapped.size == expectedFrameSize)
+            #expect(negative.size == expectedFrameSize)
+        }
+
+        for clip in OperationMascotIdleClip.allCases {
+            #expect(sheet.loadedFrameCount(for: clip) == clip.frameCount)
+
+            let first = try #require(sheet.frame(for: clip, index: 0))
+            let wrapped = try #require(sheet.frame(for: clip, index: clip.frameCount))
+            let negative = try #require(sheet.frame(for: clip, index: -1))
 
             #expect(first.isValid)
             #expect(wrapped.isValid)
@@ -338,54 +343,46 @@ struct MascotSpriteSheetTests {
         }
     }
 
-    @Test("sprite frames keep transparent gutters")
-    func spriteFramesKeepTransparentGutters() throws {
-        let url = try #require(spriteSheetURL())
-        let imageData = try Data(contentsOf: url)
-        let bitmap = try #require(NSBitmapImageRep(data: imageData))
-
+    @Test("operation strips keep transparent gutters")
+    func operationStripsKeepTransparentGutters() throws {
         let cellWidth = 160
         let cellHeight = 96
-        #expect(bitmap.pixelsWide == cellWidth * 16)
-        #expect(bitmap.pixelsHigh == cellHeight * 7)
 
         for animation in OperationMascotAnimation.allCases {
+            let bitmap = try operationBitmap(for: animation)
+            #expect(bitmap.pixelsWide == cellWidth * animation.frameCount)
+            #expect(bitmap.pixelsHigh == cellHeight)
+
             for frame in 0..<animation.frameCount {
                 let originX = frame * cellWidth
-                let originY = animation.row * cellHeight
-                let bbox = visibleBounds(
+                let bounds = try #require(visibleBounds(
                     in: bitmap,
                     xRange: originX..<(originX + cellWidth),
-                    yRange: originY..<(originY + cellHeight)
-                )
+                    yRange: 0..<cellHeight
+                ))
 
-                let bounds = try #require(bbox)
                 #expect(bounds.minX > originX)
-                #expect(bounds.minY > originY)
+                #expect(bounds.minY > 0)
                 #expect(bounds.maxX < originX + cellWidth - 1)
-                #expect(bounds.maxY < originY + cellHeight - 1)
+                #expect(bounds.maxY < cellHeight - 1)
             }
         }
     }
 
-    @Test("animation rows keep consistent mascot scale")
-    func animationRowsKeepConsistentMascotScale() throws {
-        let url = try #require(spriteSheetURL())
-        let imageData = try Data(contentsOf: url)
-        let bitmap = try #require(NSBitmapImageRep(data: imageData))
-
+    @Test("operation strips keep consistent mascot scale")
+    func operationStripsKeepConsistentMascotScale() throws {
         let cellWidth = 160
         let cellHeight = 96
 
         for animation in OperationMascotAnimation.allCases {
+            let bitmap = try operationBitmap(for: animation)
             var frameHeights: [Int] = []
             for frame in 0..<animation.frameCount {
                 let originX = frame * cellWidth
-                let originY = animation.row * cellHeight
                 guard let bounds = visibleBounds(
                     in: bitmap,
                     xRange: originX..<(originX + cellWidth),
-                    yRange: originY..<(originY + cellHeight)
+                    yRange: 0..<cellHeight
                 ) else {
                     continue
                 }
@@ -398,24 +395,20 @@ struct MascotSpriteSheetTests {
         }
     }
 
-    @Test("animation rows keep consistent mascot body width")
-    func animationRowsKeepConsistentMascotBodyWidth() throws {
-        let url = try #require(spriteSheetURL())
-        let imageData = try Data(contentsOf: url)
-        let bitmap = try #require(NSBitmapImageRep(data: imageData))
-
+    @Test("operation strips keep consistent mascot body width")
+    func operationStripsKeepConsistentMascotBodyWidth() throws {
         let cellWidth = 160
         let cellHeight = 96
 
         for animation in OperationMascotAnimation.allCases {
+            let bitmap = try operationBitmap(for: animation)
             var bodyWidths: [Int] = []
             for frame in 0..<animation.frameCount {
                 let originX = frame * cellWidth
-                let originY = animation.row * cellHeight
                 guard let bounds = largestMascotBlueBounds(
                     in: bitmap,
                     xRange: originX..<(originX + cellWidth),
-                    yRange: originY..<(originY + cellHeight)
+                    yRange: 0..<cellHeight
                 ) else {
                     continue
                 }
@@ -429,24 +422,20 @@ struct MascotSpriteSheetTests {
         }
     }
 
-    @Test("animation frames keep mascot body horizontally registered")
-    func animationFramesKeepMascotBodyHorizontallyRegistered() throws {
-        let url = try #require(spriteSheetURL())
-        let imageData = try Data(contentsOf: url)
-        let bitmap = try #require(NSBitmapImageRep(data: imageData))
-
+    @Test("operation strips keep mascot body horizontally registered")
+    func operationStripsKeepMascotBodyHorizontallyRegistered() throws {
         let cellWidth = 160
         let cellHeight = 96
 
         for animation in OperationMascotAnimation.allCases {
+            let bitmap = try operationBitmap(for: animation)
             var bodyCenters: [Double] = []
             for frame in 0..<animation.frameCount {
                 let originX = frame * cellWidth
-                let originY = animation.row * cellHeight
                 guard let bounds = largestMascotBlueBounds(
                     in: bitmap,
                     xRange: originX..<(originX + cellWidth),
-                    yRange: originY..<(originY + cellHeight)
+                    yRange: 0..<cellHeight
                 ) else {
                     continue
                 }
@@ -462,11 +451,6 @@ struct MascotSpriteSheetTests {
         }
     }
 
-    private func spriteSheetURL() -> URL? {
-        resourcesDirectoryURL()?
-            .appendingPathComponent("NibGeneratedMasterSheet.png", isDirectory: false)
-    }
-
     private func resourcesDirectoryURL() -> URL? {
         URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -480,9 +464,20 @@ struct MascotSpriteSheetTests {
             .appendingPathComponent("\(clip.resourceName).png", isDirectory: false)
     }
 
+    private func operationStripURL(for animation: OperationMascotAnimation) -> URL? {
+        resourcesDirectoryURL()?
+            .appendingPathComponent("\(animation.resourceName).png", isDirectory: false)
+    }
+
     private func standaloneClipURL(for clip: OperationMascotStandaloneClip) -> URL? {
         resourcesDirectoryURL()?
             .appendingPathComponent("\(clip.resourceName).png", isDirectory: false)
+    }
+
+    private func operationBitmap(for animation: OperationMascotAnimation) throws -> NSBitmapImageRep {
+        let url = try #require(operationStripURL(for: animation))
+        let imageData = try Data(contentsOf: url)
+        return try #require(NSBitmapImageRep(data: imageData))
     }
 
     private func visibleBounds(

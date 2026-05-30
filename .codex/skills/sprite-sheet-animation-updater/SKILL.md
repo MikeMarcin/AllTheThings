@@ -73,59 +73,51 @@ Avoid prop colors that match the mascot body detector. Gray papers, gears, shado
 
 ## Validator
 
-Run the bundled validator from the repo skill directory:
+For AllTheThings, run the strip-aware wrapper from the repo skill directory:
 
 ```bash
-python3 .codex/skills/sprite-sheet-animation-updater/scripts/validate_sprite_sheet.py \
-  --sheet Resources/NibGeneratedMasterSheet.png \
-  --cell-width 160 \
-  --cell-height 96 \
-  --columns 16 \
-  --rows 7 \
-  --animations idle:8,indexing:16,searching:16,optimizing:16,file_changed:6,success:8,error:6 \
-  --body-color mascot-blue \
-  --min-gutter 1 \
-  --body-width-range 69:78 \
-  --body-height-range 78:90 \
-  --body-center-range 79:84 \
-  --max-center-drift 3 \
-  --preview /tmp/sprite-sheet-preview.png
+.codex/skills/sprite-sheet-animation-updater/scripts/validate_allthethings_nib.sh .
 ```
 
-Use `--no-body-check` for non-blue characters or when a sheet does not have a detectable mascot-color component. In that case, add a project-specific test or script for the character model before shipping.
+Use `scripts/validate_sprite_sheet.py` directly for legacy master sheets, non-AllTheThings projects, or one-off generated rows. Add `--no-body-check` for non-blue characters or when a sheet does not have a detectable mascot-color component. In that case, add a project-specific test or script for the character model before shipping.
 
-The validator checks:
+The AllTheThings wrapper checks every runtime strip, then runs Swift tests and the CMake app bundle build. The image checks include:
 
-- sheet dimensions equal `columns * cellWidth` by `rows * cellHeight`
+- strip dimensions equal `frameCount * cellWidth` by `cellHeight`
 - active frames are nonempty
 - active frames keep transparent gutters
-- optional mascot-blue body component width and height stay within bounds
-- optional mascot-blue body center stays within bounds and has limited per-row drift
-- inactive padded cells are allowed to be empty
+- optional mascot-blue body component width stays within bounds
+- optional mascot-blue body center stays within bounds and has limited strip drift
 
 ## AllTheThings / Nib Defaults
 
 For this repository's Nib mascot, use:
 
-- runtime asset: `Resources/NibGeneratedMasterSheet.png`
-- sheet size: `2560 x 672`
 - cell size: `160 x 96`
+- runtime operation strips:
+  - `Resources/NibOperationIdleStrip.png`, 8 frames, 4 fps
+  - `Resources/NibOperationIndexingStrip.png`, 16 frames, 5 fps
+  - `Resources/NibOperationSearchingStrip.png`, 16 frames, 8 fps
+  - `Resources/NibOperationOptimizingStrip.png`, 16 frames, 5 fps
+  - `Resources/NibOperationFileChangedStrip.png`, 6 frames, 6 fps
+  - `Resources/NibOperationSuccessStrip.png`, 8 frames, 6 fps
+  - `Resources/NibOperationErrorStrip.png`, 6 frames, 5 fps
+- runtime idle strips:
+  - `Resources/NibIdleMainLoopStrip.png`, 8 frames
+  - `Resources/NibIdleBlinkFidgetStrip.png`, 8 frames
+  - `Resources/NibIdleAntennaFidgetStrip.png`, 8 frames
+  - `Resources/NibIdleFileFinderSparkStrip.png`, 10 frames
+  - `Resources/NibIdleVictoryBounceStrip.png`, 10 frames
 - standalone first-run intro strip: `Resources/NibIntroWelcomeStrip.png`, 32 frames, 4 fps
 - standalone flydown strip: `Resources/NibFlydownStrip.png`, 10 frames, 14 fps, one-shot
-- columns: `16`
-- rows/frame counts:
-  - `idle`: row 0, 8 frames, loops
-  - `indexing`: row 1, 16 frames, loops
-  - `searching`: row 2, 16 frames, loops
-  - `optimizing`: row 3, 16 frames, loops
-  - `file_changed`: row 4, 6 frames, one-shot
-  - `success`: row 5, 8 frames, one-shot
-  - `error`: row 6, 6 frames, one-shot
+- temporary audit contact sheet: `artifacts/mascot-animation/nib-all-animations-contact-sheet.png`
 
-To regenerate the smoother first-impression operation rows and the first-run intro strip, keep the approved idle body locked and redraw only the props:
+The app should load only the individual runtime strips. The audit contact sheet is a generated inspection artifact and must not be bundled or referenced by app code.
+
+To regenerate the smoother first-impression operation strips, standalone strips, and the audit contact sheet, keep the approved idle body locked and redraw only the props:
 
 ```bash
-python3 .codex/skills/sprite-sheet-animation-updater/scripts/generate_allthethings_operation_rows.py --repo-root . --frames 16 --columns 16
+python3 .codex/skills/sprite-sheet-animation-updater/scripts/generate_allthethings_operation_rows.py --repo-root . --frames 16
 ```
 
 After changing the sheet in AllTheThings, run:
@@ -134,4 +126,4 @@ After changing the sheet in AllTheThings, run:
 .codex/skills/sprite-sheet-animation-updater/scripts/validate_allthethings_nib.sh .
 ```
 
-Also keep or update Swift regression tests that check sprite metadata, slicing, transparent gutters, body height, body width, horizontal body registration, standalone strip dimensions, and standalone loop seams.
+Also keep or update Swift regression tests that check sprite metadata, strip slicing, transparent gutters, body height, body width, horizontal body registration, standalone strip dimensions, and standalone loop seams.

@@ -10,15 +10,15 @@ enum OperationMascotAnimation: String, CaseIterable {
     case success
     case error
 
-    var row: Int {
+    var resourceName: String {
         switch self {
-        case .idle: 0
-        case .indexing: 1
-        case .searching: 2
-        case .optimizing: 3
-        case .fileChanged: 4
-        case .success: 5
-        case .error: 6
+        case .idle: "NibOperationIdleStrip"
+        case .indexing: "NibOperationIndexingStrip"
+        case .searching: "NibOperationSearchingStrip"
+        case .optimizing: "NibOperationOptimizingStrip"
+        case .fileChanged: "NibOperationFileChangedStrip"
+        case .success: "NibOperationSuccessStrip"
+        case .error: "NibOperationErrorStrip"
         }
     }
 
@@ -128,20 +128,6 @@ enum OperationMascotIdleClip: String, CaseIterable {
         }
     }
 
-    var fallbackFrameIndices: [Int] {
-        switch self {
-        case .mainLoop:
-            [0, 0, 0, 0, 0, 0, 0, 0]
-        case .blink:
-            [0, 0, 2, 2, 0, 0, 0, 0]
-        case .antennaWiggle:
-            [0, 1, 3, 4, 3, 1, 0, 0]
-        case .fileFinderSpark:
-            [0, 1, 1, 0, 2, 0, 1, 0, 0, 0]
-        case .victoryBounce:
-            [0, 1, 1, 0, 1, 0, 2, 0, 1, 0]
-        }
-    }
 }
 
 enum OperationMascotStandaloneClip: String, CaseIterable {
@@ -358,34 +344,18 @@ struct OperationMascotAnimationController {
 final class MascotSpriteSheet {
     static let shared = MascotSpriteSheet()
 
-    private static let columnCount = 16
-    private static let rowCount = 7
-
     private let frames: [OperationMascotAnimation: [NSImage]]
     private let idleClipFrames: [OperationMascotIdleClip: [NSImage]]
     private let standaloneClipFrames: [OperationMascotStandaloneClip: [NSImage]]
 
     convenience init() {
-        self.init(
-            imageURL: Self.bundledSpriteSheetURL(),
-            idleClipDirectoryURL: Bundle.main.resourceURL
-        )
+        self.init(resourceDirectoryURL: Bundle.main.resourceURL)
     }
 
-    init(imageURL: URL?, idleClipDirectoryURL: URL? = nil) {
-        let slicedFrames: [OperationMascotAnimation: [NSImage]]
-        if let imageURL, let image = NSImage(contentsOf: imageURL), let frames = Self.sliceFrames(from: image) {
-            slicedFrames = frames
-        } else {
-            slicedFrames = [:]
-        }
-
-        self.frames = slicedFrames
-        self.idleClipFrames = Self.loadIdleClipFrames(
-            from: idleClipDirectoryURL,
-            fallbackFrames: slicedFrames[.idle] ?? []
-        )
-        self.standaloneClipFrames = Self.loadStandaloneClipFrames(from: idleClipDirectoryURL)
+    init(resourceDirectoryURL: URL? = nil) {
+        self.frames = Self.loadAnimationFrames(from: resourceDirectoryURL)
+        self.idleClipFrames = Self.loadIdleClipFrames(from: resourceDirectoryURL)
+        self.standaloneClipFrames = Self.loadStandaloneClipFrames(from: resourceDirectoryURL)
     }
 
     func frame(for animation: OperationMascotAnimation, index: Int) -> NSImage? {
@@ -402,18 +372,18 @@ final class MascotSpriteSheet {
     }
 
     func frame(for idleClip: OperationMascotIdleClip, index: Int) -> NSImage? {
-        guard let frames = idleClipFrames[idleClip], !frames.isEmpty else {
-            return frame(for: .idle, index: index)
-        }
+        guard let frames = idleClipFrames[idleClip], !frames.isEmpty else { return nil }
 
         let wrappedIndex = ((index % frames.count) + frames.count) % frames.count
         return frames[wrappedIndex]
     }
 
+    func loadedFrameCount(for idleClip: OperationMascotIdleClip) -> Int {
+        idleClipFrames[idleClip]?.count ?? 0
+    }
+
     func frame(for standaloneClip: OperationMascotStandaloneClip, index: Int) -> NSImage? {
-        guard let frames = standaloneClipFrames[standaloneClip], !frames.isEmpty else {
-            return frame(for: .idle, index: index)
-        }
+        guard let frames = standaloneClipFrames[standaloneClip], !frames.isEmpty else { return nil }
 
         let wrappedIndex = ((index % frames.count) + frames.count) % frames.count
         return frames[wrappedIndex]
@@ -423,48 +393,26 @@ final class MascotSpriteSheet {
         standaloneClipFrames[standaloneClip]?.count ?? 0
     }
 
-    private static func bundledSpriteSheetURL() -> URL? {
-        Bundle.main.url(forResource: "NibGeneratedMasterSheet", withExtension: "png")
-    }
-
-    private static func sliceFrames(from image: NSImage) -> [OperationMascotAnimation: [NSImage]]? {
-        var proposedRect = NSRect(origin: .zero, size: image.size)
-        guard let cgImage = image.cgImage(forProposedRect: &proposedRect, context: nil, hints: nil) else {
-            return nil
-        }
-
+    private static func loadAnimationFrames(from directoryURL: URL?) -> [OperationMascotAnimation: [NSImage]] {
         var result: [OperationMascotAnimation: [NSImage]] = [:]
         for animation in OperationMascotAnimation.allCases {
-            var animationFrames: [NSImage] = []
-            animationFrames.reserveCapacity(animation.frameCount)
-
-            for column in 0..<animation.frameCount {
-                let rect = cropRect(
-                    imageWidth: cgImage.width,
-                    imageHeight: cgImage.height,
-                    column: column,
-                    row: animation.row
+            if
+                let directoryURL,
+                let stripFrames = sliceStripFrames(
+                    from: directoryURL
+                        .appendingPathComponent(animation.resourceName, isDirectory: false)
+                        .appendingPathExtension("png"),
+                    frameCount: animation.frameCount
                 )
-
-                guard let frameImage = cgImage.cropping(to: rect) else {
-                    continue
-                }
-
-                let image = NSImage(cgImage: frameImage, size: NSSize(width: rect.width, height: rect.height))
-                image.isTemplate = false
-                animationFrames.append(image)
+            {
+                result[animation] = stripFrames
             }
-
-            result[animation] = animationFrames
         }
 
         return result
     }
 
-    private static func loadIdleClipFrames(
-        from directoryURL: URL?,
-        fallbackFrames: [NSImage]
-    ) -> [OperationMascotIdleClip: [NSImage]] {
+    private static func loadIdleClipFrames(from directoryURL: URL?) -> [OperationMascotIdleClip: [NSImage]] {
         var result: [OperationMascotIdleClip: [NSImage]] = [:]
 
         for clip in OperationMascotIdleClip.allCases {
@@ -478,15 +426,6 @@ final class MascotSpriteSheet {
                 )
             {
                 result[clip] = stripFrames
-                continue
-            }
-
-            let frames = clip.fallbackFrameIndices.compactMap { index -> NSImage? in
-                guard fallbackFrames.indices.contains(index) else { return nil }
-                return fallbackFrames[index]
-            }
-            if frames.count == clip.frameCount {
-                result[clip] = frames
             }
         }
 
@@ -547,24 +486,6 @@ final class MascotSpriteSheet {
         }
 
         return frames.count == frameCount ? frames : nil
-    }
-
-    private static func cropRect(imageWidth: Int, imageHeight: Int, column: Int, row: Int) -> CGRect {
-        let x0 = floor(Double(column) * Double(imageWidth) / Double(columnCount))
-        let x1 = column == columnCount - 1
-            ? Double(imageWidth)
-            : floor(Double(column + 1) * Double(imageWidth) / Double(columnCount))
-        let y0 = floor(Double(row) * Double(imageHeight) / Double(rowCount))
-        let y1 = row == rowCount - 1
-            ? Double(imageHeight)
-            : floor(Double(row + 1) * Double(imageHeight) / Double(rowCount))
-
-        return CGRect(
-            x: x0,
-            y: y0,
-            width: max(1, x1 - x0),
-            height: max(1, y1 - y0)
-        )
     }
 }
 
@@ -680,10 +601,10 @@ final class StandaloneMascotCoordinator {
 
 @MainActor
 final class OperationMascotCoordinator {
-    static let layoutSize: CGFloat = 40
-    static let statusDisplaySize: CGFloat = layoutSize
+    static let statusDisplaySize: CGFloat = 40
+    static let footerSlotHeight: CGFloat = 28
     static let heroDisplaySize: CGFloat = 86
-    static let expandedDisplaySize: CGFloat = layoutSize * 4
+    static let expandedDisplaySize: CGFloat = statusDisplaySize * 4
 
     private let imageView: NSImageView
     private let spriteSheet: MascotSpriteSheet
@@ -699,7 +620,7 @@ final class OperationMascotCoordinator {
     init(
         imageView: NSImageView,
         spriteSheet: MascotSpriteSheet = .shared,
-        displaySize: CGFloat = 40
+        displaySize: CGFloat = OperationMascotCoordinator.statusDisplaySize
     ) {
         self.imageView = imageView
         self.spriteSheet = spriteSheet
