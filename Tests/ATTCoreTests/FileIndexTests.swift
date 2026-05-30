@@ -291,10 +291,12 @@ struct FileIndexTests {
         #expect(diagnostics.visibleModifiedOrderCount == diagnostics.indexedCount)
         #expect(diagnostics.simdTextVerificationEnabled)
         let packageURL = supportDirectory(applicationName: applicationName)
-            .appendingPathComponent("filename-index-v5.attindex", isDirectory: true)
+            .appendingPathComponent("filename-index-v6.attindex", isDirectory: true)
         #expect(FileManager.default.fileExists(atPath: packageURL.appendingPathComponent("parent.i32").path))
         #expect(FileManager.default.fileExists(atPath: packageURL.appendingPathComponent("flags.u8").path))
         #expect(FileManager.default.fileExists(atPath: packageURL.appendingPathComponent("visible.bitset").path))
+        #expect(FileManager.default.fileExists(atPath: packageURL.appendingPathComponent("subtreeEnd.i32").path))
+        #expect(FileManager.default.fileExists(atPath: packageURL.appendingPathComponent("componentPostings.bin").path))
         #expect(FileManager.default.fileExists(atPath: packageURL.appendingPathComponent("visibleModifiedOrder.i32").path))
         #expect(reloaded.search(SearchRequest(
             query: "swc",
@@ -302,8 +304,8 @@ struct FileIndexTests {
         ), maxResults: 5).results.contains { $0.record.name == "SearchWindowController.swift" })
     }
 
-    @Test("v5 hard cut removes lingering v4 packages")
-    func v5HardCutRemovesLingeringV4Packages() throws {
+    @Test("v6 cutover removes obsolete index artifacts")
+    func v6CutoverRemovesObsoleteIndexArtifacts() throws {
         let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
         let supportDirectory = supportDirectory(applicationName: applicationName)
         try FileManager.default.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
@@ -311,20 +313,35 @@ struct FileIndexTests {
             try? FileManager.default.removeItem(at: supportDirectory)
         }
 
-        let oldPackage = supportDirectory.appendingPathComponent("filename-index-v4.attindex", isDirectory: true)
-        let oldTemporaryPackage = supportDirectory
-            .appendingPathComponent("filename-index-v4-\(UUID().uuidString).attindex.tmp", isDirectory: true)
-        try FileManager.default.createDirectory(at: oldPackage, withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(at: oldTemporaryPackage, withIntermediateDirectories: true)
+        let obsoletePackages = [
+            supportDirectory.appendingPathComponent("filename-index-v5.attindex", isDirectory: true),
+            supportDirectory.appendingPathComponent("filename-index-v4.attindex", isDirectory: true),
+            supportDirectory.appendingPathComponent("filename-index-v5-\(UUID().uuidString).attindex.tmp", isDirectory: true),
+            supportDirectory.appendingPathComponent("filename-index-v4-\(UUID().uuidString).attindex.tmp", isDirectory: true)
+        ]
+        for package in obsoletePackages {
+            try FileManager.default.createDirectory(at: package, withIntermediateDirectories: true)
+        }
+
+        let obsoleteFiles = [
+            supportDirectory.appendingPathComponent("filename-index-v2.jsonl", isDirectory: false),
+            supportDirectory.appendingPathComponent("filename-index-v2-\(UUID().uuidString).jsonl.tmp", isDirectory: false),
+            supportDirectory.appendingPathComponent("filename-index.json", isDirectory: false),
+            supportDirectory.appendingPathComponent("filename-index.json.tmp", isDirectory: false)
+        ]
+        for file in obsoleteFiles {
+            try Data([1]).write(to: file)
+        }
 
         _ = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
 
-        #expect(!FileManager.default.fileExists(atPath: oldPackage.path))
-        #expect(!FileManager.default.fileExists(atPath: oldTemporaryPackage.path))
+        for url in obsoletePackages + obsoleteFiles {
+            #expect(!FileManager.default.fileExists(atPath: url.path))
+        }
     }
 
-    @Test("missing v5 sidecars invalidate persisted snapshots")
-    func missingV5SidecarsInvalidatePersistedSnapshots() throws {
+    @Test("missing v6 sidecars invalidate persisted snapshots")
+    func missingV6SidecarsInvalidatePersistedSnapshots() throws {
         let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
         let supportDirectory = supportDirectory(applicationName: applicationName)
         defer {
@@ -337,7 +354,7 @@ struct FileIndexTests {
         ])
         index.persistSnapshotForTesting()
 
-        let packageURL = supportDirectory.appendingPathComponent("filename-index-v5.attindex", isDirectory: true)
+        let packageURL = supportDirectory.appendingPathComponent("filename-index-v6.attindex", isDirectory: true)
         try FileManager.default.removeItem(at: packageURL.appendingPathComponent("visible.bitset"))
 
         let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)

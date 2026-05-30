@@ -263,6 +263,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var visibleColumns: Set<Column>
     private var indexedRoots: [URL]
     private var pendingEventPaths = Set<String>()
+    private var pendingRecursiveEventPaths = Set<String>()
     private var eventDebounce: DispatchWorkItem?
     private var memoryStatusTask: Task<Void, Never>?
     private var memoryStatusText = ProcessMemoryFormatter.label(for: ProcessMemorySampler.currentUsage())
@@ -1670,22 +1671,29 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             return
         }
 
-        watcher.start(roots: indexedRoots) { @MainActor @Sendable [weak self] paths in
-            self?.coalesceFSEvents(paths)
+        watcher.start(roots: indexedRoots) { @MainActor @Sendable [weak self] events in
+            self?.coalesceFSEvents(events)
         }
     }
 
-    private func coalesceFSEvents(_ paths: [String]) {
-        pendingEventPaths.formUnion(paths)
+    private func coalesceFSEvents(_ events: [FileSystemEvent]) {
+        pendingEventPaths.formUnion(events.map(\.path))
+        pendingRecursiveEventPaths.formUnion(events.filter(\.requiresRecursiveRescan).map(\.path))
         eventDebounce?.cancel()
 
         let workItem = DispatchWorkItem { [weak self] in
             guard let self else { return }
             let paths = Array(self.pendingEventPaths)
+            let recursivePaths = Array(self.pendingRecursiveEventPaths)
             self.pendingEventPaths.removeAll(keepingCapacity: false)
+            self.pendingRecursiveEventPaths.removeAll(keepingCapacity: false)
             guard !paths.isEmpty else { return }
             self.playMascotTransient(.fileChanged)
-            self.index.refresh(paths: paths)
+            if recursivePaths.isEmpty {
+                self.index.refresh(paths: paths)
+            } else {
+                self.index.replaceRootsAndRebuild(self.indexedRoots)
+            }
         }
 
         eventDebounce = workItem

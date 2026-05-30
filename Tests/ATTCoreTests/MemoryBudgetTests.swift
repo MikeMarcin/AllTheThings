@@ -151,27 +151,6 @@ struct MemoryBudgetTests {
         #expect(response.results.contains { $0.record.path == longChild })
     }
 
-    @Test("old streaming snapshots are ignored")
-    func oldStreamingSnapshotsAreIgnored() throws {
-        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
-        let supportDirectory = try applicationSupportDirectory(for: applicationName)
-        try FileManager.default.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
-
-        let snapshotURL = supportDirectory.appendingPathComponent("filename-index-v2.jsonl")
-        let staleHeader = """
-        {"schemaVersion":2,"savedAt":0,"roots":[],"exclusionPatterns":[],"recordCount":1}
-
-        """
-        try staleHeader.write(to: snapshotURL, atomically: true, encoding: .utf8)
-
-        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
-        #expect(index.currentStats().indexedCount == 0)
-        #expect(index.search(SearchRequest(
-            query: "type_trai",
-            sort: SortSpec(column: .relevance, ascending: false)
-        ), maxResults: 10).results.isEmpty)
-    }
-
     @Test("refresh storms are coalesced")
     func refreshStormsAreCoalesced() async throws {
         let fileManager = FileManager.default
@@ -233,14 +212,42 @@ struct MemoryBudgetTests {
         ), maxResults: 5).results.contains { $0.record.name == "File000010.swift" })
     }
 
+    @Test("v6 snapshots persist a virtual component namespace")
+    func v6SnapshotsPersistVirtualComponentNamespace() {
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let records = makeCatalogRecords(count: 2_000)
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        index.replaceRecordsForTesting(records)
+        index.persistSnapshotForTesting()
+
+        let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
+        let diagnostics = reloaded.currentDiagnostics()
+
+        #expect(diagnostics.schemaVersion == 6)
+        #expect(diagnostics.indexedCount == records.count)
+        #expect(diagnostics.resultCount == records.count)
+        #expect(diagnostics.virtualRowCount > 0)
+        #expect(diagnostics.componentGramPostingCount > diagnostics.nameGramPostingCount)
+
+        let response = reloaded.search(SearchRequest(
+            query: "catalog",
+            sort: SortSpec(column: .name, ascending: true),
+            includeHidden: false
+        ), maxResults: 25)
+
+        #expect(response.usesIndexedCandidates)
+        #expect(response.totalMatches == records.count)
+        #expect(response.results.count == 25)
+    }
+
     @Test("corrupt mmap snapshots are ignored")
     func corruptMmapSnapshotsAreIgnored() throws {
         let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
         let supportDirectory = try applicationSupportDirectory(for: applicationName)
-        let packageURL = supportDirectory.appendingPathComponent("filename-index-v5.attindex", isDirectory: true)
+        let packageURL = supportDirectory.appendingPathComponent("filename-index-v6.attindex", isDirectory: true)
         try FileManager.default.createDirectory(at: packageURL, withIntermediateDirectories: true)
         let manifest = CompactSnapshotManifest(
-            schemaVersion: 5,
+            schemaVersion: 6,
             savedAt: Date(),
             roots: [],
             exclusionPatterns: FileExclusionRules.defaultPatterns,
@@ -418,6 +425,49 @@ struct MemoryBudgetTests {
         }
     }
 
+    @Test("opt-in v6 mapped search benchmark")
+    func optInV6MappedSearchBenchmark() {
+        guard
+            let rawCount = ProcessInfo.processInfo.environment["ATT_V6_SEARCH_BENCH_RECORDS"],
+            let recordCount = Int(rawCount),
+            recordCount > 0
+        else {
+            return
+        }
+
+        let index = FileIndex(
+            applicationName: "AllTheThingsV6SearchBench-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        let records = makeCatalogRecords(count: recordCount)
+        index.replaceRecordsForTesting(records)
+        index.persistSnapshotForTesting()
+
+        let threshold = (Double(ProcessInfo.processInfo.environment["ATT_V6_SEARCH_BENCH_MAX_MS"] ?? "200") ?? 200) / 1_000
+
+        for query in ["log", "aito"] {
+            let response = index.search(SearchRequest(
+                query: query,
+                sort: SortSpec(column: .name, ascending: true),
+                includeHidden: false
+            ), maxResults: 2_000)
+
+            print(
+                """
+                ATT_V6_SEARCH_BENCH_RECORDS=\(recordCount) \
+                query=\(query) \
+                elapsed_ms=\(Int(response.elapsed * 1_000)) \
+                total=\(response.totalMatches) \
+                shown=\(response.results.count)
+                """
+            )
+
+            #expect(response.usesIndexedCandidates)
+            #expect(response.totalMatches == records.count)
+            #expect(response.elapsed < threshold)
+        }
+    }
+
     private func makeSyntheticRecords(count: Int, directoryPadding: String = "") -> [FileRecord] {
         var records: [FileRecord] = []
         records.reserveCapacity(count)
@@ -425,6 +475,34 @@ struct MemoryBudgetTests {
         for index in 0..<count {
             let name = String(format: "File%06d.swift", index)
             let directory = "/tmp/allthethings-memory/\(directoryPadding)project-\(index % 256)/module-\((index / 256) % 512)"
+            let path = "\(directory)/\(name)"
+            records.append(FileRecord(
+                id: FileRecord.stableID(for: path),
+                path: path,
+                name: name,
+                directoryPath: directory,
+                fileExtension: "swift",
+                sizeBytes: UInt64(index % 16_384),
+                modifiedTime: TimeInterval(index),
+                createdTime: nil,
+                isDirectory: false,
+                isHidden: false,
+                volumeName: "Synthetic",
+                normalizedName: FuzzyMatcher.normalize(name),
+                normalizedPath: FuzzyMatcher.normalize(path)
+            ))
+        }
+
+        return records
+    }
+
+    private func makeCatalogRecords(count: Int) -> [FileRecord] {
+        var records: [FileRecord] = []
+        records.reserveCapacity(count)
+
+        for index in 0..<count {
+            let name = String(format: "File%06d.swift", index)
+            let directory = "/tmp/allthethings-v6/aito/catalog-\(index % 512)/module-\((index / 512) % 512)"
             let path = "\(directory)/\(name)"
             records.append(FileRecord(
                 id: FileRecord.stableID(for: path),
