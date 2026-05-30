@@ -1,4 +1,4 @@
-import ATTCore
+@testable import ATTCore
 import Foundation
 import Testing
 
@@ -192,6 +192,59 @@ struct FileIndexTests {
         #expect(response.results.isEmpty)
     }
 
+    @Test("optimized search keeps fuzzy and acronym filename matches")
+    func optimizedSearchKeepsFuzzyAndAcronymFilenameMatches() throws {
+        let acronymPath = "/tmp/allthethings-tests/reports/PhotoSyncReport.final.pdf"
+        let typoPath = "/tmp/allthethings-tests/docs/README.md"
+        let exactPath = "/tmp/allthethings-tests/docs/redme-notes.txt"
+        let index = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        index.replaceRecordsForTesting([
+            makeRecord(path: acronymPath),
+            makeRecord(path: typoPath),
+            makeRecord(path: exactPath)
+        ])
+
+        var response = index.search(SearchRequest(
+            query: "psr",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10)
+        #expect(response.results.contains { $0.record.path == acronymPath })
+
+        response = index.search(SearchRequest(
+            query: "redme",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10)
+        #expect(response.results.contains { $0.record.path == typoPath })
+        #expect(response.results.contains { $0.record.path == exactPath })
+    }
+
+    @Test("persisted snapshots reload optimized search structures")
+    func persistedSnapshotsReloadOptimizedSearchStructures() throws {
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        index.replaceRecordsForTesting([
+            makeRecord(path: "/tmp/allthethings-tests/project/Sources/SearchWindowController.swift"),
+            makeRecord(path: "/tmp/allthethings-tests/project/README.md")
+        ])
+        index.persistSnapshotForTesting()
+
+        let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
+        let diagnostics = reloaded.currentDiagnostics()
+
+        #expect(diagnostics.recordStoreKind == .mapped)
+        #expect(diagnostics.optimizedCount == diagnostics.indexedCount)
+        #expect(diagnostics.nameGramPostingCount > 0)
+        #expect(diagnostics.pathGramIndexEnabled)
+        #expect(diagnostics.pathGramPostingCount > 0)
+        #expect(reloaded.search(SearchRequest(
+            query: "swc",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 5).results.contains { $0.record.name == "SearchWindowController.swift" })
+    }
+
     @Test("custom exclusions apply during scan and refresh")
     func customExclusionsApplyDuringScanAndRefresh() async throws {
         let fileManager = FileManager.default
@@ -267,5 +320,26 @@ struct FileIndexTests {
         }
 
         Issue.record("Timed out waiting for condition")
+    }
+
+    private func makeRecord(path: String, isDirectory: Bool = false) -> FileRecord {
+        let url = URL(fileURLWithPath: path)
+        let name = url.lastPathComponent
+        let directory = url.deletingLastPathComponent().path
+        return FileRecord(
+            id: FileRecord.stableID(for: path),
+            path: path,
+            name: name,
+            directoryPath: directory,
+            fileExtension: url.pathExtension.lowercased(),
+            sizeBytes: isDirectory ? 0 : 128,
+            modifiedTime: Date().timeIntervalSinceReferenceDate,
+            createdTime: nil,
+            isDirectory: isDirectory,
+            isHidden: FileRecord.pathIsHidden(path),
+            volumeName: "Test",
+            normalizedName: FuzzyMatcher.normalize(name),
+            normalizedPath: FuzzyMatcher.normalize(path)
+        )
     }
 }

@@ -701,6 +701,7 @@ final class MappedRecordStore: RecordStore {
 
         try Data().write(to: packageURL.appendingPathComponent("modifiedOrder.bin", isDirectory: false))
         try Data().write(to: packageURL.appendingPathComponent("namePostings.bin", isDirectory: false))
+        try Data().write(to: packageURL.appendingPathComponent("pathPostings.bin", isDirectory: false))
         try Data().write(to: packageURL.appendingPathComponent("extensionPostings.bin", isDirectory: false))
     }
 
@@ -755,6 +756,11 @@ final class MappedIntPostingIndex: @unchecked Sendable {
         self.postingCount = postingCount
     }
 
+    convenience init(contentsOf url: URL) throws {
+        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        try self.init(data: data, temporaryURL: nil)
+    }
+
     deinit {
         if let temporaryURL {
             try? FileManager.default.removeItem(at: temporaryURL)
@@ -794,6 +800,23 @@ final class MappedIntPostingIndex: @unchecked Sendable {
         try data.write(to: temporaryURL, options: .atomic)
         let mapped = try Data(contentsOf: temporaryURL, options: [.mappedIfSafe])
         return try MappedIntPostingIndex(data: mapped, temporaryURL: temporaryURL)
+    }
+
+    static func load(from url: URL, fileManager: FileManager = .default) throws -> MappedIntPostingIndex? {
+        guard fileManager.fileExists(atPath: url.path) else {
+            return nil
+        }
+
+        let attributes = try fileManager.attributesOfItem(atPath: url.path)
+        guard (attributes[.size] as? NSNumber)?.intValue ?? 0 > 0 else {
+            return nil
+        }
+
+        return try MappedIntPostingIndex(contentsOf: url)
+    }
+
+    func write(to url: URL) throws {
+        try data.write(to: url, options: .atomic)
     }
 
     func values(for key: Int) -> [Int32]? {
@@ -836,6 +859,60 @@ final class MappedIntPostingIndex: @unchecked Sendable {
 
     private func entryCount(at index: Int) -> Int {
         Int(data.readUInt32LE(at: Self.headerSize + index * Self.entrySize + 8))
+    }
+}
+
+enum CompactSearchStructureFiles {
+    private static let modifiedOrderMagic: UInt64 = 0x31444f4d54415441 // ATTMOD1 little-endian bytes.
+    private static let modifiedOrderVersion: UInt32 = 1
+    private static let modifiedOrderHeaderSize = 24
+
+    static func loadModifiedOrder(from url: URL, expectedCount: Int, fileManager: FileManager = .default) -> [Int]? {
+        guard expectedCount >= 0, fileManager.fileExists(atPath: url.path) else {
+            return nil
+        }
+
+        guard
+            let attributes = try? fileManager.attributesOfItem(atPath: url.path),
+            ((attributes[.size] as? NSNumber)?.intValue ?? 0) > 0,
+            let data = try? Data(contentsOf: url, options: [.mappedIfSafe]),
+            data.count == modifiedOrderHeaderSize + expectedCount * 4,
+            data.readUInt64LE(at: 0) == modifiedOrderMagic,
+            data.readUInt32LE(at: 8) == modifiedOrderVersion,
+            Int(data.readUInt64LE(at: 16)) == expectedCount
+        else {
+            return nil
+        }
+
+        var seen = Set<Int>()
+        seen.reserveCapacity(expectedCount)
+        var order: [Int] = []
+        order.reserveCapacity(expectedCount)
+
+        for index in 0..<expectedCount {
+            let rowID = Int(data.readInt32LE(at: modifiedOrderHeaderSize + index * 4))
+            guard rowID >= 0, rowID < expectedCount, seen.insert(rowID).inserted else {
+                return nil
+            }
+            order.append(rowID)
+        }
+
+        return order
+    }
+
+    static func writeModifiedOrder(_ order: [Int], to url: URL) throws {
+        var data = Data()
+        data.reserveCapacity(modifiedOrderHeaderSize + order.count * 4)
+        data.appendUInt64LE(modifiedOrderMagic)
+        data.appendUInt32LE(modifiedOrderVersion)
+        data.appendUInt32LE(4)
+        data.appendUInt64LE(UInt64(order.count))
+
+        for rowID in order {
+            data.appendInt32LE(Int32(rowID))
+        }
+
+        try data.write(to: url, options: .atomic)
     }
 }
 
