@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Regenerate AllTheThings Nib operation animations and intro strip.
+"""Regenerate AllTheThings Nib operation animations and standalone strips.
 
 This script keeps Nib's approved idle/fidget bodies on model and redraws the
 searching/indexing/optimizing props as longer, smoother loops inside the fixed cell grid.
-It also builds the first-run standalone welcome strip from those same approved
-body frames plus deterministic overlays.
+It also builds the first-run standalone welcome and flydown strips from those
+same approved body frames plus deterministic overlays. A contact sheet of every
+animation is written for audit only; app code loads the individual strips.
 """
 
 from __future__ import annotations
@@ -18,10 +19,25 @@ from PIL import Image, ImageDraw, ImageFilter
 
 CELL_WIDTH = 160
 CELL_HEIGHT = 96
-ROWS = {
-    "indexing": 1,
-    "searching": 2,
-    "optimizing": 3,
+OPERATION_STRIPS = {
+    "idle": "NibOperationIdleStrip",
+    "indexing": "NibOperationIndexingStrip",
+    "searching": "NibOperationSearchingStrip",
+    "optimizing": "NibOperationOptimizingStrip",
+    "file_changed": "NibOperationFileChangedStrip",
+    "success": "NibOperationSuccessStrip",
+    "error": "NibOperationErrorStrip",
+}
+IDLE_STRIPS = {
+    "main_loop": "NibIdleMainLoopStrip",
+    "blink": "NibIdleBlinkFidgetStrip",
+    "antenna_wiggle": "NibIdleAntennaFidgetStrip",
+    "file_finder_spark": "NibIdleFileFinderSparkStrip",
+    "victory_bounce": "NibIdleVictoryBounceStrip",
+}
+STANDALONE_STRIPS = {
+    "intro_welcome": "NibIntroWelcomeStrip",
+    "flydown": "NibFlydownStrip",
 }
 SCALE = 4
 INTRO_FRAME_COUNT = 32
@@ -145,17 +161,6 @@ def draw_folder(size: tuple[int, int] = (25, 18), angle: float = 0, alpha: float
     return image
 
 
-def draw_antenna_glow(canvas: Image.Image, strength: float) -> None:
-    if strength <= 0.04:
-        return
-    draw = ImageDraw.Draw(canvas)
-    for cx, cy in ((61, 11), (93, 11)):
-        for ring, alpha_scale in ((6, 0.42), (10, 0.18)):
-            alpha = int(180 * strength * alpha_scale)
-            color = (235, 248, 255, alpha)
-            draw.ellipse([cx - ring, cy - ring, cx + ring, cy + ring], outline=color, width=2)
-
-
 def draw_motion_lines(canvas: Image.Image, side: str, strength: float) -> None:
     if strength <= 0.04:
         return
@@ -224,18 +229,13 @@ def draw_cheeks(canvas: Image.Image, strength: float) -> None:
 
 
 def operation_body_frames(strips: dict[str, list[Image.Image]], operation: str, frame_index: int) -> tuple[Image.Image, tuple[int, int]]:
-    antenna_cycle = [0, 1, 3, 5, 6, 7, 6, 5, 3, 1, 0, 1, 3, 5, 6, 0]
     if operation == "indexing":
-        frame = strips["antenna"][antenna_cycle[frame_index % len(antenna_cycle)]]
-        y_offsets = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1, 1, 0]
-        return frame, (0, y_offsets[frame_index % len(y_offsets)])
+        return strips["idle"][0], (0, 0)
 
     if operation == "searching":
         return strips["idle"][0], (0, 0)
 
-    frame = strips["antenna"][antenna_cycle[(frame_index + 3) % len(antenna_cycle)]]
-    y_offsets = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1]
-    return frame, (0, y_offsets[frame_index % len(y_offsets)])
+    return strips["idle"][0], (0, 0)
 
 
 def draw_indexing_stack(canvas: Image.Image, frame_index: int, frame_count: int) -> None:
@@ -254,7 +254,6 @@ def draw_indexing_frame(strips: dict[str, list[Image.Image]], frame_index: int, 
     canvas = Image.new("RGBA", (CELL_WIDTH, CELL_HEIGHT), (0, 0, 0, 0))
     loop_phase = frame_index / frame_count
     theta = loop_phase * 2 * pi
-    glow = smoothstep(sin(loop_phase * 2 * pi - pi / 2) * 0.5 + 0.5)
 
     # Every document follows a closed path so the operation can loop without
     # papers teleporting at the seam.
@@ -278,7 +277,6 @@ def draw_indexing_frame(strips: dict[str, list[Image.Image]], frame_index: int, 
 
     body, offset = operation_body_frames(strips, "indexing", frame_index)
     paste_alpha(canvas, body, offset)
-    draw_antenna_glow(canvas, 0.75 if frame_index in (1, 2, 3, 4, 10, 11, 12) else 0.25 * glow)
     draw_motion_lines(canvas, "left", smoothstep(sin(theta + pi / 2) * 0.5 + 0.5) * 0.35)
     draw_motion_lines(canvas, "right", smoothstep(sin(theta - pi / 2) * 0.5 + 0.5) * 0.35)
 
@@ -498,7 +496,6 @@ def draw_optimizing_frame(strips: dict[str, list[Image.Image]], frame_index: int
 
     body, offset = operation_body_frames(strips, "optimizing", frame_index)
     paste_alpha(canvas, body, offset)
-    draw_antenna_glow(canvas, 0.45 + 0.35 * smoothstep(sin(rotation - pi / 2) * 0.5 + 0.5))
     if frame_index in (3, 4, 5, 11, 12):
         draw_mouth(canvas, (82, 65), smile=1.0, alpha=0.9)
         draw_cheeks(canvas, 0.7)
@@ -556,7 +553,6 @@ def draw_intro_frame(strips: dict[str, list[Image.Image]], frame_index: int, fra
     body = strips["idle"][frame_index % len(strips["idle"])]
 
     paste_alpha(canvas, body, (0, 0))
-    draw_antenna_glow(canvas, 0.22 + 0.28 * smoothstep(sin(theta - pi / 2) * 0.5 + 0.5))
 
     # The document starts and ends tucked in Nib's hand so the 32-frame strip
     # loops cleanly after the second wave.
@@ -610,12 +606,10 @@ def draw_flydown_frame(strips: dict[str, list[Image.Image]], frame_index: int, f
     canvas = Image.new("RGBA", (CELL_WIDTH, CELL_HEIGHT), (0, 0, 0, 0))
     phase = frame_index / max(1, frame_count - 1)
     flutter = sin(phase * 2 * pi)
-    antenna_cycle = [0, 1, 3, 5, 7, 6, 4, 2, 1, 0]
-    body = strips["antenna"][antenna_cycle[frame_index % len(antenna_cycle)]]
+    body = strips["idle"][frame_index % len(strips["idle"])]
 
     draw_motion_lines(canvas, "left", 0.35 + 0.25 * smoothstep(phase))
     draw_motion_lines(canvas, "right", 0.45 + 0.25 * smoothstep(phase))
-    draw_antenna_glow(canvas, 0.35 + 0.35 * smoothstep(sin(phase * pi) * 0.5 + 0.5))
 
     for index, (base_x, base_y, angle_offset, alpha) in enumerate((
         (43, 37, -18, 0.46),
@@ -671,6 +665,36 @@ def save_contact_sheet(output_path: Path, frames: list[Image.Image]) -> None:
     background.convert("RGB").save(output_path)
 
 
+def save_audit_contact_sheet(output_path: Path, sections: list[tuple[str, list[Image.Image]]]) -> None:
+    scale = 2
+    gap = 8
+    label_width = 180
+    frame_width = CELL_WIDTH * scale
+    frame_height = CELL_HEIGHT * scale
+    width = label_width + max(len(frames) for _, frames in sections) * (frame_width + gap) + gap
+    height = gap + len(sections) * (frame_height + gap)
+    background = Image.new("RGBA", (width, height), (26, 26, 26, 255))
+    draw = ImageDraw.Draw(background)
+
+    for section_index, (label, frames) in enumerate(sections):
+        y = gap + section_index * (frame_height + gap)
+        draw.text((gap, y + frame_height // 2 - 6), label, fill=(235, 235, 235, 255))
+        for frame_index, frame in enumerate(frames):
+            x = label_width + frame_index * (frame_width + gap)
+            checker = Image.new("RGBA", (frame_width, frame_height), (0, 0, 0, 0))
+            checker_draw = ImageDraw.Draw(checker)
+            square = 16
+            for yy in range(0, frame_height, square):
+                for xx in range(0, frame_width, square):
+                    color = (62, 62, 62, 255) if ((xx // square + yy // square) % 2 == 0) else (48, 48, 48, 255)
+                    checker_draw.rectangle([xx, yy, xx + square - 1, yy + square - 1], fill=color)
+            checker.alpha_composite(frame.resize((frame_width, frame_height), Image.Resampling.NEAREST))
+            background.alpha_composite(checker, (x, y))
+            draw.text((x + 4, y + 4), f"{frame_index:02d}", fill=(230, 230, 230, 255))
+
+    background.convert("RGB").save(output_path)
+
+
 def save_preview_gif(output_path: Path, frames: list[Image.Image], duration_ms: int = 170) -> None:
     preview_frames = []
     for frame in frames:
@@ -680,27 +704,21 @@ def save_preview_gif(output_path: Path, frames: list[Image.Image], duration_ms: 
     preview_frames[0].save(output_path, save_all=True, append_images=preview_frames[1:], duration=duration_ms, loop=0, disposal=2)
 
 
-def generate(repo_root: Path, frame_count: int, columns: int, write_artifacts: bool) -> None:
-    if columns < frame_count:
-        raise ValueError("--columns must be greater than or equal to --frames")
-
+def generate(repo_root: Path, frame_count: int, write_artifacts: bool) -> None:
     resources = repo_root / "Resources"
-    sheet_path = resources / "NibGeneratedMasterSheet.png"
-    original_sheet = Image.open(sheet_path).convert("RGBA")
     strips = {
         "idle": load_strip(resources / "NibIdleMainLoopStrip.png"),
         "blink": load_strip(resources / "NibIdleBlinkFidgetStrip.png"),
-        "antenna": load_strip(resources / "NibIdleAntennaFidgetStrip.png"),
     }
 
-    rows = original_sheet.height // CELL_HEIGHT
-    updated_sheet = Image.new("RGBA", (columns * CELL_WIDTH, rows * CELL_HEIGHT), (0, 0, 0, 0))
-    updated_sheet.alpha_composite(original_sheet.crop((0, 0, min(original_sheet.width, updated_sheet.width), updated_sheet.height)), (0, 0))
-
-    generated_rows = {
+    operation_frames = {
+        "idle": load_strip(resources / "NibOperationIdleStrip.png"),
         "indexing": [draw_indexing_frame(strips, index, frame_count) for index in range(frame_count)],
         "searching": [draw_searching_frame(strips, index, frame_count) for index in range(frame_count)],
         "optimizing": [draw_optimizing_frame(strips, index, frame_count) for index in range(frame_count)],
+        "file_changed": load_strip(resources / "NibOperationFileChangedStrip.png"),
+        "success": load_strip(resources / "NibOperationSuccessStrip.png"),
+        "error": load_strip(resources / "NibOperationErrorStrip.png"),
     }
     intro_frames = [
         draw_intro_frame(strips, index, INTRO_FRAME_COUNT)
@@ -711,36 +729,30 @@ def generate(repo_root: Path, frame_count: int, columns: int, write_artifacts: b
         for index in range(FLYDOWN_FRAME_COUNT)
     ]
 
-    artifact_dir = repo_root / "artifacts" / "mascot-animation" / "operation-row-previews"
+    artifact_dir = repo_root / "artifacts" / "mascot-animation"
+    preview_dir = artifact_dir / "operation-strip-previews"
     frame_dir = repo_root / "artifacts" / "mascot-animation" / "reference-frames"
     if write_artifacts:
-        artifact_dir.mkdir(parents=True, exist_ok=True)
+        preview_dir.mkdir(parents=True, exist_ok=True)
         frame_dir.mkdir(parents=True, exist_ok=True)
 
-    for name, frames in generated_rows.items():
-        row = ROWS[name]
+    for name, frames in operation_frames.items():
+        resource_name = OPERATION_STRIPS[name]
+        strip = Image.new("RGBA", (len(frames) * CELL_WIDTH, CELL_HEIGHT), (0, 0, 0, 0))
         if write_artifacts:
-            original_sheet.crop((0, row * CELL_HEIGHT, original_sheet.width, (row + 1) * CELL_HEIGHT)).save(
-                artifact_dir / f"{name}-before-strip.png"
-            )
-
-        strip = Image.new("RGBA", (columns * CELL_WIDTH, CELL_HEIGHT), (0, 0, 0, 0))
-        if write_artifacts:
-            operation_frame_dir = frame_dir / f"NibOperation{name.capitalize()}"
+            operation_frame_dir = frame_dir / resource_name
             operation_frame_dir.mkdir(parents=True, exist_ok=True)
         for index, frame in enumerate(frames):
             strip.alpha_composite(frame, (index * CELL_WIDTH, 0))
             if write_artifacts:
                 frame.save(operation_frame_dir / f"frame-{index:02d}.png")
 
-        updated_sheet.paste(strip, (0, row * CELL_HEIGHT))
+        strip.save(resources / f"{resource_name}.png")
 
         if write_artifacts:
-            strip.save(artifact_dir / f"{name}-strip.png")
-            save_contact_sheet(artifact_dir / f"{name}-contact-sheet.png", frames)
-        save_preview_gif(artifact_dir / f"{name}.gif", frames)
-
-    updated_sheet.save(sheet_path)
+            strip.save(preview_dir / f"{name}-strip.png")
+            save_contact_sheet(preview_dir / f"{name}-contact-sheet.png", frames)
+            save_preview_gif(preview_dir / f"{name}.gif", frames)
 
     intro_strip = Image.new("RGBA", (INTRO_FRAME_COUNT * CELL_WIDTH, CELL_HEIGHT), (0, 0, 0, 0))
     intro_frame_dir = frame_dir / "NibIntroWelcomeStrip"
@@ -753,9 +765,9 @@ def generate(repo_root: Path, frame_count: int, columns: int, write_artifacts: b
     intro_strip.save(resources / "NibIntroWelcomeStrip.png")
 
     if write_artifacts:
-        intro_strip.save(artifact_dir / "intro-welcome-strip.png")
-        save_contact_sheet(artifact_dir / "intro-welcome-contact-sheet.png", intro_frames)
-        save_preview_gif(artifact_dir / "intro-welcome.gif", intro_frames, duration_ms=250)
+        intro_strip.save(preview_dir / "intro-welcome-strip.png")
+        save_contact_sheet(preview_dir / "intro-welcome-contact-sheet.png", intro_frames)
+        save_preview_gif(preview_dir / "intro-welcome.gif", intro_frames, duration_ms=250)
 
     flydown_strip = Image.new("RGBA", (FLYDOWN_FRAME_COUNT * CELL_WIDTH, CELL_HEIGHT), (0, 0, 0, 0))
     flydown_frame_dir = frame_dir / "NibFlydownStrip"
@@ -768,20 +780,28 @@ def generate(repo_root: Path, frame_count: int, columns: int, write_artifacts: b
     flydown_strip.save(resources / "NibFlydownStrip.png")
 
     if write_artifacts:
-        flydown_strip.save(artifact_dir / "flydown-strip.png")
-        save_contact_sheet(artifact_dir / "flydown-contact-sheet.png", flydown_frames)
-        save_preview_gif(artifact_dir / "flydown.gif", flydown_frames, duration_ms=72)
+        flydown_strip.save(preview_dir / "flydown-strip.png")
+        save_contact_sheet(preview_dir / "flydown-contact-sheet.png", flydown_frames)
+        save_preview_gif(preview_dir / "flydown.gif", flydown_frames, duration_ms=72)
+
+        audit_sections: list[tuple[str, list[Image.Image]]] = []
+        for name, resource_name in OPERATION_STRIPS.items():
+            audit_sections.append((f"operation/{name}", load_strip(resources / f"{resource_name}.png")))
+        for name, resource_name in IDLE_STRIPS.items():
+            audit_sections.append((f"idle/{name}", load_strip(resources / f"{resource_name}.png")))
+        for name, resource_name in STANDALONE_STRIPS.items():
+            audit_sections.append((f"standalone/{name}", load_strip(resources / f"{resource_name}.png")))
+        save_audit_contact_sheet(artifact_dir / "nib-all-animations-contact-sheet.png", audit_sections)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
     parser.add_argument("--frames", type=int, default=16)
-    parser.add_argument("--columns", type=int, default=16)
     parser.add_argument("--no-artifacts", action="store_true")
     args = parser.parse_args()
 
-    generate(args.repo_root.resolve(), args.frames, args.columns, not args.no_artifacts)
+    generate(args.repo_root.resolve(), args.frames, not args.no_artifacts)
 
 
 if __name__ == "__main__":

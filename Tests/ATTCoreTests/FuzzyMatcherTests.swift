@@ -29,6 +29,24 @@ struct FuzzyMatcherTests {
         #expect(score > 0)
     }
 
+    @Test("calibrates short log matches")
+    func shortLogMatchCalibration() throws {
+        let arcology = try #require(makeRecord(name: "Arcology.md"))
+        let yellowGlow = try #require(makeRecord(name: "YellowGlow.funhouse"))
+        let colorGradient = try #require(makeRecord(name: "22_ColorGradient"))
+        let klopfgeist = try #require(makeRecord(name: "#default.pst", directory: "/Applications/GarageBand.app/Contents/Resources/Plug-In Settings/Klopfgeist"))
+        let alertCollector = try #require(makeRecord(name: "AlertCollector.strings", directory: "/Applications/GarageBand.app/Contents/Resources/ca.lproj"))
+
+        let arcologyMatch = try #require(FuzzyMatcher.explain(record: arcology, query: "log"))
+        #expect(arcologyMatch.matchClass == .substring)
+        #expect(arcologyMatch.field == .name)
+
+        #expect(FuzzyMatcher.explain(record: yellowGlow, query: "log")?.matchClass == .near)
+        #expect(FuzzyMatcher.explain(record: colorGradient, query: "log")?.matchClass == .near)
+        #expect(FuzzyMatcher.explain(record: klopfgeist, query: "log") == nil)
+        #expect(FuzzyMatcher.explain(record: alertCollector, query: "log") == nil)
+    }
+
     @Test("supports negative path tokens")
     func negativeToken() throws {
         let record = try #require(makeRecord(name: "Package.swift", directory: "/tmp/project/node_modules"))

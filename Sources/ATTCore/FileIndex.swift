@@ -36,9 +36,114 @@ public struct SearchRequest: Sendable {
     }
 }
 
+public enum MatchClass: Int, Codable, CaseIterable, Sendable {
+    case metadata = 0
+    case weakPath = 1
+    case near = 2
+    case substring = 3
+    case prefix = 4
+    case exact = 5
+}
+
+public struct MatchQuality: Codable, Equatable, Comparable, Sendable {
+    public let matchClass: MatchClass
+    public let scoreBin: Int
+
+    public init(matchClass: MatchClass, scoreBin: Int) {
+        self.matchClass = matchClass
+        self.scoreBin = max(0, min(scoreBin, 4))
+    }
+
+    public init(matchClass: MatchClass, score: Int) {
+        self.init(matchClass: matchClass, scoreBin: score / 2_000)
+    }
+
+    public static func < (lhs: MatchQuality, rhs: MatchQuality) -> Bool {
+        if lhs.matchClass.rawValue != rhs.matchClass.rawValue {
+            return lhs.matchClass.rawValue < rhs.matchClass.rawValue
+        }
+        return lhs.scoreBin < rhs.scoreBin
+    }
+}
+
+public enum MatchField: String, Codable, Sendable {
+    case name
+    case path
+    case ancestorPath
+    case fileExtension = "extension"
+    case kind
+}
+
+public enum MatchSpanStyle: String, Codable, Sendable {
+    case contiguous
+    case subsequence
+    case typo
+}
+
+public struct MatchSpan: Codable, Equatable, Sendable {
+    public let field: MatchField
+    public let location: Int
+    public let length: Int
+    public let style: MatchSpanStyle
+
+    public init(field: MatchField, location: Int, length: Int, style: MatchSpanStyle) {
+        self.field = field
+        self.location = location
+        self.length = length
+        self.style = style
+    }
+}
+
+public struct MatchExplanation: Codable, Equatable, Sendable {
+    public let quality: MatchQuality
+    public let score: Int
+    public let field: MatchField
+    public let reason: String
+    public let spans: [MatchSpan]
+
+    public var matchClass: MatchClass {
+        quality.matchClass
+    }
+
+    public init(
+        matchClass: MatchClass,
+        score: Int,
+        field: MatchField,
+        reason: String,
+        spans: [MatchSpan] = []
+    ) {
+        self.quality = MatchQuality(matchClass: matchClass, score: score)
+        self.score = score
+        self.field = field
+        self.reason = reason
+        self.spans = spans
+    }
+
+    public init(
+        quality: MatchQuality,
+        score: Int,
+        field: MatchField,
+        reason: String,
+        spans: [MatchSpan] = []
+    ) {
+        self.quality = quality
+        self.score = score
+        self.field = field
+        self.reason = reason
+        self.spans = spans
+    }
+}
+
 public struct SearchResult: Identifiable, Sendable {
     public let record: FileRecord
     public let score: Int
+    public let match: MatchExplanation?
+
+    public init(record: FileRecord, score: Int, match: MatchExplanation? = nil) {
+        self.record = record
+        self.score = score
+        self.match = match
+    }
 
     public var id: UInt64 {
         record.id
@@ -265,6 +370,13 @@ public final class FileIndex: @unchecked Sendable {
     private struct SearchMatch {
         let rowID: Int
         let score: Int
+        let match: MatchExplanation?
+
+        init(rowID: Int, score: Int, match: MatchExplanation? = nil) {
+            self.rowID = rowID
+            self.score = score
+            self.match = match
+        }
     }
 
     private struct RowInterval {
@@ -1746,12 +1858,12 @@ public final class FileIndex: @unchecked Sendable {
             sortAndLimitMatches()
         }
 
-        func appendMatch(rowID: Int, score: Int) {
+        func appendMatch(rowID: Int, score: Int, match: MatchExplanation? = nil) {
             guard snapshot.store.isResultRow(at: rowID) else { return }
             guard request.includeHidden || snapshot.isVisible(at: rowID) else { return }
             total += 1
             guard boundedMaxResults > 0 else { return }
-            matches.append(SearchMatch(rowID: rowID, score: score))
+            matches.append(SearchMatch(rowID: rowID, score: score, match: match))
             if matches.count > trimThreshold {
                 trimMatches()
             }
@@ -1858,8 +1970,8 @@ public final class FileIndex: @unchecked Sendable {
                 }
                 guard snapshot.store.isResultRow(at: index) else { continue }
                 let record = snapshot.view(at: index)
-                if let score = FuzzyMatcher.score(record: record, parsedQuery: parsedQuery) {
-                    appendMatch(rowID: index, score: score)
+                if let explanation = FuzzyMatcher.explain(record: record, parsedQuery: parsedQuery) {
+                    appendMatch(rowID: index, score: explanation.score, match: explanation)
                 }
             }
         }
@@ -1881,7 +1993,7 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     private static func materialize(_ matches: [SearchMatch], from snapshot: SearchSnapshot) -> [SearchResult] {
-        matches.map { SearchResult(record: snapshot.record(at: $0.rowID), score: $0.score) }
+        matches.map { SearchResult(record: snapshot.record(at: $0.rowID), score: $0.score, match: $0.match) }
     }
 
     private static func fastV6ComponentNameSortedSearch(
@@ -1973,31 +2085,42 @@ public final class FileIndex: @unchecked Sendable {
             )
         }
 
-        let total = rowSet.count(using: request.includeHidden ? snapshot.resultPrefixCounts : snapshot.visibleResultPrefixCounts)
-        guard total > 0 else {
-            return SearchResponse(
-                results: [],
-                totalMatches: 0,
-                elapsed: Date().timeIntervalSince(started),
-                snapshotRevision: snapshotRevision,
-                usesIndexedCandidates: true
-            )
+        var matches: [SearchMatch] = []
+        matches.reserveCapacity(maxResults)
+        let trimThreshold = maxResults * 5
+        var total = 0
+
+        func sortAndLimitMatches() {
+            matches.sort {
+                compare($0, $1, snapshot: snapshot, sort: request.sort, queryIsEmpty: false)
+            }
+            if matches.count > maxResults {
+                matches.removeSubrange(maxResults..<matches.count)
+            }
         }
 
-        let order = request.sort.ascending ? snapshot.nameAscending : snapshot.nameDescending
-        var matches: [SearchMatch] = []
-        matches.reserveCapacity(min(maxResults, total))
-        for (offset, rowID) in order.enumerated() {
-            if offset & 511 == 0, shouldCancel() {
-                return nil
-            }
-            guard rowSet.contains(rowID) else { continue }
-            guard request.includeHidden || snapshot.isVisible(at: rowID) else { continue }
-            matches.append(SearchMatch(rowID: rowID, score: 0))
-            if matches.count == maxResults {
-                break
+        for interval in rowSet.intervals {
+            for rowID in interval.start..<interval.end {
+                if rowID & 511 == 0, shouldCancel() {
+                    return nil
+                }
+                guard rowID >= 0, rowID < snapshot.count else { continue }
+                guard snapshot.store.isResultRow(at: rowID) else { continue }
+                guard request.includeHidden || snapshot.isVisible(at: rowID) else { continue }
+                guard let explanation = FuzzyMatcher.explain(record: snapshot.view(at: rowID), parsedQuery: parsedQuery) else {
+                    continue
+                }
+
+                total += 1
+                matches.append(SearchMatch(rowID: rowID, score: explanation.score, match: explanation))
+                if matches.count > trimThreshold {
+                    sortAndLimitMatches()
+                }
             }
         }
+
+        guard !shouldCancel() else { return nil }
+        sortAndLimitMatches()
 
         return SearchResponse(
             results: materialize(matches, from: snapshot),
@@ -2080,6 +2203,7 @@ public final class FileIndex: @unchecked Sendable {
         guard let selected = nameSortedPathSubstringMatches(
             snapshot: snapshot,
             candidates: candidates,
+            parsedQuery: parsedQuery,
             request: request,
             maxResults: maxResults,
             shouldCancel: shouldCancel
@@ -2194,10 +2318,14 @@ public final class FileIndex: @unchecked Sendable {
                 }
                 guard candidateSet.contains(rowID) else { continue }
                 guard snapshot.store.isResultRow(at: rowID) else { continue }
+                guard request.includeHidden || snapshot.isVisible(at: rowID) else { continue }
+                guard let explanation = FuzzyMatcher.explain(record: snapshot.view(at: rowID), parsedQuery: parsedQuery) else {
+                    continue
+                }
 
                 total += 1
-                if maxResults > 0, matches.count < maxResults {
-                    matches.append(SearchMatch(rowID: rowID, score: 0))
+                if maxResults > 0 {
+                    matches.append(SearchMatch(rowID: rowID, score: explanation.score, match: explanation))
                 }
             }
 
@@ -2206,6 +2334,12 @@ public final class FileIndex: @unchecked Sendable {
             }
 
             guard !shouldCancel() else { return nil }
+            matches.sort {
+                compare($0, $1, snapshot: snapshot, sort: request.sort, queryIsEmpty: false)
+            }
+            if matches.count > maxResults {
+                matches.removeSubrange(maxResults..<matches.count)
+            }
             return SearchResponse(
                 results: materialize(matches, from: snapshot),
                 totalMatches: total,
@@ -2219,6 +2353,7 @@ public final class FileIndex: @unchecked Sendable {
             guard let selected = nameSortedPathSubstringMatches(
                 snapshot: snapshot,
                 candidates: exactPathCandidates,
+                parsedQuery: parsedQuery,
                 request: request,
                 maxResults: maxResults,
                 shouldCancel: shouldCancel
@@ -2263,11 +2398,14 @@ public final class FileIndex: @unchecked Sendable {
             guard rowID >= 0, rowID < snapshot.count else { continue }
             guard snapshot.store.isResultRow(at: rowID) else { continue }
             guard request.includeHidden || snapshot.isVisible(at: rowID) else { continue }
+            guard let explanation = FuzzyMatcher.explain(record: snapshot.view(at: rowID), parsedQuery: parsedQuery) else {
+                continue
+            }
 
             total += 1
             guard maxResults > 0 else { continue }
 
-            matches.append(SearchMatch(rowID: rowID, score: 0))
+            matches.append(SearchMatch(rowID: rowID, score: explanation.score, match: explanation))
             if matches.count > trimThreshold {
                 sortAndLimitMatches()
             }
@@ -2304,11 +2442,13 @@ public final class FileIndex: @unchecked Sendable {
         let rowID: Int
         let normalizedName: String
         let path: String
+        let match: MatchExplanation?
     }
 
     private static func nameSortedPathSubstringMatches(
         snapshot: SearchSnapshot,
         candidates: [Int32],
+        parsedQuery: FuzzyMatcher.ParsedQuery,
         request: SearchRequest,
         maxResults: Int,
         shouldCancel: @Sendable () -> Bool
@@ -2316,6 +2456,8 @@ public final class FileIndex: @unchecked Sendable {
         let ascending = request.sort.ascending
         if maxResults > 0, !snapshot.nameAscending.isEmpty {
             var included = Array(repeating: UInt8(0), count: snapshot.count)
+            var explanations: [Int: MatchExplanation] = [:]
+            explanations.reserveCapacity(min(candidates.count, maxResults * 8))
             var total = 0
             for (offset, candidate) in candidates.enumerated() {
                 if offset.isMultiple(of: 512), shouldCancel() {
@@ -2327,7 +2469,11 @@ public final class FileIndex: @unchecked Sendable {
                 guard snapshot.store.isResultRow(at: rowID) else { continue }
                 guard request.includeHidden || snapshot.isVisible(at: rowID) else { continue }
                 guard included[rowID] == 0 else { continue }
+                guard let explanation = FuzzyMatcher.explain(record: snapshot.view(at: rowID), parsedQuery: parsedQuery) else {
+                    continue
+                }
                 included[rowID] = 1
+                explanations[rowID] = explanation
                 total += 1
             }
 
@@ -2343,7 +2489,8 @@ public final class FileIndex: @unchecked Sendable {
                     return nil
                 }
                 guard included[rowID] != 0 else { continue }
-                matches.append(SearchMatch(rowID: rowID, score: 0))
+                let explanation = explanations[rowID]
+                matches.append(SearchMatch(rowID: rowID, score: explanation?.score ?? 0, match: explanation))
                 if matches.count == maxResults {
                     break
                 }
@@ -2415,6 +2562,9 @@ public final class FileIndex: @unchecked Sendable {
             guard rowID >= 0, rowID < snapshot.count else { continue }
             guard snapshot.store.isResultRow(at: rowID) else { continue }
             guard request.includeHidden || snapshot.isVisible(at: rowID) else { continue }
+            guard FuzzyMatcher.explain(record: snapshot.view(at: rowID), parsedQuery: parsedQuery) != nil else {
+                continue
+            }
 
             total += 1
             appendToHeap(NameSortCandidate(
@@ -2430,10 +2580,12 @@ public final class FileIndex: @unchecked Sendable {
         return NameSortedSelection(
             matches: sortNamePathCandidates(
                 heap.map {
-                    NamePathSortCandidate(
+                    let explanation = FuzzyMatcher.explain(record: snapshot.view(at: $0.rowID), parsedQuery: parsedQuery)
+                    return NamePathSortCandidate(
                         rowID: $0.rowID,
                         normalizedName: $0.normalizedName,
-                        path: snapshot.store.path(at: $0.rowID)
+                        path: snapshot.store.path(at: $0.rowID),
+                        match: explanation
                     )
                 },
                 ascending: ascending,
@@ -2458,7 +2610,7 @@ public final class FileIndex: @unchecked Sendable {
         if candidates.count > maxResults {
             candidates.removeSubrange(maxResults..<candidates.count)
         }
-        return candidates.map { SearchMatch(rowID: $0.rowID, score: 0) }
+        return candidates.map { SearchMatch(rowID: $0.rowID, score: $0.match?.score ?? 0, match: $0.match) }
     }
 
     private static func indexedCandidateSearch(
@@ -2529,7 +2681,7 @@ public final class FileIndex: @unchecked Sendable {
             guard request.includeHidden || snapshot.isVisible(at: index) else {
                 continue
             }
-            guard let score = FuzzyMatcher.score(record: record, parsedQuery: parsedQuery) else {
+            guard let explanation = FuzzyMatcher.explain(record: record, parsedQuery: parsedQuery) else {
                 continue
             }
 
@@ -2538,7 +2690,7 @@ public final class FileIndex: @unchecked Sendable {
                 continue
             }
 
-            matches.append(SearchMatch(rowID: index, score: score))
+            matches.append(SearchMatch(rowID: index, score: explanation.score, match: explanation))
             if matches.count > trimThreshold {
                 trimMatches()
             }
@@ -4638,8 +4790,10 @@ public final class FileIndex: @unchecked Sendable {
         compareRecords(
             lhs: snapshot.view(at: lhs.rowID),
             lhsScore: lhs.score,
+            lhsMatch: lhs.match,
             rhs: snapshot.view(at: rhs.rowID),
             rhsScore: rhs.score,
+            rhsMatch: rhs.match,
             sort: sort,
             queryIsEmpty: queryIsEmpty
         )
@@ -4649,8 +4803,10 @@ public final class FileIndex: @unchecked Sendable {
         compareRecords(
             lhs: lhs.record,
             lhsScore: lhs.score,
+            lhsMatch: lhs.match,
             rhs: rhs.record,
             rhsScore: rhs.score,
+            rhsMatch: rhs.match,
             sort: sort,
             queryIsEmpty: queryIsEmpty
         )
@@ -4659,8 +4815,10 @@ public final class FileIndex: @unchecked Sendable {
     private static func compareRecords<L: SearchRecordReadable, R: SearchRecordReadable>(
         lhs: L,
         lhsScore: Int,
+        lhsMatch: MatchExplanation?,
         rhs: R,
         rhsScore: Int,
+        rhsMatch: MatchExplanation?,
         sort: SortSpec,
         queryIsEmpty: Bool
     ) -> Bool {
@@ -4671,13 +4829,19 @@ public final class FileIndex: @unchecked Sendable {
             return ascending ? left < right : left > right
         }
 
+        if !queryIsEmpty {
+            let lhsQuality = lhsMatch?.quality ?? MatchQuality(matchClass: .metadata, scoreBin: 0)
+            let rhsQuality = rhsMatch?.quality ?? MatchQuality(matchClass: .metadata, scoreBin: 0)
+            if lhsQuality != rhsQuality {
+                return lhsQuality > rhsQuality
+            }
+        }
+
         let primary: Bool?
         switch sort.column {
         case .relevance:
             if queryIsEmpty {
                 primary = lhs.modifiedTime == rhs.modifiedTime ? nil : lhs.modifiedTime > rhs.modifiedTime
-            } else if lhsScore != rhsScore {
-                primary = lhsScore > rhsScore
             } else {
                 primary = nil
             }

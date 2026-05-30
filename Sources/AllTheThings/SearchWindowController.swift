@@ -56,6 +56,7 @@ final class SearchWindowController: NSWindowController {
 
 private final class SearchViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate, NSMenuDelegate {
     private enum Column: String, CaseIterable {
+        case match
         case name
         case path
         case modified
@@ -67,6 +68,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         var title: String {
             switch self {
+            case .match: "Match"
             case .name: "Name"
             case .path: "Path"
             case .modified: "Modified"
@@ -80,6 +82,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         var width: CGFloat {
             switch self {
+            case .match: 64
             case .name: 220
             case .path: 380
             case .modified: 112
@@ -93,6 +96,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         var sortColumn: SortColumn {
             switch self {
+            case .match: .relevance
             case .name: .name
             case .path: .path
             case .modified: .modified
@@ -106,6 +110,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         var menuTitle: String {
             switch self {
+            case .match: "Match Quality"
             case .name: "Name"
             case .path: "Path"
             case .modified: "Date Modified"
@@ -120,7 +125,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         static func column(for sortColumn: SortColumn) -> Column? {
             switch sortColumn {
             case .relevance:
-                nil
+                .match
             case .name:
                 .name
             case .path:
@@ -293,6 +298,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         static let sortColumn = "ATTSortColumn"
         static let sortAscending = "ATTSortAscending"
         static let visibleColumns = "ATTVisibleColumns"
+        static let visibleColumnsSchema = "ATTVisibleColumnsSchema"
     }
 
     private enum ExpandedMascotLayout {
@@ -415,16 +421,34 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             return nil
         }
 
+        let result = results[row]
+        let record = result.record
+
+        if column == .match {
+            let cell = makeMatchCell(for: tableColumn.identifier)
+            configureMatchCell(cell, explanation: result.match)
+            return cell
+        }
+
         let cell = makeCell(for: tableColumn.identifier)
-        let record = results[row].record
         let textField = cell.textField
 
         switch column {
+        case .match:
+            break
         case .name:
-            textField?.attributedStringValue = highlightedName(record.name)
+            textField?.attributedStringValue = highlightedText(
+                record.name,
+                field: .name,
+                explanation: result.match,
+                baseAttributes: [
+                    .foregroundColor: NSColor.labelColor,
+                    .font: NSFont.systemFont(ofSize: 12, weight: .semibold)
+                ]
+            )
             textField?.lineBreakMode = .byTruncatingMiddle
         case .path:
-            textField?.stringValue = AppSettings.displayPath(record.directoryPath)
+            textField?.attributedStringValue = highlightedPath(record.directoryPath, explanation: result.match)
             textField?.textColor = .secondaryLabelColor
             textField?.lineBreakMode = .byTruncatingMiddle
         case .modified:
@@ -585,7 +609,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         footer.orientation = .horizontal
         footer.alignment = .centerY
         footer.spacing = 12
-        footer.edgeInsets = NSEdgeInsets(top: 7, left: 14, bottom: 10, right: 14)
+        footer.edgeInsets = NSEdgeInsets(top: 2, left: 14, bottom: 2, right: 14)
         footer.translatesAutoresizingMaskIntoConstraints = false
 
         countLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
@@ -658,10 +682,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         mascotImageView.imageAlignment = .alignCenter
         mascotImageView.toolTip = "Toggle large Nib"
         NSLayoutConstraint.activate([
-            mascotSlotView.widthAnchor.constraint(equalToConstant: OperationMascotCoordinator.layoutSize),
-            mascotSlotView.heightAnchor.constraint(equalToConstant: OperationMascotCoordinator.layoutSize),
+            mascotSlotView.widthAnchor.constraint(equalToConstant: OperationMascotCoordinator.statusDisplaySize),
+            mascotSlotView.heightAnchor.constraint(equalToConstant: OperationMascotCoordinator.footerSlotHeight),
             mascotImageView.centerXAnchor.constraint(equalTo: mascotSlotView.centerXAnchor),
-            mascotImageView.centerYAnchor.constraint(equalTo: mascotSlotView.centerYAnchor)
+            mascotImageView.bottomAnchor.constraint(equalTo: mascotSlotView.bottomAnchor)
         ])
     }
 
@@ -1164,6 +1188,31 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         ])
 
         return cell
+    }
+
+    private func makeMatchCell(for identifier: NSUserInterfaceItemIdentifier) -> MatchTableCellView {
+        if let reusable = tableView.makeView(withIdentifier: identifier, owner: self) as? MatchTableCellView {
+            return reusable
+        }
+
+        let cell = MatchTableCellView()
+        cell.identifier = identifier
+        cell.textField = cell.label
+        return cell
+    }
+
+    private func configureMatchCell(_ cell: MatchTableCellView, explanation: MatchExplanation?) {
+        guard let explanation else {
+            cell.label.stringValue = ""
+            cell.swatch.color = .tertiaryLabelColor
+            cell.toolTip = nil
+            return
+        }
+
+        cell.label.stringValue = matchLabel(for: explanation.matchClass)
+        cell.label.textColor = .labelColor
+        cell.swatch.color = matchColor(for: explanation.quality)
+        cell.toolTip = explanation.reason
     }
 
     private func scheduleSearch(force: Bool = false) {
@@ -1784,32 +1833,112 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
     }
 
-    private func highlightedName(_ name: String) -> NSAttributedString {
-        let attributed = NSMutableAttributedString(string: name, attributes: [
-            .foregroundColor: NSColor.labelColor,
-            .font: NSFont.systemFont(ofSize: 12, weight: .semibold)
-        ])
+    private func highlightedPath(_ directoryPath: String, explanation: MatchExplanation?) -> NSAttributedString {
+        let displayPath = AppSettings.displayPath(directoryPath)
+        let attributes: [NSAttributedString.Key: Any] = [
+            .foregroundColor: NSColor.secondaryLabelColor,
+            .font: NSFont.systemFont(ofSize: 12)
+        ]
+        return highlightedText(
+            displayPath,
+            field: .path,
+            explanation: explanation,
+            baseAttributes: attributes,
+            originalPath: directoryPath
+        )
+    }
 
-        let query = searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard highlightsSearchText, let token = FuzzyMatcher.primaryHighlightToken(for: query) else {
+    private func highlightedText(
+        _ text: String,
+        field: MatchField,
+        explanation: MatchExplanation?,
+        baseAttributes: [NSAttributedString.Key: Any],
+        originalPath: String? = nil
+    ) -> NSAttributedString {
+        let attributed = NSMutableAttributedString(string: text, attributes: baseAttributes)
+        guard highlightsSearchText, let explanation else {
             return attributed
         }
 
-        let normalizedName = FuzzyMatcher.normalize(name)
-        if let range = normalizedName.range(of: token) {
-            let lower = normalizedName.distance(from: normalizedName.startIndex, to: range.lowerBound)
-            let upper = normalizedName.distance(from: normalizedName.startIndex, to: range.upperBound)
-            attributed.addAttributes([
-                .foregroundColor: highlightTextColor(),
-                .font: NSFont.systemFont(ofSize: 12, weight: .bold)
-            ], range: NSRange(location: lower, length: upper - lower))
+        for span in explanation.spans where span.field == field || (field == .path && span.field == .ancestorPath) {
+            guard let range = displayRange(for: span, in: text, originalPath: originalPath) else {
+                continue
+            }
+            attributed.addAttributes(highlightAttributes(for: span.style), range: range)
         }
 
         return attributed
     }
 
+    private func displayRange(for span: MatchSpan, in displayText: String, originalPath: String?) -> NSRange? {
+        var location = span.location
+        if
+            let originalPath,
+            displayText.hasPrefix("~"),
+            originalPath.hasPrefix(FileManager.default.homeDirectoryForCurrentUser.path)
+        {
+            let home = FileManager.default.homeDirectoryForCurrentUser.path
+            let homeUTF16Count = home.utf16.count
+            if location >= homeUTF16Count {
+                location = 1 + (location - homeUTF16Count)
+            }
+        }
+
+        guard location >= 0, span.length > 0, location + span.length <= displayText.utf16.count else {
+            return nil
+        }
+        return NSRange(location: location, length: span.length)
+    }
+
+    private func highlightAttributes(for style: MatchSpanStyle) -> [NSAttributedString.Key: Any] {
+        let color = highlightTextColor()
+        switch style {
+        case .contiguous:
+            return [
+                .foregroundColor: color,
+                .font: NSFont.systemFont(ofSize: 12, weight: .bold)
+            ]
+        case .subsequence:
+            return [
+                .foregroundColor: color,
+                .font: NSFont.systemFont(ofSize: 12, weight: .bold),
+                .underlineStyle: NSUnderlineStyle.single.rawValue
+            ]
+        case .typo:
+            return [
+                .foregroundColor: color,
+                .font: NSFont.systemFont(ofSize: 12, weight: .bold),
+                .backgroundColor: color.withAlphaComponent(0.18)
+            ]
+        }
+    }
+
     private func highlightTextColor() -> NSColor {
         AppTheme.isDarkAppearance(for: view) ? .systemYellow : .systemOrange
+    }
+
+    private func matchLabel(for matchClass: MatchClass) -> String {
+        switch matchClass {
+        case .exact: "Exact"
+        case .prefix: "Prefix"
+        case .substring: "Text"
+        case .near: "Near"
+        case .weakPath: "Path"
+        case .metadata: "Meta"
+        }
+    }
+
+    private func matchColor(for quality: MatchQuality) -> NSColor {
+        let base: NSColor = switch quality.matchClass {
+        case .exact: .systemGreen
+        case .prefix: .systemBlue
+        case .substring: .systemYellow
+        case .near: .systemOrange
+        case .weakPath: .systemPurple
+        case .metadata: .systemGray
+        }
+        let alpha = 0.45 + (CGFloat(quality.scoreBin) * 0.12)
+        return base.withAlphaComponent(min(alpha, 1))
     }
 
     private func sortSpec(for descriptor: NSSortDescriptor) -> SortSpec {
@@ -2193,6 +2322,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             .filter { visibleColumns.contains($0) }
             .map(\.rawValue)
         defaults.set(ordered, forKey: DefaultsKey.visibleColumns)
+        defaults.set(2, forKey: DefaultsKey.visibleColumnsSchema)
     }
 
     private static func loadSortSpec(defaults: UserDefaults) -> SortSpec {
@@ -2217,6 +2347,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         var columns = Set(saved.compactMap(Column.init(rawValue:)))
         columns.insert(.name)
+        if defaults.integer(forKey: DefaultsKey.visibleColumnsSchema) < 2 {
+            columns.insert(.match)
+        }
         return columns
     }
 
@@ -2226,6 +2359,56 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
 
         return spec
+    }
+}
+
+private final class MatchTableCellView: NSTableCellView {
+    let swatch = MatchSwatchView()
+    let label = NSTextField(labelWithString: "")
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        configure()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configure()
+    }
+
+    private func configure() {
+        swatch.translatesAutoresizingMaskIntoConstraints = false
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.usesSingleLineMode = true
+        label.lineBreakMode = .byTruncatingTail
+        label.font = .systemFont(ofSize: 11, weight: .medium)
+
+        addSubview(swatch)
+        addSubview(label)
+
+        NSLayoutConstraint.activate([
+            swatch.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
+            swatch.centerYAnchor.constraint(equalTo: centerYAnchor),
+            swatch.widthAnchor.constraint(equalToConstant: 8),
+            swatch.heightAnchor.constraint(equalToConstant: 8),
+            label.leadingAnchor.constraint(equalTo: swatch.trailingAnchor, constant: 5),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -4),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
+    }
+}
+
+private final class MatchSwatchView: NSView {
+    var color: NSColor = .tertiaryLabelColor {
+        didSet {
+            needsDisplay = true
+        }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        color.setFill()
+        bounds.insetBy(dx: 1, dy: 1).fill()
     }
 }
 
