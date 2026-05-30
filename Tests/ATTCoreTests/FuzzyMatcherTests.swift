@@ -37,10 +37,10 @@ struct FuzzyMatcherTests {
 
     @Test("plain text filters out unrelated paths")
     func plainTextDoesNotMatchScatteredPathCharacters() throws {
-        let unrelated = try #require(makeRecord(name: "FETCH_HEAD", directory: "/Users/jaeger/Documents/Personal/embc/.git"))
-        let projectPath = try #require(makeRecord(name: "artifacts", directory: "/Users/jaeger/Documents/GitHub/AllTheThings", isDirectory: true))
-        let matchingName = try #require(makeRecord(name: "UnitTests.swift", directory: "/Users/jaeger/Documents/Personal/embc/Sources"))
-        let matchingPath = try #require(makeRecord(name: "Package.swift", directory: "/Users/jaeger/Documents/Personal/embc/Tests"))
+        let unrelated = try #require(makeRecord(name: "FETCH_HEAD", directory: "/Users/example/Documents/Workspace/embc/.git"))
+        let projectPath = try #require(makeRecord(name: "artifacts", directory: "/Users/example/Documents/GitHub/AllTheThings", isDirectory: true))
+        let matchingName = try #require(makeRecord(name: "UnitTests.swift", directory: "/Users/example/Documents/Workspace/embc/Sources"))
+        let matchingPath = try #require(makeRecord(name: "Package.swift", directory: "/Users/example/Documents/Workspace/embc/Tests"))
 
         #expect(FuzzyMatcher.score(record: unrelated, query: "test") == nil)
         #expect(FuzzyMatcher.score(record: projectPath, query: "test") == nil)
@@ -92,7 +92,7 @@ struct FuzzyMatcherTests {
     func antStylePathWildcards() throws {
         let record = try #require(makeRecord(
             name: "fuzzy_match.hpp",
-            directory: "/Users/jaeger/Documents/Personal/containers/source/gct/strings"
+            directory: "/Users/example/Documents/Workspace/containers/source/gct/strings"
         ))
 
         #expect(FuzzyMatcher.score(record: record, query: "source/**/*.hpp") != nil)
@@ -105,16 +105,16 @@ struct FuzzyMatcherTests {
     func slashStructuredPathPrefixes() throws {
         let record = try #require(makeRecord(
             name: "fuzzy_match.hpp",
-            directory: "/Users/jaeger/Documents/Personal/containers/source/gct/strings"
+            directory: "/Users/example/Documents/Workspace/containers/source/gct/strings"
         ))
 
         #expect(FuzzyMatcher.score(
             record: record,
-            query: "/Users/jae/Doc/Per/cont/source/gct/str/fuzzy"
+            query: "/Users/exa/Doc/Wor/cont/source/gct/str/fuzzy"
         ) != nil)
         #expect(FuzzyMatcher.score(
             record: record,
-            query: "/Users/jaeger/Documents/Personal/source/containers"
+            query: "/Users/example/Documents/Workspace/source/containers"
         ) == nil)
     }
 

@@ -248,6 +248,58 @@ final class OverlayRecordStore: RecordStore {
         return upserts[index - visibleBaseRows.count]
     }
 
+    func recordID(at index: Int) -> UInt64 {
+        withBaseRowOrUpsert(at: index, baseValue: { base.recordID(at: $0) }, upsertValue: \.id)
+    }
+
+    func path(at index: Int) -> String {
+        withBaseRowOrUpsert(at: index, baseValue: { base.path(at: $0) }, upsertValue: \.path)
+    }
+
+    func name(at index: Int) -> String {
+        withBaseRowOrUpsert(at: index, baseValue: { base.name(at: $0) }, upsertValue: \.name)
+    }
+
+    func directoryPath(at index: Int) -> String {
+        withBaseRowOrUpsert(at: index, baseValue: { base.directoryPath(at: $0) }, upsertValue: \.directoryPath)
+    }
+
+    func fileExtension(at index: Int) -> String {
+        withBaseRowOrUpsert(at: index, baseValue: { base.fileExtension(at: $0) }, upsertValue: \.fileExtension)
+    }
+
+    func sizeBytes(at index: Int) -> UInt64 {
+        withBaseRowOrUpsert(at: index, baseValue: { base.sizeBytes(at: $0) }, upsertValue: \.sizeBytes)
+    }
+
+    func modifiedTime(at index: Int) -> TimeInterval {
+        withBaseRowOrUpsert(at: index, baseValue: { base.modifiedTime(at: $0) }, upsertValue: \.modifiedTime)
+    }
+
+    func createdTime(at index: Int) -> TimeInterval? {
+        withBaseRowOrUpsert(at: index, baseValue: { base.createdTime(at: $0) }, upsertValue: \.createdTime)
+    }
+
+    func isDirectory(at index: Int) -> Bool {
+        withBaseRowOrUpsert(at: index, baseValue: { base.isDirectory(at: $0) }, upsertValue: \.isDirectory)
+    }
+
+    func isHidden(at index: Int) -> Bool {
+        withBaseRowOrUpsert(at: index, baseValue: { base.isHidden(at: $0) }, upsertValue: \.isHidden)
+    }
+
+    func volumeName(at index: Int) -> String {
+        withBaseRowOrUpsert(at: index, baseValue: { base.volumeName(at: $0) }, upsertValue: \.volumeName)
+    }
+
+    func normalizedName(at index: Int) -> String {
+        withBaseRowOrUpsert(at: index, baseValue: { base.normalizedName(at: $0) }, upsertValue: \.normalizedName)
+    }
+
+    func normalizedPath(at index: Int) -> String {
+        withBaseRowOrUpsert(at: index, baseValue: { base.normalizedPath(at: $0) }, upsertValue: \.normalizedPath)
+    }
+
     func rowID(forPath path: String) -> Int? {
         if let row = pathToOverlay[path] {
             return visibleBaseRows.count + (row - base.count)
@@ -255,7 +307,39 @@ final class OverlayRecordStore: RecordStore {
         guard let row = base.rowID(forPath: path), !deletedRows.contains(row) else {
             return nil
         }
-        return visibleBaseRows.firstIndex(of: row)
+        return visibleIndex(forBaseRow: row)
+    }
+
+    private func withBaseRowOrUpsert<Value>(
+        at index: Int,
+        baseValue: (Int) -> Value,
+        upsertValue: KeyPath<FileRecord, Value>
+    ) -> Value {
+        precondition(index >= 0 && index < count, "Record index \(index) is out of bounds")
+        if index < visibleBaseRows.count {
+            return baseValue(visibleBaseRows[index])
+        }
+        return upserts[index - visibleBaseRows.count][keyPath: upsertValue]
+    }
+
+    private func visibleIndex(forBaseRow row: Int) -> Int? {
+        var lower = 0
+        var upper = visibleBaseRows.count
+
+        while lower < upper {
+            let middle = (lower + upper) / 2
+            let candidate = visibleBaseRows[middle]
+            if candidate == row {
+                return middle
+            }
+            if candidate < row {
+                lower = middle + 1
+            } else {
+                upper = middle
+            }
+        }
+
+        return nil
     }
 }
 

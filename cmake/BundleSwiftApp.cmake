@@ -68,6 +68,11 @@ configure_file(
 file(COPY "${SOURCE_DIR}/Resources/AllTheThings.icns" DESTINATION "${APP_BUNDLE_DIR}/Contents/Resources")
 file(COPY "${SOURCE_DIR}/Resources/GameCoreTechLogo.png" DESTINATION "${APP_BUNDLE_DIR}/Contents/Resources")
 file(COPY "${SOURCE_DIR}/Resources/NibGeneratedMasterSheet.png" DESTINATION "${APP_BUNDLE_DIR}/Contents/Resources")
+file(COPY "${SOURCE_DIR}/Resources/NibIdleMainLoopStrip.png" DESTINATION "${APP_BUNDLE_DIR}/Contents/Resources")
+file(COPY "${SOURCE_DIR}/Resources/NibIdleBlinkFidgetStrip.png" DESTINATION "${APP_BUNDLE_DIR}/Contents/Resources")
+file(COPY "${SOURCE_DIR}/Resources/NibIdleAntennaFidgetStrip.png" DESTINATION "${APP_BUNDLE_DIR}/Contents/Resources")
+file(COPY "${SOURCE_DIR}/Resources/NibIdleFileFinderSparkStrip.png" DESTINATION "${APP_BUNDLE_DIR}/Contents/Resources")
+file(COPY "${SOURCE_DIR}/Resources/NibIdleVictoryBounceStrip.png" DESTINATION "${APP_BUNDLE_DIR}/Contents/Resources")
 file(WRITE "${APP_BUNDLE_DIR}/Contents/PkgInfo" "APPL????")
 
 find_program(CODESIGN_EXECUTABLE codesign)

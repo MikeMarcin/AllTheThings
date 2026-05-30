@@ -71,3 +71,6 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# Generated captures, contact sheets, and animation review output
+artifacts/

@@ -6,6 +6,7 @@ import Testing
 @Suite("Mascot sprite sheet")
 struct MascotSpriteSheetTests {
     @Test("animation metadata matches sprite sheet rows")
+    @MainActor
     func animationMetadataMatchesSpriteSheetRows() {
         #expect(OperationMascotAnimation.idle.row == 0)
         #expect(OperationMascotAnimation.indexing.row == 1)
@@ -37,6 +38,12 @@ struct MascotSpriteSheetTests {
             #expect(animation.framesPerSecond <= 6)
         }
 
+        #expect(OperationMascotCoordinator.layoutSize == 40)
+        #expect(OperationMascotCoordinator.heroDisplaySize == 86)
+        #expect(OperationMascotCoordinator.heroDisplaySize > OperationMascotCoordinator.layoutSize * 2)
+        #expect(OperationMascotCoordinator.expandedDisplaySize == OperationMascotCoordinator.layoutSize * 4)
+        #expect(OperationMascotCoordinator.expandedDisplaySize > OperationMascotCoordinator.heroDisplaySize)
+
         #expect(OperationMascotAnimation.idle.loops)
         #expect(OperationMascotAnimation.indexing.loops)
         #expect(OperationMascotAnimation.searching.loops)
@@ -44,6 +51,121 @@ struct MascotSpriteSheetTests {
         #expect(!OperationMascotAnimation.fileChanged.loops)
         #expect(!OperationMascotAnimation.success.loops)
         #expect(!OperationMascotAnimation.error.loops)
+    }
+
+    @Test("idle clip metadata supports a subtle loop and unique fidgets")
+    func idleClipMetadataSupportsSubtleLoopAndUniqueFidgets() {
+        #expect(OperationMascotIdleClip.mainLoop.frameCount == 8)
+        #expect(OperationMascotIdleClip.mainLoop.framesPerSecond <= 2)
+        #expect(OperationMascotIdleClip.mainLoop.loops)
+        #expect(!OperationMascotIdleClip.mainLoop.isFidget)
+        #expect(!OperationMascotIdleClip.mainLoop.isFlourish)
+
+        let fidgets = OperationMascotIdleClip.allCases.filter(\.isFidget)
+        #expect(fidgets.count >= 2)
+        let flourishes = OperationMascotIdleClip.allCases.filter(\.isFlourish)
+        #expect(flourishes.count >= 2)
+        #expect(OperationMascotAnimationController.idleSelectionTable.count == OperationMascotIdleClip.allCases.count)
+
+        for clip in OperationMascotIdleClip.allCases {
+            #expect(!clip.resourceName.isEmpty)
+            #expect(clip.frameCount == clip.fallbackFrameIndices.count)
+            #expect(clip.framesPerSecond > 0)
+            #expect(clip.framesPerSecond <= 5)
+            #expect(!(clip.isFidget && clip.isFlourish))
+            #expect(clip.idleSelectionWeight > 0)
+
+            for index in clip.fallbackFrameIndices {
+                #expect(index >= 0)
+                #expect(index < OperationMascotAnimation.idle.frameCount)
+            }
+        }
+
+        #expect(OperationMascotIdleClip.mainLoop.idleSelectionWeight > fidgets.map(\.idleSelectionWeight).reduce(0, +))
+        #expect(flourishes.allSatisfy { $0.idleSelectionWeight < OperationMascotIdleClip.blink.idleSelectionWeight })
+    }
+
+    @Test("animation controller rolls weighted idle table after main loop")
+    func animationControllerRollsWeightedIdleTableAfterMainLoop() {
+        var controller = OperationMascotAnimationController(idleClipSelector: { .victoryBounce })
+        #expect(controller.currentFrame == .idleClip(.mainLoop, index: 0))
+
+        for index in 1..<OperationMascotIdleClip.mainLoop.frameCount {
+            #expect(controller.advanceFrame() == .advanced)
+            #expect(controller.currentFrame == .idleClip(.mainLoop, index: index))
+        }
+
+        #expect(controller.advanceFrame() == .changedIdleClip)
+        #expect(controller.currentFrame == .idleClip(.victoryBounce, index: 0))
+    }
+
+    @Test("animation controller returns to main idle after fidgets")
+    func animationControllerReturnsToMainIdleAfterFidgets() {
+        var controller = OperationMascotAnimationController()
+        #expect(controller.currentFrame == .idleClip(.mainLoop, index: 0))
+        #expect(controller.isIdleMainLoop)
+
+        controller.beginIdleFidget(.blink)
+        #expect(controller.currentFrame == .idleClip(.blink, index: 0))
+        #expect(!controller.isIdleMainLoop)
+
+        for index in 1..<OperationMascotIdleClip.blink.frameCount {
+            #expect(controller.advanceFrame() == .advanced)
+            #expect(controller.currentFrame == .idleClip(.blink, index: index))
+        }
+
+        #expect(controller.advanceFrame() == .changedIdleClip)
+        #expect(controller.currentFrame == .idleClip(.mainLoop, index: 0))
+        #expect(controller.isIdleMainLoop)
+    }
+
+    @Test("animation controller returns to main idle after rare flourishes")
+    func animationControllerReturnsToMainIdleAfterRareFlourishes() {
+        var controller = OperationMascotAnimationController()
+        #expect(controller.currentFrame == .idleClip(.mainLoop, index: 0))
+        #expect(controller.isIdleMainLoop)
+
+        controller.beginIdleFlourish(.fileFinderSpark)
+        #expect(controller.currentFrame == .idleClip(.fileFinderSpark, index: 0))
+        #expect(!controller.isIdleMainLoop)
+
+        for index in 1..<OperationMascotIdleClip.fileFinderSpark.frameCount {
+            #expect(controller.advanceFrame() == .advanced)
+            #expect(controller.currentFrame == .idleClip(.fileFinderSpark, index: index))
+        }
+
+        #expect(controller.advanceFrame() == .changedIdleClip)
+        #expect(controller.currentFrame == .idleClip(.mainLoop, index: 0))
+        #expect(controller.isIdleMainLoop)
+    }
+
+    @Test("animation controller reports one shot completion")
+    func animationControllerReportsOneShotCompletion() {
+        var controller = OperationMascotAnimationController()
+        controller.start(.success)
+        #expect(controller.currentFrame == .animation(.success, index: 0))
+
+        for index in 1..<OperationMascotAnimation.success.frameCount {
+            #expect(controller.advanceFrame() == .advanced)
+            #expect(controller.currentFrame == .animation(.success, index: index))
+        }
+
+        #expect(controller.advanceFrame() == .completedOneShot)
+    }
+
+    @Test("coordinator renders first idle frame on initialization")
+    @MainActor
+    func coordinatorRendersFirstIdleFrameOnInitialization() throws {
+        let spriteSheet = MascotSpriteSheet(
+            imageURL: try #require(spriteSheetURL()),
+            idleClipDirectoryURL: resourcesDirectoryURL()
+        )
+        let imageView = NSImageView()
+
+        _ = OperationMascotCoordinator(imageView: imageView, spriteSheet: spriteSheet)
+
+        #expect(imageView.image != nil)
+        #expect(imageView.accessibilityLabel() == OperationMascotAnimation.idle.accessibilityLabel)
     }
 
     @Test("sprite sheet slices all animation frames")
@@ -62,6 +184,59 @@ struct MascotSpriteSheetTests {
             #expect(negative.isValid)
             #expect(first.size.width > 0)
             #expect(first.size.height > 0)
+        }
+    }
+
+    @Test("idle clip strips match fixed cell metadata")
+    func idleClipStripsMatchFixedCellMetadata() throws {
+        let cellWidth = 160
+        let cellHeight = 96
+
+        for clip in OperationMascotIdleClip.allCases {
+            let url = try #require(idleClipURL(for: clip))
+            let imageData = try Data(contentsOf: url)
+            let bitmap = try #require(NSBitmapImageRep(data: imageData))
+
+            #expect(bitmap.pixelsWide == cellWidth * clip.frameCount)
+            #expect(bitmap.pixelsHigh == cellHeight)
+
+            var bodyCenters: [Double] = []
+            var bodyBottoms: [Int] = []
+            for frame in 0..<clip.frameCount {
+                let originX = frame * cellWidth
+                let xRange = originX..<(originX + cellWidth)
+                let yRange = 0..<cellHeight
+
+                let bounds = try #require(visibleBounds(in: bitmap, xRange: xRange, yRange: yRange))
+                #expect(bounds.minX > originX)
+                #expect(bounds.minY > 0)
+                #expect(bounds.maxX < originX + cellWidth - 1)
+                #expect(bounds.maxY < cellHeight - 1)
+
+                let bodyBounds = try #require(largestMascotBlueBounds(in: bitmap, xRange: xRange, yRange: yRange))
+                let bodyWidth = bodyBounds.maxX - bodyBounds.minX + 1
+                #expect(bodyWidth >= 69)
+                #expect(bodyWidth <= 78)
+                bodyCenters.append(Double(bodyBounds.minX + bodyBounds.maxX) / 2 - Double(originX))
+                bodyBottoms.append(bodyBounds.maxY)
+            }
+
+            let minimumCenter = try #require(bodyCenters.min())
+            let maximumCenter = try #require(bodyCenters.max())
+            #expect(minimumCenter >= 79)
+            #expect(maximumCenter <= 84)
+            #expect(maximumCenter - minimumCenter <= 3)
+            if clip == .antennaWiggle {
+                #expect(maximumCenter == minimumCenter)
+            }
+
+            let minimumBottom = try #require(bodyBottoms.min())
+            let maximumBottom = try #require(bodyBottoms.max())
+            if [OperationMascotIdleClip.blink, .antennaWiggle].contains(clip) {
+                #expect(maximumBottom == minimumBottom)
+            } else if ![OperationMascotIdleClip.mainLoop, .victoryBounce].contains(clip) {
+                #expect(maximumBottom - minimumBottom <= 1)
+            }
         }
     }
 
@@ -190,11 +365,21 @@ struct MascotSpriteSheetTests {
     }
 
     private func spriteSheetURL() -> URL? {
+        resourcesDirectoryURL()?
+            .appendingPathComponent("NibGeneratedMasterSheet.png", isDirectory: false)
+    }
+
+    private func resourcesDirectoryURL() -> URL? {
         URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-            .appendingPathComponent("Resources/NibGeneratedMasterSheet.png", isDirectory: false)
+            .appendingPathComponent("Resources", isDirectory: true)
+    }
+
+    private func idleClipURL(for clip: OperationMascotIdleClip) -> URL? {
+        resourcesDirectoryURL()?
+            .appendingPathComponent("\(clip.resourceName).png", isDirectory: false)
     }
 
     private func visibleBounds(
