@@ -290,8 +290,11 @@ log "Creating backup release ZIP"
 ditto -c -k --keepParent "${APP_PATH}" "${ZIP_PATH}"
 
 log "Writing SHA-256 checksums"
-shasum -a 256 "${DMG_PATH}" > "${DMG_CHECKSUM_PATH}"
-shasum -a 256 "${ZIP_PATH}" > "${ZIP_CHECKSUM_PATH}"
+(
+    cd "${OUTPUT_DIR}"
+    shasum -a 256 "$(basename "${DMG_PATH}")" > "$(basename "${DMG_CHECKSUM_PATH}")"
+    shasum -a 256 "$(basename "${ZIP_PATH}")" > "$(basename "${ZIP_CHECKSUM_PATH}")"
+)
 
 cat <<EOF
 
