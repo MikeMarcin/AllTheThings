@@ -305,6 +305,65 @@ struct FileIndexTests {
         #expect(!paths.contains(refreshedIgnored.path))
     }
 
+    @Test("search responses identify the source snapshot revision")
+    func searchResponsesIdentifySourceSnapshotRevision() {
+        let index = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+
+        index.replaceRecordsForTesting([
+            makeRecord(path: "/tmp/allthethings-tests/project/Alpha.swift")
+        ])
+
+        let firstStats = index.currentStats()
+        let firstResponse = index.search(SearchRequest(
+            query: "Alpha",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10)
+        #expect(firstResponse.snapshotRevision == firstStats.snapshotRevision)
+
+        index.replaceRecordsForTesting([
+            makeRecord(path: "/tmp/allthethings-tests/project/Alpha.swift"),
+            makeRecord(path: "/tmp/allthethings-tests/project/Beta.swift")
+        ])
+
+        let secondStats = index.currentStats()
+        let secondResponse = index.search(SearchRequest(
+            query: "Beta",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10)
+
+        #expect(secondStats.snapshotRevision > firstStats.snapshotRevision)
+        #expect(secondResponse.snapshotRevision == secondStats.snapshotRevision)
+    }
+
+    @Test("search responses identify indexed candidate searches")
+    func searchResponsesIdentifyIndexedCandidateSearches() {
+        let index = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        var records = (0..<32).map {
+            makeRecord(path: "/tmp/allthethings-tests/project/Other\($0).txt")
+        }
+        records.append(makeRecord(path: "/tmp/allthethings-tests/project/NeedleUnique.txt"))
+        index.replaceRecordsForTesting(records)
+
+        let indexedResponse = index.search(SearchRequest(
+            query: "NeedleUnique",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10)
+        #expect(indexedResponse.usesIndexedCandidates)
+        #expect(indexedResponse.results.map(\.record.name) == ["NeedleUnique.txt"])
+
+        let fullScanResponse = index.search(SearchRequest(
+            query: "tmp",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10)
+        #expect(!fullScanResponse.usesIndexedCandidates)
+    }
+
     private func waitUntil(
         timeout: Duration = .seconds(5),
         pollInterval: Duration = .milliseconds(25),
