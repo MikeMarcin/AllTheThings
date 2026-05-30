@@ -213,6 +213,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var queryGeneration: UInt64 = 0
     private var activeSearchToken: SearchCancellationToken?
     private var scheduledSearchSignature: SearchSignature?
+    private var displayedSearchSignature: SearchSignature?
     private var sortSpec: SortSpec
     private var visibleColumns: Set<Column>
     private var indexedRoots: [URL]
@@ -915,13 +916,29 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             sort: request.sort,
             includeHidden: request.includeHidden
         )
-        guard force || signature != scheduledSearchSignature else { return }
+        let signatureChanged = signature != scheduledSearchSignature
+        guard force || signatureChanged else { return }
+
+        if activeSearchToken != nil, force, !signatureChanged {
+            return
+        }
+
         scheduledSearchSignature = signature
 
         activeSearchToken?.cancel()
         let token = SearchCancellationToken()
         activeSearchToken = token
         updateMascotPersistentAnimation()
+
+        if signature != displayedSearchSignature {
+            results = []
+            totalMatches = 0
+            queryElapsed = 0
+            tableView.reloadData()
+            updateStatus()
+            updateLoadingOverlay()
+            updateActionButtons()
+        }
 
         queryGeneration &+= 1
         let generation = queryGeneration
@@ -948,11 +965,20 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                 self.results = response.results
                 self.totalMatches = response.totalMatches
                 self.queryElapsed = response.elapsed
+                self.displayedSearchSignature = signature
                 self.tableView.reloadData()
                 self.updateStatus(refreshesMemory: true)
                 self.updateLoadingOverlay()
                 self.updateActionButtons()
                 self.updateMascotPersistentAnimation()
+                if
+                    response.usesIndexedCandidates,
+                    let responseRevision = response.snapshotRevision,
+                    responseRevision < self.indexStats.snapshotRevision,
+                    signature == self.scheduledSearchSignature
+                {
+                    self.scheduleSearch(force: true)
+                }
             }
         }
     }
@@ -1277,6 +1303,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         activeSearchToken?.cancel()
         activeSearchToken = nil
         scheduledSearchSignature = nil
+        displayedSearchSignature = nil
         results.removeAll(keepingCapacity: true)
         totalMatches = 0
         queryElapsed = 0

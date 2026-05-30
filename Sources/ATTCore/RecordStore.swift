@@ -31,6 +31,9 @@ protocol RecordStore: AnyObject, Sendable {
     func volumeName(at index: Int) -> String
     func normalizedName(at index: Int) -> String
     func normalizedPath(at index: Int) -> String
+    func parentRowID(at index: Int) -> Int?
+    func normalizedPath(at index: Int, contains token: String, cache: inout [Int: Bool]) -> Bool
+    func isHiddenInPath(at index: Int, cache: inout [Int: Bool]) -> Bool
 }
 
 struct RecordSearchView: Sendable {
@@ -82,6 +85,36 @@ extension RecordStore {
     func volumeName(at index: Int) -> String { record(at: index).volumeName }
     func normalizedName(at index: Int) -> String { record(at: index).normalizedName }
     func normalizedPath(at index: Int) -> String { record(at: index).normalizedPath }
+    func parentRowID(at index: Int) -> Int? {
+        let record = record(at: index)
+        guard record.directoryPath != record.path else { return nil }
+        return rowID(forPath: record.directoryPath)
+    }
+
+    func normalizedPath(at index: Int, contains token: String, cache: inout [Int: Bool]) -> Bool {
+        if let cached = cache[index] {
+            return cached
+        }
+
+        let containsToken = normalizedPath(at: index).contains(token)
+        if isDirectory(at: index) {
+            cache[index] = containsToken
+        }
+        return containsToken
+    }
+
+    func isHiddenInPath(at index: Int, cache: inout [Int: Bool]) -> Bool {
+        if let cached = cache[index] {
+            return cached
+        }
+
+        let record = record(at: index)
+        let hidden = record.isHidden || FileRecord.pathIsHidden(record.path)
+        if record.isDirectory {
+            cache[index] = hidden
+        }
+        return hidden
+    }
 }
 
 final class EmptyRecordStore: RecordStore {
@@ -485,6 +518,11 @@ final class MappedRecordStore: RecordStore {
     }
 
     func recordID(at index: Int) -> UInt64 { readRow(index).id }
+    func parentRowID(at index: Int) -> Int? {
+        let parent = recordsData.readInt32LE(at: rowOffset(for: index) + 8)
+        return parent >= 0 ? Int(parent) : nil
+    }
+
     func name(at index: Int) -> String {
         let row = readRow(index)
         return string(offset: row.nameOffset, length: row.nameLength)
@@ -562,9 +600,48 @@ final class MappedRecordStore: RecordStore {
         return value
     }
 
+    func normalizedPath(at index: Int, contains token: String, cache: inout [Int: Bool]) -> Bool {
+        if let cached = cache[index] {
+            return cached
+        }
+
+        let row = readRow(index)
+        let containsToken: Bool
+        if string(offset: row.normalizedNameOffset, length: row.normalizedNameLength).contains(token) {
+            containsToken = true
+        } else if row.parent >= 0 {
+            containsToken = normalizedPath(at: Int(row.parent), contains: token, cache: &cache)
+        } else {
+            containsToken = string(
+                offset: row.normalizedBaseDirectoryOffset,
+                length: row.normalizedBaseDirectoryLength
+            ).contains(token)
+        }
+
+        if row.flags & 1 != 0 || row.parent < 0 {
+            cache[index] = containsToken
+        }
+        return containsToken
+    }
+
+    func isHiddenInPath(at index: Int, cache: inout [Int: Bool]) -> Bool {
+        if let cached = cache[index] {
+            return cached
+        }
+
+        let offset = rowOffset(for: index)
+        let parent = recordsData.readInt32LE(at: offset + 8)
+        let flags = recordsData.readUInt32LE(at: offset + 12)
+        let hidden = flags & 2 != 0 || (parent >= 0 && isHiddenInPath(at: Int(parent), cache: &cache))
+
+        if flags & 1 != 0 || parent < 0 {
+            cache[index] = hidden
+        }
+        return hidden
+    }
+
     private func readRow(_ index: Int) -> Row {
-        precondition(index >= 0 && index < count, "Record index \(index) is out of bounds")
-        let offset = Self.recordsHeaderSize + index * Self.rowSize
+        let offset = rowOffset(for: index)
         return Row(
             id: recordsData.readUInt64LE(at: offset),
             parent: recordsData.readInt32LE(at: offset + 8),
@@ -583,6 +660,11 @@ final class MappedRecordStore: RecordStore {
             extensionID: recordsData.readUInt32LE(at: offset + 88),
             volumeID: recordsData.readUInt32LE(at: offset + 92)
         )
+    }
+
+    private func rowOffset(for index: Int) -> Int {
+        precondition(index >= 0 && index < count, "Record index \(index) is out of bounds")
+        return Self.recordsHeaderSize + index * Self.rowSize
     }
 
     private func readLookupEntry(_ index: Int) -> PathLookupEntry {

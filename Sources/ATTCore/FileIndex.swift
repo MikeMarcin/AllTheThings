@@ -49,11 +49,21 @@ public struct SearchResponse: Sendable {
     public let results: [SearchResult]
     public let totalMatches: Int
     public let elapsed: TimeInterval
+    public let snapshotRevision: UInt64?
+    public let usesIndexedCandidates: Bool
 
-    public init(results: [SearchResult], totalMatches: Int, elapsed: TimeInterval) {
+    public init(
+        results: [SearchResult],
+        totalMatches: Int,
+        elapsed: TimeInterval,
+        snapshotRevision: UInt64? = nil,
+        usesIndexedCandidates: Bool = false
+    ) {
         self.results = results
         self.totalMatches = totalMatches
         self.elapsed = elapsed
+        self.snapshotRevision = snapshotRevision
+        self.usesIndexedCandidates = usesIndexedCandidates
     }
 }
 
@@ -75,6 +85,7 @@ public struct IndexStats: Sendable {
     public let discoveredCount: Int
     public let searchableCount: Int
     public let optimizedCount: Int
+    public let snapshotRevision: UInt64
     public let status: String
     public let lastUpdated: Date
 
@@ -86,6 +97,7 @@ public struct IndexStats: Sendable {
         discoveredCount: Int? = nil,
         searchableCount: Int? = nil,
         optimizedCount: Int? = nil,
+        snapshotRevision: UInt64 = 0,
         status: String,
         lastUpdated: Date
     ) {
@@ -96,6 +108,7 @@ public struct IndexStats: Sendable {
         self.discoveredCount = discoveredCount ?? indexedCount
         self.searchableCount = searchableCount ?? indexedCount
         self.optimizedCount = optimizedCount ?? (isIndexing ? 0 : indexedCount)
+        self.snapshotRevision = snapshotRevision
         self.status = status
         self.lastUpdated = lastUpdated
     }
@@ -630,6 +643,10 @@ public final class FileIndex: @unchecked Sendable {
             store.view(at: index)
         }
 
+        func isHiddenInPath(at index: Int, cache: inout [Int: Bool]) -> Bool {
+            store.isHiddenInPath(at: index, cache: &cache)
+        }
+
         func orderedIndices(for sort: SortSpec, queryIsEmpty: Bool) -> [Int]? {
             guard hasSortedOrder else { return nil }
 
@@ -728,6 +745,92 @@ public final class FileIndex: @unchecked Sendable {
 
         func candidateNameIndices(containingAllBytes tokenBytes: [UInt8]) -> [Int32]? {
             candidateIndices(in: nameGramIndex, containingAllBytes: tokenBytes)
+        }
+
+        func candidatePathIndicesByScanning(containing token: String, shouldCancel: @Sendable () -> Bool) -> [Int32]? {
+            guard gramIndex == nil, !token.isEmpty else { return nil }
+
+            var cache: [Int: Bool] = [:]
+            var candidates: [Int32] = []
+            for rowID in 0..<count {
+                if rowID.isMultiple(of: 512), shouldCancel() {
+                    return nil
+                }
+                if store.normalizedPath(at: rowID, contains: token, cache: &cache) {
+                    candidates.append(Int32(rowID))
+                }
+            }
+            return candidates
+        }
+
+        func candidatePathIndicesByComponentExpansion(
+            containing token: String,
+            shouldCancel: @Sendable () -> Bool
+        ) -> [Int32]? {
+            guard
+                gramIndex == nil,
+                nameGramIndex != nil,
+                !token.isEmpty,
+                !FileIndex.tokenContainsPathSeparator(token),
+                let componentCandidates = candidateNameIndices(containing: Array(token.utf8))
+            else {
+                return nil
+            }
+
+            var directMatches = Set<Int>()
+            directMatches.reserveCapacity(componentCandidates.count)
+            for candidate in componentCandidates {
+                let rowID = Int(candidate)
+                guard rowID >= 0, rowID < count else { continue }
+                if store.normalizedName(at: rowID).contains(token) {
+                    directMatches.insert(rowID)
+                }
+            }
+
+            guard !directMatches.isEmpty else { return nil }
+
+            var memo = Array(repeating: Int8(-1), count: count)
+
+            func pathMatches(at rowID: Int) -> Bool {
+                if directMatches.contains(rowID) {
+                    memo[rowID] = 1
+                    return true
+                }
+
+                switch memo[rowID] {
+                case 0:
+                    return false
+                case 1:
+                    return true
+                default:
+                    break
+                }
+
+                guard
+                    let parent = store.parentRowID(at: rowID),
+                    parent >= 0,
+                    parent < count,
+                    parent != rowID
+                else {
+                    memo[rowID] = 0
+                    return false
+                }
+
+                let matches = pathMatches(at: parent)
+                memo[rowID] = matches ? 1 : 0
+                return matches
+            }
+
+            var candidates: [Int32] = []
+            for rowID in 0..<count {
+                if rowID.isMultiple(of: 512), shouldCancel() {
+                    return nil
+                }
+                if pathMatches(at: rowID) {
+                    candidates.append(Int32(rowID))
+                }
+            }
+            return candidates
         }
 
         private func candidateIndices(in postingIndex: MappedIntPostingIndex?, containingAllBytes tokenBytes: [UInt8]) -> [Int32]? {
@@ -1056,7 +1159,11 @@ public final class FileIndex: @unchecked Sendable {
         shouldCancel: @Sendable () -> Bool
     ) -> SearchResponse? {
         let started = Date()
-        let snapshot = lock.withLock { searchSnapshot }
+        let snapshotData = lock.withLock {
+            (snapshot: searchSnapshot, revision: searchSnapshotRevision)
+        }
+        let snapshot = snapshotData.snapshot
+        let snapshotRevision = snapshotData.revision
 
         guard !shouldCancel() else { return nil }
 
@@ -1135,12 +1242,25 @@ public final class FileIndex: @unchecked Sendable {
                 }
             }
         } else {
+            if let fastResponse = Self.fastLargePathSubstringSearch(
+                snapshot: snapshot,
+                request: request,
+                parsedQuery: parsedQuery,
+                maxResults: boundedMaxResults,
+                started: started,
+                snapshotRevision: snapshotRevision,
+                shouldCancel: shouldCancel
+            ) {
+                return fastResponse
+            }
+
             if let indexedResponse = Self.indexedCandidateSearch(
                 snapshot: snapshot,
                 request: request,
                 parsedQuery: parsedQuery,
                 maxResults: boundedMaxResults,
                 started: started,
+                snapshotRevision: snapshotRevision,
                 shouldCancel: shouldCancel
             ) {
                 return indexedResponse
@@ -1165,11 +1285,185 @@ public final class FileIndex: @unchecked Sendable {
 
         guard !shouldCancel() else { return nil }
 
-        return SearchResponse(results: Self.materialize(matches, from: snapshot), totalMatches: total, elapsed: Date().timeIntervalSince(started))
+        return SearchResponse(
+            results: Self.materialize(matches, from: snapshot),
+            totalMatches: total,
+            elapsed: Date().timeIntervalSince(started),
+            snapshotRevision: snapshotRevision
+        )
     }
 
     private static func materialize(_ matches: [SearchMatch], from snapshot: SearchSnapshot) -> [SearchResult] {
         matches.map { SearchResult(record: snapshot.record(at: $0.rowID), score: $0.score) }
+    }
+
+    private static func fastLargePathSubstringSearch(
+        snapshot: SearchSnapshot,
+        request: SearchRequest,
+        parsedQuery: FuzzyMatcher.ParsedQuery,
+        maxResults: Int,
+        started: Date,
+        snapshotRevision: UInt64,
+        shouldCancel: @Sendable () -> Bool
+    ) -> SearchResponse? {
+        guard
+            request.sort.column != .relevance,
+            request.sort.column != .path,
+            snapshot.gramIndex == nil,
+            snapshot.nameGramIndex != nil,
+            parsedQuery.negative.isEmpty,
+            parsedQuery.positive.count == 1,
+            let clause = parsedQuery.positive.first,
+            clause.alternatives.count == 1,
+            let part = clause.alternatives.first,
+            case .text(let field, let pattern, let mode) = part,
+            mode == .fuzzy || mode == .exact,
+            !tokenContainsPathSeparator(pattern.token),
+            pattern.token.utf8.count > 3
+        else {
+            return nil
+        }
+
+        let tokenBytes = Array(pattern.token.utf8)
+        let exactNameCandidates = snapshot.candidateNameIndices(containing: tokenBytes) ?? []
+        let exactPathCandidates: [Int32]
+        switch field {
+        case .name:
+            exactPathCandidates = exactNameCandidates
+        case .any, .path:
+            guard let pathCandidates = snapshot.candidatePathIndicesByComponentExpansion(
+                containing: pattern.token,
+                shouldCancel: shouldCancel
+            ) else {
+                return nil
+            }
+            exactPathCandidates = field == .any ? unionPostingLists(pathCandidates, exactNameCandidates) : pathCandidates
+        }
+
+        guard exactPathCandidates.count >= max(maxResults, 1) || exactPathCandidates.count > 1_000 else {
+            return nil
+        }
+
+        if request.sort.column == .modified, snapshot.hasSortedOrder {
+            var candidateSet = Set<Int>()
+            candidateSet.reserveCapacity(exactPathCandidates.count)
+            for candidate in exactPathCandidates {
+                let rowID = Int(candidate)
+                guard rowID >= 0, rowID < snapshot.count else { continue }
+                candidateSet.insert(rowID)
+            }
+
+            let orderedRows = request.sort.ascending ? snapshot.modifiedAscending : snapshot.modifiedDescending
+            var matches: [SearchMatch] = []
+            matches.reserveCapacity(min(candidateSet.count, maxResults))
+
+            if request.includeHidden {
+                if maxResults > 0 {
+                    for (offset, rowID) in orderedRows.enumerated() {
+                        if offset.isMultiple(of: 512), shouldCancel() {
+                            return nil
+                        }
+                        guard candidateSet.contains(rowID) else { continue }
+                        matches.append(SearchMatch(rowID: rowID, score: 0))
+                        if matches.count >= maxResults {
+                            break
+                        }
+                    }
+                }
+
+                guard candidateSet.count >= max(maxResults, 1) || candidateSet.count > 1_000 else {
+                    return nil
+                }
+            } else {
+                var total = 0
+                var hiddenCache: [Int: Bool] = [:]
+                for (offset, rowID) in orderedRows.enumerated() {
+                    if offset.isMultiple(of: 512), shouldCancel() {
+                        return nil
+                    }
+                    guard candidateSet.contains(rowID) else { continue }
+
+                    guard !snapshot.isHiddenInPath(at: rowID, cache: &hiddenCache) else { continue }
+
+                    total += 1
+                    if maxResults > 0, matches.count < maxResults {
+                        matches.append(SearchMatch(rowID: rowID, score: 0))
+                    }
+                }
+
+                guard total >= max(maxResults, 1) || total > 1_000 else {
+                    return nil
+                }
+
+                guard !shouldCancel() else { return nil }
+                return SearchResponse(
+                    results: materialize(matches, from: snapshot),
+                    totalMatches: total,
+                    elapsed: Date().timeIntervalSince(started),
+                    snapshotRevision: snapshotRevision,
+                    usesIndexedCandidates: true
+                )
+            }
+
+            guard !shouldCancel() else { return nil }
+            return SearchResponse(
+                results: materialize(matches, from: snapshot),
+                totalMatches: candidateSet.count,
+                elapsed: Date().timeIntervalSince(started),
+                snapshotRevision: snapshotRevision,
+                usesIndexedCandidates: true
+            )
+        }
+
+        var matches: [SearchMatch] = []
+        matches.reserveCapacity(min(exactPathCandidates.count, maxResults))
+        let trimThreshold = maxResults > 0 ? maxResults * 5 : 0
+        var total = 0
+
+        func sortAndLimitMatches() {
+            guard maxResults > 0 else { return }
+            matches.sort {
+                compare($0, $1, snapshot: snapshot, sort: request.sort, queryIsEmpty: false)
+            }
+            if matches.count > maxResults {
+                matches.removeSubrange(maxResults..<matches.count)
+            }
+        }
+
+        var hiddenCache: [Int: Bool] = [:]
+        for (offset, candidate) in exactPathCandidates.enumerated() {
+            if offset.isMultiple(of: 512), shouldCancel() {
+                return nil
+            }
+
+            let rowID = Int(candidate)
+            guard rowID >= 0, rowID < snapshot.count else { continue }
+            guard request.includeHidden || !snapshot.isHiddenInPath(at: rowID, cache: &hiddenCache) else { continue }
+
+            total += 1
+            guard maxResults > 0 else { continue }
+
+            matches.append(SearchMatch(rowID: rowID, score: 0))
+            if matches.count > trimThreshold {
+                sortAndLimitMatches()
+            }
+        }
+
+        guard total >= max(maxResults, 1) || total > 1_000 else {
+            return nil
+        }
+
+        guard !shouldCancel() else { return nil }
+        sortAndLimitMatches()
+
+        guard !shouldCancel() else { return nil }
+        return SearchResponse(
+            results: materialize(matches, from: snapshot),
+            totalMatches: total,
+            elapsed: Date().timeIntervalSince(started),
+            snapshotRevision: snapshotRevision,
+            usesIndexedCandidates: true
+        )
     }
 
     private static func indexedCandidateSearch(
@@ -1178,14 +1472,25 @@ public final class FileIndex: @unchecked Sendable {
         parsedQuery: FuzzyMatcher.ParsedQuery,
         maxResults: Int,
         started: Date,
+        snapshotRevision: UInt64,
         shouldCancel: @Sendable () -> Bool
     ) -> SearchResponse? {
-        guard let candidateIndices = candidateIndices(snapshot: snapshot, parsedQuery: parsedQuery) else {
+        guard let candidateIndices = candidateIndices(
+            snapshot: snapshot,
+            parsedQuery: parsedQuery,
+            shouldCancel: shouldCancel
+        ) else {
             return nil
         }
 
         if candidateIndices.isEmpty {
-            return SearchResponse(results: [], totalMatches: 0, elapsed: Date().timeIntervalSince(started))
+            return SearchResponse(
+                results: [],
+                totalMatches: 0,
+                elapsed: Date().timeIntervalSince(started),
+                snapshotRevision: snapshotRevision,
+                usesIndexedCandidates: true
+            )
         }
 
         guard candidateIndices.count < snapshot.count else {
@@ -1245,19 +1550,33 @@ public final class FileIndex: @unchecked Sendable {
         sortAndLimitMatches()
 
         guard !shouldCancel() else { return nil }
-        return SearchResponse(results: materialize(matches, from: snapshot), totalMatches: total, elapsed: Date().timeIntervalSince(started))
+        return SearchResponse(
+            results: materialize(matches, from: snapshot),
+            totalMatches: total,
+            elapsed: Date().timeIntervalSince(started),
+            snapshotRevision: snapshotRevision,
+            usesIndexedCandidates: true
+        )
     }
 
     private static func recordIsHidden<Record: SearchRecordReadable>(_ record: Record) -> Bool {
         record.isHidden || FileRecord.pathIsHidden(record.path)
     }
 
-    private static func candidateIndices(snapshot: SearchSnapshot, parsedQuery: FuzzyMatcher.ParsedQuery) -> [Int32]? {
+    private static func candidateIndices(
+        snapshot: SearchSnapshot,
+        parsedQuery: FuzzyMatcher.ParsedQuery,
+        shouldCancel: @Sendable () -> Bool
+    ) -> [Int32]? {
         var candidates: [Int32]?
         var foundUsableClause = false
 
         for clause in parsedQuery.positive {
-            guard let clauseCandidates = candidateIndices(snapshot: snapshot, clause: clause) else {
+            guard let clauseCandidates = candidateIndices(
+                snapshot: snapshot,
+                clause: clause,
+                shouldCancel: shouldCancel
+            ) else {
                 continue
             }
 
@@ -1280,12 +1599,20 @@ public final class FileIndex: @unchecked Sendable {
         return foundUsableClause ? candidates : nil
     }
 
-    private static func candidateIndices(snapshot: SearchSnapshot, clause: FuzzyMatcher.QueryClause) -> [Int32]? {
+    private static func candidateIndices(
+        snapshot: SearchSnapshot,
+        clause: FuzzyMatcher.QueryClause,
+        shouldCancel: @Sendable () -> Bool
+    ) -> [Int32]? {
         var candidates: [Int32] = []
         var foundUsableAlternative = false
 
         for alternative in clause.alternatives {
-            guard let alternativeCandidates = candidateIndices(snapshot: snapshot, part: alternative) else {
+            guard let alternativeCandidates = candidateIndices(
+                snapshot: snapshot,
+                part: alternative,
+                shouldCancel: shouldCancel
+            ) else {
                 return nil
             }
 
@@ -1296,15 +1623,31 @@ public final class FileIndex: @unchecked Sendable {
         return foundUsableAlternative ? candidates : nil
     }
 
-    private static func candidateIndices(snapshot: SearchSnapshot, part: FuzzyMatcher.QueryPart) -> [Int32]? {
+    private static func candidateIndices(
+        snapshot: SearchSnapshot,
+        part: FuzzyMatcher.QueryPart,
+        shouldCancel: @Sendable () -> Bool
+    ) -> [Int32]? {
         switch part {
         case .kind:
             return nil
         case .fileExtension(let pattern, let mode):
             return snapshot.candidateIndices(fileExtension: pattern.token, mode: mode)
-                ?? candidateIndices(snapshot: snapshot, token: pattern.token, mode: mode, allowsFuzzyPrefix: true)
+                ?? candidateIndices(
+                    snapshot: snapshot,
+                    token: pattern.token,
+                    mode: mode,
+                    allowsFuzzyPrefix: true,
+                    shouldCancel: shouldCancel
+                )
         case .text(let field, let pattern, let mode):
-            return candidateIndices(snapshot: snapshot, field: field, token: pattern.token, mode: mode)
+            return candidateIndices(
+                snapshot: snapshot,
+                field: field,
+                token: pattern.token,
+                mode: mode,
+                shouldCancel: shouldCancel
+            )
         }
     }
 
@@ -1312,11 +1655,17 @@ public final class FileIndex: @unchecked Sendable {
         snapshot: SearchSnapshot,
         field: FuzzyMatcher.QueryField,
         token: String,
-        mode: FuzzyMatcher.MatchMode
+        mode: FuzzyMatcher.MatchMode,
+        shouldCancel: @Sendable () -> Bool
     ) -> [Int32]? {
         switch mode {
         case .exact:
-            return snapshot.candidateIndices(containing: Array(token.utf8), field: field)
+            return exactTextCandidateIndices(
+                snapshot: snapshot,
+                field: field,
+                token: token,
+                shouldCancel: shouldCancel
+            )
         case .wildcard:
             let candidateField: FuzzyMatcher.QueryField = field == .any && tokenContainsPathSeparator(token) ? .path : field
             return candidateIndices(snapshot: snapshot, requiredFragments: wildcardRequiredFragments(from: token), field: candidateField)
@@ -1328,7 +1677,12 @@ public final class FileIndex: @unchecked Sendable {
                 return candidateIndices(snapshot: snapshot, requiredFragments: pathLiteralFragments(from: token), field: .path)
             }
 
-            return fuzzyTextCandidateIndices(snapshot: snapshot, field: field, token: token)
+            return fuzzyTextCandidateIndices(
+                snapshot: snapshot,
+                field: field,
+                token: token,
+                shouldCancel: shouldCancel
+            )
         }
     }
 
@@ -1336,18 +1690,27 @@ public final class FileIndex: @unchecked Sendable {
         snapshot: SearchSnapshot,
         token: String,
         mode: FuzzyMatcher.MatchMode,
-        allowsFuzzyPrefix: Bool
+        allowsFuzzyPrefix: Bool,
+        shouldCancel: @Sendable () -> Bool
     ) -> [Int32]? {
         switch mode {
         case .exact:
-            return snapshot.candidatePathIndices(containing: Array(token.utf8))
+            return pathSubstringCandidateIndices(
+                snapshot: snapshot,
+                token: token,
+                shouldCancel: shouldCancel
+            )
         case .wildcard:
             return candidateIndices(snapshot: snapshot, requiredFragments: wildcardRequiredFragments(from: token), field: .path)
         case .fuzzy:
             guard allowsFuzzyPrefix else {
                 return nil
             }
-            return snapshot.candidatePathIndices(containing: Array(token.utf8))
+            return pathSubstringCandidateIndices(
+                snapshot: snapshot,
+                token: token,
+                shouldCancel: shouldCancel
+            )
         }
     }
 
@@ -1414,10 +1777,69 @@ public final class FileIndex: @unchecked Sendable {
             .map { Array($0.utf8) }
     }
 
+    private static func exactTextCandidateIndices(
+        snapshot: SearchSnapshot,
+        field: FuzzyMatcher.QueryField,
+        token: String,
+        shouldCancel: @Sendable () -> Bool
+    ) -> [Int32]? {
+        let tokenBytes = Array(token.utf8)
+        switch field {
+        case .name:
+            return snapshot.candidateNameIndices(containing: tokenBytes)
+        case .path:
+            return pathSubstringCandidateIndices(
+                snapshot: snapshot,
+                token: token,
+                shouldCancel: shouldCancel
+            )
+        case .any:
+            guard let nameCandidates = snapshot.candidateNameIndices(containing: tokenBytes) else {
+                return nil
+            }
+            guard let pathCandidates = pathSubstringCandidateIndices(
+                snapshot: snapshot,
+                token: token,
+                shouldCancel: shouldCancel
+            ) else {
+                return nil
+            }
+            return unionPostingLists(pathCandidates, nameCandidates)
+        }
+    }
+
+    private static func pathSubstringCandidateIndices(
+        snapshot: SearchSnapshot,
+        token: String,
+        shouldCancel: @Sendable () -> Bool
+    ) -> [Int32]? {
+        let tokenBytes = Array(token.utf8)
+        if let candidates = snapshot.candidatePathIndices(containing: tokenBytes) {
+            return candidates
+        }
+
+        if let candidates = snapshot.candidatePathIndicesByComponentExpansion(
+            containing: token,
+            shouldCancel: shouldCancel
+        ) {
+            return candidates
+        }
+
+        guard tokenBytes.count > 3 else {
+            return nil
+        }
+
+        return snapshot.candidatePathIndicesByScanning(
+            containing: token,
+            shouldCancel: shouldCancel
+        )
+    }
+
     private static func fuzzyTextCandidateIndices(
         snapshot: SearchSnapshot,
         field: FuzzyMatcher.QueryField,
-        token: String
+        token: String,
+        shouldCancel: @Sendable () -> Bool
     ) -> [Int32]? {
         guard token.utf8.allSatisfy({ $0 < 128 }) else {
             return nil
@@ -1430,11 +1852,21 @@ public final class FileIndex: @unchecked Sendable {
         case .name:
             return nameCandidates
         case .path:
-            return fuzzyPathCandidateIndices(snapshot: snapshot, tokenBytes: tokenBytes)
+            return fuzzyPathCandidateIndices(
+                snapshot: snapshot,
+                token: token,
+                tokenBytes: tokenBytes,
+                shouldCancel: shouldCancel
+            )
         case .any:
             guard
                 let nameCandidates,
-                let pathCandidates = fuzzyPathCandidateIndices(snapshot: snapshot, tokenBytes: tokenBytes)
+                let pathCandidates = fuzzyPathCandidateIndices(
+                    snapshot: snapshot,
+                    token: token,
+                    tokenBytes: tokenBytes,
+                    shouldCancel: shouldCancel
+                )
             else {
                 return nil
             }
@@ -1466,7 +1898,12 @@ public final class FileIndex: @unchecked Sendable {
         return snapshot.candidateNameIndices(containingAny: requiredSubsets)
     }
 
-    private static func fuzzyPathCandidateIndices(snapshot: SearchSnapshot, tokenBytes: [UInt8]) -> [Int32]? {
+    private static func fuzzyPathCandidateIndices(
+        snapshot: SearchSnapshot,
+        token: String,
+        tokenBytes: [UInt8],
+        shouldCancel: @Sendable () -> Bool
+    ) -> [Int32]? {
         guard !tokenBytes.isEmpty else {
             return nil
         }
@@ -1479,7 +1916,11 @@ public final class FileIndex: @unchecked Sendable {
             return snapshot.candidatePathIndices(containingAllBytes: distinctBytes)
         }
 
-        return snapshot.candidatePathIndices(containing: tokenBytes)
+        return pathSubstringCandidateIndices(
+            snapshot: snapshot,
+            token: token,
+            shouldCancel: shouldCancel
+        )
     }
 
     private static func distinctBytes(in bytes: [UInt8]) -> [UInt8] {
@@ -2829,6 +3270,7 @@ public final class FileIndex: @unchecked Sendable {
                     discoveredCount: discoveredCount,
                     searchableCount: searchableCount,
                     optimizedCount: optimizedCount,
+                    snapshotRevision: searchSnapshotRevision,
                     status: status,
                     lastUpdated: lastUpdated
                 ),
@@ -2853,6 +3295,7 @@ public final class FileIndex: @unchecked Sendable {
                 discoveredCount: discoveredCount,
                 searchableCount: searchableCount,
                 optimizedCount: optimizedCount,
+                snapshotRevision: searchSnapshotRevision,
                 status: status,
                 lastUpdated: lastUpdated
             )
