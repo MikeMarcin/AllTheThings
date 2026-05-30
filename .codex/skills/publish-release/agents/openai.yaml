@@ -1,0 +1,6 @@
+interface:
+  display_name: "Publish Release"
+  short_description: "Package and publish AllTheThings releases"
+  default_prompt: "Use $publish-release to bump versions, build signed/notarized release artifacts, tag, push, and create the GitHub release for AllTheThings."
+policy:
+  allow_implicit_invocation: true

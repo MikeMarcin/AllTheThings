@@ -1,0 +1,6 @@
+interface:
+  display_name: "Sprite Sheet Animation Updater"
+  short_description: "Validate fixed-cell sprite animations"
+  default_prompt: "Use $sprite-sheet-animation-updater to update sprite sheet animations, preserve the character model, validate gutters/scale/registration, and run regression tests."
+policy:
+  allow_implicit_invocation: true
