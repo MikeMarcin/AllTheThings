@@ -108,6 +108,49 @@ struct MemoryBudgetTests {
         #expect(!response.results.contains { $0.record.path == hiddenPath })
     }
 
+    @Test("short fuzzy path tokens use component expansion without path postings")
+    func shortFuzzyPathTokensUseComponentExpansionWithoutPathPostings() {
+        let rootDirectory = "/tmp/allthethings-memory/"
+            + String(repeating: "wide-directory-segment/", count: 120)
+        let klopfgeistDirectory = "\(rootDirectory)/Klopfgeist"
+        let longDirectory = "\(rootDirectory)/Long Vibrating Springs.patch"
+        let klopfgeistChild = "\(klopfgeistDirectory)/#default.pst"
+        let longChild = "\(longDirectory)/#Root.cst"
+        var records = [
+            makeRecord(path: klopfgeistDirectory, isDirectory: true, modifiedTime: 0),
+            makeRecord(path: longDirectory, isDirectory: true, modifiedTime: 1),
+            makeRecord(path: klopfgeistChild, modifiedTime: 2),
+            makeRecord(path: longChild, modifiedTime: 3)
+        ]
+
+        for index in 0..<12_000 {
+            records.append(makeRecord(
+                path: "\(rootDirectory)/unrelated/File\(String(format: "%06d", index)).swift",
+                modifiedTime: TimeInterval(10_000 + index)
+            ))
+        }
+
+        let index = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        index.replaceRecordsForTesting(records)
+
+        let diagnostics = index.currentDiagnostics()
+        #expect(!diagnostics.pathGramIndexEnabled)
+        #expect(diagnostics.nameGramPostingCount > 0)
+
+        let response = index.search(SearchRequest(
+            query: "log",
+            sort: SortSpec(column: .name, ascending: true),
+            includeHidden: false
+        ), maxResults: 20)
+
+        #expect(response.usesIndexedCandidates)
+        #expect(response.results.contains { $0.record.path == klopfgeistChild })
+        #expect(response.results.contains { $0.record.path == longChild })
+    }
+
     @Test("old streaming snapshots are ignored")
     func oldStreamingSnapshotsAreIgnored() throws {
         let applicationName = "AllTheThingsTests-\(UUID().uuidString)"

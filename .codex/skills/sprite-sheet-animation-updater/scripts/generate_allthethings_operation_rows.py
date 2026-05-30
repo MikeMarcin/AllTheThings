@@ -2,7 +2,7 @@
 """Regenerate AllTheThings Nib operation animations and intro strip.
 
 This script keeps Nib's approved idle/fidget bodies on model and redraws the
-indexing/optimizing props as longer, smoother loops inside the fixed cell grid.
+searching/indexing/optimizing props as longer, smoother loops inside the fixed cell grid.
 It also builds the first-run standalone welcome strip from those same approved
 body frames plus deterministic overlays.
 """
@@ -20,6 +20,7 @@ CELL_WIDTH = 160
 CELL_HEIGHT = 96
 ROWS = {
     "indexing": 1,
+    "searching": 2,
     "optimizing": 3,
 }
 SCALE = 4
@@ -229,6 +230,9 @@ def operation_body_frames(strips: dict[str, list[Image.Image]], operation: str, 
         y_offsets = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1, 1, 0]
         return frame, (0, y_offsets[frame_index % len(y_offsets)])
 
+    if operation == "searching":
+        return strips["idle"][0], (0, 0)
+
     frame = strips["antenna"][antenna_cycle[(frame_index + 3) % len(antenna_cycle)]]
     y_offsets = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1]
     return frame, (0, y_offsets[frame_index % len(y_offsets)])
@@ -301,6 +305,104 @@ def draw_indexing_frame(strips: dict[str, list[Image.Image]], frame_index: int, 
     if frame_index in (3, 4, 11, 12, 13, 14):
         draw_sparkle(canvas, (28, 36), ((frame_index % 8) / 8), max_radius=3)
         draw_sparkle(canvas, (134, 33), (((frame_index + 3) % 8) / 8), max_radius=3)
+
+    return canvas
+
+
+def draw_magnifying_glass(
+    canvas: Image.Image,
+    center: tuple[float, float],
+    phase: float,
+    handle_angle: float = 0.88,
+) -> tuple[int, int]:
+    overlay = Image.new("RGBA", (CELL_WIDTH * SCALE, CELL_HEIGHT * SCALE), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    cx = center[0] * SCALE
+    cy = center[1] * SCALE
+    radius = 14 * SCALE
+    handle_start = radius * 0.68
+    handle_end = radius + 14 * SCALE
+    dx = cos(handle_angle)
+    dy = sin(handle_angle)
+    sx = cx + dx * handle_start
+    sy = cy + dy * handle_start
+    ex = cx + dx * handle_end
+    ey = cy + dy * handle_end
+
+    draw.line(
+        [(sx + 2 * SCALE, sy + 2 * SCALE), (ex + 2 * SCALE, ey + 2 * SCALE)],
+        fill=(0, 0, 0, 80),
+        width=5 * SCALE,
+    )
+    draw.line(
+        [(sx, sy), (ex, ey)],
+        fill=(91, 91, 98, 255),
+        width=5 * SCALE,
+    )
+    draw.line(
+        [(sx, sy), (ex, ey)],
+        fill=(160, 160, 168, 180),
+        width=2 * SCALE,
+    )
+
+    ring_box = [cx - radius, cy - radius, cx + radius, cy + radius]
+    shadow_box = [value + 1.6 * SCALE for value in ring_box]
+    draw.ellipse(shadow_box, outline=(0, 0, 0, 82), width=5 * SCALE)
+    draw.ellipse(ring_box, fill=(226, 246, 255, 82), outline=(71, 72, 78, 255), width=5 * SCALE)
+    draw.ellipse(
+        [cx - radius + 3 * SCALE, cy - radius + 3 * SCALE, cx + radius - 3 * SCALE, cy + radius - 3 * SCALE],
+        outline=(174, 184, 194, 185),
+        width=SCALE,
+    )
+
+    scan = (smoothstep(phase) * 2 - 1) * radius * 0.62
+    draw.line(
+        [(cx + scan - 4 * SCALE, cy - radius * 0.62), (cx + scan + 5 * SCALE, cy + radius * 0.58)],
+        fill=(255, 236, 128, 155),
+        width=2 * SCALE,
+    )
+    draw.arc(
+        [cx - radius * 0.56, cy - radius * 0.62, cx + radius * 0.42, cy + radius * 0.28],
+        start=205,
+        end=278,
+        fill=(255, 255, 255, 185),
+        width=2 * SCALE,
+    )
+
+    canvas.alpha_composite(overlay.resize((CELL_WIDTH, CELL_HEIGHT), Image.Resampling.LANCZOS))
+    return (int(round(ex / SCALE)), int(round(ey / SCALE)))
+
+
+def draw_searching_frame(strips: dict[str, list[Image.Image]], frame_index: int, frame_count: int) -> Image.Image:
+    canvas = Image.new("RGBA", (CELL_WIDTH, CELL_HEIGHT), (0, 0, 0, 0))
+    phase = frame_index / frame_count
+    theta = phase * 2 * pi
+
+    body, offset = operation_body_frames(strips, "searching", frame_index)
+    paste_alpha(canvas, body, offset)
+
+    lens_center = (
+        105 + 10 * cos(theta - pi / 8),
+        52 + 5 * sin(theta * 2 + pi / 5),
+    )
+    handle_angle = 0.88 + 0.10 * sin(theta + pi / 3)
+    hand_center = draw_magnifying_glass(
+        canvas,
+        lens_center,
+        (phase * 2) % 1.0,
+        handle_angle=handle_angle,
+    )
+    draw_mitten(
+        canvas,
+        (hand_center[0] - 8, hand_center[1] - 6),
+        angle=23 + 10 * sin(theta + pi / 6),
+        alpha=0.96,
+    )
+
+    draw_sparkle(canvas, (129, 37), (phase + 0.10) % 1.0, max_radius=3)
+    draw_sparkle(canvas, (92, 41), (phase + 0.58) % 1.0, max_radius=2)
+    if frame_index in (5, 6, 13, 14):
+        draw_motion_lines(canvas, "right", 0.32)
 
     return canvas
 
@@ -597,6 +699,7 @@ def generate(repo_root: Path, frame_count: int, columns: int, write_artifacts: b
 
     generated_rows = {
         "indexing": [draw_indexing_frame(strips, index, frame_count) for index in range(frame_count)],
+        "searching": [draw_searching_frame(strips, index, frame_count) for index in range(frame_count)],
         "optimizing": [draw_optimizing_frame(strips, index, frame_count) for index in range(frame_count)],
     }
     intro_frames = [

@@ -102,6 +102,53 @@ struct FileIndexTests {
         #expect(abs(refreshedModifiedTime - newestDate.timeIntervalSinceReferenceDate) < 0.001)
     }
 
+    @Test("same-path refresh preserves optimized search structures")
+    func samePathRefreshPreservesOptimizedSearchStructures() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        let match = root.appendingPathComponent("AitoProject.swift")
+        let other = root.appendingPathComponent("Other.swift")
+        try "old".write(to: match, atomically: true, encoding: .utf8)
+        try "other".write(to: other, atomically: true, encoding: .utf8)
+
+        let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)")
+        index.replaceRootsAndRebuild([root])
+
+        try await waitUntil {
+            let stats = index.currentStats()
+            return !stats.isIndexing && stats.indexedCount >= 3
+        }
+
+        let before = index.currentDiagnostics()
+        #expect(before.optimizedCount == before.indexedCount)
+        #expect(before.nameGramPostingCount > 0)
+
+        try "new".write(to: match, atomically: true, encoding: .utf8)
+        index.refresh(paths: [match.path])
+
+        try await waitUntil {
+            index.currentDiagnostics().completedRefreshBatches > before.completedRefreshBatches
+        }
+
+        let after = index.currentDiagnostics()
+        #expect(after.optimizedCount == after.indexedCount)
+        #expect(after.nameGramPostingCount == before.nameGramPostingCount)
+        #expect(after.overlayCount == 1)
+
+        let response = index.search(SearchRequest(
+            query: "aitoproject",
+            sort: SortSpec(column: .name, ascending: true)
+        ), maxResults: 10)
+        #expect(response.usesIndexedCandidates)
+        #expect(response.results.contains { $0.record.path == match.path })
+    }
+
     @Test("search applies name sort to small result sets")
     func searchAppliesNameSortToSmallResultSets() async throws {
         let fileManager = FileManager.default

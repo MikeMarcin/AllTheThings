@@ -393,6 +393,122 @@ final class OverlayRecordStore: RecordStore {
     }
 }
 
+final class ReplacingRecordStore: RecordStore {
+    let kind = RecordStoreKind.overlay
+
+    private let base: RecordStore
+    private let replacements: [Int: FileRecord]
+
+    var count: Int { base.count }
+    var mappedByteSize: Int { base.mappedByteSize }
+    var heapPageCount: Int { base.heapPageCount }
+    var overlayCount: Int { replacements.count }
+    var hasColumnarSidecars: Bool { base.hasColumnarSidecars }
+
+    init(base: RecordStore, replacements: [Int: FileRecord]) {
+        self.base = base
+        self.replacements = replacements
+    }
+
+    func record(at index: Int) -> FileRecord {
+        replacements[index] ?? base.record(at: index)
+    }
+
+    func recordID(at index: Int) -> UInt64 {
+        replacements[index]?.id ?? base.recordID(at: index)
+    }
+
+    func path(at index: Int) -> String {
+        replacements[index]?.path ?? base.path(at: index)
+    }
+
+    func name(at index: Int) -> String {
+        replacements[index]?.name ?? base.name(at: index)
+    }
+
+    func directoryPath(at index: Int) -> String {
+        replacements[index]?.directoryPath ?? base.directoryPath(at: index)
+    }
+
+    func fileExtension(at index: Int) -> String {
+        replacements[index]?.fileExtension ?? base.fileExtension(at: index)
+    }
+
+    func sizeBytes(at index: Int) -> UInt64 {
+        replacements[index]?.sizeBytes ?? base.sizeBytes(at: index)
+    }
+
+    func modifiedTime(at index: Int) -> TimeInterval {
+        replacements[index]?.modifiedTime ?? base.modifiedTime(at: index)
+    }
+
+    func createdTime(at index: Int) -> TimeInterval? {
+        replacements[index]?.createdTime ?? base.createdTime(at: index)
+    }
+
+    func isDirectory(at index: Int) -> Bool {
+        replacements[index]?.isDirectory ?? base.isDirectory(at: index)
+    }
+
+    func isHidden(at index: Int) -> Bool {
+        replacements[index]?.isHidden ?? base.isHidden(at: index)
+    }
+
+    func volumeName(at index: Int) -> String {
+        replacements[index]?.volumeName ?? base.volumeName(at: index)
+    }
+
+    func normalizedName(at index: Int) -> String {
+        replacements[index]?.normalizedName ?? base.normalizedName(at: index)
+    }
+
+    func normalizedPath(at index: Int) -> String {
+        replacements[index]?.normalizedPath ?? base.normalizedPath(at: index)
+    }
+
+    func parentRowID(at index: Int) -> Int? {
+        base.parentRowID(at: index)
+    }
+
+    func isVisible(at index: Int) -> Bool {
+        guard let replacement = replacements[index] else {
+            return base.isVisible(at: index)
+        }
+
+        if replacement.isHidden {
+            return false
+        }
+
+        guard let parent = base.parentRowID(at: index), parent != index else {
+            return true
+        }
+
+        return base.isVisible(at: parent)
+    }
+
+    func normalizedPath(at index: Int, contains token: String, cache: inout [Int: Bool]) -> Bool {
+        guard replacements[index] != nil else {
+            return base.normalizedPath(at: index, contains: token, cache: &cache)
+        }
+        return normalizedPath(at: index).contains(token)
+    }
+
+    func normalizedName(at index: Int, contains token: String) -> Bool {
+        guard let replacement = replacements[index] else {
+            return base.normalizedName(at: index, contains: token)
+        }
+        return replacement.normalizedName.contains(token)
+    }
+
+    func isHiddenInPath(at index: Int, cache: inout [Int: Bool]) -> Bool {
+        !isVisible(at: index)
+    }
+
+    func rowID(forPath path: String) -> Int? {
+        base.rowID(forPath: path)
+    }
+}
+
 final class MappedRecordStore: RecordStore {
     let kind = RecordStoreKind.mapped
 
