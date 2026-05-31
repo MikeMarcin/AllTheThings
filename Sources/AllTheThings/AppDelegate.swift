@@ -291,8 +291,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @MainActor
-    func showSettings() {
-        presentSettingsWindow()
+    func showSettings(section: SettingsSection = .general) {
+        presentSettingsWindow(section: section)
     }
 
     @objc @MainActor private func showSettingsWindow(_ sender: Any?) {
@@ -304,7 +304,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @MainActor
-    private func presentSettingsWindow() {
+    private func presentSettingsWindow(section: SettingsSection = .general) {
         let controller: SettingsWindowController
         if let existingController = settingsWindowController {
             controller = existingController
@@ -313,6 +313,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             settingsWindowController = controller
         }
 
+        controller.selectSection(section)
         controller.showWindow(nil)
         controller.window?.makeKeyAndOrderFront(nil)
         NSApp.activate()

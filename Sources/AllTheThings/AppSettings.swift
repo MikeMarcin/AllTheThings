@@ -176,6 +176,12 @@ enum AppSettings {
         saveIndexedRoots(suggestedDefaultIndexedRoots(), defaults: defaults)
     }
 
+    static func initializeIndexedRootsWithDefaultsIfNeeded(defaults: UserDefaults = .standard) {
+        guard !indexedRootsConfigured(defaults: defaults) else { return }
+
+        resetIndexedRoots(defaults: defaults)
+    }
+
     static func exclusionPatterns(defaults: UserDefaults = .standard) -> [String] {
         defaults.array(forKey: exclusionPatternsKey) as? [String] ?? FileExclusionRules.defaultPatterns
     }
