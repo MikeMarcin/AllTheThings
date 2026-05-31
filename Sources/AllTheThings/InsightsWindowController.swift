@@ -3,12 +3,19 @@ import ATTCore
 
 @MainActor
 final class InsightsWindowController: NSWindowController {
+    static let defaultContentSize = NSSize(width: 900, height: 720)
+    static let minimumContentSize = NSSize(width: 720, height: 560)
+    private static let screenMargin: CGFloat = 18
+
     init(
         index: FileIndex,
         defaults: UserDefaults = .standard,
         clearCachedIndexHandler: @escaping () throws -> Void
     ) {
-        let contentSize = NSSize(width: 980, height: 720)
+        let contentSize = Self.clampedContentSize(
+            Self.defaultContentSize,
+            visibleFrame: NSScreen.main?.visibleFrame
+        )
         let viewController = InsightsViewController(
             index: index,
             defaults: defaults,
@@ -24,12 +31,57 @@ final class InsightsWindowController: NSWindowController {
         )
         window.title = "Insights"
         window.isRestorable = false
-        window.contentMinSize = NSSize(width: 900, height: 620)
+        window.contentMinSize = Self.clampedContentSize(
+            Self.minimumContentSize,
+            visibleFrame: NSScreen.main?.visibleFrame
+        )
         window.contentViewController = viewController
         window.setContentSize(contentSize)
-        window.center()
+        Self.fitWindowToVisibleScreen(window)
 
         super.init(window: window)
+    }
+
+    override func showWindow(_ sender: Any?) {
+        super.showWindow(sender)
+        if let window {
+            Self.fitWindowToVisibleScreen(window)
+        }
+    }
+
+    static func clampedContentSize(_ size: NSSize, visibleFrame: NSRect?) -> NSSize {
+        guard let visibleFrame else { return size }
+
+        let maxWidth = max(480, visibleFrame.width - screenMargin * 2)
+        let maxHeight = max(420, visibleFrame.height - screenMargin * 2)
+        return NSSize(
+            width: min(size.width, maxWidth),
+            height: min(size.height, maxHeight)
+        )
+    }
+
+    static func frameFittingVisibleScreen(_ frame: NSRect, visibleFrame: NSRect) -> NSRect {
+        let maxWidth = max(480, visibleFrame.width - screenMargin * 2)
+        let maxHeight = max(420, visibleFrame.height - screenMargin * 2)
+        let width = min(frame.width, maxWidth)
+        let height = min(frame.height, maxHeight)
+        let centeredX = visibleFrame.midX - width / 2
+        let centeredY = visibleFrame.midY - height / 2
+        let x = min(max(centeredX, visibleFrame.minX + screenMargin), visibleFrame.maxX - screenMargin - width)
+        let y = min(max(centeredY, visibleFrame.minY + screenMargin), visibleFrame.maxY - screenMargin - height)
+        return NSRect(x: x, y: y, width: width, height: height)
+    }
+
+    private static func fitWindowToVisibleScreen(_ window: NSWindow) {
+        let visibleFrame = window.screen?.visibleFrame ?? NSScreen.main?.visibleFrame
+        guard let visibleFrame else {
+            window.center()
+            return
+        }
+        window.setFrame(
+            frameFittingVisibleScreen(window.frame, visibleFrame: visibleFrame),
+            display: false
+        )
     }
 
     @available(*, unavailable)
@@ -64,6 +116,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
     private var refreshTimer: Timer?
     private var latestSnapshot: IndexInsightsSnapshot?
     private var displayedRoots: [IndexRootInsight] = []
+    private var unrepresentedRootPaths = Set<String>()
     private var isRefreshingInsights = false
 
     init(
@@ -84,7 +137,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
     }
 
     override func loadView() {
-        view = ThemedBackgroundView(frame: NSRect(x: 0, y: 0, width: 980, height: 720))
+        view = ThemedBackgroundView(frame: NSRect(origin: .zero, size: InsightsWindowController.defaultContentSize))
         buildInterface()
     }
 
@@ -122,10 +175,10 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         statusLabel.font = .systemFont(ofSize: 13, weight: .regular)
         statusLabel.textColor = .secondaryLabelColor
 
-        configureTextButton(revealDataFolderButton, title: "Reveal Data Folder", symbol: "folder", action: #selector(revealDataFolder(_:)))
-        configureTextButton(clearCachedIndexButton, title: "Clear Cached Index...", symbol: "trash", action: #selector(clearCachedIndex(_:)))
-        configureTextButton(copyReportButton, title: "Copy Diagnostics Report", symbol: "doc.on.doc", action: #selector(copyDiagnosticsReport(_:)))
-        configureTextButton(saveReportButton, title: "Save Diagnostics Report...", symbol: "square.and.arrow.down", action: #selector(saveDiagnosticsReport(_:)))
+        configureIconButton(revealDataFolderButton, title: "Reveal Data Folder", symbol: "folder", action: #selector(revealDataFolder(_:)))
+        configureIconButton(clearCachedIndexButton, title: "Clear Cached Index...", symbol: "trash", action: #selector(clearCachedIndex(_:)))
+        configureIconButton(copyReportButton, title: "Copy Diagnostics Report", symbol: "doc.on.doc", action: #selector(copyDiagnosticsReport(_:)))
+        configureIconButton(saveReportButton, title: "Save Diagnostics Report...", symbol: "square.and.arrow.down", action: #selector(saveDiagnosticsReport(_:)))
 
         let buttonStack = NSStackView(views: [
             revealDataFolderButton,
@@ -230,6 +283,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
             statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: contentView.trailingAnchor, constant: -26),
 
             buttonStack.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
+            buttonStack.leadingAnchor.constraint(greaterThanOrEqualTo: titleLabel.trailingAnchor, constant: 16),
             buttonStack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -26),
 
             overviewCard.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 12),
@@ -305,6 +359,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
             snapshotRoots: snapshot.roots,
             configuredRootPaths: configuredIndexedRootPaths()
         )
+        unrepresentedRootPaths = Set(displayedRoots.filter(InsightsRootDisplay.isUnrepresented).map(\.path))
         sortDisplayedRoots()
 
         statusLabel.stringValue = "\(snapshot.stats.status) - updated \(relativeDateString(snapshot.stats.lastUpdated))"
@@ -336,8 +391,8 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
             makeMetricTile(title: "Launches", value: snapshot.lifetime.launchCount.formatted(), detail: dateOnlyString(snapshot.lifetime.firstLaunchDate))
         ]
 
-        for rowStart in stride(from: 0, to: tiles.count, by: 6) {
-            let rowViews = Array(tiles[rowStart..<min(rowStart + 6, tiles.count)])
+        for rowStart in stride(from: 0, to: tiles.count, by: 3) {
+            let rowViews = Array(tiles[rowStart..<min(rowStart + 3, tiles.count)])
             overviewGrid.addRow(with: rowViews)
         }
     }
@@ -352,7 +407,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
 
         for column in [
             makeTableColumn("root", title: "Root", width: 170),
-            makeTableColumn("files", title: "Files", width: 72),
+            makeTableColumn("files", title: "Files", width: 90),
             makeTableColumn("content", title: "Content", width: 82),
             makeTableColumn("estimate", title: "Index Est.", width: 82)
         ] {
@@ -376,10 +431,12 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
             "Counts are exact; package bytes are estimated from indexed path weight."
         ]
 
-        let snapshotRootPaths = Set(snapshot.roots.map(\.path))
-        let pendingRoots = displayedRoots.filter { !snapshotRootPaths.contains($0.path) }.count
-        if pendingRoots > 0 {
-            parts.append("\(pendingRoots) configured root\(pendingRoots == 1 ? "" : "s") waiting for snapshot load or rebuild.")
+        let unrepresentedRoots = displayedRoots.filter(InsightsRootDisplay.isUnrepresented).count
+        let noRowRoots = displayedRoots.filter(InsightsRootDisplay.hasNoIndexedRows).count
+        if unrepresentedRoots > 0 {
+            parts.append("\(unrepresentedRoots) configured root\(unrepresentedRoots == 1 ? " is" : "s are") not represented in the current index snapshot.")
+        } else if noRowRoots > 0 {
+            parts.append("\(noRowRoots) root\(noRowRoots == 1 ? " has" : "s have") no indexed rows; check access, exclusions, or whether they are empty.")
         } else {
             parts.append(storageMeasurementText(snapshot.storage))
         }
@@ -455,21 +512,36 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         guard row >= 0, row < displayedRoots.count, let identifier = tableColumn?.identifier.rawValue else { return nil }
         let root = displayedRoots[row]
+        let isUnrepresented = unrepresentedRootPaths.contains(root.path)
+        let hasNoIndexedRows = InsightsRootDisplay.hasNoIndexedRows(root)
         let cell = NSTextField(labelWithString: "")
-        cell.font = identifier == "root" ? .systemFont(ofSize: 12, weight: .medium) : .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
-        cell.textColor = identifier == "root" ? .labelColor : .secondaryLabelColor
+        cell.font = identifier == "root" || isUnrepresented
+            ? .systemFont(ofSize: 12, weight: identifier == "root" ? .medium : .regular)
+            : .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        cell.textColor = (isUnrepresented || hasNoIndexedRows) ? .tertiaryLabelColor : (identifier == "root" ? .labelColor : .secondaryLabelColor)
         cell.lineBreakMode = .byTruncatingMiddle
+        if isUnrepresented {
+            cell.toolTip = "This configured root is not represented in the current index snapshot. Rebuild or let indexing finish to count it."
+        } else if hasNoIndexedRows {
+            cell.toolTip = "No files or folders from this root are in the current index. The folder may be empty, inaccessible, or fully excluded."
+        }
 
         switch identifier {
         case "root":
             cell.stringValue = AppSettings.displayPath(root.path)
-            cell.toolTip = root.path
+            cell.toolTip = (isUnrepresented || hasNoIndexedRows) ? cell.toolTip : root.path
         case "files":
-            cell.stringValue = root.trackedFileCount.formatted()
+            if isUnrepresented {
+                cell.stringValue = "Not indexed"
+            } else if hasNoIndexedRows {
+                cell.stringValue = "No rows"
+            } else {
+                cell.stringValue = root.trackedFileCount.formatted()
+            }
         case "content":
-            cell.stringValue = byteString(root.indexedContentBytes)
+            cell.stringValue = (isUnrepresented || hasNoIndexedRows) ? "-" : byteString(root.indexedContentBytes)
         case "estimate":
-            cell.stringValue = byteString(root.estimatedIndexBytes)
+            cell.stringValue = (isUnrepresented || hasNoIndexedRows) ? "-" : byteString(root.estimatedIndexBytes)
         default:
             cell.stringValue = ""
         }
@@ -604,17 +676,22 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         return "First launch: \(firstLaunch). Launches: \(snapshot.lifetime.launchCount.formatted()). Current version first seen: \(versionSeen). \(memory)."
     }
 
-    private func configureTextButton(_ button: NSButton, title: String, symbol: String, action: Selector) {
+    private func configureIconButton(_ button: NSButton, title: String, symbol: String, action: Selector) {
         button.translatesAutoresizingMaskIntoConstraints = false
-        button.title = title
+        button.title = ""
         button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
-        button.imagePosition = .imageLeading
+        button.imagePosition = .imageOnly
         button.bezelStyle = .rounded
         button.target = self
         button.action = action
         button.toolTip = title
+        button.setAccessibilityLabel(title)
         button.setContentHuggingPriority(.required, for: .horizontal)
         button.setContentCompressionResistancePriority(.required, for: .horizontal)
+        NSLayoutConstraint.activate([
+            button.widthAnchor.constraint(equalToConstant: 32),
+            button.heightAnchor.constraint(equalToConstant: 28)
+        ])
     }
 
     private func makeSectionLabel(_ text: String) -> NSTextField {
@@ -714,6 +791,19 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
 }
 
 enum InsightsRootDisplay {
+    static func hasNoIndexedRows(_ root: IndexRootInsight) -> Bool {
+        root.trackedFileCount == 0
+            && root.directoryCount == 0
+            && root.indexedContentBytes == 0
+            && root.pathByteWeight == 0
+    }
+
+    static func isUnrepresented(_ root: IndexRootInsight) -> Bool {
+        root.attributionSource == .estimated
+            && hasNoIndexedRows(root)
+            && root.estimatedIndexBytes == 0
+    }
+
     static func roots(
         snapshotRoots: [IndexRootInsight],
         configuredRootPaths: [String]

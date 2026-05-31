@@ -59,8 +59,10 @@ struct InsightsTreemapLayoutTests {
         ])
         #expect(roots[0].attributionSource == .estimated)
         #expect(roots[0].trackedFileCount == 0)
+        #expect(InsightsRootDisplay.isUnrepresented(roots[0]))
         #expect(roots[1].trackedFileCount == 12)
         #expect(roots[2].attributionSource == .estimated)
+        #expect(InsightsRootDisplay.isUnrepresented(roots[2]))
     }
 
     @Test("root display keeps snapshot roots when settings are unavailable")
@@ -76,6 +78,23 @@ struct InsightsTreemapLayoutTests {
         )
 
         #expect(roots == snapshotRoots)
+    }
+
+    @Test("root display distinguishes exact empty roots from unrepresented roots")
+    func rootDisplayDistinguishesExactEmptyRootsFromUnrepresentedRoots() {
+        let exactEmptyRoot = IndexRootInsight(
+            path: "/Users/example/Downloads",
+            trackedFileCount: 0,
+            directoryCount: 0,
+            hiddenCount: 0,
+            indexedContentBytes: 0,
+            pathByteWeight: 0,
+            estimatedIndexBytes: 0,
+            attributionSource: .persistedExact
+        )
+
+        #expect(InsightsRootDisplay.hasNoIndexedRows(exactEmptyRoot))
+        #expect(!InsightsRootDisplay.isUnrepresented(exactEmptyRoot))
     }
 
     @Test("default Insights layout fits the initial viewport")
@@ -102,7 +121,7 @@ struct InsightsTreemapLayoutTests {
             clearCachedIndexHandler: {}
         )
         let window = try #require(controller.window)
-        window.setContentSize(NSSize(width: 980, height: 720))
+        window.setContentSize(InsightsWindowController.defaultContentSize)
         window.contentView?.layoutSubtreeIfNeeded()
 
         let scrollView = try #require(findScrollView(in: window.contentView))
@@ -111,6 +130,26 @@ struct InsightsTreemapLayoutTests {
         documentView.layoutSubtreeIfNeeded()
 
         #expect(documentView.fittingSize.height <= scrollView.contentView.bounds.height + 1)
+        #expect(documentView.fittingSize.width <= scrollView.contentView.bounds.width + 1)
+    }
+
+    @Test("Insights window placement clamps to the visible screen")
+    @MainActor
+    func insightsWindowPlacementClampsToVisibleScreen() {
+        let visibleFrame = NSRect(x: 40, y: 30, width: 760, height: 520)
+        let oversizedFrame = NSRect(x: -400, y: 10, width: 1200, height: 900)
+
+        let frame = InsightsWindowController.frameFittingVisibleScreen(
+            oversizedFrame,
+            visibleFrame: visibleFrame
+        )
+
+        #expect(frame.minX >= visibleFrame.minX)
+        #expect(frame.maxX <= visibleFrame.maxX)
+        #expect(frame.minY >= visibleFrame.minY)
+        #expect(frame.maxY <= visibleFrame.maxY)
+        #expect(frame.width <= visibleFrame.width)
+        #expect(frame.height <= visibleFrame.height)
     }
 
     private func makeRoot(path: String, trackedFileCount: Int) -> IndexRootInsight {

@@ -6907,7 +6907,8 @@ public final class FileIndex: @unchecked Sendable {
         let source: IndexRootAttributionSource = snapshot.store.kind == .mapped ? .persistedExact : .runtimeExact
 
         return normalizedRoots.map { root in
-            let value = summariesByPath[root] ?? RootAttributionSummary(id: RootAttributionTable.unassignedRootID, path: root)
+            let storedSummary = summariesByPath[root]
+            let value = storedSummary ?? RootAttributionSummary(id: RootAttributionTable.unassignedRootID, path: root)
             let estimatedBytes = totalWeight == 0
                 ? 0
                 : UInt64((Double(value.pathByteWeight) / Double(totalWeight) * Double(estimatedIndexBytes)).rounded())
@@ -6919,7 +6920,7 @@ public final class FileIndex: @unchecked Sendable {
                 indexedContentBytes: value.indexedContentBytes,
                 pathByteWeight: value.pathByteWeight,
                 estimatedIndexBytes: estimatedBytes,
-                attributionSource: source
+                attributionSource: storedSummary == nil ? .estimated : source
             )
         }
     }
