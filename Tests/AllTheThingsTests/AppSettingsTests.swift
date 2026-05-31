@@ -49,8 +49,8 @@ struct AppSettingsTests {
         #expect(AppSettings.indexedRoots(defaults: defaults).isEmpty)
     }
 
-    @Test("exclusion defaults migration adds Unreal DotNet SDK noise")
-    func exclusionDefaultsMigrationAddsUnrealDotNetSDKNoise() throws {
+    @Test("exclusion defaults migration adds generated SDK and index-store noise")
+    func exclusionDefaultsMigrationAddsGeneratedSDKAndIndexStoreNoise() throws {
         let (defaults, suiteName) = try makeDefaults()
         defer {
             defaults.removePersistentDomain(forName: suiteName)
@@ -65,7 +65,22 @@ struct AppSettingsTests {
 
         AppSettings.registerDefaults(defaults)
 
-        #expect(AppSettings.exclusionPatterns(defaults: defaults).contains("Engine/Binaries/ThirdParty/DotNet/"))
+        let patterns = AppSettings.exclusionPatterns(defaults: defaults)
+        #expect(patterns.contains("Engine/Binaries/ThirdParty/DotNet/"))
+        #expect(patterns.contains("Engine/Binaries/ThirdParty/Python3/"))
+        #expect(patterns.contains(".build/**/index/store/"))
+        #expect(patterns.contains("Engine/Content/"))
+        #expect(patterns.contains("Engine/Source/ThirdParty/"))
+        #expect(patterns.contains("Engine/Source/Runtime/Engine/Private/"))
+        #expect(patterns.contains("build/.cmake/api/"))
+        #expect(patterns.contains("build/_deps/"))
+        #expect(patterns.contains("thirdparty/"))
+        #expect(patterns.contains("third_party/"))
+        #expect(patterns.contains("vendor/"))
+        #expect(patterns.contains(".venv/"))
+        #expect(patterns.contains("*.app/Contents/_CodeSignature/"))
+        #expect(patterns.contains("Xcode.app/Contents/Developer/Platforms/"))
+        #expect(patterns.contains("Xcode.app/Contents/Developer/Toolchains/"))
     }
 
     @Test("match colors can be overridden and reset per appearance")

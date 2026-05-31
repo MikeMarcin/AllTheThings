@@ -293,11 +293,14 @@ final class OverlayRecordStore: RecordStore {
     private let deletedRows: Set<Int>
     private let visibleBaseRows: [Int]
     private let pathToOverlay: [String: Int]
+    private let resultCount: Int
 
     var count: Int { visibleBaseRows.count + upserts.count }
     var mappedByteSize: Int { base.mappedByteSize }
     var heapPageCount: Int { base.heapPageCount }
     var overlayCount: Int { upserts.count + deletedRows.count }
+    var hasColumnarSidecars: Bool { base.hasColumnarSidecars }
+    var storedResultCount: Int? { resultCount }
     var schemaVersion: Int { base.schemaVersion }
 
     init(base: RecordStore, upserts: [FileRecord], deletedRows: Set<Int>) {
@@ -306,6 +309,9 @@ final class OverlayRecordStore: RecordStore {
         self.deletedRows = deletedRows
         self.visibleBaseRows = (0..<base.count).filter { !deletedRows.contains($0) }
         self.pathToOverlay = Dictionary(uniqueKeysWithValues: upserts.enumerated().map { ($0.element.path, base.count + $0.offset) })
+        let baseResultCount = base.storedResultCount ?? (0..<base.count).filter { base.isResultRow(at: $0) }.count
+        let deletedResultCount = deletedRows.filter { base.isResultRow(at: $0) }.count
+        self.resultCount = max(0, baseResultCount - deletedResultCount) + upserts.count
     }
 
     func record(at index: Int) -> FileRecord {
@@ -367,8 +373,17 @@ final class OverlayRecordStore: RecordStore {
         withBaseRowOrUpsert(at: index, baseValue: { base.normalizedPath(at: $0) }, upsertValue: \.normalizedPath)
     }
 
+    func parentRowID(at index: Int) -> Int? {
+        if index < visibleBaseRows.count {
+            guard let parent = base.parentRowID(at: visibleBaseRows[index]) else { return nil }
+            return visibleIndex(forBaseRow: parent)
+        }
+        return rowID(forPath: upserts[index - visibleBaseRows.count].directoryPath)
+    }
+
     func subtreeEnd(at index: Int) -> Int {
-        index + 1
+        guard index < visibleBaseRows.count else { return index + 1 }
+        return visibleLowerBound(forBaseRowAtLeast: base.subtreeEnd(at: visibleBaseRows[index]))
     }
 
     func depth(at index: Int) -> Int {
@@ -390,6 +405,17 @@ final class OverlayRecordStore: RecordStore {
             return base.isVirtual(at: visibleBaseRows[index])
         }
         return false
+    }
+
+    func isVisible(at index: Int) -> Bool {
+        if index < visibleBaseRows.count {
+            return base.isVisible(at: visibleBaseRows[index])
+        }
+        return !upserts[index - visibleBaseRows.count].isHidden
+    }
+
+    func isHiddenInPath(at index: Int, cache _: inout [Int: Bool]) -> Bool {
+        !isVisible(at: index)
     }
 
     func rowID(forPath path: String) -> Int? {
@@ -415,15 +441,17 @@ final class OverlayRecordStore: RecordStore {
     }
 
     private func visibleIndex(forBaseRow row: Int) -> Int? {
+        let index = visibleLowerBound(forBaseRowAtLeast: row)
+        return index < visibleBaseRows.count && visibleBaseRows[index] == row ? index : nil
+    }
+
+    private func visibleLowerBound(forBaseRowAtLeast row: Int) -> Int {
         var lower = 0
         var upper = visibleBaseRows.count
 
         while lower < upper {
             let middle = (lower + upper) / 2
             let candidate = visibleBaseRows[middle]
-            if candidate == row {
-                return middle
-            }
             if candidate < row {
                 lower = middle + 1
             } else {
@@ -431,7 +459,7 @@ final class OverlayRecordStore: RecordStore {
             }
         }
 
-        return nil
+        return lower
     }
 }
 
@@ -756,10 +784,63 @@ final class MappedRecordStore: RecordStore {
     func allRecords() -> [FileRecord] {
         var records: [FileRecord] = []
         records.reserveCapacity(resultCount)
-        for rowID in 0..<count where isResultRow(at: rowID) {
-            records.append(record(at: rowID))
+
+        var materializedPaths = Array<String?>(repeating: nil, count: count)
+        var materializedNormalizedPaths = Array<String?>(repeating: nil, count: count)
+
+        for rowID in 0..<count {
+            let row = readRow(rowID)
+            let name = string(offset: row.nameOffset, length: row.nameLength)
+            let normalizedName = string(offset: row.normalizedNameOffset, length: row.normalizedNameLength)
+            let directoryPath: String
+            let normalizedDirectoryPath: String
+
+            if row.parent >= 0 {
+                let parent = Int(row.parent)
+                directoryPath = parent < materializedPaths.count
+                    ? materializedPaths[parent] ?? path(at: parent)
+                    : path(at: parent)
+                normalizedDirectoryPath = parent < materializedNormalizedPaths.count
+                    ? materializedNormalizedPaths[parent] ?? normalizedPath(at: parent)
+                    : normalizedPath(at: parent)
+            } else {
+                directoryPath = string(offset: row.baseDirectoryOffset, length: row.baseDirectoryLength)
+                normalizedDirectoryPath = string(
+                    offset: row.normalizedBaseDirectoryOffset,
+                    length: row.normalizedBaseDirectoryLength
+                )
+            }
+
+            let path = Self.join(directory: directoryPath, name: name)
+            let normalizedPath = Self.join(directory: normalizedDirectoryPath, name: normalizedName)
+            materializedPaths[rowID] = path
+            materializedNormalizedPaths[rowID] = normalizedPath
+
+            guard row.flags & UInt32(Self.virtualFlag) == 0 else { continue }
+            records.append(FileRecord(
+                id: row.id,
+                path: path,
+                name: name,
+                directoryPath: directoryPath,
+                fileExtension: intern(extensions, id: row.extensionID),
+                sizeBytes: row.sizeBytes,
+                modifiedTime: TimeInterval(bitPattern: row.modifiedBits),
+                createdTime: row.flags & 4 == 0 ? nil : TimeInterval(bitPattern: row.createdBits),
+                isDirectory: row.flags & 1 != 0,
+                isHidden: row.flags & 2 != 0,
+                volumeName: intern(volumes, id: row.volumeID),
+                normalizedName: normalizedName,
+                normalizedPath: normalizedPath
+            ))
         }
         return records
+    }
+
+    private static func join(directory: String, name: String) -> String {
+        if directory.isEmpty || directory == "/" {
+            return directory == "/" ? "/\(name)" : name
+        }
+        return "\(directory)/\(name)"
     }
 
     func recordID(at index: Int) -> UInt64 { readRow(index).id }
@@ -1003,7 +1084,6 @@ final class MappedRecordStore: RecordStore {
         }
 
         func addVirtualDirectory(_ path: String) {
-            let path = standardPath(path)
             guard path != "/", !path.isEmpty, rowsByPath[path] == nil else { return }
             rowsByPath[path] = PackageRow(record: virtualDirectoryRecord(path: path), isVirtual: true)
         }
@@ -1058,12 +1138,7 @@ final class MappedRecordStore: RecordStore {
         return ordered
     }
 
-    private static func standardPath(_ path: String) -> String {
-        URL(fileURLWithPath: path).standardizedFileURL.path
-    }
-
     private static func ancestorPaths(through path: String) -> [String] {
-        let path = standardPath(path)
         guard path != "/", !path.isEmpty else { return [] }
         let parts = path.split(separator: "/")
         guard !parts.isEmpty else { return [] }
@@ -1080,8 +1155,7 @@ final class MappedRecordStore: RecordStore {
 
     private static func parentPath(for record: FileRecord) -> String? {
         guard record.directoryPath != record.path else { return nil }
-        let parent = standardPath(record.directoryPath)
-        return parent == record.path ? nil : parent
+        return record.directoryPath
     }
 
     private static func virtualDirectoryRecord(path: String) -> FileRecord {
@@ -1188,7 +1262,6 @@ final class MappedRecordStore: RecordStore {
         pathToRow.reserveCapacity(packageRows.count)
         for (index, row) in packageRows.enumerated() {
             pathToRow[row.record.path] = Int32(index)
-            pathToRow[standardPath(row.record.path)] = Int32(index)
         }
 
         var header = Data()
@@ -1216,9 +1289,7 @@ final class MappedRecordStore: RecordStore {
             try autoreleasepool {
                 let name = try appendString(record.name)
                 let normalizedName = try appendString(record.normalizedName)
-                let standardizedParent = standardPath(record.directoryPath)
-                let standardizedPath = standardPath(record.path)
-                let parent = standardizedParent == standardizedPath ? -1 : (pathToRow[standardizedParent] ?? pathToRow[record.directoryPath] ?? -1)
+                let parent = record.directoryPath == record.path ? -1 : (pathToRow[record.directoryPath] ?? -1)
                 let baseDirectory: (offset: UInt64, length: UInt32) = parent >= 0 ? (0, 0) : try appendString(record.directoryPath)
                 let normalizedDirectory: (offset: UInt64, length: UInt32) = parent >= 0 ? (0, 0) : try appendString(FuzzyMatcher.normalize(record.directoryPath))
 

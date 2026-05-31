@@ -149,6 +149,143 @@ struct FileIndexTests {
         #expect(response.results.contains { $0.record.path == match.path })
     }
 
+    @Test("large refresh defers unoptimized overlay so log and log.rb searches stay indexed")
+    func largeRefreshDefersUnoptimizedOverlaySoLogAndLogRBSearchesStayIndexed() async throws {
+        let index = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        let fileCount = 100_000
+        let rootPath = (
+            "/tmp/allthethings-search-speed/"
+                + String(repeating: "wide-directory-segment/", count: 12)
+        ).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let absoluteRootPath = "/" + rootPath
+        let deletedPath = "\(absoluteRootPath)/NeutralDeleted.txt"
+        let rubyDirectory = "\(absoluteRootPath)/Ruby/lib/rubygems/resolver/molinillo/dependency_graph"
+        let rubyLogPath = "\(rubyDirectory)/log.rb"
+        var records: [FileRecord] = []
+        records.reserveCapacity(fileCount + 256)
+        var directoryPaths = Set<String>()
+
+        func appendDirectory(_ path: String) {
+            guard directoryPaths.insert(path).inserted else { return }
+            records.append(makeRecord(path: path, isDirectory: true, modifiedTime: 0))
+        }
+
+        func appendDirectoryTree(_ path: String) {
+            var currentDirectory = ""
+            for component in path.split(separator: "/") {
+                currentDirectory += "/" + component
+                appendDirectory(currentDirectory)
+            }
+        }
+
+        appendDirectoryTree(absoluteRootPath)
+        appendDirectoryTree(rubyDirectory)
+        records.append(makeRecord(path: rubyLogPath, modifiedTime: TimeInterval(fileCount + 1)))
+
+        for row in 0..<fileCount {
+            let projectDirectory = "\(absoluteRootPath)/Project\(row / 1_000)"
+            appendDirectory(projectDirectory)
+            let path: String
+            if row == 10 {
+                path = deletedPath
+            } else if row.isMultiple(of: 1_000) {
+                path = "\(projectDirectory)/LogReport\(row).txt"
+            } else {
+                path = "\(projectDirectory)/File\(row).txt"
+            }
+            records.append(makeRecord(path: path, modifiedTime: TimeInterval(row)))
+        }
+        index.replaceRecordsForTesting(records)
+
+        let before = index.currentStats()
+        #expect(before.optimizedCount == before.indexedCount)
+
+        func expectFastIndexedLogSearches() {
+            let logResponse = index.search(SearchRequest(
+                query: "log",
+                sort: SortSpec(column: .relevance, ascending: false)
+            ), maxResults: 25)
+            #expect(logResponse.usesIndexedCandidates)
+            #expect(logResponse.executionProfile.executionPath != .fullFallbackScan)
+            #expect(logResponse.elapsed < 0.5)
+            #expect(logResponse.results.contains { $0.record.name.hasPrefix("LogReport") })
+
+            let logRBResponse = index.search(SearchRequest(
+                query: "log.rb",
+                sort: SortSpec(column: .relevance, ascending: false)
+            ), maxResults: 25)
+            #expect(logRBResponse.usesIndexedCandidates)
+            #expect(logRBResponse.executionProfile.executionPath != .fullFallbackScan)
+            #expect(logRBResponse.elapsed < 0.5)
+            #expect(logRBResponse.results.contains { $0.record.path == rubyLogPath })
+        }
+
+        expectFastIndexedLogSearches()
+
+        let beforeDiagnostics = index.currentDiagnostics()
+        index.refresh(paths: [deletedPath])
+
+        try await waitUntil(timeout: .seconds(10)) {
+            index.currentDiagnostics().completedRefreshBatches > beforeDiagnostics.completedRefreshBatches
+        }
+
+        let after = index.currentStats()
+        #expect(after.optimizedCount == before.optimizedCount)
+        #expect(index.currentDiagnostics().overlayCount == 0)
+
+        expectFastIndexedLogSearches()
+    }
+
+    @Test("directory refresh removes deleted mapped children")
+    func directoryRefreshRemovesDeletedMappedChildren() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        let folder = root.appendingPathComponent("Folder", isDirectory: true)
+        try fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        let kept = folder.appendingPathComponent("Kept.swift")
+        let deleted = folder.appendingPathComponent("Deleted.swift")
+        try "kept".write(to: kept, atomically: true, encoding: .utf8)
+        try "deleted".write(to: deleted, atomically: true, encoding: .utf8)
+
+        let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)")
+        index.replaceRootsAndRebuild([root])
+        try await waitUntil {
+            let stats = index.currentStats()
+            return !stats.isIndexing && stats.indexedCount >= 4
+        }
+
+        let before = index.currentDiagnostics()
+        #expect(before.recordStoreKind == .mapped)
+
+        try fileManager.removeItem(at: deleted)
+        index.refresh(paths: [folder.path])
+
+        try await waitUntil {
+            guard index.currentDiagnostics().completedRefreshBatches > before.completedRefreshBatches else {
+                return false
+            }
+
+            let keptResponse = index.search(SearchRequest(
+                query: "Kept",
+                sort: SortSpec(column: .relevance, ascending: false)
+            ), maxResults: 10)
+            let deletedResponse = index.search(SearchRequest(
+                query: "Deleted",
+                sort: SortSpec(column: .relevance, ascending: false)
+            ), maxResults: 10)
+            return keptResponse.results.contains { $0.record.path == kept.path }
+                && !deletedResponse.results.contains { $0.record.path == deleted.path }
+        }
+    }
+
     @Test("search applies name sort to small result sets")
     func searchAppliesNameSortToSmallResultSets() async throws {
         let fileManager = FileManager.default
@@ -363,8 +500,8 @@ struct FileIndexTests {
         #expect(!FileManager.default.fileExists(atPath: packageURL.path))
     }
 
-    @Test("partial checkpoints load with fast searchable structures")
-    func partialCheckpointsLoadWithFastSearchableStructures() throws {
+    @Test("partial checkpoints load as searchable unoptimized snapshots")
+    func partialCheckpointsLoadAsSearchableUnoptimizedSnapshots() throws {
         let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
         let root = URL(fileURLWithPath: "/tmp/allthethings-checkpoint-fast", isDirectory: true)
         let records = [
@@ -390,7 +527,7 @@ struct FileIndexTests {
             query: "LogViewer",
             sort: SortSpec(column: .relevance, ascending: false)
         ), maxResults: 10)
-        #expect(response.usesIndexedCandidates)
+        #expect(!response.usesIndexedCandidates)
         #expect(response.results.map(\.record.name) == ["LogViewer.swift"])
     }
 
@@ -478,6 +615,78 @@ struct FileIndexTests {
         }
 
         #expect(!freshIndex.checkpointExistsForTesting())
+    }
+
+    @Test("scan can suppress searchable snapshot publication until final index")
+    func scanCanSuppressSearchableSnapshotPublicationUntilFinalIndex() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        for index in 0..<1_500 {
+            let file = root.appendingPathComponent("Generated-\(index).txt")
+            try "generated".write(to: file, atomically: true, encoding: .utf8)
+        }
+
+        let recorder = StatsRecorder()
+        let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)", loadsSnapshotImmediately: false)
+        index.setPublishesSearchableSnapshotsDuringScan(false)
+        index.onStatsChanged = { @MainActor @Sendable stats in
+            recorder.append(stats)
+        }
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+
+        try await waitUntil(timeout: .seconds(10)) {
+            let stats = index.currentStats()
+            return !stats.isIndexing && stats.indexedCount >= 1_501
+        }
+
+        let indexingStats = recorder.snapshot().filter(\.isIndexing)
+        #expect(indexingStats.contains { $0.discoveredCount > 0 })
+        #expect(!indexingStats.contains { $0.indexedCount > 0 })
+        #expect(index.currentStats().indexedCount >= 1_501)
+    }
+
+    @Test("reconciliation publishes refreshing scan progress from zero")
+    func reconciliationPublishesRefreshingScanProgressFromZero() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        for index in 0..<1_500 {
+            let file = root.appendingPathComponent("Generated-\(index).txt")
+            try "generated".write(to: file, atomically: true, encoding: .utf8)
+        }
+
+        let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)", loadsSnapshotImmediately: false)
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil(timeout: .seconds(10)) {
+            let stats = index.currentStats()
+            return !stats.isIndexing && stats.indexedCount >= 1_501
+        }
+
+        let recorder = StatsRecorder()
+        index.onStatsChanged = { @MainActor @Sendable stats in
+            recorder.append(stats)
+        }
+        index.reconcileIndexedRootsInBackground(rootURLs: [root])
+
+        try await waitUntil(timeout: .seconds(10)) {
+            !index.currentStats().isIndexing
+        }
+
+        let scanStats = recorder.snapshot().filter { $0.isIndexing && $0.phase == .scanning }
+        #expect(scanStats.contains { $0.status.hasPrefix("Refreshing") && $0.discoveredCount == 0 })
+        #expect(scanStats.contains { $0.status.hasPrefix("Refreshing") && $0.discoveredCount > 0 })
+        #expect(!scanStats.contains { $0.status.hasPrefix("Indexing") })
     }
 
     @Test("loaded snapshots reconcile changes made while app was closed")
@@ -786,6 +995,49 @@ struct FileIndexTests {
         #expect(colorGradientIndex < logicChildIndex)
     }
 
+    @Test("interactive preview refines to complete short fuzzy path matches")
+    func interactivePreviewRefinesToCompleteShortFuzzyPathMatches() throws {
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let root = "/tmp/allthethings-preview-refinement/"
+            + String(repeating: "wide-directory-segment/", count: 200)
+        var records = [
+            makeRecord(path: "\(root)/Arcology.md"),
+            makeRecord(path: "\(root)/MALoopManagement.framework", isDirectory: true),
+            makeRecord(path: "\(root)/MALoopManagement.framework/Versions", isDirectory: true),
+            makeRecord(path: "\(root)/MALoopManagement.framework/Versions/A", isDirectory: true)
+        ]
+
+        for index in 0..<6_000 {
+            records.append(makeRecord(
+                path: "\(root)/unrelated/File\(String(format: "%06d", index)).swift",
+                modifiedTime: TimeInterval(10_000 + index)
+            ))
+        }
+
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        index.replaceRecordsForTesting(records)
+        index.persistSnapshotForTesting()
+        let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
+        #expect(!reloaded.currentDiagnostics().pathGramIndexEnabled)
+
+        let previewResponse = reloaded.search(SearchRequest(
+            query: "log",
+            sort: SortSpec(column: .name, ascending: true),
+            includeHidden: false,
+            mode: .interactivePreview
+        ), maxResults: 20)
+        let completeResponse = reloaded.search(SearchRequest(
+            query: "log",
+            sort: SortSpec(column: .name, ascending: true),
+            includeHidden: false
+        ), maxResults: 20)
+
+        let refinedPath = "\(root)/MALoopManagement.framework/Versions/A"
+        #expect(!previewResponse.results.map(\.record.path).contains(refinedPath))
+        #expect(completeResponse.results.map(\.record.path).contains(refinedPath))
+        #expect(completeResponse.totalMatches > previewResponse.totalMatches)
+    }
+
     private func waitUntil(
         timeout: Duration = .seconds(5),
         pollInterval: Duration = .milliseconds(25),
@@ -833,5 +1085,22 @@ struct FileIndexTests {
             normalizedName: FuzzyMatcher.normalize(name),
             normalizedPath: FuzzyMatcher.normalize(path)
         )
+    }
+}
+
+private final class StatsRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stats: [IndexStats] = []
+
+    func append(_ stats: IndexStats) {
+        lock.withLock {
+            self.stats.append(stats)
+        }
+    }
+
+    func snapshot() -> [IndexStats] {
+        lock.withLock {
+            stats
+        }
     }
 }

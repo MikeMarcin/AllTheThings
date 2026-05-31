@@ -109,11 +109,10 @@ enum FullDiskAccessController {
         }
 
         errno = 0
-        guard let directory = path.withCString({ opendir($0) }) else {
+        guard path.withCString({ access($0, R_OK | X_OK) }) == 0 else {
             return isPermissionDenied(errno) ? .denied : .unavailable
         }
 
-        closedir(directory)
         return .readable
     }
 

@@ -50,6 +50,36 @@ struct FileIndexInsightsTests {
         #expect(snapshot.roots.reduce(UInt64(0)) { $0 + $1.estimatedIndexBytes } > 0)
     }
 
+    @Test("successful rebuild does not record indexing failures")
+    func successfulRebuildDoesNotRecordIndexingFailures() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsInsights-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        try "ok".write(
+            to: root.appendingPathComponent("alpha.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let applicationName = "AllTheThingsInsights-\(UUID().uuidString)"
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        defer {
+            try? fileManager.removeItem(at: index.dataDirectoryURL)
+        }
+
+        index.replaceRootsAndRebuild([root])
+        try await waitUntil {
+            !index.currentStats().isIndexing
+        }
+
+        #expect(index.currentInsightsSnapshot().usage.health.indexingFailures == 0)
+    }
+
     @Test("search profiles and metrics stay aggregate only")
     func searchProfilesAndMetricsStayAggregateOnly() throws {
         let fileManager = FileManager.default

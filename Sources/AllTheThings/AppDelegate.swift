@@ -333,6 +333,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     guard AppSettings.indexedRootsConfigured(defaults: self.defaults) else { return }
                     let roots = AppSettings.indexedRoots(defaults: self.defaults)
                     guard !roots.isEmpty else { return }
+                    self.fileIndex.setPublishesSearchableSnapshotsDuringScan(false)
                     self.fileIndex.replaceRootsAndRebuild(roots, mode: .fresh)
                 }
             )

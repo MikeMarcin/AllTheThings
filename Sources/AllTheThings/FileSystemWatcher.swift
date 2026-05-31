@@ -226,6 +226,8 @@ final class FSEventReconciliationCoordinator: @unchecked Sendable {
 }
 
 private final class FSEventHistoryReplayCollector: @unchecked Sendable {
+    private static let maximumIncrementalRefreshPaths = 5_000
+
     private let rootPaths: [String]
     private let lock = NSLock()
     private var changedPaths = Set<String>()
@@ -255,9 +257,18 @@ private final class FSEventHistoryReplayCollector: @unchecked Sendable {
 
             cursorUpdates[rootPath] = max(cursorUpdates[rootPath] ?? 0, UInt64(event.eventID))
 
+            if requiresGlobalFallback {
+                continue
+            }
+
             if event.historyIsUnsafe || event.requiresRecursiveRescan {
                 fallbackRootPaths.insert(rootPath)
             } else {
+                guard changedPaths.count < Self.maximumIncrementalRefreshPaths else {
+                    changedPaths.removeAll(keepingCapacity: false)
+                    requiresGlobalFallback = true
+                    continue
+                }
                 changedPaths.insert(event.path)
             }
         }

@@ -112,6 +112,34 @@ struct FileSystemWatcherTests {
         #expect(action == .refresh(paths: [changedPath], cursorUpdates: [root.path: 41]))
     }
 
+    @Test("FSEvent reconciliation falls back for large historical refreshes")
+    func fseventReconciliationFallsBackForLargeHistoricalRefreshes() async {
+        let root = URL(fileURLWithPath: "/tmp/allthethings/root-a", isDirectory: true)
+        let store = memoryCursorStore()
+        store.markBaseline(for: [root.path], eventID: 40)
+        var events = (0...5_000).map { offset in
+            FileSystemEvent(
+                path: root.appendingPathComponent("changed-\(offset).txt").path,
+                flags: 0,
+                eventID: FSEventStreamEventId(41 + offset)
+            )
+        }
+        events.append(FileSystemEvent(
+            path: root.path,
+            flags: FSEventStreamEventFlags(kFSEventStreamEventFlagHistoryDone),
+            eventID: 6_000
+        ))
+        let source = FakeHistoryReplaySource(events: events, completion: .completed)
+        let coordinator = FSEventReconciliationCoordinator(
+            cursorStore: store,
+            replaySource: source,
+            currentEventID: { 6_000 }
+        )
+
+        let action = await actionFromCoordinator(coordinator, roots: [root])
+        #expect(action == .fullReconcile(rootPaths: nil))
+    }
+
     @Test("FSEvent reconciliation falls back when a cursor is missing")
     func fseventReconciliationFallsBackForMissingCursor() async {
         let root = URL(fileURLWithPath: "/tmp/allthethings/root-a", isDirectory: true)

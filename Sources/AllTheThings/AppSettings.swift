@@ -42,7 +42,7 @@ enum AppSettings {
     static let indexedRootsDidChangeNotification = Notification.Name("com.allthethings.settings.indexedRootsDidChange")
     static let exclusionPatternsDidChangeNotification = Notification.Name("com.allthethings.settings.exclusionPatternsDidChange")
 
-    private static let currentExclusionDefaultsVersion = 4
+    private static let currentExclusionDefaultsVersion = 8
     private static let versionOneDefaultExclusionPatterns = [
         "node_modules/",
         "DerivedData/",
@@ -273,9 +273,37 @@ enum AppSettings {
         if version < 2 {
             return FileExclusionRules.defaultPatterns.filter { !versionOneDefaultExclusionPatterns.contains($0) }
         }
+        var additions: [String] = []
         if version < 4 {
-            return ["Engine/Binaries/ThirdParty/DotNet/"]
+            additions.append("Engine/Binaries/ThirdParty/DotNet/")
         }
-        return []
+        if version < 5 {
+            additions.append("Engine/Binaries/ThirdParty/Python3/")
+            additions.append(".build/**/index/store/")
+        }
+        if version < 6 {
+            additions.append("Engine/Content/")
+            additions.append("Engine/DerivedDataCache/")
+            additions.append("Engine/Intermediate/")
+            additions.append("Engine/Saved/")
+            additions.append("Engine/Source/ThirdParty/")
+            additions.append("Engine/Source/Runtime/Engine/Private/")
+            additions.append("build/.cmake/api/")
+            additions.append("build/_deps/")
+            additions.append(".venv/")
+            additions.append("venv/")
+            additions.append(".tox/")
+        }
+        if version < 7 {
+            additions.append("*.app/Contents/_CodeSignature/")
+            additions.append("Xcode.app/Contents/Developer/Platforms/")
+            additions.append("Xcode.app/Contents/Developer/Toolchains/")
+        }
+        if version < 8 {
+            additions.append("thirdparty/")
+            additions.append("third_party/")
+            additions.append("vendor/")
+        }
+        return additions
     }
 }
