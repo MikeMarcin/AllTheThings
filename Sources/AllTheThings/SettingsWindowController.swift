@@ -28,6 +28,10 @@ final class SettingsWindowController: NSWindowController {
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
+
+    func selectSection(_ section: SettingsSection) {
+        (contentViewController as? SettingsViewController)?.selectSection(section)
+    }
 }
 
 private final class SettingsWindow: NSWindow {
@@ -239,7 +243,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         selectSection(sender.section)
     }
 
-    private func selectSection(_ section: SettingsSection) {
+    fileprivate func selectSection(_ section: SettingsSection) {
         selectedSection = section
         appearanceSidebarRow.isSelected = section == .appearance
         generalSidebarRow.isSelected = section == .general

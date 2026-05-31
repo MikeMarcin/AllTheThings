@@ -49,6 +49,33 @@ struct AppSettingsTests {
         #expect(AppSettings.indexedRoots(defaults: defaults).isEmpty)
     }
 
+    @Test("indexed roots can be initialized with defaults for setup")
+    func indexedRootsCanBeInitializedWithDefaultsForSetup() throws {
+        let (defaults, suiteName) = try makeDefaults()
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        AppSettings.initializeIndexedRootsWithDefaultsIfNeeded(defaults: defaults)
+
+        #expect(AppSettings.indexedRootsConfigured(defaults: defaults))
+        #expect(AppSettings.indexedRoots(defaults: defaults) == AppSettings.suggestedDefaultIndexedRoots())
+    }
+
+    @Test("default indexed root initialization preserves configured roots")
+    func defaultIndexedRootInitializationPreservesConfiguredRoots() throws {
+        let (defaults, suiteName) = try makeDefaults()
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        let root = URL(fileURLWithPath: "/tmp/AllTheThingsTests", isDirectory: true)
+        AppSettings.saveIndexedRoots([root], defaults: defaults)
+        AppSettings.initializeIndexedRootsWithDefaultsIfNeeded(defaults: defaults)
+
+        #expect(AppSettings.indexedRoots(defaults: defaults) == [root.standardizedFileURL])
+    }
+
     @Test("exclusion defaults migration adds generated SDK and index-store noise")
     func exclusionDefaultsMigrationAddsGeneratedSDKAndIndexStoreNoise() throws {
         let (defaults, suiteName) = try makeDefaults()

@@ -965,7 +965,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     @objc private func chooseSuggestedIndexedFolders(_ sender: NSButton) {
-        presentIndexedFolderChooser(prompt: "Index")
+        AppSettings.initializeIndexedRootsWithDefaultsIfNeeded(defaults: defaults)
+        (NSApp.delegate as? AppDelegate)?.showSettings(section: .indexedFolders)
+        updateSetupSuggestions()
     }
 
     private func markFullDiskAccessOnboardingShown() {
