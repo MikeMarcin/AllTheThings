@@ -39,6 +39,7 @@ STANDALONE_STRIPS = {
     "intro_welcome": "NibIntroWelcomeStrip",
     "flydown": "NibFlydownStrip",
 }
+PAPER_HEAVY_PREVIEW_NAMES = {"indexing", "intro-welcome", "flydown"}
 SCALE = 4
 INTRO_FRAME_COUNT = 32
 FLYDOWN_FRAME_COUNT = 10
@@ -81,7 +82,7 @@ def draw_shadowed_document(size: tuple[int, int] = (18, 23), angle: float = 0, a
     shadow_draw.rounded_rectangle(
         [x0 + 2 * SCALE, y0 + 2 * SCALE, x1 + 2 * SCALE, y1 + 2 * SCALE],
         radius=radius,
-        fill=(0, 0, 0, 78),
+        fill=(0, 0, 0, 86),
     )
     image.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(1.2 * SCALE)))
 
@@ -89,21 +90,21 @@ def draw_shadowed_document(size: tuple[int, int] = (18, 23), angle: float = 0, a
         [x0, y0, x1, y1],
         radius=radius,
         fill=(247, 249, 252, 255),
-        outline=(205, 208, 212, 255),
+        outline=(170, 169, 164, 255),
         width=SCALE,
     )
     fold = 5 * SCALE
     draw.polygon(
         [(x1 - fold, y0), (x1, y0), (x1, y0 + fold)],
-        fill=(232, 233, 235, 255),
-        outline=(198, 200, 202, 255),
+        fill=(231, 231, 227, 255),
+        outline=(158, 157, 153, 255),
     )
     for index, line_width in enumerate((10, 12, 8)):
         y = y0 + (8 + index * 4) * SCALE
         draw.rounded_rectangle(
             [x0 + 4 * SCALE, y, x0 + (4 + line_width) * SCALE, y + SCALE],
             radius=max(1, SCALE // 2),
-            fill=(156, 158, 161, 210),
+            fill=(116, 115, 111, 225),
         )
 
     image = image.resize((width + pad * 2, height + pad * 2), Image.Resampling.LANCZOS)
@@ -240,7 +241,7 @@ def operation_body_frames(strips: dict[str, list[Image.Image]], operation: str, 
 
 def draw_indexing_stack(canvas: Image.Image, frame_index: int, frame_count: int) -> None:
     wobble = sin((frame_index / frame_count) * 2 * pi) * 1.0
-    base_x = 116
+    base_x = 118
     base_y = 62
     for index in range(5):
         angle = [-5, 3, -2, 2, -3][index]
@@ -665,6 +666,51 @@ def save_contact_sheet(output_path: Path, frames: list[Image.Image]) -> None:
     background.convert("RGB").save(output_path)
 
 
+def make_app_background(size: tuple[int, int], theme: str) -> Image.Image:
+    if theme == "light":
+        row_colors = ((255, 255, 255, 255), (244, 244, 244, 255))
+        divider_color = (229, 229, 229, 255)
+    elif theme == "dark":
+        row_colors = ((31, 31, 31, 255), (43, 43, 43, 255))
+        divider_color = (50, 50, 50, 255)
+    else:
+        raise ValueError(f"Unknown preview theme: {theme}")
+
+    width, height = size
+    background = Image.new("RGBA", size, row_colors[0])
+    draw = ImageDraw.Draw(background)
+    row_height = 36
+    for y in range(0, height, row_height):
+        color = row_colors[(y // row_height) % 2]
+        draw.rectangle([0, y, width, min(height, y + row_height) - 1], fill=color)
+        draw.line([(0, y), (width, y)], fill=divider_color)
+    return background
+
+
+def save_app_background_contact_sheet(output_path: Path, frames: list[Image.Image], theme: str) -> None:
+    scale = 2
+    gap = 8
+    label_height = 22
+    frame_width = CELL_WIDTH * scale
+    frame_height = CELL_HEIGHT * scale
+    width = len(frames) * frame_width + (len(frames) + 1) * gap
+    height = frame_height + label_height + gap * 2
+    is_light = theme == "light"
+    sheet_background = Image.new("RGBA", (width, height), (246, 246, 246, 255) if is_light else (26, 26, 26, 255))
+    draw = ImageDraw.Draw(sheet_background)
+    label_fill = (50, 50, 50, 255) if is_light else (230, 230, 230, 255)
+
+    for index, frame in enumerate(frames):
+        x = gap + index * (frame_width + gap)
+        y = gap + label_height
+        cell = make_app_background((frame_width, frame_height), theme)
+        cell.alpha_composite(frame.resize((frame_width, frame_height), Image.Resampling.NEAREST))
+        sheet_background.alpha_composite(cell, (x, y))
+        draw.text((x + 4, 4), f"{index:02d}", fill=label_fill)
+
+    sheet_background.convert("RGB").save(output_path)
+
+
 def save_audit_contact_sheet(output_path: Path, sections: list[tuple[str, list[Image.Image]]]) -> None:
     scale = 2
     gap = 8
@@ -702,6 +748,14 @@ def save_preview_gif(output_path: Path, frames: list[Image.Image], duration_ms: 
         background.alpha_composite(frame)
         preview_frames.append(background.convert("P", palette=Image.Palette.ADAPTIVE))
     preview_frames[0].save(output_path, save_all=True, append_images=preview_frames[1:], duration=duration_ms, loop=0, disposal=2)
+
+
+def save_theme_audit_previews(preview_dir: Path, name: str, frames: list[Image.Image]) -> None:
+    if name not in PAPER_HEAVY_PREVIEW_NAMES:
+        return
+
+    save_app_background_contact_sheet(preview_dir / f"{name}-light-contact-sheet.png", frames, "light")
+    save_app_background_contact_sheet(preview_dir / f"{name}-dark-contact-sheet.png", frames, "dark")
 
 
 def generate(repo_root: Path, frame_count: int, write_artifacts: bool) -> None:
@@ -753,6 +807,7 @@ def generate(repo_root: Path, frame_count: int, write_artifacts: bool) -> None:
             strip.save(preview_dir / f"{name}-strip.png")
             save_contact_sheet(preview_dir / f"{name}-contact-sheet.png", frames)
             save_preview_gif(preview_dir / f"{name}.gif", frames)
+            save_theme_audit_previews(preview_dir, name, frames)
 
     intro_strip = Image.new("RGBA", (INTRO_FRAME_COUNT * CELL_WIDTH, CELL_HEIGHT), (0, 0, 0, 0))
     intro_frame_dir = frame_dir / "NibIntroWelcomeStrip"
@@ -768,6 +823,7 @@ def generate(repo_root: Path, frame_count: int, write_artifacts: bool) -> None:
         intro_strip.save(preview_dir / "intro-welcome-strip.png")
         save_contact_sheet(preview_dir / "intro-welcome-contact-sheet.png", intro_frames)
         save_preview_gif(preview_dir / "intro-welcome.gif", intro_frames, duration_ms=250)
+        save_theme_audit_previews(preview_dir, "intro-welcome", intro_frames)
 
     flydown_strip = Image.new("RGBA", (FLYDOWN_FRAME_COUNT * CELL_WIDTH, CELL_HEIGHT), (0, 0, 0, 0))
     flydown_frame_dir = frame_dir / "NibFlydownStrip"
@@ -783,6 +839,7 @@ def generate(repo_root: Path, frame_count: int, write_artifacts: bool) -> None:
         flydown_strip.save(preview_dir / "flydown-strip.png")
         save_contact_sheet(preview_dir / "flydown-contact-sheet.png", flydown_frames)
         save_preview_gif(preview_dir / "flydown.gif", flydown_frames, duration_ms=72)
+        save_theme_audit_previews(preview_dir, "flydown", flydown_frames)
 
         audit_sections: list[tuple[str, list[Image.Image]]] = []
         for name, resource_name in OPERATION_STRIPS.items():

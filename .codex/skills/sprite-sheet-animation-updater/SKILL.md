@@ -13,9 +13,10 @@ Use this workflow for fixed-cell mascot sprite sheets where visual consistency m
 2. **Record the runtime layout.** Capture cell size, row order, frame counts, padded columns, sheet dimensions, and resource name used by app code.
 3. **Generate or edit one row at a time.** If using image generation, prompt for the exact frame count, a single horizontal row, fixed cell size, consistent baseline/scale, and no text/borders/background scene.
 4. **Post-process deterministically.** Remove background, crop/pad into fixed cells, and keep transparent gutters. Never let confetti, papers, gears, or other props determine mascot body scale.
-5. **Check model metrics before integrating.** Validate active frames for nonempty alpha, gutters, body height, body width, and body center registration. For Nib-style blue mascot sheets, use `scripts/validate_sprite_sheet.py`.
-6. **Integrate the asset.** Update app resource references, bundle scripts, animation metadata, and tests together. Remove obsolete sheet assets only after references are gone.
-7. **Run regression tests and build.** Run the validator, the project tests, and the app/resource build path that copies the sheet into the bundle.
+5. **Check theme contrast.** Composite transparent frames over the app's expected light and dark backgrounds before approving pale props, gray strokes, shadows, glows, or sparkles. A prop that reads on checkerboard or dark gray can disappear on a light table row.
+6. **Check model metrics before integrating.** Validate active frames for nonempty alpha, gutters, body height, body width, and body center registration. For Nib-style blue mascot sheets, use `scripts/validate_sprite_sheet.py`.
+7. **Integrate the asset.** Update app resource references, bundle scripts, animation metadata, and tests together. Remove obsolete sheet assets only after references are gone.
+8. **Run regression tests and build.** Run the validator, the project tests, and the app/resource build path that copies the sheet into the bundle.
 
 ## Rules To Preserve Character Model
 
@@ -26,6 +27,14 @@ Use this workflow for fixed-cell mascot sprite sheets where visual consistency m
 - For prop-heavy rows, verify the prop motion separately from mascot body registration. The magnifying glass can move; the mascot body should not slide unless intended.
 - Use transparent PNGs for runtime assets. Checkerboard previews are for inspection only and must not be referenced by app code.
 - Do not rely only on visual-frame width/height; those include props and can hide a narrow or drifting mascot body.
+
+## Theme And Background Contrast
+
+Transparent mascot assets must be audited on the UI backgrounds where they will actually appear. Generate light and dark composites for prop-heavy rows, especially when the animation includes white papers, pale glows, gray motion marks, or low-alpha shadows. Keep runtime assets theme-neutral unless the product explicitly requires theme-specific strips.
+
+For AllTheThings/Nib document props, prefer light paper fills with neutral or warm gray outlines, fold strokes, internal marks, and soft shadows. Avoid relying on very pale gray paper edges; they are hard to see on light-mode table stripes. Avoid blue-gray outlines and shadows near the mascot body because they can interfere with body-color validation and visually merge with Nib.
+
+Master sheets, contact sheets, checkerboards, and light/dark composites are audit artifacts only. App code should continue loading the standalone runtime strips directly.
 
 ## Idle Clip Pattern
 
