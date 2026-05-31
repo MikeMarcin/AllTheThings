@@ -8,8 +8,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private static let activationRequestNotification = Notification.Name("com.allthethings.app.activateExistingInstance")
 
     private let defaults = UserDefaults.standard
+    private lazy var fileIndex = FileIndex(
+        loadsSnapshotImmediately: false,
+        exclusionPatterns: AppSettings.exclusionPatterns(defaults: defaults)
+    )
     private var windowController: SearchWindowController?
     private var settingsWindowController: SettingsWindowController?
+    private var insightsWindowController: InsightsWindowController?
     private var aboutWindowController: NSWindowController?
     private var noticesWindowController: NSWindowController?
     private var globalHotKeyController: GlobalHotKeyController?
@@ -77,6 +82,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func finishLaunching() {
         configureMainMenu()
         applyMenuBarIconSetting()
+        fileIndex.recordAppLaunch(appVersion: Self.appVersionString)
         let launchedAsLoginItem = Self.launchedAsLoginItem()
         let window = launchedAsLoginItem ? nil : showPrimaryWindow(activate: true)
         configureGlobalHotKey(presentsErrors: !launchedAsLoginItem)
@@ -92,10 +98,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let existingController = windowController {
             controller = existingController
         } else {
-            let newController = SearchWindowController(index: FileIndex(
-                loadsSnapshotImmediately: false,
-                exclusionPatterns: AppSettings.exclusionPatterns(defaults: defaults)
-            ))
+            let newController = SearchWindowController(index: fileIndex)
             windowController = newController
             controller = newController
         }
@@ -117,6 +120,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return event.eventClass == AEEventClass(kCoreEventClass)
             && event.eventID == AEEventID(kAEOpenApplication)
             && event.paramDescriptor(forKeyword: AEKeyword(keyAELaunchedAsLogInItem)) != nil
+    }
+
+    private static var appVersionString: String {
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+        switch (version, build) {
+        case let (version?, build?) where !version.isEmpty && !build.isEmpty:
+            return "\(version) (\(build))"
+        case let (version?, _) where !version.isEmpty:
+            return version
+        case let (_, build?) where !build.isEmpty:
+            return build
+        default:
+            return "unknown"
+        }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -281,6 +299,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         presentSettingsWindow()
     }
 
+    @objc @MainActor private func showInsightsWindow(_ sender: Any?) {
+        presentInsightsWindow()
+    }
+
     @MainActor
     private func presentSettingsWindow() {
         let controller: SettingsWindowController
@@ -289,6 +311,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             controller = SettingsWindowController(defaults: defaults)
             settingsWindowController = controller
+        }
+
+        controller.showWindow(nil)
+        controller.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate()
+    }
+
+    @MainActor
+    private func presentInsightsWindow() {
+        let controller: InsightsWindowController
+        if let existingController = insightsWindowController {
+            controller = existingController
+        } else {
+            controller = InsightsWindowController(
+                index: fileIndex,
+                defaults: defaults,
+                clearCachedIndexHandler: { [weak self] in
+                    guard let self else { return }
+                    try self.fileIndex.clearPersistedIndexData()
+                    guard AppSettings.indexedRootsConfigured(defaults: self.defaults) else { return }
+                    let roots = AppSettings.indexedRoots(defaults: self.defaults)
+                    guard !roots.isEmpty else { return }
+                    self.fileIndex.replaceRootsAndRebuild(roots)
+                }
+            )
+            insightsWindowController = controller
         }
 
         controller.showWindow(nil)
@@ -364,6 +412,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
         settingsItem.target = self
         appMenu.addItem(settingsItem)
+
+        let insightsItem = NSMenuItem(
+            title: "Insights...",
+            action: #selector(showInsightsWindow(_:)),
+            keyEquivalent: "i"
+        )
+        insightsItem.keyEquivalentModifierMask = [.command, .option]
+        insightsItem.target = self
+        appMenu.addItem(insightsItem)
 
         appMenu.addItem(.separator())
 
@@ -465,6 +522,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
         settingsItem.target = self
         menu.addItem(settingsItem)
+
+        let insightsItem = NSMenuItem(
+            title: "Insights...",
+            action: #selector(showInsightsWindow(_:)),
+            keyEquivalent: ""
+        )
+        insightsItem.target = self
+        menu.addItem(insightsItem)
 
         menu.addItem(.separator())
 

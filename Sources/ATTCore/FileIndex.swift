@@ -156,23 +156,33 @@ public struct SearchResponse: Sendable {
     public let elapsed: TimeInterval
     public let snapshotRevision: UInt64?
     public let usesIndexedCandidates: Bool
+    public let executionProfile: SearchExecutionProfile
 
     public init(
         results: [SearchResult],
         totalMatches: Int,
         elapsed: TimeInterval,
         snapshotRevision: UInt64? = nil,
-        usesIndexedCandidates: Bool = false
+        usesIndexedCandidates: Bool = false,
+        executionProfile: SearchExecutionProfile? = nil
     ) {
         self.results = results
         self.totalMatches = totalMatches
         self.elapsed = elapsed
         self.snapshotRevision = snapshotRevision
         self.usesIndexedCandidates = usesIndexedCandidates
+        self.executionProfile = executionProfile ?? SearchExecutionProfile(
+            executionPath: usesIndexedCandidates ? .unprofiledIndexed : .unprofiled,
+            indexesUsed: usesIndexedCandidates ? [.nameGrams] : [],
+            candidateCount: usesIndexedCandidates ? results.count : 0,
+            scannedRowCount: usesIndexedCandidates ? 0 : results.count,
+            didFallbackToFullScan: !usesIndexedCandidates,
+            elapsed: elapsed
+        )
     }
 }
 
-public enum IndexPhase: String, Sendable {
+public enum IndexPhase: String, Codable, Sendable {
     case idle
     case loading
     case scanning
@@ -182,7 +192,7 @@ public enum IndexPhase: String, Sendable {
     case failed
 }
 
-public struct IndexStats: Sendable {
+public struct IndexStats: Codable, Equatable, Sendable {
     public let indexedCount: Int
     public let isIndexing: Bool
     public let isLoadingSnapshot: Bool
@@ -1680,6 +1690,7 @@ public final class FileIndex: @unchecked Sendable {
     private let fileManager: FileManager
     private let supportDirectory: URL
     private let snapshotURL: URL
+    private let metricsURL: URL
     private let indexQueue = DispatchQueue(label: "att.index.work", qos: .utility)
     private var recordsByPath: [String: FileRecord] = [:]
     private var searchSnapshot = SearchSnapshot.empty
@@ -1696,6 +1707,7 @@ public final class FileIndex: @unchecked Sendable {
     private var scannedRowCount: UInt64 = 0
     private var pathMaterializationCount: UInt64 = 0
     private var activeIndexJobs = 0
+    private var usageMetrics = IndexUsageMetrics()
     private var snapshotLoadState = SnapshotLoadState.notStarted
     private var indexing = false
     private var phase: IndexPhase = .idle
@@ -1721,6 +1733,8 @@ public final class FileIndex: @unchecked Sendable {
         try? fileManager.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
         self.supportDirectory = supportDirectory
         self.snapshotURL = SnapshotLayout.packageURL(in: supportDirectory)
+        self.metricsURL = supportDirectory.appendingPathComponent("index-metrics.json", isDirectory: false)
+        self.usageMetrics = Self.loadUsageMetrics(from: metricsURL, fileManager: fileManager)
         cleanupStaleTemporaryFiles()
         cleanupObsoleteIndexFiles()
 
@@ -1739,6 +1753,34 @@ public final class FileIndex: @unchecked Sendable {
 
     public func currentStats() -> IndexStats {
         lockedStats()
+    }
+
+    public var dataDirectoryURL: URL {
+        supportDirectory
+    }
+
+    public func recordAppLaunch(appVersion: String? = nil) {
+        updateUsageMetrics { metrics in
+            metrics.recordAppLaunch(appVersion: appVersion)
+        }
+    }
+
+    public func recordFileAction(_ action: FileActionMetric) {
+        updateUsageMetrics { metrics in
+            metrics.recordFileAction(action)
+        }
+    }
+
+    public func recordMemorySample(bytes: UInt64) {
+        updateUsageMetrics { metrics in
+            metrics.recordMemorySample(bytes: bytes)
+        }
+    }
+
+    public func recordRecursiveRescan() {
+        updateUsageMetrics { metrics in
+            metrics.recordRecursiveRescan()
+        }
     }
 
     public func allRoots() -> [URL] {
@@ -1760,8 +1802,79 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
+    public func currentInsightsSnapshot() -> IndexInsightsSnapshot {
+        let state = lock.withLock {
+            (
+                snapshot: searchSnapshot,
+                roots: roots,
+                stats: lockedStatsWithoutLock(),
+                usage: usageMetrics,
+                health: currentHealthDiagnosticsWithoutLock()
+            )
+        }
+
+        let storage = Self.storageInsights(
+            supportDirectory: supportDirectory,
+            snapshotURL: snapshotURL,
+            applicationName: supportDirectory.lastPathComponent,
+            fileManager: fileManager
+        )
+        let rootInsights = Self.rootInsights(
+            snapshot: state.snapshot,
+            roots: state.roots,
+            estimatedIndexBytes: storage.indexPackageBytes
+        )
+
+        return IndexInsightsSnapshot(
+            generatedAt: Date(),
+            stats: state.stats,
+            roots: rootInsights,
+            storage: storage,
+            usage: state.usage,
+            lifetime: state.usage.lifetime,
+            health: state.health
+        )
+    }
+
+    public enum ClearCachedIndexError: LocalizedError {
+        case busy
+
+        public var errorDescription: String? {
+            switch self {
+            case .busy:
+                "AllTheThings is currently indexing. Wait for the current index job to finish before clearing the cached index."
+            }
+        }
+    }
+
+    public func clearPersistedIndexData() throws {
+        let canClear = lock.withLock {
+            activeIndexJobs == 0 && !indexing && snapshotLoadState != .loading
+        }
+        guard canClear else {
+            throw ClearCachedIndexError.busy
+        }
+
+        try indexQueue.sync {
+            try removePersistedIndexFiles()
+            lock.withLock {
+                recordsByPath.removeAll(keepingCapacity: false)
+                searchSnapshot = .empty
+                searchSnapshotRevision &+= 1
+                discoveredCount = 0
+                searchableCount = 0
+                optimizedCount = 0
+                phase = .idle
+                status = "Cached index cleared"
+                lastUpdated = Date()
+            }
+        }
+        publishStats()
+    }
+
     public func replaceRootsAndRebuild(_ rootURLs: [URL]) {
         let canonicalRoots = canonicalizedRoots(rootURLs)
+        let rebuildStarted = Date()
         let currentGeneration = lock.withLock { () -> UInt64 in
             generation &+= 1
             snapshotLoadState = .finished
@@ -1779,7 +1892,7 @@ public final class FileIndex: @unchecked Sendable {
         publishStats()
 
         indexQueue.async { [weak self] in
-            self?.rebuild(roots: canonicalRoots, generation: currentGeneration)
+            self?.rebuild(roots: canonicalRoots, generation: currentGeneration, started: rebuildStarted)
         }
     }
 
@@ -1825,6 +1938,21 @@ public final class FileIndex: @unchecked Sendable {
         shouldCancel: @Sendable () -> Bool
     ) -> SearchResponse? {
         let started = Date()
+        recordSearchStarted()
+        var didCompleteSearch = false
+
+        func finish(_ response: SearchResponse) -> SearchResponse {
+            didCompleteSearch = true
+            recordSearchCompleted(response.executionProfile)
+            return response
+        }
+
+        defer {
+            if !didCompleteSearch {
+                recordSearchCancelled(elapsed: Date().timeIntervalSince(started))
+            }
+        }
+
         let snapshotData = lock.withLock {
             (snapshot: searchSnapshot, revision: searchSnapshotRevision)
         }
@@ -1920,7 +2048,7 @@ public final class FileIndex: @unchecked Sendable {
                 snapshotRevision: snapshotRevision,
                 shouldCancel: shouldCancel
             ) {
-                return fastResponse
+                return finish(fastResponse)
             }
 
             if let fastResponse = Self.fastLargeShortFuzzyComponentSearch(
@@ -1932,7 +2060,7 @@ public final class FileIndex: @unchecked Sendable {
                 snapshotRevision: snapshotRevision,
                 shouldCancel: shouldCancel
             ) {
-                return fastResponse
+                return finish(fastResponse)
             }
 
             if let fastResponse = Self.fastLargePathSubstringSearch(
@@ -1944,7 +2072,7 @@ public final class FileIndex: @unchecked Sendable {
                 snapshotRevision: snapshotRevision,
                 shouldCancel: shouldCancel
             ) {
-                return fastResponse
+                return finish(fastResponse)
             }
 
             if let indexedResponse = Self.indexedCandidateSearch(
@@ -1956,7 +2084,7 @@ public final class FileIndex: @unchecked Sendable {
                 snapshotRevision: snapshotRevision,
                 shouldCancel: shouldCancel
             ) {
-                return indexedResponse
+                return finish(indexedResponse)
             }
 
             lock.withLock {
@@ -1983,12 +2111,33 @@ public final class FileIndex: @unchecked Sendable {
 
         guard !shouldCancel() else { return nil }
 
-        return SearchResponse(
+        let elapsed = Date().timeIntervalSince(started)
+        let profile: SearchExecutionProfile
+        if parsedQuery.isEmpty {
+            profile = SearchExecutionProfile(
+                executionPath: .emptyQuerySortedOrder,
+                indexesUsed: request.includeHidden ? [.modifiedOrder] : [.modifiedOrder, .visibleBitset],
+                candidateCount: total,
+                scannedRowCount: min(snapshot.count, total),
+                elapsed: elapsed
+            )
+        } else {
+            profile = SearchExecutionProfile(
+                executionPath: .fullFallbackScan,
+                scannedRowCount: snapshot.count,
+                didFallbackToFullScan: true,
+                elapsed: elapsed
+            )
+        }
+
+        return finish(SearchResponse(
             results: Self.materialize(matches, from: snapshot),
             totalMatches: total,
-            elapsed: Date().timeIntervalSince(started),
-            snapshotRevision: snapshotRevision
-        )
+            elapsed: elapsed,
+            snapshotRevision: snapshotRevision,
+            usesIndexedCandidates: parsedQuery.isEmpty,
+            executionProfile: profile
+        ))
     }
 
     private static func materialize(_ matches: [SearchMatch], from snapshot: SearchSnapshot) -> [SearchResult] {
@@ -2075,12 +2224,19 @@ public final class FileIndex: @unchecked Sendable {
 
         let rowSet = RowIntervalSet.build(intervals)
         guard !rowSet.isEmpty else {
+            let elapsed = Date().timeIntervalSince(started)
             return SearchResponse(
                 results: [],
                 totalMatches: 0,
-                elapsed: Date().timeIntervalSince(started),
+                elapsed: elapsed,
                 snapshotRevision: snapshotRevision,
-                usesIndexedCandidates: true
+                usesIndexedCandidates: true,
+                executionProfile: SearchExecutionProfile(
+                    executionPath: .optimizedSortedFastPath,
+                    indexesUsed: [.nameGrams, .componentGrams],
+                    candidateCount: 0,
+                    elapsed: elapsed
+                )
             )
         }
 
@@ -2121,12 +2277,20 @@ public final class FileIndex: @unchecked Sendable {
         guard !shouldCancel() else { return nil }
         sortAndLimitMatches()
 
+        let elapsed = Date().timeIntervalSince(started)
+        let candidateCount = rowSet.intervals.reduce(0) { $0 + max($1.end - $1.start, 0) }
         return SearchResponse(
             results: materialize(matches, from: snapshot),
             totalMatches: total,
-            elapsed: Date().timeIntervalSince(started),
+            elapsed: elapsed,
             snapshotRevision: snapshotRevision,
-            usesIndexedCandidates: true
+            usesIndexedCandidates: true,
+            executionProfile: SearchExecutionProfile(
+                executionPath: .optimizedSortedFastPath,
+                indexesUsed: [.nameGrams, .componentGrams],
+                candidateCount: candidateCount,
+                elapsed: elapsed
+            )
         )
     }
 
@@ -2190,12 +2354,19 @@ public final class FileIndex: @unchecked Sendable {
 
         let candidates = unionPostingLists(pathCandidates, nameCandidates)
         guard !candidates.isEmpty else {
+            let elapsed = Date().timeIntervalSince(started)
             return SearchResponse(
                 results: [],
                 totalMatches: 0,
-                elapsed: Date().timeIntervalSince(started),
+                elapsed: elapsed,
                 snapshotRevision: snapshotRevision,
-                usesIndexedCandidates: true
+                usesIndexedCandidates: true,
+                executionProfile: SearchExecutionProfile(
+                    executionPath: .nameComponentIndex,
+                    indexesUsed: [.nameGrams, .componentGrams],
+                    candidateCount: 0,
+                    elapsed: elapsed
+                )
             )
         }
 
@@ -2210,12 +2381,19 @@ public final class FileIndex: @unchecked Sendable {
             return nil
         }
 
+        let elapsed = Date().timeIntervalSince(started)
         return SearchResponse(
             results: materialize(selected.matches, from: snapshot),
             totalMatches: selected.total,
-            elapsed: Date().timeIntervalSince(started),
+            elapsed: elapsed,
             snapshotRevision: snapshotRevision,
-            usesIndexedCandidates: true
+            usesIndexedCandidates: true,
+            executionProfile: SearchExecutionProfile(
+                executionPath: .nameComponentIndex,
+                indexesUsed: [.nameGrams, .componentGrams],
+                candidateCount: candidates.count,
+                elapsed: elapsed
+            )
         )
     }
 
@@ -2339,12 +2517,19 @@ public final class FileIndex: @unchecked Sendable {
             if matches.count > maxResults {
                 matches.removeSubrange(maxResults..<matches.count)
             }
+            let elapsed = Date().timeIntervalSince(started)
             return SearchResponse(
                 results: materialize(matches, from: snapshot),
                 totalMatches: total,
-                elapsed: Date().timeIntervalSince(started),
+                elapsed: elapsed,
                 snapshotRevision: snapshotRevision,
-                usesIndexedCandidates: true
+                usesIndexedCandidates: true,
+                executionProfile: SearchExecutionProfile(
+                    executionPath: .pathGramIndex,
+                    indexesUsed: [.nameGrams, .pathGrams, .modifiedOrder],
+                    candidateCount: exactPathCandidates.count,
+                    elapsed: elapsed
+                )
             )
         }
 
@@ -2364,12 +2549,19 @@ public final class FileIndex: @unchecked Sendable {
                 return nil
             }
 
+            let elapsed = Date().timeIntervalSince(started)
             return SearchResponse(
                 results: materialize(selected.matches, from: snapshot),
                 totalMatches: selected.total,
-                elapsed: Date().timeIntervalSince(started),
+                elapsed: elapsed,
                 snapshotRevision: snapshotRevision,
-                usesIndexedCandidates: true
+                usesIndexedCandidates: true,
+                executionProfile: SearchExecutionProfile(
+                    executionPath: .pathGramIndex,
+                    indexesUsed: [.nameGrams, .pathGrams],
+                    candidateCount: exactPathCandidates.count,
+                    elapsed: elapsed
+                )
             )
         }
 
@@ -2418,12 +2610,19 @@ public final class FileIndex: @unchecked Sendable {
         sortAndLimitMatches()
 
         guard !shouldCancel() else { return nil }
+        let elapsed = Date().timeIntervalSince(started)
         return SearchResponse(
             results: materialize(matches, from: snapshot),
             totalMatches: total,
-            elapsed: Date().timeIntervalSince(started),
+            elapsed: elapsed,
             snapshotRevision: snapshotRevision,
-            usesIndexedCandidates: true
+            usesIndexedCandidates: true,
+            executionProfile: SearchExecutionProfile(
+                executionPath: .pathGramIndex,
+                indexesUsed: [.nameGrams, .pathGrams],
+                candidateCount: exactPathCandidates.count,
+                elapsed: elapsed
+            )
         )
     }
 
@@ -2630,12 +2829,19 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         if candidateIndices.isEmpty {
+            let elapsed = Date().timeIntervalSince(started)
             return SearchResponse(
                 results: [],
                 totalMatches: 0,
-                elapsed: Date().timeIntervalSince(started),
+                elapsed: elapsed,
                 snapshotRevision: snapshotRevision,
-                usesIndexedCandidates: true
+                usesIndexedCandidates: true,
+                executionProfile: SearchExecutionProfile(
+                    executionPath: .indexedCandidateIntersection,
+                    indexesUsed: Self.indexUses(for: parsedQuery),
+                    candidateCount: 0,
+                    elapsed: elapsed
+                )
             )
         }
 
@@ -2699,13 +2905,60 @@ public final class FileIndex: @unchecked Sendable {
         sortAndLimitMatches()
 
         guard !shouldCancel() else { return nil }
+        let elapsed = Date().timeIntervalSince(started)
         return SearchResponse(
             results: materialize(matches, from: snapshot),
             totalMatches: total,
-            elapsed: Date().timeIntervalSince(started),
+            elapsed: elapsed,
             snapshotRevision: snapshotRevision,
-            usesIndexedCandidates: true
+            usesIndexedCandidates: true,
+            executionProfile: SearchExecutionProfile(
+                executionPath: Self.executionPath(forIndexedCandidateQuery: parsedQuery),
+                indexesUsed: Self.indexUses(for: parsedQuery),
+                candidateCount: candidateIndices.count,
+                elapsed: elapsed
+            )
         )
+    }
+
+    private static func executionPath(forIndexedCandidateQuery parsedQuery: FuzzyMatcher.ParsedQuery) -> SearchExecutionPath {
+        let uses = indexUses(for: parsedQuery)
+        if uses.contains(.extensionPostings) {
+            return .extensionCandidateIntersection
+        }
+        if uses.contains(.pathGrams) {
+            return .pathGramIndex
+        }
+        if uses.contains(.nameGrams) || uses.contains(.componentGrams) {
+            return .nameComponentIndex
+        }
+        return .indexedCandidateIntersection
+    }
+
+    private static func indexUses(for parsedQuery: FuzzyMatcher.ParsedQuery) -> Set<SearchIndexUse> {
+        var uses = Set<SearchIndexUse>()
+
+        for clause in parsedQuery.positive {
+            for alternative in clause.alternatives {
+                switch alternative {
+                case .fileExtension:
+                    uses.insert(.extensionPostings)
+                    uses.insert(.nameGrams)
+                case .kind:
+                    break
+                case .text(let field, let pattern, _):
+                    if field != .path {
+                        uses.insert(.nameGrams)
+                    }
+                    if field != .name || tokenContainsPathSeparator(pattern.token) {
+                        uses.insert(.pathGrams)
+                        uses.insert(.componentGrams)
+                    }
+                }
+            }
+        }
+
+        return uses
     }
 
     private static func recordIsHidden<Record: SearchRecordReadable>(_ record: Record) -> Bool {
@@ -3588,7 +3841,7 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
-    private func rebuild(roots rootURLs: [URL], generation currentGeneration: UInt64) {
+    private func rebuild(roots rootURLs: [URL], generation currentGeneration: UInt64, started: Date) {
         let jobID = beginIndexJob("rebuild")
         defer { endIndexJob("rebuild", jobID: jobID) }
 
@@ -3611,6 +3864,8 @@ public final class FileIndex: @unchecked Sendable {
         guard isCurrentGeneration(currentGeneration) else { return }
         publishPrimary(scanResult.store, scanResult.visited, true)
         optimizeAndPublish(recordsByPath: scanResult.records, initialStore: scanResult.store, generation: currentGeneration)
+        guard isCurrentGeneration(currentGeneration) else { return }
+        recordFullRebuild(duration: Date().timeIntervalSince(started))
     }
 
     private func scanConcurrently(
@@ -3980,6 +4235,7 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         if didApply {
+            recordIndexingFailure()
             publishStats()
         }
     }
@@ -4092,6 +4348,7 @@ public final class FileIndex: @unchecked Sendable {
             return
         }
 
+        let refreshStarted = Date()
         let jobID = beginIndexJob("refresh")
         defer { endIndexJob("refresh", jobID: jobID) }
 
@@ -4143,6 +4400,7 @@ public final class FileIndex: @unchecked Sendable {
                 refreshBatchSize: paths.count,
                 activeIndexJobs: currentActiveIndexJobCount()
             )
+            recordIncrementalRefresh(duration: Date().timeIntervalSince(refreshStarted))
             return
         }
 
@@ -4234,6 +4492,7 @@ public final class FileIndex: @unchecked Sendable {
             refreshBatchSize: paths.count,
             activeIndexJobs: currentActiveIndexJobCount()
         )
+        recordIncrementalRefresh(duration: Date().timeIntervalSince(refreshStarted))
     }
 
     private func scanDirectoryShallow(_ directory: URL, exclusions: FileExclusionRules, rootPaths: [String]) -> [FileRecord] {
@@ -4376,6 +4635,7 @@ public final class FileIndex: @unchecked Sendable {
                 status = "Could not persist index: \(error.localizedDescription)"
                 lastUpdated = Date()
             }
+            recordPersistFailure()
             publishStats()
             return false
         }
@@ -4473,6 +4733,7 @@ public final class FileIndex: @unchecked Sendable {
             )
         } catch {
             try? fileManager.removeItem(at: snapshotURL)
+            recordSnapshotLoadFailure(corruptSnapshotRemoved: true)
             MemoryTelemetry.log("snapshot.load.failed", activeIndexJobs: currentActiveIndexJobCount())
             return nil
         }
@@ -4529,6 +4790,7 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         let now = Date()
+        var removedCount: UInt64 = 0
         for url in contents {
             let name = url.lastPathComponent
             let isTemporary = name.hasPrefix(".dat.nosync")
@@ -4537,13 +4799,22 @@ public final class FileIndex: @unchecked Sendable {
 
             let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
             guard minimumAge <= 0 || now.timeIntervalSince(modified) >= minimumAge else { continue }
-            try? fileManager.removeItem(at: url)
+            if (try? fileManager.removeItem(at: url)) != nil {
+                removedCount &+= 1
+            }
+        }
+
+        if removedCount > 0 {
+            recordTempCleanup(count: removedCount)
         }
     }
 
     private func cleanupObsoleteIndexFiles() {
+        var removedCount: UInt64 = 0
         for name in SnapshotLayout.obsoletePackageNames + SnapshotLayout.obsoleteFileNames {
-            try? fileManager.removeItem(at: supportDirectory.appendingPathComponent(name))
+            if (try? fileManager.removeItem(at: supportDirectory.appendingPathComponent(name))) != nil {
+                removedCount &+= 1
+            }
         }
 
         guard let contents = try? fileManager.contentsOfDirectory(
@@ -4557,8 +4828,14 @@ public final class FileIndex: @unchecked Sendable {
         for url in contents {
             let name = url.lastPathComponent
             if SnapshotLayout.isObsoleteTemporaryName(name) {
-                try? fileManager.removeItem(at: url)
+                if (try? fileManager.removeItem(at: url)) != nil {
+                    removedCount &+= 1
+                }
             }
+        }
+
+        if removedCount > 0 {
+            recordTempCleanup(count: removedCount)
         }
     }
 
@@ -4597,8 +4874,10 @@ public final class FileIndex: @unchecked Sendable {
     private func beginIndexJob(_ name: String) -> Int {
         let activeJobs = lock.withLock { () -> Int in
             activeIndexJobs += 1
+            usageMetrics.recordActiveJobHighWaterMark(activeIndexJobs)
             return activeIndexJobs
         }
+        saveUsageMetricsSnapshot()
         MemoryTelemetry.log("job.\(name).begin", activeIndexJobs: activeJobs)
         return activeJobs
     }
@@ -4617,41 +4896,75 @@ public final class FileIndex: @unchecked Sendable {
 
     func currentDiagnostics() -> FileIndexDiagnostics {
         lock.withLock {
-            FileIndexDiagnostics(
-                indexedCount: searchSnapshot.resultCount,
-                snapshotRevision: searchSnapshotRevision,
-                phase: phase,
-                discoveredCount: discoveredCount,
-                searchableCount: searchableCount,
-                optimizedCount: optimizedCount,
-                recordStoreKind: searchSnapshot.store.kind,
-                mappedByteSize: searchSnapshot.store.mappedByteSize,
-                heapPageCount: searchSnapshot.store.heapPageCount,
-                overlayCount: searchSnapshot.store.overlayCount,
-                columnarSidecarsLoaded: searchSnapshot.store.hasColumnarSidecars,
-                visibleCount: searchSnapshot.visibleCount,
-                visibleModifiedOrderCount: searchSnapshot.visibleModifiedDescending.count,
-                simdTextVerificationEnabled: searchSnapshot.diagnostics.simdTextVerificationEnabled,
-                pathGramIndexEnabled: searchSnapshot.diagnostics.pathGramIndexEnabled,
-                pathGramKeyCount: searchSnapshot.diagnostics.pathGramKeyCount,
-                pathGramPostingCount: searchSnapshot.diagnostics.pathGramPostingCount,
-                nameGramKeyCount: searchSnapshot.diagnostics.nameGramKeyCount,
-                nameGramPostingCount: searchSnapshot.diagnostics.nameGramPostingCount,
-                componentGramKeyCount: searchSnapshot.diagnostics.componentGramKeyCount,
-                componentGramPostingCount: searchSnapshot.diagnostics.componentGramPostingCount,
-                extensionKeyCount: searchSnapshot.diagnostics.extensionKeyCount,
-                extensionPostingCount: searchSnapshot.diagnostics.extensionPostingCount,
-                completedRefreshBatches: completedRefreshBatches,
-                completedSnapshotRebuilds: completedSnapshotRebuilds,
-                activeIndexJobs: activeIndexJobs,
-                schemaVersion: searchSnapshot.store.schemaVersion,
-                resultCount: searchSnapshot.resultCount,
-                virtualRowCount: searchSnapshot.virtualRowCount,
-                fallbackScanCount: fallbackScanCount,
-                scannedRowCount: scannedRowCount,
-                pathMaterializationCount: pathMaterializationCount
-            )
+            currentDiagnosticsWithoutLock()
         }
+    }
+
+    private func currentDiagnosticsWithoutLock() -> FileIndexDiagnostics {
+        FileIndexDiagnostics(
+            indexedCount: searchSnapshot.resultCount,
+            snapshotRevision: searchSnapshotRevision,
+            phase: phase,
+            discoveredCount: discoveredCount,
+            searchableCount: searchableCount,
+            optimizedCount: optimizedCount,
+            recordStoreKind: searchSnapshot.store.kind,
+            mappedByteSize: searchSnapshot.store.mappedByteSize,
+            heapPageCount: searchSnapshot.store.heapPageCount,
+            overlayCount: searchSnapshot.store.overlayCount,
+            columnarSidecarsLoaded: searchSnapshot.store.hasColumnarSidecars,
+            visibleCount: searchSnapshot.visibleCount,
+            visibleModifiedOrderCount: searchSnapshot.visibleModifiedDescending.count,
+            simdTextVerificationEnabled: searchSnapshot.diagnostics.simdTextVerificationEnabled,
+            pathGramIndexEnabled: searchSnapshot.diagnostics.pathGramIndexEnabled,
+            pathGramKeyCount: searchSnapshot.diagnostics.pathGramKeyCount,
+            pathGramPostingCount: searchSnapshot.diagnostics.pathGramPostingCount,
+            nameGramKeyCount: searchSnapshot.diagnostics.nameGramKeyCount,
+            nameGramPostingCount: searchSnapshot.diagnostics.nameGramPostingCount,
+            componentGramKeyCount: searchSnapshot.diagnostics.componentGramKeyCount,
+            componentGramPostingCount: searchSnapshot.diagnostics.componentGramPostingCount,
+            extensionKeyCount: searchSnapshot.diagnostics.extensionKeyCount,
+            extensionPostingCount: searchSnapshot.diagnostics.extensionPostingCount,
+            completedRefreshBatches: completedRefreshBatches,
+            completedSnapshotRebuilds: completedSnapshotRebuilds,
+            activeIndexJobs: activeIndexJobs,
+            schemaVersion: searchSnapshot.store.schemaVersion,
+            resultCount: searchSnapshot.resultCount,
+            virtualRowCount: searchSnapshot.virtualRowCount,
+            fallbackScanCount: fallbackScanCount,
+            scannedRowCount: scannedRowCount,
+            pathMaterializationCount: pathMaterializationCount
+        )
+    }
+
+    private func currentHealthDiagnosticsWithoutLock() -> IndexHealthDiagnostics {
+        IndexHealthDiagnostics(
+            phase: phase,
+            status: status,
+            activeIndexJobs: activeIndexJobs,
+            activeIndexJobHighWaterMark: usageMetrics.health.activeJobHighWaterMark,
+            schemaVersion: searchSnapshot.store.schemaVersion,
+            snapshotRevision: searchSnapshotRevision,
+            recordStoreKind: searchSnapshot.store.kind.rawValue,
+            mappedByteSize: searchSnapshot.store.mappedByteSize,
+            heapPageCount: searchSnapshot.store.heapPageCount,
+            overlayCount: searchSnapshot.store.overlayCount,
+            columnarSidecarsLoaded: searchSnapshot.store.hasColumnarSidecars,
+            resultCount: searchSnapshot.resultCount,
+            virtualRowCount: searchSnapshot.virtualRowCount,
+            visibleCount: searchSnapshot.visibleCount,
+            pathGramIndexEnabled: searchSnapshot.diagnostics.pathGramIndexEnabled,
+            nameGramKeyCount: searchSnapshot.diagnostics.nameGramKeyCount,
+            componentGramKeyCount: searchSnapshot.diagnostics.componentGramKeyCount,
+            pathGramKeyCount: searchSnapshot.diagnostics.pathGramKeyCount,
+            extensionKeyCount: searchSnapshot.diagnostics.extensionKeyCount,
+            completedRefreshBatches: completedRefreshBatches,
+            completedSnapshotRebuilds: completedSnapshotRebuilds,
+            fallbackScanCount: fallbackScanCount,
+            scannedRowCount: scannedRowCount,
+            pathMaterializationCount: pathMaterializationCount,
+            canClearCachedIndex: activeIndexJobs == 0 && !indexing && snapshotLoadState != .loading
+        )
     }
 
     func replaceRecordsForTesting(
@@ -4716,19 +5029,300 @@ public final class FileIndex: @unchecked Sendable {
 
     private func lockedStats() -> IndexStats {
         lock.withLock {
-            IndexStats(
-                indexedCount: searchSnapshot.resultCount,
-                isIndexing: indexing,
-                isLoadingSnapshot: snapshotLoadState == .loading,
-                phase: phase,
-                discoveredCount: discoveredCount,
-                searchableCount: searchableCount,
-                optimizedCount: optimizedCount,
-                snapshotRevision: searchSnapshotRevision,
-                status: status,
-                lastUpdated: lastUpdated
+            lockedStatsWithoutLock()
+        }
+    }
+
+    private func lockedStatsWithoutLock() -> IndexStats {
+        IndexStats(
+            indexedCount: searchSnapshot.resultCount,
+            isIndexing: indexing,
+            isLoadingSnapshot: snapshotLoadState == .loading,
+            phase: phase,
+            discoveredCount: discoveredCount,
+            searchableCount: searchableCount,
+            optimizedCount: optimizedCount,
+            snapshotRevision: searchSnapshotRevision,
+            status: status,
+            lastUpdated: lastUpdated
+        )
+    }
+
+    private func recordSearchStarted() {
+        updateUsageMetrics { metrics in
+            metrics.recordSearchStarted()
+        }
+    }
+
+    private func recordSearchCompleted(_ profile: SearchExecutionProfile) {
+        updateUsageMetrics { metrics in
+            metrics.recordSearchCompleted(profile)
+        }
+    }
+
+    private func recordSearchCancelled(elapsed: TimeInterval) {
+        updateUsageMetrics { metrics in
+            metrics.recordSearchCancelled(elapsed: elapsed)
+        }
+    }
+
+    private func recordFullRebuild(duration: TimeInterval) {
+        updateUsageMetrics { metrics in
+            metrics.recordFullRebuild(duration: duration)
+        }
+    }
+
+    private func recordIncrementalRefresh(duration: TimeInterval) {
+        updateUsageMetrics { metrics in
+            metrics.recordIncrementalRefresh(duration: duration)
+        }
+    }
+
+    private func recordIndexingFailure() {
+        updateUsageMetrics { metrics in
+            metrics.recordIndexingFailure()
+        }
+    }
+
+    private func recordSnapshotLoadFailure(corruptSnapshotRemoved: Bool) {
+        updateUsageMetrics { metrics in
+            metrics.recordSnapshotLoadFailure(corruptSnapshotRemoved: corruptSnapshotRemoved)
+        }
+    }
+
+    private func recordPersistFailure() {
+        updateUsageMetrics { metrics in
+            metrics.recordPersistFailure()
+        }
+    }
+
+    private func recordTempCleanup(count: UInt64) {
+        updateUsageMetrics { metrics in
+            metrics.recordTempCleanup(count: count)
+        }
+    }
+
+    private func updateUsageMetrics(_ body: (inout IndexUsageMetrics) -> Void) {
+        let metrics = lock.withLock { () -> IndexUsageMetrics in
+            body(&usageMetrics)
+            usageMetrics.schemaVersion = IndexUsageMetrics.currentSchemaVersion
+            return usageMetrics
+        }
+        Self.saveUsageMetrics(metrics, to: metricsURL, fileManager: fileManager)
+    }
+
+    private func saveUsageMetricsSnapshot() {
+        let metrics = lock.withLock { usageMetrics }
+        Self.saveUsageMetrics(metrics, to: metricsURL, fileManager: fileManager)
+    }
+
+    private static func loadUsageMetrics(from url: URL, fileManager: FileManager) -> IndexUsageMetrics {
+        guard
+            fileManager.fileExists(atPath: url.path),
+            let data = try? Data(contentsOf: url),
+            var metrics = try? JSONDecoder().decode(IndexUsageMetrics.self, from: data),
+            metrics.schemaVersion == IndexUsageMetrics.currentSchemaVersion
+        else {
+            return IndexUsageMetrics(schemaVersion: IndexUsageMetrics.currentSchemaVersion)
+        }
+
+        metrics.pruneDailyBuckets()
+        return metrics
+    }
+
+    private static func saveUsageMetrics(_ metrics: IndexUsageMetrics, to url: URL, fileManager: FileManager) {
+        do {
+            try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            let data = try encoder.encode(metrics)
+            try data.write(to: url, options: .atomic)
+        } catch {
+            MemoryTelemetry.log("metrics.save.failed")
+        }
+    }
+
+    private func removePersistedIndexFiles() throws {
+        if fileManager.fileExists(atPath: snapshotURL.path) {
+            try fileManager.removeItem(at: snapshotURL)
+        }
+
+        guard
+            let contents = try? fileManager.contentsOfDirectory(
+                at: supportDirectory,
+                includingPropertiesForKeys: nil,
+                options: [.skipsSubdirectoryDescendants]
+            )
+        else {
+            return
+        }
+
+        for url in contents where SnapshotLayout.isCurrentTemporaryPackageName(url.lastPathComponent) {
+            try fileManager.removeItem(at: url)
+        }
+        cleanupObsoleteIndexFiles()
+    }
+
+    private static func rootInsights(
+        snapshot: SearchSnapshot,
+        roots: [String],
+        estimatedIndexBytes: UInt64
+    ) -> [IndexRootInsight] {
+        guard !roots.isEmpty else { return [] }
+
+        struct MutableRootInsight {
+            var trackedFileCount = 0
+            var directoryCount = 0
+            var hiddenCount = 0
+            var indexedContentBytes: UInt64 = 0
+            var pathByteWeight: UInt64 = 0
+        }
+
+        let normalizedRoots = roots
+            .map { URL(fileURLWithPath: $0, isDirectory: true).standardizedFileURL.path }
+            .sorted { $0.count > $1.count }
+        var values = Dictionary(uniqueKeysWithValues: normalizedRoots.map { ($0, MutableRootInsight()) })
+
+        for rowID in 0..<snapshot.count {
+            guard snapshot.store.isResultRow(at: rowID) else { continue }
+            let path = snapshot.store.path(at: rowID)
+            guard let root = normalizedRoots.first(where: { path == $0 || path.hasPrefix($0 + "/") }) else {
+                continue
+            }
+
+            if snapshot.store.isDirectory(at: rowID) {
+                values[root, default: MutableRootInsight()].directoryCount += 1
+            } else {
+                values[root, default: MutableRootInsight()].trackedFileCount += 1
+                values[root, default: MutableRootInsight()].indexedContentBytes &+= snapshot.store.sizeBytes(at: rowID)
+            }
+            if snapshot.store.isHidden(at: rowID) {
+                values[root, default: MutableRootInsight()].hiddenCount += 1
+            }
+            values[root, default: MutableRootInsight()].pathByteWeight &+= UInt64(path.utf8.count)
+        }
+
+        let totalWeight = values.values.reduce(UInt64(0)) { $0 &+ $1.pathByteWeight }
+        return roots.map { root in
+            let path = URL(fileURLWithPath: root, isDirectory: true).standardizedFileURL.path
+            let value = values[path] ?? MutableRootInsight()
+            let estimatedBytes = totalWeight == 0
+                ? 0
+                : UInt64((Double(value.pathByteWeight) / Double(totalWeight) * Double(estimatedIndexBytes)).rounded())
+            return IndexRootInsight(
+                path: path,
+                trackedFileCount: value.trackedFileCount,
+                directoryCount: value.directoryCount,
+                hiddenCount: value.hiddenCount,
+                indexedContentBytes: value.indexedContentBytes,
+                pathByteWeight: value.pathByteWeight,
+                estimatedIndexBytes: estimatedBytes
             )
         }
+    }
+
+    private static func storageInsights(
+        supportDirectory: URL,
+        snapshotURL: URL,
+        applicationName: String,
+        fileManager: FileManager
+    ) -> IndexStorageInsights {
+        var locations: [IndexStorageLocationInsight] = []
+        var seenPaths = Set<String>()
+
+        func appendLocation(label: String, url: URL) {
+            let path = url.standardizedFileURL.path
+            guard seenPaths.insert(path).inserted, fileManager.fileExists(atPath: path) else { return }
+            locations.append(IndexStorageLocationInsight(
+                label: label,
+                path: path,
+                allocatedBytes: allocatedSize(of: url, fileManager: fileManager)
+            ))
+        }
+
+        appendLocation(label: "Application Support", url: supportDirectory)
+
+        let cachesRoot = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first
+        let bundleIdentifier = Bundle.main.bundleIdentifier
+        let cacheNames = [
+            bundleIdentifier,
+            "com.gamecoretech.allthethings",
+            "com.gamecoretech.AllTheThings",
+            applicationName
+        ].compactMap { $0 }
+
+        for name in cacheNames {
+            if let cachesRoot {
+                appendLocation(label: "Caches", url: cachesRoot.appendingPathComponent(name, isDirectory: true))
+            }
+        }
+
+        let indexPackageBytes = allocatedSize(of: snapshotURL, fileManager: fileManager)
+        let totalBytes = locations.reduce(UInt64(0)) { $0 &+ $1.allocatedBytes }
+        let cacheBytes = locations
+            .filter { $0.label == "Caches" }
+            .reduce(UInt64(0)) { $0 &+ $1.allocatedBytes }
+
+        return IndexStorageInsights(
+            totalATTDataBytes: totalBytes,
+            indexPackageBytes: indexPackageBytes,
+            cacheBytes: cacheBytes,
+            locations: locations,
+            sidecars: sidecarInsights(in: snapshotURL, fileManager: fileManager)
+        )
+    }
+
+    private static func sidecarInsights(in packageURL: URL, fileManager: FileManager) -> [IndexSidecarInsight] {
+        guard
+            let contents = try? fileManager.contentsOfDirectory(
+                at: packageURL,
+                includingPropertiesForKeys: [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey],
+                options: [.skipsHiddenFiles]
+            )
+        else {
+            return []
+        }
+
+        return contents
+            .filter { !$0.hasDirectoryPath }
+            .map { url in
+                IndexSidecarInsight(
+                    name: url.lastPathComponent,
+                    allocatedBytes: allocatedSize(of: url, fileManager: fileManager)
+                )
+            }
+            .sorted {
+                if $0.allocatedBytes != $1.allocatedBytes {
+                    return $0.allocatedBytes > $1.allocatedBytes
+                }
+                return $0.name < $1.name
+            }
+    }
+
+    private static func allocatedSize(of url: URL, fileManager: FileManager) -> UInt64 {
+        guard fileManager.fileExists(atPath: url.path) else { return 0 }
+
+        var total: UInt64 = allocatedFileSize(of: url)
+        if let enumerator = fileManager.enumerator(
+            at: url,
+            includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey, .totalFileAllocatedSizeKey, .fileAllocatedSizeKey],
+            options: [.skipsHiddenFiles],
+            errorHandler: { _, _ in true }
+        ) {
+            for case let child as URL in enumerator {
+                total &+= allocatedFileSize(of: child)
+            }
+        }
+
+        return total
+    }
+
+    private static func allocatedFileSize(of url: URL) -> UInt64 {
+        guard let values = try? url.resourceValues(forKeys: [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey]) else {
+            return 0
+        }
+
+        return UInt64(max(values.totalFileAllocatedSize ?? values.fileAllocatedSize ?? 0, 0))
     }
 
     private func currentGeneration() -> UInt64 {
