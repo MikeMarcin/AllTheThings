@@ -2269,8 +2269,10 @@ public final class FileIndex: @unchecked Sendable {
         let allRootURLs = state.rootPaths.map { URL(fileURLWithPath: $0, isDirectory: true) }
         let rootURLs: [URL]
         if let requestedRootURLs {
-            let requestedPaths = Set(requestedRootURLs.map { $0.standardizedFileURL.path })
-            rootURLs = allRootURLs.filter { requestedPaths.contains($0.path) }
+            rootURLs = Self.reconciliationScopeURLs(
+                for: requestedRootURLs.map { $0.standardizedFileURL.path },
+                within: state.rootPaths
+            )
         } else {
             rootURLs = allRootURLs
         }
@@ -2279,14 +2281,14 @@ public final class FileIndex: @unchecked Sendable {
             publishRootLimitFailure(count: allRootURLs.count)
             return
         }
-        let reconcilesAllRoots = rootURLs.count == allRootURLs.count
+        let reconcilesAllRoots = Set(rootURLs.map(\.path)) == Set(state.rootPaths)
         DiagnosticLogger.shared.log(
             category: "index",
             event: "index.reconcileRequested",
             fields: [
                 "reconcilesAllRoots": .publicBool(reconcilesAllRoots),
-                "rootCount": .publicInt(rootURLs.count),
-                "roots": .pathArray(rootURLs.map(\.path))
+                "scopeCount": .publicInt(rootURLs.count),
+                "scopes": .pathArray(rootURLs.map(\.path))
             ]
         )
 
@@ -4696,8 +4698,8 @@ public final class FileIndex: @unchecked Sendable {
             event: "index.reconcileBegin",
             fields: [
                 "reconcilesAllRoots": .publicBool(reconcilesAllRoots),
-                "rootCount": .publicInt(rootURLs.count),
-                "roots": .pathArray(scannedRootPaths),
+                "scopeCount": .publicInt(rootURLs.count),
+                "scopes": .pathArray(scannedRootPaths),
                 "workerCount": .publicInt(Self.refreshScanWorkerCount())
             ]
         )
@@ -4707,6 +4709,7 @@ public final class FileIndex: @unchecked Sendable {
             generation: currentGeneration,
             checkpoint: nil,
             operationStartedAt: started,
+            exclusionRootPaths: allRootPaths,
             writesCheckpoints: false,
             publishesScanStatus: true,
             workerCount: Self.refreshScanWorkerCount(),
@@ -4769,6 +4772,7 @@ public final class FileIndex: @unchecked Sendable {
         generation currentGeneration: UInt64,
         checkpoint: LoadedScanCheckpoint?,
         operationStartedAt: Date,
+        exclusionRootPaths: [String]? = nil,
         writesCheckpoints: Bool = true,
         publishesScanStatus: Bool = true,
         workerCount: Int,
@@ -4776,6 +4780,7 @@ public final class FileIndex: @unchecked Sendable {
         progress: @escaping @Sendable (_ store: HeapPagedRecordStore, _ visited: Int, _ force: Bool) -> Void
     ) -> ScanResult? {
         let rootPaths = rootURLs.map(\.path)
+        let ruleRootPaths = exclusionRootPaths ?? rootPaths
         let currentCount = lock.withLock { searchSnapshot.count }
         let state = ConcurrentScanState(
             reservedCapacity: max(8_192, currentCount, checkpoint?.store.count ?? 0),
@@ -4827,7 +4832,7 @@ public final class FileIndex: @unchecked Sendable {
                 guard
                     fileManager.fileExists(atPath: root.path),
                     canScanDirectory(root),
-                    !shouldExclude(root, exclusions: exclusions, rootPaths: rootPaths, isDirectory: true)
+                    !shouldExclude(root, exclusions: exclusions, rootPaths: ruleRootPaths, isDirectory: true)
                 else {
                     continue
                 }
@@ -4869,7 +4874,7 @@ public final class FileIndex: @unchecked Sendable {
 
                         autoreleasepool {
                             let values = try? child.resourceValues(forKeys: FileRecord.resourceKeys)
-                            guard !self.shouldExclude(child, exclusions: exclusions, rootPaths: rootPaths, isDirectory: values?.isDirectory) else {
+                            guard !self.shouldExclude(child, exclusions: exclusions, rootPaths: ruleRootPaths, isDirectory: values?.isDirectory) else {
                                 return
                             }
 
@@ -7137,6 +7142,20 @@ public final class FileIndex: @unchecked Sendable {
             seen.insert(standardized.path)
             return standardized
         }
+    }
+
+    private static func reconciliationScopeURLs(for requestedPaths: [String], within rootPaths: [String]) -> [URL] {
+        let allowedPaths = requestedPaths.filter { requestedPath in
+            rootPaths.contains { requestedPath == $0 || requestedPath.hasPrefix($0 + "/") }
+        }
+        var collapsed: [String] = []
+        for path in allowedPaths.sorted(by: { $0.count < $1.count }) {
+            guard !collapsed.contains(where: { path == $0 || path.hasPrefix($0 + "/") }) else {
+                continue
+            }
+            collapsed.append(path)
+        }
+        return collapsed.map { URL(fileURLWithPath: $0, isDirectory: true).standardizedFileURL }
     }
 
     private static func path(_ path: String, isContainedIn rootPaths: [String]) -> Bool {

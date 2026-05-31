@@ -84,10 +84,11 @@ struct FileSystemWatcherTests {
         #expect(mustScan.requiresRecursiveRescan)
     }
 
-    @Test("FSEvent reconciliation reconciles roots with normal historical paths")
-    func fseventReconciliationReconcilesRootsWithNormalHistoricalPaths() async {
+    @Test("FSEvent reconciliation scopes normal historical file paths to parent folders")
+    func fseventReconciliationScopesNormalHistoricalFilePathsToParentFolders() async {
         let root = URL(fileURLWithPath: "/tmp/allthethings/root-a", isDirectory: true)
-        let changedPath = root.appendingPathComponent("log.txt").path
+        let folder = root.appendingPathComponent("Project", isDirectory: true)
+        let changedPath = folder.appendingPathComponent("log.txt").path
         let store = memoryCursorStore()
         store.markBaseline(for: [root.path], eventID: 40)
         let source = FakeHistoryReplaySource(
@@ -109,11 +110,42 @@ struct FileSystemWatcherTests {
 
         let action = await actionFromCoordinator(coordinator, roots: [root])
         #expect(source.requestedSinceEventID == 40)
-        #expect(action == .reconcile(rootPaths: [root.path]))
+        #expect(action == .reconcile(paths: [folder.path]))
     }
 
-    @Test("FSEvent reconciliation falls back for large historical reconciliations")
-    func fseventReconciliationFallsBackForLargeHistoricalReconciliations() async {
+    @Test("FSEvent reconciliation scopes normal historical directory paths directly")
+    func fseventReconciliationScopesNormalHistoricalDirectoryPathsDirectly() async {
+        let root = URL(fileURLWithPath: "/tmp/allthethings/root-a", isDirectory: true)
+        let folder = root.appendingPathComponent("Project", isDirectory: true)
+        let store = memoryCursorStore()
+        store.markBaseline(for: [root.path], eventID: 40)
+        let source = FakeHistoryReplaySource(
+            events: [
+                FileSystemEvent(
+                    path: folder.path,
+                    flags: FSEventStreamEventFlags(kFSEventStreamEventFlagItemIsDir),
+                    eventID: 41
+                ),
+                FileSystemEvent(
+                    path: root.path,
+                    flags: FSEventStreamEventFlags(kFSEventStreamEventFlagHistoryDone),
+                    eventID: 42
+                )
+            ],
+            completion: .completed
+        )
+        let coordinator = FSEventReconciliationCoordinator(
+            cursorStore: store,
+            replaySource: source,
+            currentEventID: { 42 }
+        )
+
+        let action = await actionFromCoordinator(coordinator, roots: [root])
+        #expect(action == .reconcile(paths: [folder.path]))
+    }
+
+    @Test("FSEvent reconciliation collapses large historical file sets to parent scopes")
+    func fseventReconciliationCollapsesLargeHistoricalFileSetsToParentScopes() async {
         let root = URL(fileURLWithPath: "/tmp/allthethings/root-a", isDirectory: true)
         let store = memoryCursorStore()
         store.markBaseline(for: [root.path], eventID: 40)
@@ -137,7 +169,7 @@ struct FileSystemWatcherTests {
         )
 
         let action = await actionFromCoordinator(coordinator, roots: [root])
-        #expect(action == .fullReconcile(rootPaths: nil))
+        #expect(action == .reconcile(paths: [root.path]))
     }
 
     @Test("FSEvent reconciliation falls back when a cursor is missing")
@@ -150,7 +182,7 @@ struct FileSystemWatcherTests {
         )
 
         let action = await actionFromCoordinator(coordinator, roots: [root])
-        #expect(action == .fullReconcile(rootPaths: nil))
+        #expect(action == .fullReconcile(paths: nil))
     }
 
     @Test("FSEvent reconciliation falls back for unsafe history")
@@ -180,7 +212,7 @@ struct FileSystemWatcherTests {
         )
 
         let action = await actionFromCoordinator(coordinator, roots: [root])
-        #expect(action == .fullReconcile(rootPaths: [root.path]))
+        #expect(action == .fullReconcile(paths: [root.path]))
     }
 
     @Test("FSEvent reconciliation records up to date baselines")

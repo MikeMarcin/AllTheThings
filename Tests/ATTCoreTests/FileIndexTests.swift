@@ -829,6 +829,55 @@ struct FileIndexTests {
         }
     }
 
+    @Test("scoped reconciliation accepts changed folders inside an indexed root")
+    func scopedReconciliationAcceptsChangedFoldersInsideIndexedRoot() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        let changedFolder = root.appendingPathComponent("Changed", isDirectory: true)
+        let unchangedFolder = root.appendingPathComponent("Unchanged", isDirectory: true)
+        try fileManager.createDirectory(at: changedFolder, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: unchangedFolder, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        let removedFile = changedFolder.appendingPathComponent("Removed.log")
+        let addedFile = changedFolder.appendingPathComponent("Added.log")
+        let retainedFile = unchangedFolder.appendingPathComponent("Retained.log")
+        try "removed".write(to: removedFile, atomically: true, encoding: .utf8)
+        try "retained".write(to: retainedFile, atomically: true, encoding: .utf8)
+
+        let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)", loadsSnapshotImmediately: false)
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil {
+            let stats = index.currentStats()
+            return !stats.isIndexing && stats.indexedCount >= 5
+        }
+
+        try fileManager.removeItem(at: removedFile)
+        try "added".write(to: addedFile, atomically: true, encoding: .utf8)
+        index.reconcileIndexedRootsInBackground(rootURLs: [changedFolder])
+
+        try await waitUntil(timeout: .seconds(10)) {
+            let removed = index.search(SearchRequest(
+                query: "Removed",
+                sort: SortSpec(column: .relevance, ascending: false)
+            ), maxResults: 10)
+            let added = index.search(SearchRequest(
+                query: "Added",
+                sort: SortSpec(column: .relevance, ascending: false)
+            ), maxResults: 10)
+            let retained = index.search(SearchRequest(
+                query: "Retained",
+                sort: SortSpec(column: .relevance, ascending: false)
+            ), maxResults: 10)
+            return removed.results.isEmpty
+                && added.results.contains { $0.record.path == addedFile.path }
+                && retained.results.contains { $0.record.path == retainedFile.path }
+        }
+    }
+
     @Test("visible bitset hides descendants of hidden parent rows")
     func visibleBitsetHidesDescendantsOfHiddenParentRows() throws {
         let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
