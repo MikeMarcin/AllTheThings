@@ -305,6 +305,8 @@ public final class FileIndex: @unchecked Sendable {
     private static let pathGramRecordLimit = 200_000
     private static let pathGramTotalPathByteLimit = 24 * 1024 * 1024
     private static let exactEmptyQuerySortLimit = 100_000
+    private static let exactInsightsRootAttributionLimit = 25_000
+    private static let storageSizeEnumerationLimit = 4_000
 
     public var onStatsChanged: (@MainActor @Sendable (IndexStats) -> Void)? {
         get {
@@ -6453,6 +6455,13 @@ public final class FileIndex: @unchecked Sendable {
         estimatedIndexBytes: UInt64
     ) -> [IndexRootInsight] {
         guard !roots.isEmpty else { return [] }
+        guard snapshot.count <= exactInsightsRootAttributionLimit else {
+            return approximateRootInsights(
+                snapshot: snapshot,
+                roots: roots,
+                estimatedIndexBytes: estimatedIndexBytes
+            )
+        }
 
         struct MutableRootInsight {
             var trackedFileCount = 0
@@ -6505,6 +6514,54 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
+    private static func approximateRootInsights(
+        snapshot: SearchSnapshot,
+        roots: [String],
+        estimatedIndexBytes: UInt64
+    ) -> [IndexRootInsight] {
+        let normalizedRoots = roots.map { URL(fileURLWithPath: $0, isDirectory: true).standardizedFileURL.path }
+        let counts = Dictionary(uniqueKeysWithValues: normalizedRoots.map { root in
+            let count: Int
+            if
+                let rowID = snapshot.store.rowID(forPath: root),
+                rowID >= 0,
+                rowID < snapshot.count,
+                snapshot.resultPrefixCounts.count > rowID
+            {
+                let end = min(
+                    max(snapshot.store.subtreeEnd(at: rowID), rowID + 1),
+                    snapshot.resultPrefixCounts.count - 1
+                )
+                count = max(0, snapshot.resultPrefixCounts[end] - snapshot.resultPrefixCounts[rowID])
+            } else {
+                count = 0
+            }
+            return (root, count)
+        })
+
+        let knownTotal = counts.values.reduce(0, +)
+        let fallbackPerRoot = knownTotal == 0 && !normalizedRoots.isEmpty
+            ? max(snapshot.resultCount / normalizedRoots.count, 0)
+            : 0
+        let total = max(knownTotal, fallbackPerRoot * normalizedRoots.count)
+
+        return normalizedRoots.map { root in
+            let count = counts[root] ?? fallbackPerRoot
+            let estimatedBytes = total == 0
+                ? 0
+                : UInt64((Double(count) / Double(total) * Double(estimatedIndexBytes)).rounded())
+            return IndexRootInsight(
+                path: root,
+                trackedFileCount: count,
+                directoryCount: 0,
+                hiddenCount: 0,
+                indexedContentBytes: 0,
+                pathByteWeight: UInt64(count),
+                estimatedIndexBytes: estimatedBytes
+            )
+        }
+    }
+
     private static func storageInsights(
         supportDirectory: URL,
         snapshotURL: URL,
@@ -6520,7 +6577,11 @@ public final class FileIndex: @unchecked Sendable {
             locations.append(IndexStorageLocationInsight(
                 label: label,
                 path: path,
-                allocatedBytes: allocatedSize(of: url, fileManager: fileManager)
+                allocatedBytes: allocatedSize(
+                    of: url,
+                    fileManager: fileManager,
+                    maximumDescendants: storageSizeEnumerationLimit
+                )
             ))
         }
 
@@ -6572,7 +6633,7 @@ public final class FileIndex: @unchecked Sendable {
             .map { url in
                 IndexSidecarInsight(
                     name: url.lastPathComponent,
-                    allocatedBytes: allocatedSize(of: url, fileManager: fileManager)
+                    allocatedBytes: allocatedSize(of: url, fileManager: fileManager, maximumDescendants: 0)
                 )
             }
             .sorted {
@@ -6583,10 +6644,17 @@ public final class FileIndex: @unchecked Sendable {
             }
     }
 
-    private static func allocatedSize(of url: URL, fileManager: FileManager) -> UInt64 {
+    private static func allocatedSize(
+        of url: URL,
+        fileManager: FileManager,
+        maximumDescendants: Int = Int.max
+    ) -> UInt64 {
         guard fileManager.fileExists(atPath: url.path) else { return 0 }
 
         var total: UInt64 = allocatedFileSize(of: url)
+        guard maximumDescendants != 0 else { return total }
+
+        var visited = 0
         if let enumerator = fileManager.enumerator(
             at: url,
             includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey, .totalFileAllocatedSizeKey, .fileAllocatedSizeKey],
@@ -6595,6 +6663,10 @@ public final class FileIndex: @unchecked Sendable {
         ) {
             for case let child as URL in enumerator {
                 total &+= allocatedFileSize(of: child)
+                visited += 1
+                if visited >= maximumDescendants {
+                    break
+                }
             }
         }
 
