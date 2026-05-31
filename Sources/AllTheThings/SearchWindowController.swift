@@ -1742,7 +1742,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private func shouldSuppressEmptySearchDuringIndexing(request: SearchRequest, stats: IndexStats? = nil) -> Bool {
         let stats = stats ?? indexStats
         return stats.isIndexing
-            && !stats.isRefreshing
+            && !stats.isReconciling
             && stats.searchableCount == 0
             && request.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
@@ -2276,7 +2276,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private func markFSEventBaselineIfNeeded(previous: IndexStats, current: IndexStats) {
         guard previous.isIndexing, !current.isIndexing, current.phase == .ready else { return }
         let completedFreshIndex = current.status.hasPrefix("Indexed") && !previous.resumedFromCheckpoint
-        let completedFullReconcile = current.status.hasPrefix("Refreshed")
+        let completedFullReconcile = current.status.hasPrefix("Reconciled")
         guard completedFreshIndex || completedFullReconcile else { return }
 
         let rootPaths = rootPaths(index.allRoots())
@@ -2343,23 +2343,17 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             self.fseventCatchUpStartedAt = nil
 
             switch action {
-            case let .update(paths, cursorUpdates):
+            case let .reconcile(rootPaths):
                 DiagnosticLogger.shared.log(
                     category: "fsevents",
-                    event: "fsevents.reconciliationUpdate",
+                    event: "fsevents.reconciliationReconcile",
                     fields: [
-                        "pathCount": .publicInt(paths.count),
-                        "paths": .pathArray(paths),
-                        "cursorUpdateCount": .publicInt(cursorUpdates.count)
+                        "rootCount": .publicInt(rootPaths.count),
+                        "roots": .pathArray(rootPaths)
                     ]
                 )
-                guard !paths.isEmpty else {
-                    self.fseventCursorStore.markBaseline(for: self.rootPaths(roots))
-                    self.updateStatus()
-                    return
-                }
-                self.index.update(paths: paths)
-                self.fseventCursorStore.update(cursorUpdates)
+                let rootURLs = rootPaths.map { URL(fileURLWithPath: $0, isDirectory: true) }
+                self.index.reconcileIndexedRootsInBackground(rootURLs: rootURLs)
             case let .upToDate(baselineEventID):
                 DiagnosticLogger.shared.log(
                     category: "fsevents",
@@ -2515,10 +2509,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             if indexStats.isUpdating {
                 return "\(indexStats.status) • \(indexStats.searchableCount.formatted()) searchable\(operationElapsedSuffix())"
             }
-            if indexStats.status == "Refreshing changed paths" {
+            if indexStats.status == "Reconciling changed folders" {
                 return "\(indexStats.status) • \(indexStats.searchableCount.formatted()) searchable\(operationElapsedSuffix())"
             }
-            let verb = indexStats.isRefreshing ? "Refreshing" : "Indexing"
+            let verb = indexStats.isReconciling ? "Reconciling" : "Indexing"
             return "\(verb) \(indexStats.discoveredCount.formatted()) discovered • \(indexStats.searchableCount.formatted()) searchable\(operationElapsedSuffix())"
         case .optimizing:
             return "\(indexStats.status) • \(indexStats.searchableCount.formatted()) searchable\(operationElapsedSuffix())"

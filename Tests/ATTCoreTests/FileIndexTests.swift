@@ -705,14 +705,14 @@ struct FileIndexTests {
 
         let indexingStats = recorder.snapshot().filter(\.isIndexing)
         #expect(indexingStats.contains { $0.discoveredCount > 0 })
-        #expect(!indexingStats.contains { $0.isRefreshing })
+        #expect(!indexingStats.contains { $0.isReconciling })
         #expect(!indexingStats.contains { $0.isUpdating })
         #expect(!indexingStats.contains { $0.indexedCount > 0 })
         #expect(index.currentStats().indexedCount >= 1_501)
     }
 
-    @Test("reconciliation publishes refreshing scan progress from zero")
-    func reconciliationPublishesRefreshingScanProgressFromZero() async throws {
+    @Test("reconciliation publishes reconciling scan progress from zero")
+    func reconciliationPublishesReconcilingScanProgressFromZero() async throws {
         let fileManager = FileManager.default
         let root = fileManager.temporaryDirectory
             .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
@@ -744,12 +744,12 @@ struct FileIndexTests {
         }
 
         let scanStats = recorder.snapshot().filter { $0.isIndexing && $0.phase == .scanning }
-        #expect(scanStats.contains { $0.status.hasPrefix("Refreshing") && $0.discoveredCount == 0 })
-        #expect(scanStats.contains { $0.status.hasPrefix("Refreshing") && $0.discoveredCount > 0 })
-        #expect(scanStats.allSatisfy { $0.isRefreshing })
+        #expect(scanStats.contains { $0.status.hasPrefix("Reconciling") && $0.discoveredCount == 0 })
+        #expect(scanStats.contains { $0.status.hasPrefix("Reconciling") && $0.discoveredCount > 0 })
+        #expect(scanStats.allSatisfy { $0.isReconciling })
         #expect(!scanStats.contains { $0.isUpdating })
         #expect(!scanStats.contains { $0.status.hasPrefix("Indexing") })
-        #expect(!index.currentStats().isRefreshing)
+        #expect(!index.currentStats().isReconciling)
     }
 
     @Test("loaded snapshots reconcile changes made while app was closed")
@@ -928,23 +928,23 @@ struct FileIndexTests {
         #expect(!paths.contains(ignoredFile.path))
         #expect(!paths.contains(ignoredChild.path))
 
-        let refreshedVisible = root.appendingPathComponent("Refreshed.swift")
-        let refreshedIgnored = root.appendingPathComponent("Refreshed.tmp")
-        try "visible".write(to: refreshedVisible, atomically: true, encoding: .utf8)
-        try "ignored".write(to: refreshedIgnored, atomically: true, encoding: .utf8)
-        index.update(paths: [refreshedVisible.path, refreshedIgnored.path])
+        let updatedVisible = root.appendingPathComponent("Updated.swift")
+        let updatedIgnored = root.appendingPathComponent("Updated.tmp")
+        try "visible".write(to: updatedVisible, atomically: true, encoding: .utf8)
+        try "ignored".write(to: updatedIgnored, atomically: true, encoding: .utf8)
+        index.update(paths: [updatedVisible.path, updatedIgnored.path])
 
         try await waitUntil {
             response = index.search(SearchRequest(
                 query: "",
                 sort: SortSpec(column: .name, ascending: true)
             ), maxResults: 20)
-            return response.results.contains { $0.record.path == refreshedVisible.path }
+            return response.results.contains { $0.record.path == updatedVisible.path }
         }
 
         paths = Set(response.results.map(\.record.path))
-        #expect(paths.contains(refreshedVisible.path))
-        #expect(!paths.contains(refreshedIgnored.path))
+        #expect(paths.contains(updatedVisible.path))
+        #expect(!paths.contains(updatedIgnored.path))
     }
 
     @Test("search responses identify the source snapshot revision")
