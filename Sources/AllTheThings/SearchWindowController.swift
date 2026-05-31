@@ -739,8 +739,11 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         countLabel.textColor = .secondaryLabelColor
         countLabel.lineBreakMode = .byTruncatingTail
+        countLabel.setContentHuggingPriority(.required, for: .horizontal)
+        countLabel.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
         statusLabel.textColor = .tertiaryLabelColor
         statusLabel.lineBreakMode = .byTruncatingMiddle
+        statusLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
         statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         configureMascotSlotView()
