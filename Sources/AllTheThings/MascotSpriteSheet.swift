@@ -6,6 +6,7 @@ enum OperationMascotAnimation: String, CaseIterable {
     case indexing
     case searching
     case optimizing
+    case updating
     case fileChanged
     case success
     case error
@@ -16,6 +17,7 @@ enum OperationMascotAnimation: String, CaseIterable {
         case .indexing: "NibOperationIndexingStrip"
         case .searching: "NibOperationSearchingStrip"
         case .optimizing: "NibOperationOptimizingStrip"
+        case .updating: "NibOperationFileChangedStrip"
         case .fileChanged: "NibOperationFileChangedStrip"
         case .success: "NibOperationSuccessStrip"
         case .error: "NibOperationErrorStrip"
@@ -28,6 +30,7 @@ enum OperationMascotAnimation: String, CaseIterable {
         case .indexing: 16
         case .searching: 16
         case .optimizing: 16
+        case .updating: 6
         case .fileChanged: 6
         case .success: 8
         case .error: 6
@@ -40,6 +43,7 @@ enum OperationMascotAnimation: String, CaseIterable {
         case .indexing: 5
         case .searching: 8
         case .optimizing: 5
+        case .updating: 6
         case .fileChanged: 6
         case .success: 6
         case .error: 5
@@ -48,7 +52,7 @@ enum OperationMascotAnimation: String, CaseIterable {
 
     var loops: Bool {
         switch self {
-        case .idle, .indexing, .searching, .optimizing:
+        case .idle, .indexing, .searching, .optimizing, .updating:
             true
         case .fileChanged, .success, .error:
             false
@@ -61,6 +65,7 @@ enum OperationMascotAnimation: String, CaseIterable {
         case .indexing: "Indexing files"
         case .searching: "Searching files"
         case .optimizing: "Optimizing files"
+        case .updating: "Updating changed paths"
         case .fileChanged: "File changed"
         case .success: "Operation completed"
         case .error: "Operation needs attention"
@@ -71,7 +76,7 @@ enum OperationMascotAnimation: String, CaseIterable {
         switch self {
         case .idle:
             0
-        case .searching, .fileChanged, .success, .error:
+        case .searching, .updating, .fileChanged, .success, .error:
             1
         case .indexing, .optimizing:
             2
@@ -785,7 +790,7 @@ final class OperationMascotCoordinator {
             amplitude = 2.4
             duration = 1.15
             tilt = 0.025
-        case .fileChanged, .success:
+        case .updating, .fileChanged, .success:
             amplitude = 2.0
             duration = 0.75
             tilt = 0.02

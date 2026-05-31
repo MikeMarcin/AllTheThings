@@ -1034,7 +1034,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             self.isSetupMascotTuckInProgress = false
             self.indexingSetupOverlay.setMascotVisible(true)
             self.updateSetupSuggestions()
-            self.updateExpandedMascotForOperation(animated: false)
+            self.updateExpandedMascotForOperation(animated: true)
             self.updateMascotPlacementVisibility()
         }
     }
@@ -1709,10 +1709,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     private func handleStatsChanged(_ stats: IndexStats) {
         let previousStats = indexStats
-        let previousPhase = previousStats.phase
         indexStats = stats
         markFSEventBaselineIfNeeded(previous: previousStats, current: stats)
-        handleMascotTransition(from: previousPhase, to: stats.phase)
+        handleMascotTransition(from: previousStats, to: stats)
         updateStatus()
         updateLoadingOverlay()
 
@@ -1881,17 +1880,17 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
     }
 
-    private func handleMascotTransition(from previousPhase: IndexPhase, to nextPhase: IndexPhase) {
+    private func handleMascotTransition(from previousStats: IndexStats, to nextStats: IndexStats) {
         updateMascotPersistentAnimation()
-        updateExpandedMascotForOperation(from: previousPhase, animated: true)
+        updateExpandedMascotForOperation(from: previousStats.phase, animated: true)
 
-        if nextPhase == .failed {
+        if nextStats.phase == .failed {
             playMascotTransient(.error)
             return
         }
 
         let completedPhases: Set<IndexPhase> = [.scanning, .optimizing, .saving]
-        if completedPhases.contains(previousPhase), nextPhase == .ready {
+        if completedPhases.contains(previousStats.phase), nextStats.phase == .ready, !previousStats.isUpdating {
             playMascotTransient(.success)
         }
     }
@@ -1912,7 +1911,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     @objc private func toggleExpandedMascot(_ sender: Any?) {
-        let importantOperationActive = isImportantMascotOperation(indexStats.phase)
+        let importantOperationActive = isImportantMascotOperation(indexStats)
 
         if isExpandedMascotVisible {
             userExpandedMascot = false
@@ -1932,7 +1931,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func updateExpandedMascotForOperation(from previousPhase: IndexPhase? = nil, animated: Bool) {
-        let importantOperationActive = isImportantMascotOperation(indexStats.phase)
+        let importantOperationActive = isImportantMascotOperation(indexStats)
         let wasOperationActive = wasImportantMascotOperationActive
 
         if importantOperationActive && !wasOperationActive {
@@ -1966,7 +1965,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             self.pendingMascotExpansion = nil
 
             guard
-                self.isImportantMascotOperation(self.indexStats.phase),
+                self.isImportantMascotOperation(self.indexStats),
                 !self.userCollapsedExpandedMascotDuringOperation
             else {
                 return
@@ -2011,6 +2010,11 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
     }
 
+    private func isImportantMascotOperation(_ stats: IndexStats) -> Bool {
+        guard !stats.isUpdating else { return false }
+        return isImportantMascotOperation(stats.phase)
+    }
+
     private func isImportantMascotOperation(_ phase: IndexPhase) -> Bool {
         switch phase {
         case .scanning, .optimizing, .saving:
@@ -2045,6 +2049,14 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         return mascotImageView.convert(mascotImageView.bounds, to: view)
     }
 
+    private func shouldTweenExpandedMascotTransition(requested animated: Bool) -> Bool {
+        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
+            return false
+        }
+
+        return animated || view.window != nil
+    }
+
     private func setExpandedMascotVisible(_ visible: Bool, animated: Bool) {
         guard isExpandedMascotVisible != visible else {
             updateMascotPlacementVisibility()
@@ -2061,6 +2073,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let footerAnchorX = footerMascotAnchorX()
         let targetAnchorX = visible ? expandedMascotAnchorX(for: targetSize) : footerAnchorX
         let targetBottomOffset = expandedMascotImageBottomOffset(for: targetSize)
+        let shouldTween = shouldTweenExpandedMascotTransition(requested: animated)
         if visible && !loadingOverlay.isHidden {
             expandedMascotCenterXConstraint?.constant = expandedMascotAnchorX(for: targetSize)
             expandedMascotImageBottomConstraint?.constant = targetBottomOffset
@@ -2078,7 +2091,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             view.layoutSubtreeIfNeeded()
         }
 
-        guard animated else {
+        guard shouldTween else {
             expandedMascotCenterXConstraint?.constant = targetAnchorX
             expandedMascotImageBottomConstraint?.constant = targetBottomOffset
             expandedMascotCoordinator?.setDisplaySize(targetSize)
@@ -2122,6 +2135,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func persistentMascotAnimation() -> OperationMascotAnimation {
+        if indexStats.isUpdating {
+            return .updating
+        }
+
         switch indexStats.phase {
         case .loading, .scanning:
             return .indexing
