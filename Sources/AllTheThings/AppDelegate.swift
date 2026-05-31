@@ -333,8 +333,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @MainActor
-    func showSettings(section: SettingsSection = .general) {
+    func showSettings(section: SettingsSection? = nil) {
         presentSettingsWindow(section: section)
+    }
+
+    @MainActor
+    func showInsights() {
+        presentInsightsWindow()
     }
 
     @objc @MainActor private func showSettingsWindow(_ sender: Any?) {
@@ -496,19 +501,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @MainActor
-    private func presentSettingsWindow(section: SettingsSection = .general) {
+    private func presentSettingsWindow(section: SettingsSection? = nil) {
         let controller: SettingsWindowController
         if let existingController = settingsWindowController {
             controller = existingController
         } else {
-            controller = SettingsWindowController(defaults: defaults)
+            controller = SettingsWindowController(
+                defaults: defaults,
+                index: fileIndex,
+                reindexHandler: { [weak self] in
+                    self?.reindexFromCurrentSettings()
+                }
+            )
             settingsWindowController = controller
         }
 
-        controller.selectSection(section)
+        if let section {
+            controller.selectSection(section)
+        }
         controller.showWindow(nil)
         controller.window?.makeKeyAndOrderFront(nil)
         NSApp.activate()
+    }
+
+    @MainActor
+    private func reindexFromCurrentSettings() {
+        guard AppSettings.indexingSetupCompleted(defaults: defaults) else { return }
+        let roots = AppSettings.indexedRoots(defaults: defaults)
+        guard !roots.isEmpty else { return }
+
+        if let windowController {
+            windowController.reindexConfiguredRootsFromSettings()
+            return
+        }
+
+        fileIndex.setPublishesSearchableSnapshotsDuringScan(false)
+        fileIndex.updateExclusionPatterns(AppSettings.exclusionPatterns(defaults: defaults))
+        fileIndex.replaceRootsAndRebuild(roots, mode: .fresh)
     }
 
     @MainActor
@@ -523,11 +552,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 clearCachedIndexHandler: { [weak self] in
                     guard let self else { return }
                     try self.fileIndex.clearPersistedIndexData()
-                    guard AppSettings.indexingSetupCompleted(defaults: self.defaults) else { return }
-                    let roots = AppSettings.indexedRoots(defaults: self.defaults)
-                    guard !roots.isEmpty else { return }
-                    self.fileIndex.setPublishesSearchableSnapshotsDuringScan(false)
-                    self.fileIndex.replaceRootsAndRebuild(roots, mode: .fresh)
+                    self.reindexFromCurrentSettings()
                 }
             )
             insightsWindowController = controller
