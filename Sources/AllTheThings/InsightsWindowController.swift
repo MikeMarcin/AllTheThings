@@ -63,6 +63,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
     private var refreshTimer: Timer?
     private var latestSnapshot: IndexInsightsSnapshot?
     private var displayedRoots: [IndexRootInsight] = []
+    private var isRefreshingInsights = false
 
     init(
         index: FileIndex,
@@ -293,10 +294,13 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
     }
 
     private func refreshInsights() {
+        guard !isRefreshingInsights else { return }
+        isRefreshingInsights = true
         let index = self.index
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let snapshot = index.currentInsightsSnapshot()
             DispatchQueue.main.async {
+                self?.isRefreshingInsights = false
                 self?.apply(snapshot: snapshot)
             }
         }
