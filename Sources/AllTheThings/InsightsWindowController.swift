@@ -1,5 +1,6 @@
 import AppKit
 import ATTCore
+import Carbon.HIToolbox
 
 @MainActor
 final class InsightsWindowController: NSWindowController {
@@ -23,7 +24,7 @@ final class InsightsWindowController: NSWindowController {
         )
         viewController.preferredContentSize = contentSize
 
-        let window = NSWindow(
+        let window = InsightsWindow(
             contentRect: NSRect(origin: .zero, size: contentSize),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
@@ -87,6 +88,23 @@ final class InsightsWindowController: NSWindowController {
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+}
+
+private final class InsightsWindow: NSWindow {
+    override func sendEvent(_ event: NSEvent) {
+        if shouldClose(for: event) {
+            close()
+            return
+        }
+
+        super.sendEvent(event)
+    }
+
+    private func shouldClose(for event: NSEvent) -> Bool {
+        event.type == .keyDown
+            && event.keyCode == UInt16(kVK_Escape)
+            && event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty
     }
 }
 
