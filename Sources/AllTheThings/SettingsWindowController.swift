@@ -4,9 +4,17 @@ import Carbon.HIToolbox
 
 @MainActor
 final class SettingsWindowController: NSWindowController {
-    init(defaults: UserDefaults = .standard) {
+    init(
+        defaults: UserDefaults = .standard,
+        index: FileIndex,
+        reindexHandler: @escaping @MainActor () -> Void
+    ) {
         let contentSize = NSSize(width: 780, height: 640)
-        let viewController = SettingsViewController(defaults: defaults)
+        let viewController = SettingsViewController(
+            defaults: defaults,
+            index: index,
+            reindexHandler: reindexHandler
+        )
         viewController.preferredContentSize = contentSize
         let window = SettingsWindow(
             contentRect: NSRect(origin: .zero, size: contentSize),
@@ -83,6 +91,8 @@ enum SettingsSection {
 @MainActor
 private final class SettingsViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate {
     private let defaults: UserDefaults
+    private let index: FileIndex
+    private let reindexHandler: @MainActor () -> Void
     private let contentContainer = NSView()
     private let appearanceSidebarRow = SidebarRow(section: .appearance)
     private let generalSidebarRow = SidebarRow(section: .general)
@@ -119,6 +129,9 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     private let rootsTableView = NSTableView()
     private let addRootButton = NSButton()
     private let resetRootsButton = NSButton()
+    private let indexSizeValueLabel = NSTextField(labelWithString: "")
+    private let indexCreatedValueLabel = NSTextField(labelWithString: "")
+    private let reindexButton = NSButton()
     private let exclusionsTableView = NSTableView()
     private let addExclusionButton = NSButton()
     private let resetExclusionsButton = NSButton()
@@ -139,8 +152,14 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     private static let indexedRootsMaximumVisibleRows = 8
     private static let exclusionPatternsMaximumVisibleRows = 10
 
-    init(defaults: UserDefaults) {
+    init(
+        defaults: UserDefaults,
+        index: FileIndex,
+        reindexHandler: @escaping @MainActor () -> Void
+    ) {
         self.defaults = defaults
+        self.index = index
+        self.reindexHandler = reindexHandler
         AppSettings.registerDefaults(defaults)
         super.init(nibName: nil, bundle: nil)
     }
@@ -487,6 +506,10 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     private func makeIndexedFoldersPage() -> NSView {
         let (scrollView, contentView) = makePageScrollView()
 
+        let indexLabel = makeSectionLabel("Index")
+        configureIndexSummaryControls()
+        let indexCard = makeIndexSummaryCard()
+
         let rootsHeader = NSStackView()
         rootsHeader.translatesAutoresizingMaskIntoConstraints = false
         rootsHeader.orientation = .horizontal
@@ -562,6 +585,8 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         indexedFoldersAccessWarningCollapsedHeightConstraint = warningCollapsedHeightConstraint
         indexedRootsCardTopConstraint = rootsCardTopConstraint
 
+        contentView.addSubview(indexLabel)
+        contentView.addSubview(indexCard)
         contentView.addSubview(rootsHeader)
         contentView.addSubview(accessWarning)
         contentView.addSubview(rootsCard)
@@ -569,9 +594,17 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         contentView.addSubview(exclusionsCard)
 
         NSLayoutConstraint.activate([
-            rootsHeader.topAnchor.constraint(equalTo: contentView.safeAreaLayoutGuide.topAnchor, constant: 26),
-            rootsHeader.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 36),
-            rootsHeader.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -36),
+            indexLabel.topAnchor.constraint(equalTo: contentView.safeAreaLayoutGuide.topAnchor, constant: 26),
+            indexLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 36),
+            indexLabel.trailingAnchor.constraint(lessThanOrEqualTo: contentView.trailingAnchor, constant: -36),
+
+            indexCard.topAnchor.constraint(equalTo: indexLabel.bottomAnchor, constant: 12),
+            indexCard.leadingAnchor.constraint(equalTo: indexLabel.leadingAnchor),
+            indexCard.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -36),
+
+            rootsHeader.topAnchor.constraint(equalTo: indexCard.bottomAnchor, constant: 28),
+            rootsHeader.leadingAnchor.constraint(equalTo: indexCard.leadingAnchor),
+            rootsHeader.trailingAnchor.constraint(equalTo: indexCard.trailingAnchor),
             resetRootsButton.widthAnchor.constraint(equalToConstant: 28),
             resetRootsButton.heightAnchor.constraint(equalToConstant: 24),
             addRootButton.widthAnchor.constraint(equalToConstant: 74),
@@ -603,6 +636,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
             contentBottomConstraint
         ])
 
+        updateIndexSummary()
         updateIndexedFoldersAccessWarning()
         return scrollView
     }
@@ -619,6 +653,30 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         control.translatesAutoresizingMaskIntoConstraints = false
         control.target = self
         control.action = action
+    }
+
+    private func configureIndexSummaryControls() {
+        for label in [indexSizeValueLabel, indexCreatedValueLabel] {
+            label.translatesAutoresizingMaskIntoConstraints = false
+            label.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+            label.textColor = .labelColor
+            label.alignment = .right
+            label.lineBreakMode = .byTruncatingTail
+            label.setContentHuggingPriority(.required, for: .horizontal)
+            label.setContentCompressionResistancePriority(.required, for: .horizontal)
+        }
+
+        configureTextButton(
+            reindexButton,
+            title: "Reindex",
+            symbol: "arrow.clockwise",
+            action: #selector(reindexIndexedFolders(_:))
+        )
+
+        NSLayoutConstraint.activate([
+            indexSizeValueLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 150),
+            indexCreatedValueLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 150)
+        ])
     }
 
     private func configureThemeControl() {
@@ -852,6 +910,26 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         ])
 
         return card
+    }
+
+    private func makeIndexSummaryCard() -> NSView {
+        makeSettingsCard(rows: [
+            makeControlRow(
+                title: "Size on disk",
+                detail: "Current persisted index package size.",
+                control: indexSizeValueLabel
+            ),
+            makeControlRow(
+                title: "Created on",
+                detail: "Persisted index package creation timestamp.",
+                control: indexCreatedValueLabel
+            ),
+            makeControlRow(
+                title: "Reindex",
+                detail: "Rebuild the local index from the folders below.",
+                control: reindexButton
+            )
+        ])
     }
 
     private func makeFullDiskAccessCard() -> NSView {
@@ -1112,6 +1190,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         rootsTableView.reloadData()
         updateIndexedFolderCardHeights()
         updateIndexedFoldersAccessWarning()
+        updateIndexSummary()
     }
 
     private func renderExclusionPatterns() {
@@ -1129,6 +1208,13 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
             itemCount: exclusionPatterns.count,
             maximumVisibleRows: Self.exclusionPatternsMaximumVisibleRows
         )
+    }
+
+    private func updateIndexSummary() {
+        let snapshot = index.currentInsightsSnapshot()
+        indexSizeValueLabel.stringValue = byteString(snapshot.storage.indexPackageBytes)
+        indexCreatedValueLabel.stringValue = dateTimeString(snapshot.storage.indexPackageCreatedAt)
+        reindexButton.isEnabled = AppSettings.indexingSetupCompleted(defaults: defaults) && !indexedRoots.isEmpty
     }
 
     private func updateIndexedFoldersAccessWarning() {
@@ -1150,6 +1236,21 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     private static func tableCardHeight(itemCount: Int, maximumVisibleRows: Int) -> CGFloat {
         let visibleRows = min(max(itemCount, 1), maximumVisibleRows)
         return CGFloat(visibleRows) * settingsTableRowHeight
+    }
+
+    private func byteString(_ bytes: UInt64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        formatter.allowsNonnumericFormatting = false
+        return formatter.string(fromByteCount: Int64(min(bytes, UInt64(Int64.max))))
+    }
+
+    private func dateTimeString(_ date: Date?) -> String {
+        guard let date else { return "Not created" }
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int {
@@ -1607,6 +1708,16 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         } else {
             completion(panel.runModal())
         }
+    }
+
+    @objc private func reindexIndexedFolders(_ sender: NSButton) {
+        guard AppSettings.indexingSetupCompleted(defaults: defaults), !indexedRoots.isEmpty else {
+            updateIndexSummary()
+            return
+        }
+
+        reindexHandler()
+        updateIndexSummary()
     }
 
     @objc private func removeIndexedRoot(_ sender: NSButton) {

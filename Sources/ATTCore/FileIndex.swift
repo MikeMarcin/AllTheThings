@@ -6934,6 +6934,7 @@ public final class FileIndex: @unchecked Sendable {
             return IndexStorageInsights(
                 totalATTDataBytes: package.indexPackageBytes,
                 indexPackageBytes: package.indexPackageBytes,
+                indexPackageCreatedAt: package.indexPackageCreatedAt,
                 cacheBytes: 0,
                 measuredAt: nil,
                 isMeasuring: true,
@@ -6945,6 +6946,7 @@ public final class FileIndex: @unchecked Sendable {
         return IndexStorageInsights(
             totalATTDataBytes: max(cached.totalATTDataBytes, package.indexPackageBytes),
             indexPackageBytes: package.indexPackageBytes,
+            indexPackageCreatedAt: package.indexPackageCreatedAt,
             cacheBytes: cached.cacheBytes,
             measuredAt: cached.measuredAt,
             isMeasuring: storageInsightsLock.withLock { storageInsightsRefreshInFlight },
@@ -6992,10 +6994,10 @@ public final class FileIndex: @unchecked Sendable {
     private static func packageStorageInsights(
         snapshotURL: URL,
         fileManager: FileManager
-    ) -> (indexPackageBytes: UInt64, sidecars: [IndexSidecarInsight]) {
+    ) -> (indexPackageBytes: UInt64, indexPackageCreatedAt: Date?, sidecars: [IndexSidecarInsight]) {
         let sidecars = sidecarInsights(in: snapshotURL, fileManager: fileManager)
         let packageBytes = sidecars.reduce(UInt64(0)) { $0 &+ $1.allocatedBytes }
-        return (packageBytes, sidecars)
+        return (packageBytes, creationDate(of: snapshotURL, fileManager: fileManager), sidecars)
     }
 
     private static func storageInsights(
@@ -7043,6 +7045,7 @@ public final class FileIndex: @unchecked Sendable {
         return IndexStorageInsights(
             totalATTDataBytes: totalBytes,
             indexPackageBytes: indexPackageBytes,
+            indexPackageCreatedAt: creationDate(of: snapshotURL, fileManager: fileManager),
             cacheBytes: cacheBytes,
             measuredAt: Date(),
             isMeasuring: false,
@@ -7076,6 +7079,11 @@ public final class FileIndex: @unchecked Sendable {
                 }
                 return $0.name < $1.name
             }
+    }
+
+    private static func creationDate(of url: URL, fileManager: FileManager) -> Date? {
+        guard fileManager.fileExists(atPath: url.path) else { return nil }
+        return (try? url.resourceValues(forKeys: [.creationDateKey]))?.creationDate
     }
 
     private static func allocatedSize(

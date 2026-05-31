@@ -125,6 +125,7 @@ public struct IndexRootInsight: Codable, Equatable, Sendable {
 public struct IndexStorageInsights: Codable, Equatable, Sendable {
     public let totalATTDataBytes: UInt64
     public let indexPackageBytes: UInt64
+    public let indexPackageCreatedAt: Date?
     public let cacheBytes: UInt64
     public let measuredAt: Date?
     public let isMeasuring: Bool
@@ -134,6 +135,7 @@ public struct IndexStorageInsights: Codable, Equatable, Sendable {
     public init(
         totalATTDataBytes: UInt64,
         indexPackageBytes: UInt64,
+        indexPackageCreatedAt: Date? = nil,
         cacheBytes: UInt64,
         measuredAt: Date? = nil,
         isMeasuring: Bool = false,
@@ -142,6 +144,7 @@ public struct IndexStorageInsights: Codable, Equatable, Sendable {
     ) {
         self.totalATTDataBytes = totalATTDataBytes
         self.indexPackageBytes = indexPackageBytes
+        self.indexPackageCreatedAt = indexPackageCreatedAt
         self.cacheBytes = cacheBytes
         self.measuredAt = measuredAt
         self.isMeasuring = isMeasuring

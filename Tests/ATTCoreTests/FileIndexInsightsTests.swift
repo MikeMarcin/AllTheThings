@@ -51,6 +51,28 @@ struct FileIndexInsightsTests {
         #expect(snapshot.roots.reduce(UInt64(0)) { $0 + $1.estimatedIndexBytes } > 0)
     }
 
+    @Test("storage insights reports index package creation date when package exists")
+    func storageInsightsReportsIndexPackageCreationDateWhenPackageExists() throws {
+        let fileManager = FileManager.default
+        let applicationName = "AllTheThingsInsights-\(UUID().uuidString)"
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        defer {
+            try? fileManager.removeItem(at: index.dataDirectoryURL)
+        }
+
+        #expect(index.currentInsightsSnapshot().storage.indexPackageCreatedAt == nil)
+
+        index.replaceRecordsForTesting([
+            makeRecord(path: "/tmp/AllTheThingsInsights/alpha.txt", size: 12)
+        ])
+        index.persistSnapshotForTesting()
+
+        let snapshot = index.currentInsightsSnapshot()
+        let createdAt = try #require(snapshot.storage.indexPackageCreatedAt)
+        #expect(snapshot.storage.indexPackageBytes > 0)
+        #expect(createdAt <= Date())
+    }
+
     @Test("nested roots attribute descendants to deepest configured root")
     func nestedRootsAttributeDescendantsToDeepestConfiguredRoot() async throws {
         let fileManager = FileManager.default

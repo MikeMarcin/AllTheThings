@@ -76,6 +76,12 @@ final class SearchWindowController: NSWindowController {
         viewController.focusSearchField(selectText: selectText)
     }
 
+    @MainActor
+    func reindexConfiguredRootsFromSettings() {
+        guard let viewController = window?.contentViewController as? SearchViewController else { return }
+        viewController.reindexConfiguredRootsFromSettings()
+    }
+
     private static func startupContentSize() -> NSSize {
         guard let visibleFrame = NSScreen.main?.visibleFrame else {
             return WindowLayout.preferredContentSize
@@ -321,8 +327,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private let openButton = NSButton()
     private let revealButton = NSButton()
     private let copyButton = NSButton()
-    private let addScopeButton = NSButton()
-    private let reindexButton = NSButton()
+    private let settingsButton = NSButton()
+    private let insightsButton = NSButton()
     private let loadingOverlay = ThemedBackgroundView(backgroundColor: NSColor.windowBackgroundColor.withAlphaComponent(0.92))
     private let loadingMascotImageView = NSImageView()
     private let loadingLabel = NSTextField(labelWithString: "Loading file list...")
@@ -682,13 +688,13 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         searchField.translatesAutoresizingMaskIntoConstraints = false
         topBar.addArrangedSubview(searchField)
 
-        configureToolbarButton(addScopeButton, symbol: "folder.badge.plus", tooltip: "Add indexed folder", action: #selector(addScope(_:)))
-        configureToolbarButton(reindexButton, symbol: "arrow.clockwise", tooltip: "Reindex scopes", action: #selector(reindex(_:)))
+        configureToolbarButton(settingsButton, symbol: "gearshape", tooltip: "Open Settings", action: #selector(openSettings(_:)))
+        configureToolbarButton(insightsButton, symbol: "chart.pie", tooltip: "Open Insights", action: #selector(openInsights(_:)))
         configureToolbarButton(openButton, symbol: "arrow.up.forward.app", tooltip: "Open selected file", action: #selector(openSelected(_:)))
         configureToolbarButton(revealButton, symbol: "folder", tooltip: "Reveal selected file in Finder", action: #selector(revealSelected(_:)))
         configureToolbarButton(copyButton, symbol: "doc.on.doc", tooltip: "Copy selected path", action: #selector(copySelectedPath(_:)))
 
-        for button in [addScopeButton, reindexButton, openButton, revealButton, copyButton] {
+        for button in [settingsButton, insightsButton, openButton, revealButton, copyButton] {
             topBar.addArrangedSubview(button)
         }
 
@@ -948,7 +954,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             hotKey: AppSettings.globalSearchHotKey(defaults: defaults),
             defaults: defaults
         )
-        (NSApp.delegate as? AppDelegate)?.showSettings()
+        (NSApp.delegate as? AppDelegate)?.showSettings(section: .general)
         updateSetupSuggestions()
     }
 
@@ -2269,6 +2275,18 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         index.replaceRootsAndRebuild(indexedRoots, mode: .fresh)
     }
 
+    func reindexConfiguredRootsFromSettings() {
+        indexedRoots = AppSettings.indexedRoots(defaults: defaults)
+        index.updateExclusionPatterns(AppSettings.exclusionPatterns(defaults: defaults))
+        refreshRootDisplayNames()
+        guard AppSettings.indexingSetupCompleted(defaults: defaults), !indexedRoots.isEmpty else { return }
+        didRequestInitialSnapshotLoad = true
+        didRequestInitialRebuild = true
+        prepareFSEventsForFreshIndexBuild()
+        updateScanSnapshotPublishingPreference()
+        index.replaceRootsAndRebuild(indexedRoots, mode: .fresh)
+    }
+
     private func indexSettingsMatchConfiguredSettings() -> Bool {
         guard index.allExclusionPatterns() == AppSettings.exclusionPatterns(defaults: defaults) else {
             return false
@@ -2556,7 +2574,6 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         openButton.isEnabled = enabled
         revealButton.isEnabled = enabled
         copyButton.isEnabled = enabled
-        reindexButton.isEnabled = AppSettings.indexingSetupCompleted(defaults: defaults) && !indexedRoots.isEmpty
     }
 
     private func selectedRecord() -> FileRecord? {
@@ -2750,51 +2767,12 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         scheduleSearch(force: true)
     }
 
-    @objc private func addScope(_ sender: Any?) {
-        presentIndexedFolderChooser(prompt: "Index")
+    @objc private func openSettings(_ sender: Any?) {
+        (NSApp.delegate as? AppDelegate)?.showSettings()
     }
 
-    private func presentIndexedFolderChooser(prompt: String) {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = true
-        panel.prompt = prompt
-
-        guard panel.runModal() == .OK else { return }
-
-        let existing = Set(indexedRoots.map { $0.standardizedFileURL.path })
-        let additions = panel.urls
-            .map(\.standardizedFileURL)
-            .filter { !existing.contains($0.path) }
-
-        guard !additions.isEmpty else { return }
-        beginSetupMascotTuckAwayIfPossible()
-        indexedRoots.append(contentsOf: additions)
-        refreshRootDisplayNames()
-        saveRoots()
-        guard AppSettings.indexingSetupCompleted(defaults: defaults) else {
-            updateSetupSuggestions()
-            updateStatus()
-            updateActionButtons()
-            return
-        }
-
-        didRequestInitialSnapshotLoad = true
-        didRequestInitialRebuild = true
-        prepareFSEventsForFreshIndexBuild()
-        updateScanSnapshotPublishingPreference()
-        index.replaceRootsAndRebuild(indexedRoots, mode: .fresh)
-        updateSetupSuggestions()
-    }
-
-    @objc private func reindex(_ sender: Any?) {
-        guard AppSettings.indexingSetupCompleted(defaults: defaults), !indexedRoots.isEmpty else { return }
-        didRequestInitialSnapshotLoad = true
-        didRequestInitialRebuild = true
-        prepareFSEventsForFreshIndexBuild()
-        updateScanSnapshotPublishingPreference()
-        index.replaceRootsAndRebuild(indexedRoots, mode: .fresh)
+    @objc private func openInsights(_ sender: Any?) {
+        (NSApp.delegate as? AppDelegate)?.showInsights()
     }
 
     @objc private func searchFieldDidChange(_ sender: NSSearchField) {
