@@ -156,8 +156,8 @@ struct MemoryBudgetTests {
         #expect(response.results.contains { $0.record.path == longChild })
     }
 
-    @Test("refresh storms are coalesced")
-    func refreshStormsAreCoalesced() async throws {
+    @Test("update storms are coalesced")
+    func updateStormsAreCoalesced() async throws {
         let fileManager = FileManager.default
         let root = fileManager.temporaryDirectory
             .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
@@ -168,7 +168,7 @@ struct MemoryBudgetTests {
 
         var files: [URL] = []
         for offset in 0..<20 {
-            let file = root.appendingPathComponent("Refresh\(offset).swift")
+            let file = root.appendingPathComponent("Update\(offset).swift")
             try "old".write(to: file, atomically: true, encoding: .utf8)
             files.append(file)
         }
@@ -187,7 +187,7 @@ struct MemoryBudgetTests {
         let before = index.currentDiagnostics()
         for file in files {
             try "new".write(to: file, atomically: true, encoding: .utf8)
-            index.refresh(paths: [file.path])
+            index.update(paths: [file.path])
         }
 
         try await waitUntil {

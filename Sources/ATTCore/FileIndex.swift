@@ -230,6 +230,8 @@ public enum RebuildMode: Sendable {
 public struct IndexStats: Codable, Equatable, Sendable {
     public let indexedCount: Int
     public let isIndexing: Bool
+    public let isRefreshing: Bool
+    public let isUpdating: Bool
     public let isLoadingSnapshot: Bool
     public let phase: IndexPhase
     public let discoveredCount: Int
@@ -242,9 +244,29 @@ public struct IndexStats: Codable, Equatable, Sendable {
     public let lastCheckpointAt: Date?
     public let resumedFromCheckpoint: Bool
 
+    private enum CodingKeys: String, CodingKey {
+        case indexedCount
+        case isIndexing
+        case isRefreshing
+        case isUpdating
+        case isLoadingSnapshot
+        case phase
+        case discoveredCount
+        case searchableCount
+        case optimizedCount
+        case snapshotRevision
+        case status
+        case lastUpdated
+        case activeOperationStartedAt
+        case lastCheckpointAt
+        case resumedFromCheckpoint
+    }
+
     public init(
         indexedCount: Int,
         isIndexing: Bool,
+        isRefreshing: Bool = false,
+        isUpdating: Bool = false,
         isLoadingSnapshot: Bool = false,
         phase: IndexPhase? = nil,
         discoveredCount: Int? = nil,
@@ -259,6 +281,8 @@ public struct IndexStats: Codable, Equatable, Sendable {
     ) {
         self.indexedCount = indexedCount
         self.isIndexing = isIndexing
+        self.isRefreshing = isRefreshing
+        self.isUpdating = isUpdating
         self.isLoadingSnapshot = isLoadingSnapshot
         self.phase = phase ?? (isLoadingSnapshot ? .loading : (isIndexing ? .scanning : .ready))
         self.discoveredCount = discoveredCount ?? indexedCount
@@ -270,6 +294,29 @@ public struct IndexStats: Codable, Equatable, Sendable {
         self.activeOperationStartedAt = activeOperationStartedAt
         self.lastCheckpointAt = lastCheckpointAt
         self.resumedFromCheckpoint = resumedFromCheckpoint
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let indexedCount = try container.decode(Int.self, forKey: .indexedCount)
+        let isIndexing = try container.decode(Bool.self, forKey: .isIndexing)
+        let isLoadingSnapshot = try container.decodeIfPresent(Bool.self, forKey: .isLoadingSnapshot) ?? false
+        self.indexedCount = indexedCount
+        self.isIndexing = isIndexing
+        self.isRefreshing = try container.decodeIfPresent(Bool.self, forKey: .isRefreshing) ?? false
+        self.isUpdating = try container.decodeIfPresent(Bool.self, forKey: .isUpdating) ?? false
+        self.isLoadingSnapshot = isLoadingSnapshot
+        self.phase = try container.decodeIfPresent(IndexPhase.self, forKey: .phase)
+            ?? (isLoadingSnapshot ? .loading : (isIndexing ? .scanning : .ready))
+        self.discoveredCount = try container.decodeIfPresent(Int.self, forKey: .discoveredCount) ?? indexedCount
+        self.searchableCount = try container.decodeIfPresent(Int.self, forKey: .searchableCount) ?? indexedCount
+        self.optimizedCount = try container.decodeIfPresent(Int.self, forKey: .optimizedCount) ?? (isIndexing ? 0 : indexedCount)
+        self.snapshotRevision = try container.decodeIfPresent(UInt64.self, forKey: .snapshotRevision) ?? 0
+        self.status = try container.decode(String.self, forKey: .status)
+        self.lastUpdated = try container.decode(Date.self, forKey: .lastUpdated)
+        self.activeOperationStartedAt = try container.decodeIfPresent(Date.self, forKey: .activeOperationStartedAt)
+        self.lastCheckpointAt = try container.decodeIfPresent(Date.self, forKey: .lastCheckpointAt)
+        self.resumedFromCheckpoint = try container.decodeIfPresent(Bool.self, forKey: .resumedFromCheckpoint) ?? false
     }
 }
 
@@ -1954,6 +2001,8 @@ public final class FileIndex: @unchecked Sendable {
     private var usageMetrics = IndexUsageMetrics()
     private var snapshotLoadState = SnapshotLoadState.notStarted
     private var indexing = false
+    private var refreshing = false
+    private var updating = false
     private var phase: IndexPhase = .idle
     private var discoveredCount = 0
     private var searchableCount = 0
@@ -2142,6 +2191,8 @@ public final class FileIndex: @unchecked Sendable {
             snapshotLoadState = .finished
             roots = canonicalRoots.map(\.path)
             indexing = true
+            refreshing = false
+            updating = false
             phase = .scanning
             discoveredCount = 0
             searchableCount = 0
@@ -2220,6 +2271,8 @@ public final class FileIndex: @unchecked Sendable {
         let currentGeneration = lock.withLock { () -> UInt64 in
             generation &+= 1
             indexing = true
+            refreshing = true
+            updating = false
             phase = .scanning
             status = reconcilesAllRoots ? "Refreshing index" : "Refreshing changed folders"
             discoveredCount = 0
@@ -2242,32 +2295,26 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
-    public func refresh(paths rawPaths: [String]) {
+    public func update(paths rawPaths: [String]) {
         let paths = Set(rawPaths.map { URL(fileURLWithPath: $0).standardizedFileURL.path })
         guard !paths.isEmpty else { return }
         DiagnosticLogger.shared.log(
             category: "index",
-            event: "index.refreshQueued",
+            event: "index.updateQueued",
             fields: [
                 "pathCount": .publicInt(paths.count),
                 "paths": .pathArray(Array(paths))
             ]
         )
 
-        let shouldSchedule = lock.withLock { () -> Bool in
+        lock.withLock {
             pendingRefreshPaths.formUnion(paths)
-            guard !isRefreshDrainScheduled else {
-                return false
-            }
-            isRefreshDrainScheduled = true
-            return true
         }
+        scheduleUpdateDrainIfNeeded(delay: .milliseconds(150))
+    }
 
-        guard shouldSchedule else { return }
-
-        indexQueue.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-            self?.drainRefreshQueue()
-        }
+    public func refresh(paths rawPaths: [String]) {
+        update(paths: rawPaths)
     }
 
     private func requestBackgroundReconciliation() {
@@ -4348,6 +4395,8 @@ public final class FileIndex: @unchecked Sendable {
             searchSnapshotRevision &+= 1
             status = "Index deleted"
             indexing = false
+            refreshing = false
+            updating = false
             phase = .idle
             discoveredCount = 0
             searchableCount = 0
@@ -4372,6 +4421,8 @@ public final class FileIndex: @unchecked Sendable {
             }
 
             snapshotLoadState = .loading
+            refreshing = false
+            updating = false
             phase = .loading
             status = "Loading saved index"
             lastUpdated = Date()
@@ -4404,6 +4455,8 @@ public final class FileIndex: @unchecked Sendable {
                 phase = .idle
                 status = "No index yet"
                 indexing = false
+                refreshing = false
+                updating = false
                 discoveredCount = 0
                 searchableCount = 0
                 optimizedCount = 0
@@ -4447,6 +4500,8 @@ public final class FileIndex: @unchecked Sendable {
                 phase = .idle
                 status = "Index settings changed"
                 indexing = false
+                refreshing = false
+                updating = false
                 discoveredCount = 0
                 searchableCount = 0
                 optimizedCount = 0
@@ -4465,6 +4520,8 @@ public final class FileIndex: @unchecked Sendable {
             phase = .ready
             status = "Loaded \(snapshot.resultCount) indexed files"
             indexing = false
+            refreshing = false
+            updating = false
             discoveredCount = snapshot.resultCount
             searchableCount = snapshot.resultCount
             optimizedCount = loadedOptimized ? snapshot.resultCount : 0
@@ -4855,6 +4912,8 @@ public final class FileIndex: @unchecked Sendable {
             searchSnapshot = snapshot
             searchSnapshotRevision &+= 1
             indexing = true
+            refreshing = false
+            updating = false
             phase = .scanning
             discoveredCount = visited
             searchableCount = snapshot.resultCount
@@ -4883,7 +4942,7 @@ public final class FileIndex: @unchecked Sendable {
                 return false
             }
 
-            let verb = status.hasPrefix("Refreshing") ? "Refreshing" : "Indexing"
+            let verb = refreshing ? "Refreshing" : "Indexing"
             discoveredCount = visited
             status = "\(verb) \(discoveredCount.formatted()) discovered"
             lastUpdated = Date()
@@ -5057,6 +5116,8 @@ public final class FileIndex: @unchecked Sendable {
             searchSnapshot = snapshot
             searchSnapshotRevision &+= 1
             indexing = false
+            refreshing = false
+            updating = false
             phase = .ready
             discoveredCount = records.count
             searchableCount = snapshot.resultCount
@@ -5143,6 +5204,8 @@ public final class FileIndex: @unchecked Sendable {
             searchSnapshot = snapshot
             searchSnapshotRevision &+= 1
             indexing = false
+            refreshing = false
+            updating = false
             phase = .ready
             discoveredCount = snapshot.resultCount
             searchableCount = snapshot.resultCount
@@ -5174,6 +5237,7 @@ public final class FileIndex: @unchecked Sendable {
             searchSnapshot = snapshot
             searchSnapshotRevision &+= 1
             indexing = true
+            updating = false
             phase = .optimizing
             discoveredCount = snapshot.resultCount
             searchableCount = snapshot.resultCount
@@ -5215,6 +5279,8 @@ public final class FileIndex: @unchecked Sendable {
             }
 
             indexing = false
+            refreshing = false
+            updating = false
             phase = .failed
             status = message
             lastUpdated = Date()
@@ -5233,6 +5299,8 @@ public final class FileIndex: @unchecked Sendable {
         lock.withLock {
             generation &+= 1
             indexing = false
+            refreshing = false
+            updating = false
             phase = .failed
             status = "The index supports at most \(Self.maximumIndexedRootCount.formatted()) roots, but \(count.formatted()) were configured."
             discoveredCount = 0
@@ -5261,6 +5329,10 @@ public final class FileIndex: @unchecked Sendable {
             }
 
             indexing = isIndexing
+            if !isIndexing {
+                refreshing = false
+                updating = false
+            }
             self.phase = phase
             discoveredCount = discovered
             searchableCount = searchable
@@ -5299,8 +5371,29 @@ public final class FileIndex: @unchecked Sendable {
         return min(2, max(1, ProcessInfo.processInfo.activeProcessorCount / 4))
     }
 
-    private func drainRefreshQueue() {
+    private func scheduleUpdateDrainIfNeeded(delay: DispatchTimeInterval) {
+        let shouldSchedule = lock.withLock { () -> Bool in
+            guard !pendingRefreshPaths.isEmpty, !isRefreshDrainScheduled else {
+                return false
+            }
+            isRefreshDrainScheduled = true
+            return true
+        }
+
+        guard shouldSchedule else { return }
+
+        indexQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.drainUpdateQueue()
+        }
+    }
+
+    private func drainUpdateQueue() {
         let paths = lock.withLock { () -> [String] in
+            guard !indexing else {
+                isRefreshDrainScheduled = false
+                return []
+            }
+
             let batch = Array(pendingRefreshPaths.prefix(Self.maximumRefreshBatchPaths))
             for path in batch {
                 pendingRefreshPaths.remove(path)
@@ -5313,46 +5406,50 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         if !paths.isEmpty {
-            refreshNow(paths: paths)
+            updateNow(paths: paths)
         }
 
         let shouldContinue = lock.withLock { !pendingRefreshPaths.isEmpty }
         if shouldContinue {
-            indexQueue.async { [weak self] in
-                self?.drainRefreshQueue()
-            }
+            scheduleUpdateDrainIfNeeded(delay: .milliseconds(0))
         }
     }
 
-    private func refreshNow(paths: [String]) {
-        let refreshStarted = Date()
+    private func updateNow(paths: [String]) {
+        let updateStarted = Date()
         let currentGeneration = lock.withLock { () -> UInt64? in
             guard !indexing else { return nil }
             generation &+= 1
             indexing = true
+            refreshing = false
+            updating = true
             phase = .scanning
-            status = "Refreshing changed paths"
-            activeOperationStartedAt = refreshStarted
+            status = "Updating changed paths"
+            activeOperationStartedAt = updateStarted
             resumedFromCheckpoint = false
             lastUpdated = Date()
             return generation
         }
         guard let currentGeneration else {
+            lock.withLock {
+                pendingRefreshPaths.formUnion(paths)
+            }
+            scheduleUpdateDrainIfNeeded(delay: .milliseconds(0))
             return
         }
         publishStats()
 
-        let jobID = beginIndexJob("refresh")
-        defer { endIndexJob("refresh", jobID: jobID) }
+        let jobID = beginIndexJob("update")
+        defer { endIndexJob("update", jobID: jobID) }
 
         MemoryTelemetry.log(
-            "refresh.begin",
+            "update.begin",
             refreshBatchSize: paths.count,
             activeIndexJobs: currentActiveIndexJobCount()
         )
         DiagnosticLogger.shared.log(
             category: "index",
-            event: "index.refreshBegin",
+            event: "index.updateBegin",
             fields: [
                 "pathCount": .publicInt(paths.count),
                 "paths": .pathArray(paths)
@@ -5367,6 +5464,7 @@ public final class FileIndex: @unchecked Sendable {
         }
         var upserts: [String: FileRecord] = [:]
         var deletedPrefixes: [String] = []
+        var reconciledDirectoryPrefixes: [String] = []
         var requiresDirectoryReconciliation = false
 
         for path in paths {
@@ -5384,6 +5482,17 @@ public final class FileIndex: @unchecked Sendable {
 
                     if isDirectory.boolValue {
                         requiresDirectoryReconciliation = true
+                        if let scannedRecords = scanDirectoryForUpdate(
+                            root: url,
+                            exclusions: indexState.exclusions,
+                            rootPaths: indexState.rootPaths,
+                            generation: currentGeneration
+                        ) {
+                            reconciledDirectoryPrefixes.append(url.path)
+                            for (path, record) in scannedRecords {
+                                upserts[path] = record
+                            }
+                        }
                     }
                 } else {
                     deletedPrefixes.append(url.path)
@@ -5396,6 +5505,8 @@ public final class FileIndex: @unchecked Sendable {
             let didApply = lock.withLock { () -> Bool in
                 guard generation == currentGeneration else { return false }
                 indexing = false
+                refreshing = false
+                updating = false
                 phase = .ready
                 status = "No file changes"
                 activeOperationStartedAt = nil
@@ -5407,17 +5518,17 @@ public final class FileIndex: @unchecked Sendable {
             }
             publishStats()
             MemoryTelemetry.log(
-                "refresh.noop",
+                "update.noop",
                 refreshBatchSize: paths.count,
                 activeIndexJobs: currentActiveIndexJobCount()
             )
-            recordIncrementalRefresh(duration: Date().timeIntervalSince(refreshStarted))
+            recordIncrementalRefresh(duration: Date().timeIntervalSince(updateStarted))
             DiagnosticLogger.shared.log(
                 category: "index",
-                event: "index.refreshNoop",
+                event: "index.updateNoop",
                 fields: [
                     "pathCount": .publicInt(paths.count),
-                    "durationSeconds": .publicDouble(Date().timeIntervalSince(refreshStarted))
+                    "durationSeconds": .publicDouble(Date().timeIntervalSince(updateStarted))
                 ]
             )
             return
@@ -5427,6 +5538,7 @@ public final class FileIndex: @unchecked Sendable {
         var deletedRows = Set<Int>()
 
         if
+            !requiresDirectoryReconciliation,
             deletedPrefixes.isEmpty,
             let updatedSnapshot = previousSnapshot.updatingMetadata(for: upserts)
         {
@@ -5438,6 +5550,8 @@ public final class FileIndex: @unchecked Sendable {
                 status = "Updated \(changedPathCount) changed path\(changedPathCount == 1 ? "" : "s")"
                 phase = .ready
                 indexing = false
+                refreshing = false
+                updating = false
                 discoveredCount = updatedSnapshot.resultCount
                 searchableCount = updatedSnapshot.resultCount
                 optimizedCount = updatedSnapshot.isOptimizedForSearch ? updatedSnapshot.resultCount : 0
@@ -5454,7 +5568,7 @@ public final class FileIndex: @unchecked Sendable {
             publishStats()
             scheduleRefreshPersistIfReasonable(updatedSnapshot)
             MemoryTelemetry.log(
-                "refresh.metadataApplied",
+                "update.metadataApplied",
                 records: RecordCollectionMetrics(recordCount: updatedSnapshot.count, totalPathBytes: 0, maxPathBytes: 0),
                 structures: updatedSnapshot.diagnostics,
                 refreshBatchSize: paths.count,
@@ -5462,19 +5576,24 @@ public final class FileIndex: @unchecked Sendable {
             )
             DiagnosticLogger.shared.log(
                 category: "index",
-                event: "index.refreshMetadataApplied",
+                event: "index.updateMetadataApplied",
                 fields: [
                     "pathCount": .publicInt(paths.count),
                     "upsertCount": .publicInt(upserts.count),
                     "recordCount": .publicInt(updatedSnapshot.resultCount),
                     "requiresDirectoryReconciliation": .publicBool(requiresDirectoryReconciliation),
-                    "durationSeconds": .publicDouble(Date().timeIntervalSince(refreshStarted))
+                    "durationSeconds": .publicDouble(Date().timeIntervalSince(updateStarted))
                 ]
             )
-            if requiresDirectoryReconciliation {
-                reconcileIndexedRootsInBackground()
-            }
             return
+        }
+
+        for prefix in reconciledDirectoryPrefixes {
+            guard let rowID = previousSnapshot.store.rowID(forPath: prefix) else { continue }
+            let subtreeEnd = previousSnapshot.store.subtreeEnd(at: rowID)
+            for deletedRow in rowID..<subtreeEnd {
+                deletedRows.insert(deletedRow)
+            }
         }
 
         for path in upserts.keys {
@@ -5516,53 +5635,12 @@ public final class FileIndex: @unchecked Sendable {
             }
         }
 
-        if shouldDeferLargeOverlayRefresh(previousSnapshot) {
-            let changedPathCount = upserts.count + deletedPrefixes.count
-            let didApply = lock.withLock { () -> Bool in
-                guard generation == currentGeneration else { return false }
-                status = "Queued full refresh after \(changedPathCount) changed path\(changedPathCount == 1 ? "" : "s")"
-                phase = .ready
-                indexing = false
-                lastUpdated = Date()
-                activeOperationStartedAt = nil
-                completedRefreshBatches &+= 1
-                return true
-            }
-            if !didApply {
-                return
-            }
-
-            publishStats()
-            MemoryTelemetry.log(
-                "refresh.overlayDeferred",
-                records: RecordCollectionMetrics(recordCount: previousSnapshot.count, totalPathBytes: 0, maxPathBytes: 0),
-                structures: previousSnapshot.diagnostics,
-                refreshBatchSize: paths.count,
-                activeIndexJobs: currentActiveIndexJobCount()
-            )
-            recordIncrementalRefresh(duration: Date().timeIntervalSince(refreshStarted))
-            DiagnosticLogger.shared.log(
-                category: "index",
-                event: "index.refreshOverlayDeferred",
-                fields: [
-                    "pathCount": .publicInt(paths.count),
-                    "upsertCount": .publicInt(upserts.count),
-                    "deletedPrefixCount": .publicInt(deletedPrefixes.count),
-                    "changedPathCount": .publicInt(changedPathCount),
-                    "durationSeconds": .publicDouble(Date().timeIntervalSince(refreshStarted))
-                ]
-            )
-            reconcileIndexedRootsInBackground()
-            return
-        }
-
         let overlayStore = OverlayRecordStore(
             base: previousSnapshot.store,
             upserts: Array(upserts.values),
             deletedRows: deletedRows
         )
         let shouldOptimizeOverlay = previousSnapshot.isOptimizedForSearch
-            && previousSnapshot.count <= Self.exactEmptyQuerySortLimit
         let snapshot = SearchSnapshot(store: overlayStore, buildsSearchStructures: shouldOptimizeOverlay)
         let changedPathCount = upserts.count + deletedPrefixes.count
 
@@ -5573,6 +5651,8 @@ public final class FileIndex: @unchecked Sendable {
             status = "Updated \(changedPathCount) changed path\(changedPathCount == 1 ? "" : "s")"
             phase = .ready
             indexing = false
+            refreshing = false
+            updating = false
             discoveredCount = snapshot.resultCount
             searchableCount = snapshot.resultCount
             optimizedCount = snapshot.isOptimizedForSearch ? snapshot.resultCount : 0
@@ -5589,16 +5669,16 @@ public final class FileIndex: @unchecked Sendable {
         publishStats()
         scheduleRefreshPersistIfReasonable(snapshot)
         MemoryTelemetry.log(
-            "refresh.overlayApplied",
+            "update.overlayApplied",
             records: RecordCollectionMetrics(recordCount: snapshot.count, totalPathBytes: 0, maxPathBytes: 0),
             structures: snapshot.diagnostics,
             refreshBatchSize: paths.count,
             activeIndexJobs: currentActiveIndexJobCount()
         )
-        recordIncrementalRefresh(duration: Date().timeIntervalSince(refreshStarted))
+        recordIncrementalRefresh(duration: Date().timeIntervalSince(updateStarted))
         DiagnosticLogger.shared.log(
             category: "index",
-            event: "index.refreshOverlayApplied",
+            event: "index.updateOverlayApplied",
             fields: [
                 "pathCount": .publicInt(paths.count),
                 "upsertCount": .publicInt(upserts.count),
@@ -5606,16 +5686,55 @@ public final class FileIndex: @unchecked Sendable {
                 "changedPathCount": .publicInt(changedPathCount),
                 "recordCount": .publicInt(snapshot.resultCount),
                 "requiresDirectoryReconciliation": .publicBool(requiresDirectoryReconciliation),
-                "durationSeconds": .publicDouble(Date().timeIntervalSince(refreshStarted))
+                "durationSeconds": .publicDouble(Date().timeIntervalSince(updateStarted))
             ]
         )
-        if requiresDirectoryReconciliation {
-            reconcileIndexedRootsInBackground()
-        }
     }
 
-    private func shouldDeferLargeOverlayRefresh(_ previousSnapshot: SearchSnapshot) -> Bool {
-        previousSnapshot.isOptimizedForSearch && previousSnapshot.count > Self.exactEmptyQuerySortLimit
+    private func scanDirectoryForUpdate(
+        root: URL,
+        exclusions: FileExclusionRules,
+        rootPaths: [String],
+        generation currentGeneration: UInt64
+    ) -> [String: FileRecord]? {
+        var records: [String: FileRecord] = [:]
+
+        func visit(_ directory: URL) -> Bool {
+            guard isCurrentGeneration(currentGeneration) else { return false }
+
+            let values = try? directory.resourceValues(forKeys: FileRecord.resourceKeys)
+            guard !shouldExclude(directory, exclusions: exclusions, rootPaths: rootPaths, isDirectory: values?.isDirectory) else {
+                return true
+            }
+
+            if let record = FileRecord(url: directory, resourceValues: values) {
+                records[record.path] = record
+            }
+
+            guard values?.isDirectory == true else { return true }
+            guard !isLikelyLoop(directory) else { return true }
+
+            return enumerateShallowChildURLs(in: directory) { child in
+                guard isCurrentGeneration(currentGeneration) else { return false }
+
+                let childValues = try? child.resourceValues(forKeys: FileRecord.resourceKeys)
+                guard !shouldExclude(child, exclusions: exclusions, rootPaths: rootPaths, isDirectory: childValues?.isDirectory) else {
+                    return true
+                }
+
+                if childValues?.isDirectory == true {
+                    return visit(child)
+                }
+
+                if let record = FileRecord(url: child, resourceValues: childValues) {
+                    records[record.path] = record
+                }
+                return true
+            }
+        }
+
+        guard visit(root) else { return nil }
+        return records
     }
 
     @discardableResult
@@ -5656,6 +5775,8 @@ public final class FileIndex: @unchecked Sendable {
     private func updateIndexingProgress(status: String, indexedCount: Int) {
         lock.withLock {
             indexing = true
+            refreshing = false
+            updating = false
             self.status = "\(status) discovered"
             lastUpdated = Date()
         }
@@ -5684,6 +5805,8 @@ public final class FileIndex: @unchecked Sendable {
             searchSnapshot = snapshot
             searchSnapshotRevision &+= 1
             indexing = isIndexing
+            refreshing = false
+            updating = false
             phase = isIndexing ? .scanning : .ready
             discoveredCount = snapshot.resultCount
             searchableCount = snapshot.resultCount
@@ -5805,6 +5928,8 @@ public final class FileIndex: @unchecked Sendable {
             lock.withLock {
                 phase = .failed
                 indexing = false
+                refreshing = false
+                updating = false
                 status = "Could not persist index: \(error.localizedDescription)"
                 lastUpdated = Date()
             }
@@ -6144,6 +6269,8 @@ public final class FileIndex: @unchecked Sendable {
                 optimizedCount = searchSnapshot.isOptimizedForSearch ? searchSnapshot.resultCount : 0
             }
             indexing = true
+            refreshing = false
+            updating = false
             phase = .scanning
             discoveredCount = checkpoint.state.discoveredCount
             status = "Indexing from \(checkpoint.state.recordCount.formatted()) checkpoint records"
@@ -6459,6 +6586,8 @@ public final class FileIndex: @unchecked Sendable {
                 searchSnapshot = snapshot
                 searchSnapshotRevision &+= 1
                 indexing = phase == .scanning || phase == .optimizing || phase == .saving
+                refreshing = false
+                updating = false
                 self.phase = phase
                 discoveredCount = records.count
                 searchableCount = snapshot.resultCount
@@ -6517,6 +6646,8 @@ public final class FileIndex: @unchecked Sendable {
             self.generation &+= 1
             roots = canonicalRoots.map(\.path)
             indexing = true
+            refreshing = false
+            updating = false
             phase = .scanning
             activeOperationStartedAt = Date()
             return self.generation
@@ -6541,6 +6672,8 @@ public final class FileIndex: @unchecked Sendable {
                 stats: IndexStats(
                     indexedCount: searchSnapshot.resultCount,
                     isIndexing: indexing,
+                    isRefreshing: refreshing,
+                    isUpdating: updating,
                     isLoadingSnapshot: snapshotLoadState == .loading,
                     phase: phase,
                     discoveredCount: discoveredCount,
@@ -6557,10 +6690,15 @@ public final class FileIndex: @unchecked Sendable {
             )
         }
 
-        guard let handler = update.handler else { return }
         let stats = update.stats
-        Task { @MainActor in
-            handler(stats)
+        if let handler = update.handler {
+            Task { @MainActor in
+                handler(stats)
+            }
+        }
+
+        if !stats.isIndexing {
+            scheduleUpdateDrainIfNeeded(delay: .milliseconds(0))
         }
     }
 
@@ -6574,6 +6712,8 @@ public final class FileIndex: @unchecked Sendable {
         IndexStats(
             indexedCount: searchSnapshot.resultCount,
             isIndexing: indexing,
+            isRefreshing: refreshing,
+            isUpdating: updating,
             isLoadingSnapshot: snapshotLoadState == .loading,
             phase: phase,
             discoveredCount: discoveredCount,

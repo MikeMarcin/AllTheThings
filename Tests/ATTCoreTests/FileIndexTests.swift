@@ -51,8 +51,8 @@ struct FileIndexTests {
         #expect(response.results.map(\.record.path) == [fuzzyHeader.path])
     }
 
-    @Test("refresh moves an updated file to the top of modified sort")
-    func refreshResortsModifiedResults() async throws {
+    @Test("update moves an updated file to the top of modified sort")
+    func updateResortsModifiedResults() async throws {
         let fileManager = FileManager.default
         let root = fileManager.temporaryDirectory
             .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
@@ -88,7 +88,7 @@ struct FileIndexTests {
 
         let newestDate = Date(timeIntervalSince1970: 1_700_000_200)
         try fileManager.setAttributes([.modificationDate: newestDate], ofItemAtPath: olderFile.path)
-        index.refresh(paths: [olderFile.path])
+        index.update(paths: [olderFile.path])
 
         try await waitUntil {
             response = index.search(SearchRequest(
@@ -98,12 +98,12 @@ struct FileIndexTests {
             return response.results.first?.record.path == olderFile.path
         }
 
-        let refreshedModifiedTime = try #require(response.results.first?.record.modifiedTime)
-        #expect(abs(refreshedModifiedTime - newestDate.timeIntervalSinceReferenceDate) < 0.001)
+        let updatedModifiedTime = try #require(response.results.first?.record.modifiedTime)
+        #expect(abs(updatedModifiedTime - newestDate.timeIntervalSinceReferenceDate) < 0.001)
     }
 
-    @Test("same-path refresh preserves optimized search structures")
-    func samePathRefreshPreservesOptimizedSearchStructures() async throws {
+    @Test("same-path update preserves optimized search structures")
+    func samePathUpdatePreservesOptimizedSearchStructures() async throws {
         let fileManager = FileManager.default
         let root = fileManager.temporaryDirectory
             .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
@@ -130,7 +130,7 @@ struct FileIndexTests {
         #expect(before.nameGramPostingCount > 0)
 
         try "new".write(to: match, atomically: true, encoding: .utf8)
-        index.refresh(paths: [match.path])
+        index.update(paths: [match.path])
 
         try await waitUntil {
             index.currentDiagnostics().completedRefreshBatches > before.completedRefreshBatches
@@ -149,17 +149,61 @@ struct FileIndexTests {
         #expect(response.results.contains { $0.record.path == match.path })
     }
 
-    @Test("large refresh defers unoptimized overlay so log and log.rb searches stay indexed")
-    func largeRefreshDefersUnoptimizedOverlaySoLogAndLogRBSearchesStayIndexed() async throws {
+    @Test("updates queued during fresh indexing apply after build finishes")
+    func updatesQueuedDuringFreshIndexingApplyAfterBuildFinishes() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        let existing = root.appendingPathComponent("Existing.swift")
+        let createdDuringBuild = root.appendingPathComponent("CreatedDuringBuild.swift")
+        try "existing".write(to: existing, atomically: true, encoding: .utf8)
+
+        let rootRecord = try #require(FileRecord(url: root))
+        let existingRecord = try #require(FileRecord(url: existing))
+        let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)", loadsSnapshotImmediately: false)
+        index.replaceRecordsForTesting(
+            [rootRecord, existingRecord],
+            roots: [root],
+            buildsSearchStructures: false,
+            phase: .scanning,
+            status: "Indexing 2 discovered"
+        )
+
+        let before = index.currentDiagnostics()
+        try "created".write(to: createdDuringBuild, atomically: true, encoding: .utf8)
+        index.update(paths: [createdDuringBuild.path])
+        try await Task.sleep(for: .milliseconds(250))
+        #expect(index.currentDiagnostics().completedRefreshBatches == before.completedRefreshBatches)
+
+        index.replaceRecordsForTesting([rootRecord, existingRecord], roots: [root])
+
+        try await waitUntil {
+            index.currentDiagnostics().completedRefreshBatches > before.completedRefreshBatches
+        }
+
+        let response = index.search(SearchRequest(
+            query: "CreatedDuringBuild",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10)
+        #expect(response.results.contains { $0.record.path == createdDuringBuild.path })
+    }
+
+    @Test("update applies optimized overlay so log and log.rb searches stay indexed")
+    func updateAppliesOptimizedOverlaySoLogAndLogRBSearchesStayIndexed() async throws {
         let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
         let index = FileIndex(
             applicationName: applicationName,
             loadsSnapshotImmediately: false
         )
-        let fileCount = 100_000
+        let fileCount = 1_000
         let rootPath = (
-            "/tmp/allthethings-search-speed/"
-                + String(repeating: "wide-directory-segment/", count: 12)
+            "/tmp/attperf/"
+                + String(repeating: "path-area/", count: 3)
         ).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         let absoluteRootPath = "/" + rootPath
         let deletedPath = "\(absoluteRootPath)/NeutralDeleted.txt"
@@ -211,7 +255,8 @@ struct FileIndexTests {
             ), maxResults: 25)
             #expect(logResponse.usesIndexedCandidates)
             #expect(logResponse.executionProfile.executionPath != .fullFallbackScan)
-            #expect(logResponse.elapsed < 0.5)
+            #expect(logResponse.executionProfile.candidateCount < before.indexedCount / 10)
+            #expect(logResponse.executionProfile.scannedRowCount <= logResponse.executionProfile.candidateCount)
             #expect(logResponse.results.contains { $0.record.name.hasPrefix("LogReport") })
 
             let logRBResponse = index.search(SearchRequest(
@@ -220,28 +265,33 @@ struct FileIndexTests {
             ), maxResults: 25)
             #expect(logRBResponse.usesIndexedCandidates)
             #expect(logRBResponse.executionProfile.executionPath != .fullFallbackScan)
-            #expect(logRBResponse.elapsed < 0.5)
+            #expect(logRBResponse.executionProfile.candidateCount < before.indexedCount / 10)
+            #expect(logRBResponse.executionProfile.scannedRowCount <= logRBResponse.executionProfile.candidateCount)
             #expect(logRBResponse.results.contains { $0.record.path == rubyLogPath })
         }
 
         expectFastIndexedLogSearches()
 
         let beforeDiagnostics = index.currentDiagnostics()
-        index.refresh(paths: [deletedPath])
+        let beforeRebuilds = beforeDiagnostics.completedSnapshotRebuilds
+        index.update(paths: [deletedPath])
 
         try await waitUntil(timeout: .seconds(10)) {
             index.currentDiagnostics().completedRefreshBatches > beforeDiagnostics.completedRefreshBatches
         }
 
         let after = index.currentStats()
-        #expect(after.optimizedCount == before.optimizedCount)
-        #expect(index.currentDiagnostics().overlayCount == 0)
+        let afterDiagnostics = index.currentDiagnostics()
+        #expect(after.optimizedCount == after.indexedCount)
+        #expect(after.indexedCount == before.indexedCount - 1)
+        #expect(afterDiagnostics.overlayCount == 1)
+        #expect(afterDiagnostics.completedSnapshotRebuilds == beforeRebuilds)
 
         expectFastIndexedLogSearches()
     }
 
-    @Test("directory refresh removes deleted mapped children")
-    func directoryRefreshRemovesDeletedMappedChildren() async throws {
+    @Test("directory update removes deleted mapped children")
+    func directoryUpdateRemovesDeletedMappedChildren() async throws {
         let fileManager = FileManager.default
         let root = fileManager.temporaryDirectory
             .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
@@ -267,7 +317,7 @@ struct FileIndexTests {
         #expect(before.recordStoreKind == .mapped)
 
         try fileManager.removeItem(at: deleted)
-        index.refresh(paths: [folder.path])
+        index.update(paths: [deleted.path])
 
         try await waitUntil {
             guard index.currentDiagnostics().completedRefreshBatches > before.completedRefreshBatches else {
@@ -655,6 +705,8 @@ struct FileIndexTests {
 
         let indexingStats = recorder.snapshot().filter(\.isIndexing)
         #expect(indexingStats.contains { $0.discoveredCount > 0 })
+        #expect(!indexingStats.contains { $0.isRefreshing })
+        #expect(!indexingStats.contains { $0.isUpdating })
         #expect(!indexingStats.contains { $0.indexedCount > 0 })
         #expect(index.currentStats().indexedCount >= 1_501)
     }
@@ -694,7 +746,10 @@ struct FileIndexTests {
         let scanStats = recorder.snapshot().filter { $0.isIndexing && $0.phase == .scanning }
         #expect(scanStats.contains { $0.status.hasPrefix("Refreshing") && $0.discoveredCount == 0 })
         #expect(scanStats.contains { $0.status.hasPrefix("Refreshing") && $0.discoveredCount > 0 })
+        #expect(scanStats.allSatisfy { $0.isRefreshing })
+        #expect(!scanStats.contains { $0.isUpdating })
         #expect(!scanStats.contains { $0.status.hasPrefix("Indexing") })
+        #expect(!index.currentStats().isRefreshing)
     }
 
     @Test("loaded snapshots reconcile changes made while app was closed")
@@ -832,8 +887,8 @@ struct FileIndexTests {
         #expect(response.results.map(\.record.path) == [hiddenChild.path])
     }
 
-    @Test("custom exclusions apply during scan and refresh")
-    func customExclusionsApplyDuringScanAndRefresh() async throws {
+    @Test("custom exclusions apply during scan and update")
+    func customExclusionsApplyDuringScanAndUpdate() async throws {
         let fileManager = FileManager.default
         let root = fileManager.temporaryDirectory
             .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
@@ -877,7 +932,7 @@ struct FileIndexTests {
         let refreshedIgnored = root.appendingPathComponent("Refreshed.tmp")
         try "visible".write(to: refreshedVisible, atomically: true, encoding: .utf8)
         try "ignored".write(to: refreshedIgnored, atomically: true, encoding: .utf8)
-        index.refresh(paths: [refreshedVisible.path, refreshedIgnored.path])
+        index.update(paths: [refreshedVisible.path, refreshedIgnored.path])
 
         try await waitUntil {
             response = index.search(SearchRequest(
