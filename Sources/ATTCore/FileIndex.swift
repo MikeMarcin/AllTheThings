@@ -12,6 +12,7 @@ public enum SortColumn: String, Codable, CaseIterable, Sendable {
     case fileExtension
     case kind
     case volume
+    case root
 }
 
 public struct SortSpec: Codable, Equatable, Sendable {
@@ -150,16 +151,33 @@ public struct SearchResult: Identifiable, Sendable {
     public let record: FileRecord
     public let score: Int
     public let match: MatchExplanation?
+    public let rootPath: String?
 
-    public init(record: FileRecord, score: Int, match: MatchExplanation? = nil) {
+    public init(record: FileRecord, score: Int, match: MatchExplanation? = nil, rootPath: String? = nil) {
         self.record = record
         self.score = score
         self.match = match
+        self.rootPath = rootPath
     }
 
     public var id: UInt64 {
         record.id
     }
+}
+
+extension SearchResult: SearchRecordReadable {
+    var path: String { record.path }
+    var name: String { record.name }
+    var directoryPath: String { record.directoryPath }
+    var fileExtension: String { record.fileExtension }
+    var sizeBytes: UInt64 { record.sizeBytes }
+    var modifiedTime: TimeInterval { record.modifiedTime }
+    var createdTime: TimeInterval? { record.createdTime }
+    var isDirectory: Bool { record.isDirectory }
+    var isHidden: Bool { record.isHidden }
+    var volumeName: String { record.volumeName }
+    var normalizedName: String { record.normalizedName }
+    var normalizedPath: String { record.normalizedPath }
 }
 
 public struct SearchResponse: Sendable {
@@ -305,8 +323,7 @@ public final class FileIndex: @unchecked Sendable {
     private static let pathGramRecordLimit = 200_000
     private static let pathGramTotalPathByteLimit = 24 * 1024 * 1024
     private static let exactEmptyQuerySortLimit = 100_000
-    private static let exactInsightsRootAttributionLimit = 25_000
-    private static let storageSizeEnumerationLimit = 4_000
+    public static let maximumIndexedRootCount = RootAttributionTable.maximumRootCount
 
     public var onStatsChanged: (@MainActor @Sendable (IndexStats) -> Void)? {
         get {
@@ -578,6 +595,7 @@ public final class FileIndex: @unchecked Sendable {
 
         init(
             reservedCapacity: Int,
+            roots: [String] = [],
             existingRecords: [FileRecord] = [],
             pendingDirectories: [URL] = [],
             completedDirectories: Set<String> = [],
@@ -587,7 +605,7 @@ public final class FileIndex: @unchecked Sendable {
             self.operationStartedAt = operationStartedAt
             records = [:]
             records.reserveCapacity(max(reservedCapacity, existingRecords.count))
-            builder = HeapPagedRecordStore.Builder(reservedCapacity: reservedCapacity)
+            builder = HeapPagedRecordStore.Builder(reservedCapacity: reservedCapacity, roots: roots)
             for record in existingRecords {
                 records[record.path] = record
                 builder.append(record)
@@ -772,8 +790,8 @@ public final class FileIndex: @unchecked Sendable {
             resultCount == 0 || (hasSortedOrder && nameGramIndex != nil && componentGramIndex != nil)
         }
 
-        init(records: [FileRecord], buildsSearchStructures: Bool = true) {
-            self.store = HeapPagedRecordStore(records: records)
+        init(records: [FileRecord], roots: [String] = [], buildsSearchStructures: Bool = true) {
+            self.store = HeapPagedRecordStore(records: records, roots: roots)
             if buildsSearchStructures {
                 let buildsPathGramIndex = FileIndex.shouldBuildPathGramIndex(records: records)
                 self.gramIndex = buildsPathGramIndex ? Self.makePathGramIndex(store: store) : nil
@@ -1130,6 +1148,10 @@ public final class FileIndex: @unchecked Sendable {
             store.isVisible(at: index)
         }
 
+        func rootPath(at index: Int) -> String? {
+            store.rootPath(at: index)
+        }
+
         func orderedIndices(for sort: SortSpec, queryIsEmpty: Bool, includeHidden: Bool) -> [Int]? {
             guard hasSortedOrder else { return nil }
 
@@ -1141,7 +1163,7 @@ public final class FileIndex: @unchecked Sendable {
                 return sort.ascending ? visibleModifiedAscending : visibleModifiedDescending
             case .relevance where queryIsEmpty:
                 return includeHidden ? modifiedDescending : visibleModifiedDescending
-            case .relevance, .name, .path, .created, .size, .fileExtension, .kind, .volume:
+            case .relevance, .name, .path, .created, .size, .fileExtension, .kind, .volume, .root:
                 return nil
             }
         }
@@ -1910,7 +1932,10 @@ public final class FileIndex: @unchecked Sendable {
     private let indexQueue = DispatchQueue(label: "att.index.work", qos: .utility)
     private let checkpointQueue = DispatchQueue(label: "att.index.checkpoint", qos: .utility)
     private let checkpointPersistenceLock = NSLock()
+    private let storageInsightsLock = NSLock()
     private var checkpointWriteInFlight = false
+    private var cachedStorageInsights: IndexStorageInsights?
+    private var storageInsightsRefreshInFlight = false
     private var recordsByPath: [String: FileRecord] = [:]
     private var searchSnapshot = SearchSnapshot.empty
     private var searchSnapshotRevision: UInt64 = 0
@@ -2038,12 +2063,7 @@ public final class FileIndex: @unchecked Sendable {
             )
         }
 
-        let storage = Self.storageInsights(
-            supportDirectory: supportDirectory,
-            snapshotURL: snapshotURL,
-            applicationName: supportDirectory.lastPathComponent,
-            fileManager: fileManager
-        )
+        let storage = currentStorageInsights()
         let rootInsights = Self.rootInsights(
             snapshot: state.snapshot,
             roots: state.roots,
@@ -2082,6 +2102,7 @@ public final class FileIndex: @unchecked Sendable {
 
         try indexQueue.sync {
             try removePersistedIndexFiles()
+            invalidateStorageInsightsCache()
             lock.withLock {
                 recordsByPath.removeAll(keepingCapacity: false)
                 searchSnapshot = .empty
@@ -2102,6 +2123,10 @@ public final class FileIndex: @unchecked Sendable {
 
     public func replaceRootsAndRebuild(_ rootURLs: [URL], mode: RebuildMode = .fresh) {
         let canonicalRoots = canonicalizedRoots(rootURLs)
+        guard canonicalRoots.count <= Self.maximumIndexedRootCount else {
+            publishRootLimitFailure(count: canonicalRoots.count)
+            return
+        }
         let rebuildStarted = Date()
         let currentGeneration = lock.withLock { () -> UInt64 in
             generation &+= 1
@@ -2141,6 +2166,7 @@ public final class FileIndex: @unchecked Sendable {
 
     public func hasResumableCheckpoint(for rootURLs: [URL]) -> Bool {
         let canonicalRoots = canonicalizedRoots(rootURLs)
+        guard canonicalRoots.count <= Self.maximumIndexedRootCount else { return false }
         let checkpoint = matchingScanCheckpointState(
             roots: canonicalRoots.map(\.path),
             exclusionPatterns: lock.withLock { exclusionRules.patterns },
@@ -2166,6 +2192,10 @@ public final class FileIndex: @unchecked Sendable {
             rootURLs = allRootURLs
         }
         guard !rootURLs.isEmpty else { return }
+        guard allRootURLs.count <= Self.maximumIndexedRootCount else {
+            publishRootLimitFailure(count: allRootURLs.count)
+            return
+        }
         let reconcilesAllRoots = rootURLs.count == allRootURLs.count
 
         let currentGeneration = lock.withLock { () -> UInt64 in
@@ -2313,7 +2343,7 @@ public final class FileIndex: @unchecked Sendable {
                     }
                     appendMatch(rowID: index, score: 0)
                 }
-            } else if snapshot.count > Self.exactEmptyQuerySortLimit, boundedMaxResults > 0 {
+            } else if snapshot.count > Self.exactEmptyQuerySortLimit, boundedMaxResults > 0, request.sort.column != .root {
                 shouldSortMatches = false
                 let canStopAtResultLimit = request.includeHidden || snapshot.visibleCount != nil
                 var matchedVisibleCount = 0
@@ -2344,7 +2374,7 @@ public final class FileIndex: @unchecked Sendable {
                 }
             }
         } else {
-            if let fastResponse = Self.fastV6ComponentNameSortedSearch(
+            if let fastResponse = Self.fastComponentNameSortedSearch(
                 snapshot: snapshot,
                 request: request,
                 parsedQuery: parsedQuery,
@@ -2446,10 +2476,17 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     private static func materialize(_ matches: [SearchMatch], from snapshot: SearchSnapshot) -> [SearchResult] {
-        matches.map { SearchResult(record: snapshot.record(at: $0.rowID), score: $0.score, match: $0.match) }
+        matches.map {
+            SearchResult(
+                record: snapshot.record(at: $0.rowID),
+                score: $0.score,
+                match: $0.match,
+                rootPath: snapshot.rootPath(at: $0.rowID)
+            )
+        }
     }
 
-    private static func fastV6ComponentNameSortedSearch(
+    private static func fastComponentNameSortedSearch(
         snapshot: SearchSnapshot,
         request: SearchRequest,
         parsedQuery: FuzzyMatcher.ParsedQuery,
@@ -4529,7 +4566,7 @@ public final class FileIndex: @unchecked Sendable {
                 mergedRecords[path] = record
             }
             recordsByPath = mergedRecords
-            initialStore = HeapPagedRecordStore(records: Array(mergedRecords.values))
+            initialStore = HeapPagedRecordStore(records: Array(mergedRecords.values), roots: allRootPaths)
         }
 
         optimizeAndPublish(
@@ -4559,6 +4596,7 @@ public final class FileIndex: @unchecked Sendable {
         let currentCount = lock.withLock { searchSnapshot.count }
         let state = ConcurrentScanState(
             reservedCapacity: max(8_192, currentCount, checkpoint?.store.count ?? 0),
+            roots: rootPaths,
             existingRecords: checkpoint?.store.allRecords() ?? [],
             pendingDirectories: checkpoint?.state.resumableDirectories
                 .map { URL(fileURLWithPath: $0, isDirectory: true) }
@@ -5087,6 +5125,23 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
+    private func publishRootLimitFailure(count: Int) {
+        lock.withLock {
+            generation &+= 1
+            indexing = false
+            phase = .failed
+            status = "The index supports at most \(Self.maximumIndexedRootCount.formatted()) roots, but \(count.formatted()) were configured."
+            discoveredCount = 0
+            searchableCount = searchSnapshot.resultCount
+            optimizedCount = searchSnapshot.isOptimizedForSearch ? searchSnapshot.resultCount : 0
+            lastUpdated = Date()
+            activeOperationStartedAt = nil
+            resumedFromCheckpoint = false
+        }
+        recordIndexingFailure()
+        publishStats()
+    }
+
     private func publishRebuildStatus(
         phase: IndexPhase,
         status: String,
@@ -5467,7 +5522,8 @@ public final class FileIndex: @unchecked Sendable {
             activeIndexJobs: currentActiveIndexJobCount()
         )
 
-        let snapshot = SearchSnapshot(records: Array(records.values), buildsSearchStructures: !isIndexing)
+        let rootPaths = lock.withLock { roots }
+        let snapshot = SearchSnapshot(records: Array(records.values), roots: rootPaths, buildsSearchStructures: !isIndexing)
         lock.withLock {
             recordsByPath = records
             searchSnapshot = snapshot
@@ -5608,6 +5664,7 @@ public final class FileIndex: @unchecked Sendable {
         try fileManager.moveItem(at: temporaryURL, to: snapshotURL)
         removeScanCheckpoint()
         cleanupObsoleteIndexFiles()
+        invalidateStorageInsightsCache()
         return try MappedRecordStore(packageURL: snapshotURL, schemaVersion: SnapshotLayout.schemaVersion)
     }
 
@@ -6183,14 +6240,17 @@ public final class FileIndex: @unchecked Sendable {
 
     func replaceRecordsForTesting(
         _ records: [FileRecord],
+        roots rootURLs: [URL] = [],
         buildsSearchStructures: Bool = true,
         phase: IndexPhase = .ready,
         status: String? = nil
     ) {
         let recordsByPath = Dictionary(uniqueKeysWithValues: records.map { ($0.path, $0) })
+        let canonicalRoots = canonicalizedRoots(rootURLs).map(\.path)
         indexQueue.sync {
-            let snapshot = SearchSnapshot(records: records, buildsSearchStructures: buildsSearchStructures)
+            let snapshot = SearchSnapshot(records: records, roots: canonicalRoots, buildsSearchStructures: buildsSearchStructures)
             lock.withLock {
+                roots = canonicalRoots
                 self.recordsByPath = recordsByPath
                 searchSnapshot = snapshot
                 searchSnapshotRevision &+= 1
@@ -6228,7 +6288,7 @@ public final class FileIndex: @unchecked Sendable {
     ) {
         indexQueue.sync {
             let canonicalRoots = canonicalizedRoots(rootURLs)
-            let store = HeapPagedRecordStore(records: records)
+            let store = HeapPagedRecordStore(records: records, roots: canonicalRoots.map(\.path))
             let progress = ScanCheckpointProgress(
                 store: store,
                 visited: records.count,
@@ -6455,111 +6515,115 @@ public final class FileIndex: @unchecked Sendable {
         estimatedIndexBytes: UInt64
     ) -> [IndexRootInsight] {
         guard !roots.isEmpty else { return [] }
-        guard snapshot.count <= exactInsightsRootAttributionLimit else {
-            return approximateRootInsights(
-                snapshot: snapshot,
-                roots: roots,
-                estimatedIndexBytes: estimatedIndexBytes
-            )
+        let normalizedRoots = RootAttributionTable.normalizedRootPaths(roots)
+        guard let table = snapshot.store.storedRootAttribution, table.isValid else {
+            return normalizedRoots.map { root in
+                IndexRootInsight(
+                    path: root,
+                    trackedFileCount: 0,
+                    directoryCount: 0,
+                    hiddenCount: 0,
+                    indexedContentBytes: 0,
+                    pathByteWeight: 0,
+                    estimatedIndexBytes: 0,
+                    attributionSource: .estimated
+                )
+            }
         }
 
-        struct MutableRootInsight {
-            var trackedFileCount = 0
-            var directoryCount = 0
-            var hiddenCount = 0
-            var indexedContentBytes: UInt64 = 0
-            var pathByteWeight: UInt64 = 0
-        }
+        let summariesByPath = Dictionary(uniqueKeysWithValues: table.roots.map { ($0.path, $0) })
+        let totalWeight = table.roots.reduce(UInt64(0)) { $0 &+ $1.pathByteWeight }
+        let source: IndexRootAttributionSource = snapshot.store.kind == .mapped ? .persistedExact : .runtimeExact
 
-        let normalizedRoots = roots
-            .map { URL(fileURLWithPath: $0, isDirectory: true).standardizedFileURL.path }
-            .sorted { $0.count > $1.count }
-        var values = Dictionary(uniqueKeysWithValues: normalizedRoots.map { ($0, MutableRootInsight()) })
-
-        for rowID in 0..<snapshot.count {
-            guard snapshot.store.isResultRow(at: rowID) else { continue }
-            let path = snapshot.store.path(at: rowID)
-            guard let root = normalizedRoots.first(where: { path == $0 || path.hasPrefix($0 + "/") }) else {
-                continue
-            }
-
-            if snapshot.store.isDirectory(at: rowID) {
-                values[root, default: MutableRootInsight()].directoryCount += 1
-            } else {
-                values[root, default: MutableRootInsight()].trackedFileCount += 1
-                values[root, default: MutableRootInsight()].indexedContentBytes &+= snapshot.store.sizeBytes(at: rowID)
-            }
-            if snapshot.store.isHidden(at: rowID) {
-                values[root, default: MutableRootInsight()].hiddenCount += 1
-            }
-            values[root, default: MutableRootInsight()].pathByteWeight &+= UInt64(path.utf8.count)
-        }
-
-        let totalWeight = values.values.reduce(UInt64(0)) { $0 &+ $1.pathByteWeight }
-        return roots.map { root in
-            let path = URL(fileURLWithPath: root, isDirectory: true).standardizedFileURL.path
-            let value = values[path] ?? MutableRootInsight()
+        return normalizedRoots.map { root in
+            let value = summariesByPath[root] ?? RootAttributionSummary(id: RootAttributionTable.unassignedRootID, path: root)
             let estimatedBytes = totalWeight == 0
                 ? 0
                 : UInt64((Double(value.pathByteWeight) / Double(totalWeight) * Double(estimatedIndexBytes)).rounded())
             return IndexRootInsight(
-                path: path,
+                path: root,
                 trackedFileCount: value.trackedFileCount,
                 directoryCount: value.directoryCount,
                 hiddenCount: value.hiddenCount,
                 indexedContentBytes: value.indexedContentBytes,
                 pathByteWeight: value.pathByteWeight,
-                estimatedIndexBytes: estimatedBytes
+                estimatedIndexBytes: estimatedBytes,
+                attributionSource: source
             )
         }
     }
 
-    private static func approximateRootInsights(
-        snapshot: SearchSnapshot,
-        roots: [String],
-        estimatedIndexBytes: UInt64
-    ) -> [IndexRootInsight] {
-        let normalizedRoots = roots.map { URL(fileURLWithPath: $0, isDirectory: true).standardizedFileURL.path }
-        let counts = Dictionary(uniqueKeysWithValues: normalizedRoots.map { root in
-            let count: Int
-            if
-                let rowID = snapshot.store.rowID(forPath: root),
-                rowID >= 0,
-                rowID < snapshot.count,
-                snapshot.resultPrefixCounts.count > rowID
-            {
-                let end = min(
-                    max(snapshot.store.subtreeEnd(at: rowID), rowID + 1),
-                    snapshot.resultPrefixCounts.count - 1
-                )
-                count = max(0, snapshot.resultPrefixCounts[end] - snapshot.resultPrefixCounts[rowID])
-            } else {
-                count = 0
-            }
-            return (root, count)
-        })
+    private func currentStorageInsights() -> IndexStorageInsights {
+        let package = Self.packageStorageInsights(snapshotURL: snapshotURL, fileManager: fileManager)
+        let cached = storageInsightsLock.withLock { cachedStorageInsights }
+        scheduleStorageInsightsRefreshIfNeeded()
 
-        let knownTotal = counts.values.reduce(0, +)
-        let fallbackPerRoot = knownTotal == 0 && !normalizedRoots.isEmpty
-            ? max(snapshot.resultCount / normalizedRoots.count, 0)
-            : 0
-        let total = max(knownTotal, fallbackPerRoot * normalizedRoots.count)
-
-        return normalizedRoots.map { root in
-            let count = counts[root] ?? fallbackPerRoot
-            let estimatedBytes = total == 0
-                ? 0
-                : UInt64((Double(count) / Double(total) * Double(estimatedIndexBytes)).rounded())
-            return IndexRootInsight(
-                path: root,
-                trackedFileCount: count,
-                directoryCount: 0,
-                hiddenCount: 0,
-                indexedContentBytes: 0,
-                pathByteWeight: UInt64(count),
-                estimatedIndexBytes: estimatedBytes
+        guard let cached else {
+            return IndexStorageInsights(
+                totalATTDataBytes: package.indexPackageBytes,
+                indexPackageBytes: package.indexPackageBytes,
+                cacheBytes: 0,
+                measuredAt: nil,
+                isMeasuring: true,
+                locations: [],
+                sidecars: package.sidecars
             )
         }
+
+        return IndexStorageInsights(
+            totalATTDataBytes: max(cached.totalATTDataBytes, package.indexPackageBytes),
+            indexPackageBytes: package.indexPackageBytes,
+            cacheBytes: cached.cacheBytes,
+            measuredAt: cached.measuredAt,
+            isMeasuring: storageInsightsLock.withLock { storageInsightsRefreshInFlight },
+            locations: cached.locations,
+            sidecars: package.sidecars
+        )
+    }
+
+    private func scheduleStorageInsightsRefreshIfNeeded() {
+        let shouldStart = storageInsightsLock.withLock { () -> Bool in
+            guard !storageInsightsRefreshInFlight else { return false }
+            if let measuredAt = cachedStorageInsights?.measuredAt, Date().timeIntervalSince(measuredAt) < 60 {
+                return false
+            }
+            storageInsightsRefreshInFlight = true
+            return true
+        }
+
+        guard shouldStart else { return }
+
+        let supportDirectory = supportDirectory
+        let snapshotURL = snapshotURL
+        let applicationName = supportDirectory.lastPathComponent
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            let measured = Self.storageInsights(
+                supportDirectory: supportDirectory,
+                snapshotURL: snapshotURL,
+                applicationName: applicationName,
+                fileManager: self.fileManager
+            )
+            self.storageInsightsLock.withLock {
+                self.cachedStorageInsights = measured
+                self.storageInsightsRefreshInFlight = false
+            }
+        }
+    }
+
+    private func invalidateStorageInsightsCache() {
+        storageInsightsLock.withLock {
+            cachedStorageInsights = nil
+        }
+    }
+
+    private static func packageStorageInsights(
+        snapshotURL: URL,
+        fileManager: FileManager
+    ) -> (indexPackageBytes: UInt64, sidecars: [IndexSidecarInsight]) {
+        let sidecars = sidecarInsights(in: snapshotURL, fileManager: fileManager)
+        let packageBytes = sidecars.reduce(UInt64(0)) { $0 &+ $1.allocatedBytes }
+        return (packageBytes, sidecars)
     }
 
     private static func storageInsights(
@@ -6577,11 +6641,7 @@ public final class FileIndex: @unchecked Sendable {
             locations.append(IndexStorageLocationInsight(
                 label: label,
                 path: path,
-                allocatedBytes: allocatedSize(
-                    of: url,
-                    fileManager: fileManager,
-                    maximumDescendants: storageSizeEnumerationLimit
-                )
+                allocatedBytes: allocatedSize(of: url, fileManager: fileManager)
             ))
         }
 
@@ -6612,6 +6672,8 @@ public final class FileIndex: @unchecked Sendable {
             totalATTDataBytes: totalBytes,
             indexPackageBytes: indexPackageBytes,
             cacheBytes: cacheBytes,
+            measuredAt: Date(),
+            isMeasuring: false,
             locations: locations,
             sidecars: sidecarInsights(in: snapshotURL, fileManager: fileManager)
         )
@@ -6776,10 +6838,10 @@ public final class FileIndex: @unchecked Sendable {
 
     private static func compare(_ lhs: SearchResult, _ rhs: SearchResult, sort: SortSpec, queryIsEmpty: Bool) -> Bool {
         compareRecords(
-            lhs: lhs.record,
+            lhs: lhs,
             lhsScore: lhs.score,
             lhsMatch: lhs.match,
-            rhs: rhs.record,
+            rhs: rhs,
             rhsScore: rhs.score,
             rhsMatch: rhs.match,
             sort: sort,
@@ -6836,6 +6898,8 @@ public final class FileIndex: @unchecked Sendable {
             primary = ordered(lhs.isDirectory ? "Folder" : "File", rhs.isDirectory ? "Folder" : "File")
         case .volume:
             primary = ordered(lhs.volumeName, rhs.volumeName)
+        case .root:
+            primary = ordered(lhs.rootPath ?? "", rhs.rootPath ?? "")
         }
 
         if let primary {

@@ -102,6 +102,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         case ext
         case kind
         case volume
+        case root
 
         var title: String {
             switch self {
@@ -114,6 +115,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             case .ext: "Ext"
             case .kind: "Kind"
             case .volume: "Volume"
+            case .root: "Root"
             }
         }
 
@@ -128,6 +130,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             case .ext: 48
             case .kind: 52
             case .volume: 80
+            case .root: 160
             }
         }
 
@@ -142,6 +145,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             case .ext: .fileExtension
             case .kind: .kind
             case .volume: .volume
+            case .root: .root
             }
         }
 
@@ -156,6 +160,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             case .ext: "Extension"
             case .kind: "Kind"
             case .volume: "Volume"
+            case .root: "Indexed Root"
             }
         }
 
@@ -179,6 +184,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                 .kind
             case .volume:
                 .volume
+            case .root:
+                .root
             }
         }
     }
@@ -342,6 +349,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var sortSpec: SortSpec
     private var visibleColumns: Set<Column>
     private var indexedRoots: [URL]
+    private var rootDisplayNames: [String: String] = [:]
     private var pendingEventPaths = Set<String>()
     private var pendingRecursiveEventPaths = Set<String>()
     private var eventDebounce: DispatchWorkItem?
@@ -393,7 +401,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private static let defaultSortSpec = SortSpec(column: .name, ascending: true)
-    private static let defaultVisibleColumns = Set(Column.allCases)
+    private static let defaultVisibleColumns = Set(Column.allCases.filter { $0 != .root })
 
     private lazy var dateFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -418,6 +426,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         self.visibleColumns = visibleColumns
         self.sortSpec = Self.normalizedSortSpec(Self.loadSortSpec(defaults: defaults), visibleColumns: visibleColumns)
         self.indexedRoots = AppSettings.indexedRoots(defaults: defaults)
+        self.rootDisplayNames = Self.rootDisplayNames(for: self.indexedRoots.map { $0.standardizedFileURL.path })
         self.highlightsSearchText = defaults.bool(forKey: AppSettings.highlightSearchTextKey)
         self.showsHiddenFiles = defaults.bool(forKey: AppSettings.showHiddenFilesKey)
         self.appFontFamilyName = AppSettings.appFontFamilyName(defaults: defaults)
@@ -581,6 +590,12 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         case .volume:
             textField?.stringValue = record.volumeName
             textField?.textColor = .secondaryLabelColor
+        case .root:
+            let rootPath = result.rootPath ?? ""
+            textField?.stringValue = rootDisplayNames[rootPath] ?? Self.defaultRootDisplayName(for: rootPath)
+            textField?.toolTip = rootPath.isEmpty ? nil : rootPath
+            textField?.textColor = .secondaryLabelColor
+            textField?.lineBreakMode = .byTruncatingMiddle
         }
 
         if column != .size {
@@ -958,6 +973,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let roots = AppSettings.suggestedDefaultIndexedRoots()
         beginSetupMascotTuckAwayIfPossible()
         indexedRoots = roots
+        refreshRootDisplayNames()
         saveRoots()
         startWatchingIfNeeded()
         rebuildIndexForCurrentSettings()
@@ -2143,6 +2159,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
 
         indexedRoots = updatedRoots
+        refreshRootDisplayNames()
         didRequestInitialRebuild = false
         startWatchingIfNeeded()
         rebuildIndexForCurrentSettings()
@@ -2207,6 +2224,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     private func rootPaths(_ roots: [URL]) -> [String] {
         roots.map(\.standardizedFileURL.path)
+    }
+
+    private func refreshRootDisplayNames() {
+        rootDisplayNames = Self.rootDisplayNames(for: rootPaths(indexedRoots))
     }
 
     private func markFSEventBaselineIfNeeded(previous: IndexStats, current: IndexStats) {
@@ -2637,6 +2658,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         guard !additions.isEmpty else { return }
         beginSetupMascotTuckAwayIfPossible()
         indexedRoots.append(contentsOf: additions)
+        refreshRootDisplayNames()
         saveRoots()
         didRequestInitialSnapshotLoad = true
         didRequestInitialRebuild = true
@@ -2962,7 +2984,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             .filter { visibleColumns.contains($0) }
             .map(\.rawValue)
         defaults.set(ordered, forKey: DefaultsKey.visibleColumns)
-        defaults.set(2, forKey: DefaultsKey.visibleColumnsSchema)
+        defaults.set(3, forKey: DefaultsKey.visibleColumnsSchema)
     }
 
     private static func loadSortSpec(defaults: UserDefaults) -> SortSpec {
@@ -2991,6 +3013,45 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             columns.insert(.match)
         }
         return columns
+    }
+
+    private static func rootDisplayNames(for paths: [String]) -> [String: String] {
+        let standardizedPaths = paths.map { URL(fileURLWithPath: $0, isDirectory: true).standardizedFileURL.path }
+        var componentsByPath: [String: [String]] = [:]
+        for path in standardizedPaths {
+            let components = URL(fileURLWithPath: path, isDirectory: true)
+                .pathComponents
+                .filter { $0 != "/" }
+            componentsByPath[path] = components.isEmpty ? [path] : components
+        }
+
+        var labels: [String: String] = [:]
+        for path in standardizedPaths {
+            let components = componentsByPath[path] ?? [path]
+            var suffixLength = 1
+            var label = defaultRootDisplayName(for: path)
+
+            while suffixLength <= components.count {
+                let candidate = components.suffix(suffixLength).joined(separator: "/")
+                let isUnique = standardizedPaths.allSatisfy { otherPath in
+                    guard otherPath != path, let otherComponents = componentsByPath[otherPath] else { return true }
+                    return otherComponents.suffix(suffixLength).joined(separator: "/") != candidate
+                }
+                label = candidate
+                if isUnique { break }
+                suffixLength += 1
+            }
+
+            labels[path] = label
+        }
+
+        return labels
+    }
+
+    private static func defaultRootDisplayName(for path: String) -> String {
+        guard !path.isEmpty else { return "" }
+        let url = URL(fileURLWithPath: path, isDirectory: true)
+        return url.lastPathComponent.isEmpty ? path : url.lastPathComponent
     }
 
     private static func normalizedSortSpec(_ spec: SortSpec, visibleColumns: Set<Column>) -> SortSpec {

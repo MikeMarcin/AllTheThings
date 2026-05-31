@@ -22,6 +22,8 @@ struct DiagnosticsReportBuilderTests {
         )
 
         #expect(report.contains("Root 1"))
+        #expect(report.contains("source=persistedExact"))
+        #expect(report.contains("Measurement: measured"))
         #expect(!report.contains(rootPath))
         #expect(!report.contains("SecretProject"))
         #expect(!report.lowercased().contains("query text:"))
@@ -81,7 +83,7 @@ struct DiagnosticsReportBuilderTests {
             status: "Ready",
             activeIndexJobs: 0,
             activeIndexJobHighWaterMark: 1,
-            schemaVersion: 6,
+            schemaVersion: 7,
             snapshotRevision: 2,
             recordStoreKind: "mapped",
             mappedByteSize: 1024,
@@ -115,13 +117,15 @@ struct DiagnosticsReportBuilderTests {
                     hiddenCount: 1,
                     indexedContentBytes: 1_024,
                     pathByteWeight: 512,
-                    estimatedIndexBytes: 256
+                    estimatedIndexBytes: 256,
+                    attributionSource: .persistedExact
                 )
             ],
             storage: IndexStorageInsights(
                 totalATTDataBytes: 2_048,
                 indexPackageBytes: 1_024,
                 cacheBytes: 128,
+                measuredAt: Date(timeIntervalSince1970: 1_700_000_150),
                 locations: [
                     IndexStorageLocationInsight(label: "Application Support", path: "/Users/example/Library/Application Support/AllTheThings", allocatedBytes: 1_920)
                 ],

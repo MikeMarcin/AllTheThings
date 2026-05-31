@@ -217,8 +217,8 @@ struct MemoryBudgetTests {
         ), maxResults: 5).results.contains { $0.record.name == "File000010.swift" })
     }
 
-    @Test("v6 snapshots persist a virtual component namespace")
-    func v6SnapshotsPersistVirtualComponentNamespace() {
+    @Test("v7 snapshots persist a virtual component namespace")
+    func v7SnapshotsPersistVirtualComponentNamespace() {
         let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
         let records = makeCatalogRecords(count: 2_000)
         let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
@@ -430,10 +430,10 @@ struct MemoryBudgetTests {
         }
     }
 
-    @Test("opt-in v6 mapped search benchmark")
-    func optInV6MappedSearchBenchmark() {
+    @Test("opt-in v7 mapped search benchmark")
+    func optInV7MappedSearchBenchmark() {
         guard
-            let rawCount = ProcessInfo.processInfo.environment["ATT_V6_SEARCH_BENCH_RECORDS"],
+            let rawCount = ProcessInfo.processInfo.environment["ATT_V7_SEARCH_BENCH_RECORDS"],
             let recordCount = Int(rawCount),
             recordCount > 0
         else {
@@ -441,14 +441,14 @@ struct MemoryBudgetTests {
         }
 
         let index = FileIndex(
-            applicationName: "AllTheThingsV6SearchBench-\(UUID().uuidString)",
+            applicationName: "AllTheThingsV7SearchBench-\(UUID().uuidString)",
             loadsSnapshotImmediately: false
         )
         let records = makeCatalogRecords(count: recordCount)
         index.replaceRecordsForTesting(records)
         index.persistSnapshotForTesting()
 
-        let threshold = (Double(ProcessInfo.processInfo.environment["ATT_V6_SEARCH_BENCH_MAX_MS"] ?? "200") ?? 200) / 1_000
+        let threshold = (Double(ProcessInfo.processInfo.environment["ATT_V7_SEARCH_BENCH_MAX_MS"] ?? "200") ?? 200) / 1_000
 
         for query in ["log", "aito"] {
             let response = index.search(SearchRequest(
@@ -459,7 +459,7 @@ struct MemoryBudgetTests {
 
             print(
                 """
-                ATT_V6_SEARCH_BENCH_RECORDS=\(recordCount) \
+                ATT_V7_SEARCH_BENCH_RECORDS=\(recordCount) \
                 query=\(query) \
                 elapsed_ms=\(Int(response.elapsed * 1_000)) \
                 total=\(response.totalMatches) \
@@ -507,7 +507,7 @@ struct MemoryBudgetTests {
 
         for index in 0..<count {
             let name = String(format: "File%06d.swift", index)
-            let directory = "/tmp/allthethings-v6/aito/catalog-\(index % 512)/module-\((index / 512) % 512)"
+            let directory = "/tmp/allthethings-v7/aito/catalog-\(index % 512)/module-\((index / 512) % 512)"
             let path = "\(directory)/\(name)"
             records.append(FileRecord(
                 id: FileRecord.stableID(for: path),

@@ -85,6 +85,12 @@ public struct IndexSidecarInsight: Codable, Equatable, Sendable {
     }
 }
 
+public enum IndexRootAttributionSource: String, Codable, Equatable, Sendable {
+    case persistedExact
+    case runtimeExact
+    case estimated
+}
+
 public struct IndexRootInsight: Codable, Equatable, Sendable {
     public let path: String
     public let trackedFileCount: Int
@@ -93,6 +99,7 @@ public struct IndexRootInsight: Codable, Equatable, Sendable {
     public let indexedContentBytes: UInt64
     public let pathByteWeight: UInt64
     public let estimatedIndexBytes: UInt64
+    public let attributionSource: IndexRootAttributionSource
 
     public init(
         path: String,
@@ -101,7 +108,8 @@ public struct IndexRootInsight: Codable, Equatable, Sendable {
         hiddenCount: Int,
         indexedContentBytes: UInt64,
         pathByteWeight: UInt64,
-        estimatedIndexBytes: UInt64
+        estimatedIndexBytes: UInt64,
+        attributionSource: IndexRootAttributionSource = .runtimeExact
     ) {
         self.path = path
         self.trackedFileCount = trackedFileCount
@@ -110,6 +118,7 @@ public struct IndexRootInsight: Codable, Equatable, Sendable {
         self.indexedContentBytes = indexedContentBytes
         self.pathByteWeight = pathByteWeight
         self.estimatedIndexBytes = estimatedIndexBytes
+        self.attributionSource = attributionSource
     }
 }
 
@@ -117,6 +126,8 @@ public struct IndexStorageInsights: Codable, Equatable, Sendable {
     public let totalATTDataBytes: UInt64
     public let indexPackageBytes: UInt64
     public let cacheBytes: UInt64
+    public let measuredAt: Date?
+    public let isMeasuring: Bool
     public let locations: [IndexStorageLocationInsight]
     public let sidecars: [IndexSidecarInsight]
 
@@ -124,12 +135,16 @@ public struct IndexStorageInsights: Codable, Equatable, Sendable {
         totalATTDataBytes: UInt64,
         indexPackageBytes: UInt64,
         cacheBytes: UInt64,
+        measuredAt: Date? = nil,
+        isMeasuring: Bool = false,
         locations: [IndexStorageLocationInsight],
         sidecars: [IndexSidecarInsight]
     ) {
         self.totalATTDataBytes = totalATTDataBytes
         self.indexPackageBytes = indexPackageBytes
         self.cacheBytes = cacheBytes
+        self.measuredAt = measuredAt
+        self.isMeasuring = isMeasuring
         self.locations = locations
         self.sidecars = sidecars
     }

@@ -7,6 +7,216 @@ enum RecordStoreKind: String, Sendable {
     case overlay
 }
 
+enum RootAttributionError: LocalizedError {
+    case tooManyRoots(Int)
+
+    var errorDescription: String? {
+        switch self {
+        case .tooManyRoots(let count):
+            return "The index supports at most \(RootAttributionTable.maximumRootCount.formatted()) roots, but \(count.formatted()) were configured."
+        }
+    }
+}
+
+struct RootAttributionInput: Sendable {
+    let path: String
+    let isResultRow: Bool
+    let isDirectory: Bool
+    let isHidden: Bool
+    let sizeBytes: UInt64
+}
+
+struct RootAttributionBuildResult: Sendable {
+    let table: RootAttributionTable
+    let rootIDs: [UInt16]
+}
+
+struct RootAttributionSummary: Codable, Equatable, Sendable {
+    let id: UInt16
+    let path: String
+    var trackedFileCount: Int
+    var directoryCount: Int
+    var hiddenCount: Int
+    var indexedContentBytes: UInt64
+    var pathByteWeight: UInt64
+
+    init(
+        id: UInt16,
+        path: String,
+        trackedFileCount: Int = 0,
+        directoryCount: Int = 0,
+        hiddenCount: Int = 0,
+        indexedContentBytes: UInt64 = 0,
+        pathByteWeight: UInt64 = 0
+    ) {
+        self.id = id
+        self.path = path
+        self.trackedFileCount = trackedFileCount
+        self.directoryCount = directoryCount
+        self.hiddenCount = hiddenCount
+        self.indexedContentBytes = indexedContentBytes
+        self.pathByteWeight = pathByteWeight
+    }
+}
+
+struct RootAttributionTable: Codable, Equatable, Sendable {
+    static let currentSchemaVersion = 1
+    static let maximumRootCount = Int(UInt16.max)
+    static let unassignedRootID = UInt16.max
+
+    let schemaVersion: Int
+    var roots: [RootAttributionSummary]
+
+    init(schemaVersion: Int = Self.currentSchemaVersion, roots: [RootAttributionSummary]) {
+        self.schemaVersion = schemaVersion
+        self.roots = roots
+    }
+
+    var isValid: Bool {
+        schemaVersion == Self.currentSchemaVersion
+            && roots.count <= Self.maximumRootCount
+            && roots.enumerated().allSatisfy { index, summary in
+                summary.id == UInt16(index) && !summary.path.isEmpty
+            }
+    }
+
+    func rootPath(for id: UInt16) -> String? {
+        guard id != Self.unassignedRootID else { return nil }
+        let index = Int(id)
+        guard index >= 0, index < roots.count else { return nil }
+        return roots[index].path
+    }
+
+    func rootID(for path: String) -> UInt16? {
+        let normalizedPath = Self.normalizedPath(path)
+        return Self.ownerID(for: normalizedPath, matchers: rootsBySpecificity())
+    }
+
+    mutating func add(_ input: RootAttributionInput, to rootID: UInt16) {
+        adjust(input, rootID: rootID, delta: 1)
+    }
+
+    mutating func subtract(_ input: RootAttributionInput, from rootID: UInt16) {
+        adjust(input, rootID: rootID, delta: -1)
+    }
+
+    private mutating func adjust(_ input: RootAttributionInput, rootID: UInt16, delta: Int) {
+        guard rootID != Self.unassignedRootID, input.isResultRow else { return }
+        let index = Int(rootID)
+        guard index >= 0, index < roots.count else { return }
+
+        if input.isDirectory {
+            roots[index].directoryCount = max(0, roots[index].directoryCount + delta)
+        } else {
+            roots[index].trackedFileCount = max(0, roots[index].trackedFileCount + delta)
+            if delta >= 0 {
+                roots[index].indexedContentBytes &+= input.sizeBytes
+            } else {
+                roots[index].indexedContentBytes = roots[index].indexedContentBytes > input.sizeBytes
+                    ? roots[index].indexedContentBytes - input.sizeBytes
+                    : 0
+            }
+        }
+
+        if input.isHidden {
+            roots[index].hiddenCount = max(0, roots[index].hiddenCount + delta)
+        }
+
+        let pathBytes = UInt64(input.path.utf8.count)
+        if delta >= 0 {
+            roots[index].pathByteWeight &+= pathBytes
+        } else {
+            roots[index].pathByteWeight = roots[index].pathByteWeight > pathBytes
+                ? roots[index].pathByteWeight - pathBytes
+                : 0
+        }
+    }
+
+    static func build(
+        roots rawRoots: [String],
+        rowCount: Int,
+        inputAt: (Int) -> RootAttributionInput
+    ) throws -> RootAttributionBuildResult {
+        let normalizedRoots = normalizedRootPaths(rawRoots)
+        guard normalizedRoots.count <= maximumRootCount else {
+            throw RootAttributionError.tooManyRoots(normalizedRoots.count)
+        }
+
+        var summaries = normalizedRoots.enumerated().map { index, path in
+            RootAttributionSummary(id: UInt16(index), path: path)
+        }
+        let matchers = summaries.sorted {
+            if $0.path.count != $1.path.count { return $0.path.count > $1.path.count }
+            return $0.id < $1.id
+        }
+
+        var rowRootIDs: [UInt16] = []
+        rowRootIDs.reserveCapacity(rowCount)
+
+        for rowID in 0..<rowCount {
+            let input = inputAt(rowID)
+            let ownerID = ownerID(for: input.path, matchers: matchers) ?? unassignedRootID
+            rowRootIDs.append(ownerID)
+            guard ownerID != unassignedRootID, input.isResultRow else { continue }
+            summaries[Int(ownerID)].apply(input)
+        }
+
+        return RootAttributionBuildResult(
+            table: RootAttributionTable(roots: summaries),
+            rootIDs: rowRootIDs
+        )
+    }
+
+    static func normalizedRootPaths(_ roots: [String]) -> [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+        result.reserveCapacity(roots.count)
+
+        for root in roots {
+            let path = normalizedPath(root)
+            guard !path.isEmpty, seen.insert(path).inserted else { continue }
+            result.append(path)
+        }
+
+        return result
+    }
+
+    private func rootsBySpecificity() -> [RootAttributionSummary] {
+        roots.sorted {
+            if $0.path.count != $1.path.count { return $0.path.count > $1.path.count }
+            return $0.id < $1.id
+        }
+    }
+
+    private static func ownerID(for path: String, matchers: [RootAttributionSummary]) -> UInt16? {
+        matchers.first { summary in
+            if summary.path == "/" {
+                return path == "/" || path.hasPrefix("/")
+            }
+            return path == summary.path || path.hasPrefix(summary.path + "/")
+        }?.id
+    }
+
+    private static func normalizedPath(_ path: String) -> String {
+        URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL.path
+    }
+}
+
+private extension RootAttributionSummary {
+    mutating func apply(_ input: RootAttributionInput) {
+        if input.isDirectory {
+            directoryCount += 1
+        } else {
+            trackedFileCount += 1
+            indexedContentBytes &+= input.sizeBytes
+        }
+        if input.isHidden {
+            hiddenCount += 1
+        }
+        pathByteWeight &+= UInt64(input.path.utf8.count)
+    }
+}
+
 protocol RecordStore: AnyObject, Sendable {
     var count: Int { get }
     var kind: RecordStoreKind { get }
@@ -16,6 +226,7 @@ protocol RecordStore: AnyObject, Sendable {
     var hasColumnarSidecars: Bool { get }
     var storedVisibleCount: Int? { get }
     var storedResultCount: Int? { get }
+    var storedRootAttribution: RootAttributionTable? { get }
     var schemaVersion: Int { get }
 
     func record(at index: Int) -> FileRecord
@@ -38,6 +249,8 @@ protocol RecordStore: AnyObject, Sendable {
     func parentRowID(at index: Int) -> Int?
     func subtreeEnd(at index: Int) -> Int
     func depth(at index: Int) -> Int
+    func rootID(at index: Int) -> UInt16?
+    func rootPath(at index: Int) -> String?
     func isResultRow(at index: Int) -> Bool
     func isVirtual(at index: Int) -> Bool
     func isVisible(at index: Int) -> Bool
@@ -63,6 +276,7 @@ struct RecordSearchView: Sendable {
     var volumeName: String { store.volumeName(at: rowID) }
     var normalizedName: String { store.normalizedName(at: rowID) }
     var normalizedPath: String { store.normalizedPath(at: rowID) }
+    var rootPath: String? { store.rootPath(at: rowID) }
 
     func materializedRecord() -> FileRecord {
         store.record(at: rowID)
@@ -76,6 +290,7 @@ extension RecordStore {
     var hasColumnarSidecars: Bool { false }
     var storedVisibleCount: Int? { nil }
     var storedResultCount: Int? { nil }
+    var storedRootAttribution: RootAttributionTable? { nil }
     var schemaVersion: Int { 0 }
 
     func view(at index: Int) -> RecordSearchView {
@@ -108,6 +323,11 @@ extension RecordStore {
     func depth(at index: Int) -> Int {
         let path = path(at: index)
         return path.split(separator: "/").count
+    }
+    func rootID(at index: Int) -> UInt16? { nil }
+    func rootPath(at index: Int) -> String? {
+        guard let rootID = rootID(at: index) else { return nil }
+        return storedRootAttribution?.rootPath(for: rootID)
     }
     func isResultRow(at index: Int) -> Bool { true }
     func isVirtual(at index: Int) -> Bool { false }
@@ -173,11 +393,13 @@ final class HeapPagedRecordStore: RecordStore {
     let kind = RecordStoreKind.heapPaged
     let pages: [[FileRecord]]
     private let pathIndex: [String: Int]?
+    private let rootIDs: [UInt16]?
+    let storedRootAttribution: RootAttributionTable?
     let count: Int
 
     var heapPageCount: Int { pages.count }
 
-    init(records: [FileRecord], buildsPathIndex: Bool = true) {
+    init(records: [FileRecord], buildsPathIndex: Bool = true, roots: [String] = []) {
         var builtPages: [[FileRecord]] = []
         builtPages.reserveCapacity((records.count + Self.pageSize - 1) / Self.pageSize)
 
@@ -195,12 +417,36 @@ final class HeapPagedRecordStore: RecordStore {
         } else {
             self.pathIndex = nil
         }
+        let attribution = try? RootAttributionTable.build(roots: roots, rowCount: records.count) { index in
+            let record = records[index]
+            return RootAttributionInput(
+                path: record.path,
+                isResultRow: true,
+                isDirectory: record.isDirectory,
+                isHidden: record.isHidden,
+                sizeBytes: record.sizeBytes
+            )
+        }
+        self.rootIDs = attribution?.rootIDs
+        self.storedRootAttribution = attribution?.table
     }
 
-    fileprivate init(pages: [[FileRecord]], count: Int, pathIndex: [String: Int]?) {
+    fileprivate init(pages: [[FileRecord]], count: Int, pathIndex: [String: Int]?, roots: [String]) {
         self.pages = pages
         self.count = count
         self.pathIndex = pathIndex
+        let attribution = try? RootAttributionTable.build(roots: roots, rowCount: count) { index in
+            let record = pages[index / Self.pageSize][index % Self.pageSize]
+            return RootAttributionInput(
+                path: record.path,
+                isResultRow: true,
+                isDirectory: record.isDirectory,
+                isHidden: record.isHidden,
+                sizeBytes: record.sizeBytes
+            )
+        }
+        self.rootIDs = attribution?.rootIDs
+        self.storedRootAttribution = attribution?.table
     }
 
     func record(at index: Int) -> FileRecord {
@@ -220,6 +466,17 @@ final class HeapPagedRecordStore: RecordStore {
     }
 
     func recordID(at index: Int) -> UInt64 { record(at: index).id }
+
+    func rootID(at index: Int) -> UInt16? {
+        guard let rootIDs, index >= 0, index < rootIDs.count else { return nil }
+        let rootID = rootIDs[index]
+        return rootID == RootAttributionTable.unassignedRootID ? nil : rootID
+    }
+
+    func rootPath(at index: Int) -> String? {
+        guard let rootID = rootID(at: index) else { return nil }
+        return storedRootAttribution?.rootPath(for: rootID)
+    }
 }
 
 extension HeapPagedRecordStore {
@@ -228,10 +485,12 @@ extension HeapPagedRecordStore {
         private var currentPage: [FileRecord] = []
         private var pathIndex: [String: Int] = [:]
         private var recordCount = 0
+        private let roots: [String]
 
         var count: Int { recordCount }
 
-        init(reservedCapacity: Int) {
+        init(reservedCapacity: Int, roots: [String] = []) {
+            self.roots = roots
             currentPage.reserveCapacity(HeapPagedRecordStore.pageSize)
             pathIndex.reserveCapacity(reservedCapacity)
         }
@@ -267,7 +526,8 @@ extension HeapPagedRecordStore {
             return HeapPagedRecordStore(
                 pages: pages,
                 count: recordCount,
-                pathIndex: includesPathIndex ? pathIndex : nil
+                pathIndex: includesPathIndex ? pathIndex : nil,
+                roots: roots
             )
         }
 
@@ -294,6 +554,7 @@ final class OverlayRecordStore: RecordStore {
     private let visibleBaseRows: [Int]
     private let pathToOverlay: [String: Int]
     private let resultCount: Int
+    private let rootAttribution: RootAttributionTable?
 
     var count: Int { visibleBaseRows.count + upserts.count }
     var mappedByteSize: Int { base.mappedByteSize }
@@ -301,6 +562,7 @@ final class OverlayRecordStore: RecordStore {
     var overlayCount: Int { upserts.count + deletedRows.count }
     var hasColumnarSidecars: Bool { base.hasColumnarSidecars }
     var storedResultCount: Int? { resultCount }
+    var storedRootAttribution: RootAttributionTable? { rootAttribution }
     var schemaVersion: Int { base.schemaVersion }
 
     init(base: RecordStore, upserts: [FileRecord], deletedRows: Set<Int>) {
@@ -312,6 +574,7 @@ final class OverlayRecordStore: RecordStore {
         let baseResultCount = base.storedResultCount ?? (0..<base.count).filter { base.isResultRow(at: $0) }.count
         let deletedResultCount = deletedRows.filter { base.isResultRow(at: $0) }.count
         self.resultCount = max(0, baseResultCount - deletedResultCount) + upserts.count
+        self.rootAttribution = Self.adjustedRootAttribution(base: base, upserts: upserts, deletedRows: deletedRows)
     }
 
     func record(at index: Int) -> FileRecord {
@@ -428,6 +691,19 @@ final class OverlayRecordStore: RecordStore {
         return visibleIndex(forBaseRow: row)
     }
 
+    func rootID(at index: Int) -> UInt16? {
+        if index < visibleBaseRows.count {
+            return base.rootID(at: visibleBaseRows[index])
+        }
+        guard let rootAttribution else { return nil }
+        return rootAttribution.rootID(for: upserts[index - visibleBaseRows.count].path)
+    }
+
+    func rootPath(at index: Int) -> String? {
+        guard let rootID = rootID(at: index) else { return nil }
+        return rootAttribution?.rootPath(for: rootID) ?? base.storedRootAttribution?.rootPath(for: rootID)
+    }
+
     private func withBaseRowOrUpsert<Value>(
         at index: Int,
         baseValue: (Int) -> Value,
@@ -461,6 +737,44 @@ final class OverlayRecordStore: RecordStore {
 
         return lower
     }
+
+    private static func adjustedRootAttribution(
+        base: RecordStore,
+        upserts: [FileRecord],
+        deletedRows: Set<Int>
+    ) -> RootAttributionTable? {
+        guard var table = base.storedRootAttribution else { return nil }
+
+        for rowID in deletedRows {
+            guard let rootID = base.rootID(at: rowID) else { continue }
+            table.subtract(
+                RootAttributionInput(
+                    path: base.path(at: rowID),
+                    isResultRow: base.isResultRow(at: rowID),
+                    isDirectory: base.isDirectory(at: rowID),
+                    isHidden: base.isHidden(at: rowID),
+                    sizeBytes: base.sizeBytes(at: rowID)
+                ),
+                from: rootID
+            )
+        }
+
+        for record in upserts {
+            guard let rootID = table.rootID(for: record.path) else { continue }
+            table.add(
+                RootAttributionInput(
+                    path: record.path,
+                    isResultRow: true,
+                    isDirectory: record.isDirectory,
+                    isHidden: record.isHidden,
+                    sizeBytes: record.sizeBytes
+                ),
+                to: rootID
+            )
+        }
+
+        return table
+    }
 }
 
 final class ReplacingRecordStore: RecordStore {
@@ -468,6 +782,7 @@ final class ReplacingRecordStore: RecordStore {
 
     private let base: RecordStore
     private let replacements: [Int: FileRecord]
+    private let rootAttribution: RootAttributionTable?
 
     var count: Int { base.count }
     var mappedByteSize: Int { base.mappedByteSize }
@@ -475,11 +790,13 @@ final class ReplacingRecordStore: RecordStore {
     var overlayCount: Int { replacements.count }
     var hasColumnarSidecars: Bool { base.hasColumnarSidecars }
     var storedResultCount: Int? { base.storedResultCount }
+    var storedRootAttribution: RootAttributionTable? { rootAttribution }
     var schemaVersion: Int { base.schemaVersion }
 
     init(base: RecordStore, replacements: [Int: FileRecord]) {
         self.base = base
         self.replacements = replacements
+        self.rootAttribution = Self.adjustedRootAttribution(base: base, replacements: replacements)
     }
 
     func record(at index: Int) -> FileRecord {
@@ -598,6 +915,48 @@ final class ReplacingRecordStore: RecordStore {
     func rowID(forPath path: String) -> Int? {
         base.rowID(forPath: path)
     }
+
+    func rootID(at index: Int) -> UInt16? {
+        base.rootID(at: index)
+    }
+
+    func rootPath(at index: Int) -> String? {
+        guard let rootID = rootID(at: index) else { return nil }
+        return rootAttribution?.rootPath(for: rootID) ?? base.rootPath(at: index)
+    }
+
+    private static func adjustedRootAttribution(
+        base: RecordStore,
+        replacements: [Int: FileRecord]
+    ) -> RootAttributionTable? {
+        guard var table = base.storedRootAttribution else { return nil }
+
+        for (rowID, replacement) in replacements {
+            guard let rootID = base.rootID(at: rowID) else { continue }
+            table.subtract(
+                RootAttributionInput(
+                    path: base.path(at: rowID),
+                    isResultRow: base.isResultRow(at: rowID),
+                    isDirectory: base.isDirectory(at: rowID),
+                    isHidden: base.isHidden(at: rowID),
+                    sizeBytes: base.sizeBytes(at: rowID)
+                ),
+                from: rootID
+            )
+            table.add(
+                RootAttributionInput(
+                    path: replacement.path,
+                    isResultRow: base.isResultRow(at: rowID),
+                    isDirectory: replacement.isDirectory,
+                    isHidden: replacement.isHidden,
+                    sizeBytes: replacement.sizeBytes
+                ),
+                to: rootID
+            )
+        }
+
+        return table
+    }
 }
 
 final class MappedRecordStore: RecordStore {
@@ -645,8 +1004,11 @@ final class MappedRecordStore: RecordStore {
     private let visibleData: Data
     private let subtreeEndData: Data?
     private let depthData: Data?
+    private let rootIDData: Data
+    private let rootsByteSize: Int
     private let extensions: [String]
     private let volumes: [String]
+    let storedRootAttribution: RootAttributionTable?
     private let visibleCount: Int
     private let resultCount: Int
     private let cache = PathMaterializationCache(limit: 16_384)
@@ -656,6 +1018,7 @@ final class MappedRecordStore: RecordStore {
         recordsData.count + stringsData.count + pathLookupData.count
             + parentData.count + flagsData.count + visibleData.count
             + (subtreeEndData?.count ?? 0) + (depthData?.count ?? 0)
+            + rootIDData.count + rootsByteSize
     }
     var hasColumnarSidecars: Bool { true }
     var storedVisibleCount: Int? { visibleCount }
@@ -672,6 +1035,8 @@ final class MappedRecordStore: RecordStore {
         let visibleURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.visible, isDirectory: false)
         let subtreeEndURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.subtreeEnd, isDirectory: false)
         let depthURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.depth, isDirectory: false)
+        let rootIDURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.rootID, isDirectory: false)
+        let rootsURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.roots, isDirectory: false)
 
         self.recordsData = try Data(contentsOf: recordsURL, options: [.mappedIfSafe])
         self.stringsData = try Data(contentsOf: stringsURL, options: [.mappedIfSafe])
@@ -681,6 +1046,14 @@ final class MappedRecordStore: RecordStore {
         self.visibleData = try Data(contentsOf: visibleURL, options: [.mappedIfSafe])
         self.subtreeEndData = (try? Data(contentsOf: subtreeEndURL, options: [.mappedIfSafe]))
         self.depthData = (try? Data(contentsOf: depthURL, options: [.mappedIfSafe]))
+        self.rootIDData = try Data(contentsOf: rootIDURL, options: [.mappedIfSafe])
+        let rootsData = try Data(contentsOf: rootsURL)
+        self.rootsByteSize = rootsData.count
+        let rootAttribution = try JSONDecoder().decode(RootAttributionTable.self, from: rootsData)
+        guard rootAttribution.isValid else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        self.storedRootAttribution = rootAttribution
 
         guard
             recordsData.count >= Self.recordsHeaderSize,
@@ -698,7 +1071,8 @@ final class MappedRecordStore: RecordStore {
         guard
             parentData.count == rowCount * 4,
             flagsData.count == rowCount,
-            visibleData.count == Self.bitsetByteCount(for: rowCount)
+            visibleData.count == Self.bitsetByteCount(for: rowCount),
+            rootIDData.count == rowCount * 2
         else {
             throw CocoaError(.fileReadCorruptFile)
         }
@@ -710,6 +1084,9 @@ final class MappedRecordStore: RecordStore {
         }
         self.visibleCount = Self.countVisibleRows(in: visibleData, rowCount: rowCount)
         self.resultCount = Self.countResultRows(flagsData: flagsData, rowCount: rowCount)
+        guard Self.rootIDsAreValid(rootIDData, rowCount: rowCount, rootCount: rootAttribution.roots.count) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
 
         guard
             pathLookupData.count >= Self.pathLookupHeaderSize,
@@ -918,6 +1295,16 @@ final class MappedRecordStore: RecordStore {
         return isResultRow(at: index) && Self.bitsetValue(in: visibleData, at: index)
     }
     func volumeName(at index: Int) -> String { intern(volumes, id: readRow(index).volumeID) }
+    func rootID(at index: Int) -> UInt16? {
+        let rootID = rootIDData.readUInt16LE(at: columnOffset(for: index, stride: 2))
+        return rootID == RootAttributionTable.unassignedRootID ? nil : rootID
+    }
+
+    func rootPath(at index: Int) -> String? {
+        guard let rootID = rootID(at: index) else { return nil }
+        return storedRootAttribution?.rootPath(for: rootID)
+    }
+
     func normalizedName(at index: Int) -> String {
         let row = readRow(index)
         return string(offset: row.normalizedNameOffset, length: row.normalizedNameLength)
@@ -1193,6 +1580,16 @@ final class MappedRecordStore: RecordStore {
         try fileManager.createDirectory(at: packageURL, withIntermediateDirectories: true)
         let packageRows = preparePackageRows(records: records, roots: roots)
         let resultCount = packageRows.reduce(0) { $0 + ($1.isVirtual ? 0 : 1) }
+        let rootAttribution = try RootAttributionTable.build(roots: roots, rowCount: packageRows.count) { index in
+            let row = packageRows[index]
+            return RootAttributionInput(
+                path: row.record.path,
+                isResultRow: !row.isVirtual,
+                isDirectory: row.record.isDirectory,
+                isHidden: row.record.isHidden,
+                sizeBytes: row.record.sizeBytes
+            )
+        }
 
         let manifest = CompactSnapshotManifest(
             schemaVersion: SnapshotLayout.schemaVersion,
@@ -1204,6 +1601,10 @@ final class MappedRecordStore: RecordStore {
         )
         let manifestData = try JSONEncoder().encode(manifest)
         try manifestData.write(to: packageURL.appendingPathComponent(SnapshotLayout.FileName.manifest, isDirectory: false), options: .atomic)
+        try JSONEncoder().encode(rootAttribution.table).write(
+            to: packageURL.appendingPathComponent(SnapshotLayout.FileName.roots, isDirectory: false),
+            options: .atomic
+        )
 
         var extensionIDs: [String: UInt32] = ["": 0]
         var volumeIDs: [String: UInt32] = ["": 0]
@@ -1231,6 +1632,7 @@ final class MappedRecordStore: RecordStore {
         let visibleURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.visible, isDirectory: false)
         let subtreeEndURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.subtreeEnd, isDirectory: false)
         let depthURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.depth, isDirectory: false)
+        let rootIDURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.rootID, isDirectory: false)
 
         guard
             fileManager.createFile(atPath: stringsURL.path, contents: nil),
@@ -1283,6 +1685,8 @@ final class MappedRecordStore: RecordStore {
         var flagBytes: [UInt8] = []
         flagBytes.reserveCapacity(packageRows.count)
         var depths = Array(repeating: UInt16(0), count: packageRows.count)
+        var rootIDColumn = Data()
+        rootIDColumn.reserveCapacity(packageRows.count * 2)
 
         for (index, packageRow) in packageRows.enumerated() {
             let record = packageRow.record
@@ -1324,6 +1728,7 @@ final class MappedRecordStore: RecordStore {
                 lookupEntries.append((FileRecord.stableID(for: record.path), Int32(index)))
                 parentColumn.appendInt32LE(parent)
                 flagColumn.append(packedFlags)
+                rootIDColumn.appendUInt16LE(rootAttribution.rootIDs[index])
                 parents.append(parent)
                 flagBytes.append(packedFlags)
                 if parent >= 0 {
@@ -1334,6 +1739,7 @@ final class MappedRecordStore: RecordStore {
 
         try parentColumn.write(to: parentURL, options: .atomic)
         try flagColumn.write(to: flagsURL, options: .atomic)
+        try rootIDColumn.write(to: rootIDURL, options: .atomic)
         try makeVisibleBitset(parents: parents, flags: flagBytes).write(to: visibleURL, options: .atomic)
         try makeSubtreeEndColumn(parents: parents).write(to: subtreeEndURL, options: .atomic)
         var depthColumn = Data()
@@ -1403,6 +1809,17 @@ final class MappedRecordStore: RecordStore {
             count += 1
         }
         return count
+    }
+
+    private static func rootIDsAreValid(_ data: Data, rowCount: Int, rootCount: Int) -> Bool {
+        guard data.count == rowCount * 2 else { return false }
+        for rowID in 0..<rowCount {
+            let rootID = data.readUInt16LE(at: rowID * 2)
+            guard rootID == RootAttributionTable.unassignedRootID || Int(rootID) < rootCount else {
+                return false
+            }
+        }
+        return true
     }
 
     private static func makeVisibleBitset(parents: [Int32], flags: [UInt8]) -> Data {
