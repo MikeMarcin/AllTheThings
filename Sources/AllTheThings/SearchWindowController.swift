@@ -1788,6 +1788,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             if recursivePaths.isEmpty {
                 self.index.refresh(paths: paths)
             } else {
+                self.index.recordRecursiveRescan()
                 self.index.replaceRootsAndRebuild(self.indexedRoots)
             }
         }
@@ -1815,7 +1816,11 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func refreshMemoryStatus() {
-        memoryStatusText = ProcessMemoryFormatter.label(for: ProcessMemorySampler.currentUsage())
+        let usage = ProcessMemorySampler.currentUsage()
+        memoryStatusText = ProcessMemoryFormatter.label(for: usage)
+        if let usage {
+            index.recordMemorySample(bytes: usage.displayBytes)
+        }
     }
 
     private func updateStatus(refreshesMemory: Bool = false) {
@@ -2123,6 +2128,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     @objc private func openSelected(_ sender: Any?) {
         guard let record = selectedRecord() else { return }
+        index.recordFileAction(.open)
         NSWorkspace.shared.open(record.url)
     }
 
@@ -2165,6 +2171,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let urls = selectedRecords().map(\.url)
         guard !urls.isEmpty else { return }
 
+        index.recordFileAction(.open)
         NSWorkspace.shared.open(
             urls,
             withApplicationAt: applicationURL,
@@ -2179,6 +2186,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     @objc private func revealSelected(_ sender: Any?) {
         let urls = selectedRecords().map(\.url)
         guard !urls.isEmpty else { return }
+        index.recordFileAction(.reveal)
         NSWorkspace.shared.activateFileViewerSelecting(urls)
     }
 
@@ -2199,6 +2207,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
 
         if !changedPaths.isEmpty {
+            index.recordFileAction(.moveToTrash)
             playMascotTransient(.fileChanged)
             index.refresh(paths: changedPaths)
             scheduleSearch(force: true)
@@ -2219,6 +2228,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         NSAppleScript(source: source)?.executeAndReturnError(&error)
         if let error {
             presentError("Could not show item info.", informativeText: error.description)
+        } else {
+            index.recordFileAction(.getInfo)
         }
     }
 
@@ -2264,6 +2275,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         do {
             try FileManager.default.moveItem(at: record.url, to: destination)
+            index.recordFileAction(.rename)
             playMascotTransient(.fileChanged)
             index.refresh(paths: [record.path, destination.path])
             scheduleSearch(force: true)
@@ -2282,6 +2294,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         do {
             try process.run()
+            index.recordFileAction(.quickLook)
         } catch {
             presentError("Could not Quick Look item.", informativeText: error.localizedDescription)
         }
@@ -2318,6 +2331,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         pasteboard.clearContents()
         pasteboard.writeObjects(records.map { $0.url as NSURL })
         pasteboard.setString(records.map(\.path).joined(separator: "\n"), forType: .string)
+        index.recordFileAction(.copyFile)
     }
 
     @objc private func copySelectedPath(_ sender: Any?) {
@@ -2326,6 +2340,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(records.map(\.path).joined(separator: "\n"), forType: .string)
+        index.recordFileAction(.copyPath)
     }
 
     private func terminalDirectoryPath(for record: FileRecord) -> String {
