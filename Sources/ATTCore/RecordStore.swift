@@ -633,17 +633,17 @@ final class MappedRecordStore: RecordStore {
     var storedVisibleCount: Int? { visibleCount }
     var storedResultCount: Int? { resultCount }
 
-    init(packageURL: URL, schemaVersion: Int = 6) throws {
+    init(packageURL: URL, schemaVersion: Int = SnapshotLayout.schemaVersion) throws {
         self.schemaVersion = schemaVersion
-        let recordsURL = packageURL.appendingPathComponent("records.bin", isDirectory: false)
-        let stringsURL = packageURL.appendingPathComponent("strings.bin", isDirectory: false)
-        let internsURL = packageURL.appendingPathComponent("interns.bin", isDirectory: false)
-        let lookupURL = packageURL.appendingPathComponent("pathLookup.bin", isDirectory: false)
-        let parentURL = packageURL.appendingPathComponent("parent.i32", isDirectory: false)
-        let flagsURL = packageURL.appendingPathComponent("flags.u8", isDirectory: false)
-        let visibleURL = packageURL.appendingPathComponent("visible.bitset", isDirectory: false)
-        let subtreeEndURL = packageURL.appendingPathComponent("subtreeEnd.i32", isDirectory: false)
-        let depthURL = packageURL.appendingPathComponent("depth.u16", isDirectory: false)
+        let recordsURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.records, isDirectory: false)
+        let stringsURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.strings, isDirectory: false)
+        let internsURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.interns, isDirectory: false)
+        let lookupURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.pathLookup, isDirectory: false)
+        let parentURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.parent, isDirectory: false)
+        let flagsURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.flags, isDirectory: false)
+        let visibleURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.visible, isDirectory: false)
+        let subtreeEndURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.subtreeEnd, isDirectory: false)
+        let depthURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.depth, isDirectory: false)
 
         self.recordsData = try Data(contentsOf: recordsURL, options: [.mappedIfSafe])
         self.stringsData = try Data(contentsOf: stringsURL, options: [.mappedIfSafe])
@@ -1121,7 +1121,7 @@ final class MappedRecordStore: RecordStore {
         let resultCount = packageRows.reduce(0) { $0 + ($1.isVirtual ? 0 : 1) }
 
         let manifest = CompactSnapshotManifest(
-            schemaVersion: 6,
+            schemaVersion: SnapshotLayout.schemaVersion,
             savedAt: savedAt,
             roots: roots,
             exclusionPatterns: exclusionPatterns,
@@ -1129,7 +1129,7 @@ final class MappedRecordStore: RecordStore {
             resultCount: resultCount
         )
         let manifestData = try JSONEncoder().encode(manifest)
-        try manifestData.write(to: packageURL.appendingPathComponent("manifest.json", isDirectory: false), options: .atomic)
+        try manifestData.write(to: packageURL.appendingPathComponent(SnapshotLayout.FileName.manifest, isDirectory: false), options: .atomic)
 
         var extensionIDs: [String: UInt32] = ["": 0]
         var volumeIDs: [String: UInt32] = ["": 0]
@@ -1146,17 +1146,17 @@ final class MappedRecordStore: RecordStore {
         try writeInterns(
             extensions: sortedInterns(extensionIDs),
             volumes: sortedInterns(volumeIDs),
-            to: packageURL.appendingPathComponent("interns.bin", isDirectory: false)
+            to: packageURL.appendingPathComponent(SnapshotLayout.FileName.interns, isDirectory: false)
         )
 
-        let stringsURL = packageURL.appendingPathComponent("strings.bin", isDirectory: false)
-        let recordsURL = packageURL.appendingPathComponent("records.bin", isDirectory: false)
-        let lookupURL = packageURL.appendingPathComponent("pathLookup.bin", isDirectory: false)
-        let parentURL = packageURL.appendingPathComponent("parent.i32", isDirectory: false)
-        let flagsURL = packageURL.appendingPathComponent("flags.u8", isDirectory: false)
-        let visibleURL = packageURL.appendingPathComponent("visible.bitset", isDirectory: false)
-        let subtreeEndURL = packageURL.appendingPathComponent("subtreeEnd.i32", isDirectory: false)
-        let depthURL = packageURL.appendingPathComponent("depth.u16", isDirectory: false)
+        let stringsURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.strings, isDirectory: false)
+        let recordsURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.records, isDirectory: false)
+        let lookupURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.pathLookup, isDirectory: false)
+        let parentURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.parent, isDirectory: false)
+        let flagsURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.flags, isDirectory: false)
+        let visibleURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.visible, isDirectory: false)
+        let subtreeEndURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.subtreeEnd, isDirectory: false)
+        let depthURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.depth, isDirectory: false)
 
         guard
             fileManager.createFile(atPath: stringsURL.path, contents: nil),
@@ -1292,11 +1292,11 @@ final class MappedRecordStore: RecordStore {
             try lookupHandle.write(contentsOf: data)
         }
 
-        try Data().write(to: packageURL.appendingPathComponent("modifiedOrder.bin", isDirectory: false))
-        try Data().write(to: packageURL.appendingPathComponent("namePostings.bin", isDirectory: false))
-        try Data().write(to: packageURL.appendingPathComponent("componentPostings.bin", isDirectory: false))
-        try Data().write(to: packageURL.appendingPathComponent("pathPostings.bin", isDirectory: false))
-        try Data().write(to: packageURL.appendingPathComponent("extensionPostings.bin", isDirectory: false))
+        try Data().write(to: packageURL.appendingPathComponent(SnapshotLayout.FileName.modifiedOrder, isDirectory: false))
+        try Data().write(to: packageURL.appendingPathComponent(SnapshotLayout.FileName.namePostings, isDirectory: false))
+        try Data().write(to: packageURL.appendingPathComponent(SnapshotLayout.FileName.componentPostings, isDirectory: false))
+        try Data().write(to: packageURL.appendingPathComponent(SnapshotLayout.FileName.pathPostings, isDirectory: false))
+        try Data().write(to: packageURL.appendingPathComponent(SnapshotLayout.FileName.extensionPostings, isDirectory: false))
     }
 
     private static func bitsetByteCount(for bitCount: Int) -> Int {

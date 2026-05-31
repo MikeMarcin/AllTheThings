@@ -65,22 +65,27 @@ configure_file(
     "${APP_BUNDLE_DIR}/Contents/Info.plist"
     COPYONLY
 )
-file(COPY "${SOURCE_DIR}/Resources/AllTheThings.icns" DESTINATION "${APP_BUNDLE_DIR}/Contents/Resources")
-file(COPY "${SOURCE_DIR}/Resources/GameCoreTechLogo.png" DESTINATION "${APP_BUNDLE_DIR}/Contents/Resources")
-file(COPY "${SOURCE_DIR}/Resources/NibOperationIdleStrip.png" DESTINATION "${APP_BUNDLE_DIR}/Contents/Resources")
-file(COPY "${SOURCE_DIR}/Resources/NibOperationIndexingStrip.png" DESTINATION "${APP_BUNDLE_DIR}/Contents/Resources")
-file(COPY "${SOURCE_DIR}/Resources/NibOperationSearchingStrip.png" DESTINATION "${APP_BUNDLE_DIR}/Contents/Resources")
-file(COPY "${SOURCE_DIR}/Resources/NibOperationOptimizingStrip.png" DESTINATION "${APP_BUNDLE_DIR}/Contents/Resources")
-file(COPY "${SOURCE_DIR}/Resources/NibOperationFileChangedStrip.png" DESTINATION "${APP_BUNDLE_DIR}/Contents/Resources")
-file(COPY "${SOURCE_DIR}/Resources/NibOperationSuccessStrip.png" DESTINATION "${APP_BUNDLE_DIR}/Contents/Resources")
-file(COPY "${SOURCE_DIR}/Resources/NibOperationErrorStrip.png" DESTINATION "${APP_BUNDLE_DIR}/Contents/Resources")
-file(COPY "${SOURCE_DIR}/Resources/NibIdleMainLoopStrip.png" DESTINATION "${APP_BUNDLE_DIR}/Contents/Resources")
-file(COPY "${SOURCE_DIR}/Resources/NibIdleBlinkFidgetStrip.png" DESTINATION "${APP_BUNDLE_DIR}/Contents/Resources")
-file(COPY "${SOURCE_DIR}/Resources/NibIdleAntennaFidgetStrip.png" DESTINATION "${APP_BUNDLE_DIR}/Contents/Resources")
-file(COPY "${SOURCE_DIR}/Resources/NibIdleFileFinderSparkStrip.png" DESTINATION "${APP_BUNDLE_DIR}/Contents/Resources")
-file(COPY "${SOURCE_DIR}/Resources/NibIdleVictoryBounceStrip.png" DESTINATION "${APP_BUNDLE_DIR}/Contents/Resources")
-file(COPY "${SOURCE_DIR}/Resources/NibIntroWelcomeStrip.png" DESTINATION "${APP_BUNDLE_DIR}/Contents/Resources")
-file(COPY "${SOURCE_DIR}/Resources/NibFlydownStrip.png" DESTINATION "${APP_BUNDLE_DIR}/Contents/Resources")
+set(APP_RESOURCE_FILES
+    "AllTheThings.icns"
+    "GameCoreTechLogo.png"
+    "NibOperationIdleStrip.png"
+    "NibOperationIndexingStrip.png"
+    "NibOperationSearchingStrip.png"
+    "NibOperationOptimizingStrip.png"
+    "NibOperationFileChangedStrip.png"
+    "NibOperationSuccessStrip.png"
+    "NibOperationErrorStrip.png"
+    "NibIdleMainLoopStrip.png"
+    "NibIdleBlinkFidgetStrip.png"
+    "NibIdleAntennaFidgetStrip.png"
+    "NibIdleFileFinderSparkStrip.png"
+    "NibIdleVictoryBounceStrip.png"
+    "NibIntroWelcomeStrip.png"
+    "NibFlydownStrip.png"
+)
+foreach(resource_file IN LISTS APP_RESOURCE_FILES)
+    file(COPY "${SOURCE_DIR}/Resources/${resource_file}" DESTINATION "${APP_BUNDLE_DIR}/Contents/Resources")
+endforeach()
 file(WRITE "${APP_BUNDLE_DIR}/Contents/PkgInfo" "APPL????")
 
 find_program(CODESIGN_EXECUTABLE codesign)

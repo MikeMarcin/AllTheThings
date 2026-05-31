@@ -90,8 +90,8 @@ The core is isolated in `Sources/ATTCore` so the mmap snapshot and refresh-overl
 This is a working MVP, not the final high-performance engine described in the product design.
 
 - The initial crawler uses Foundation APIs rather than `getattrlistbulk`.
-- The saved snapshot is a v4 `filename-index-v4.attindex` package with mapped row/string/path-lookup files; old JSON/JSONL snapshots are ignored and rebuilt.
-- Search scores lightweight record views and only materializes `FileRecord` values for returned rows, with supporting indexes for common fast paths.
+- The saved snapshot is a v6 `filename-index-v6.attindex` package with mapped record rows, string/path lookup data, visibility sidecars, component namespace rows, and persisted search structures.
+- Search scores lightweight record views and only materializes `FileRecord` values for returned rows, with persisted indexes and sorted orders for common fast paths.
 - FSEvents are treated as dirty-path refresh signals, but there is not yet a WAL or full reconciliation scheduler.
 - Full Disk Access status is informational and conservative; indexing behavior has not been overhauled around macOS privacy prompts yet.
 
