@@ -37,6 +37,11 @@ struct MascotSpriteSheetTests {
             #expect(animation.framesPerSecond <= 8)
         }
 
+        #expect(OperationMascotAnimation.indexing.playbackPriority > OperationMascotAnimation.fileChanged.playbackPriority)
+        #expect(OperationMascotAnimation.optimizing.playbackPriority > OperationMascotAnimation.fileChanged.playbackPriority)
+        #expect(OperationMascotAnimation.indexing.playbackPriority > OperationMascotAnimation.success.playbackPriority)
+        #expect(OperationMascotAnimation.optimizing.playbackPriority > OperationMascotAnimation.error.playbackPriority)
+
         #expect(OperationMascotCoordinator.statusDisplaySize == 40)
         #expect(OperationMascotCoordinator.footerSlotHeight == 28)
         #expect(OperationMascotCoordinator.footerSlotHeight < OperationMascotCoordinator.statusDisplaySize)
@@ -166,6 +171,51 @@ struct MascotSpriteSheetTests {
         }
 
         #expect(controller.advanceFrame() == .completedOneShot)
+    }
+
+    @Test("animation controller keeps indexing and optimizing ahead of lower priority transients")
+    func animationControllerKeepsIndexingAndOptimizingAheadOfLowerPriorityTransients() {
+        var controller = OperationMascotAnimationController()
+
+        let didStartIndexing = controller.setPersistentAnimation(.indexing)
+        #expect(didStartIndexing)
+        #expect(controller.currentFrame == .animation(.indexing, index: 0))
+        let didStartFileChangedWhileIndexing = controller.playTransient(.fileChanged)
+        #expect(!didStartFileChangedWhileIndexing)
+        #expect(controller.currentFrame == .animation(.indexing, index: 0))
+        let didStartSuccessWhileIndexing = controller.playTransient(.success)
+        #expect(!didStartSuccessWhileIndexing)
+        #expect(controller.currentFrame == .animation(.indexing, index: 0))
+
+        let didStartOptimizing = controller.setPersistentAnimation(.optimizing)
+        #expect(didStartOptimizing)
+        #expect(controller.currentFrame == .animation(.optimizing, index: 0))
+        let didStartFileChangedWhileOptimizing = controller.playTransient(.fileChanged)
+        #expect(!didStartFileChangedWhileOptimizing)
+        #expect(controller.currentFrame == .animation(.optimizing, index: 0))
+        let didStartErrorWhileOptimizing = controller.playTransient(.error)
+        #expect(!didStartErrorWhileOptimizing)
+        #expect(controller.currentFrame == .animation(.optimizing, index: 0))
+    }
+
+    @Test("animation controller promotes indexing and optimizing over active lower priority one shots")
+    func animationControllerPromotesIndexingAndOptimizingOverActiveLowerPriorityOneShots() {
+        var controller = OperationMascotAnimationController()
+
+        let didStartFileChanged = controller.playTransient(.fileChanged)
+        #expect(didStartFileChanged)
+        #expect(controller.currentFrame == .animation(.fileChanged, index: 0))
+        let didStartIndexing = controller.setPersistentAnimation(.indexing)
+        #expect(didStartIndexing)
+        #expect(controller.currentFrame == .animation(.indexing, index: 0))
+
+        var optimizingController = OperationMascotAnimationController()
+        let didStartSuccess = optimizingController.playTransient(.success)
+        #expect(didStartSuccess)
+        #expect(optimizingController.currentFrame == .animation(.success, index: 0))
+        let didStartOptimizing = optimizingController.setPersistentAnimation(.optimizing)
+        #expect(didStartOptimizing)
+        #expect(optimizingController.currentFrame == .animation(.optimizing, index: 0))
     }
 
     @Test("coordinator renders first idle frame on initialization")

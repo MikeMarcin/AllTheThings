@@ -66,6 +66,17 @@ enum OperationMascotAnimation: String, CaseIterable {
         case .error: "Operation needs attention"
         }
     }
+
+    var playbackPriority: Int {
+        switch self {
+        case .idle:
+            0
+        case .searching, .fileChanged, .success, .error:
+            1
+        case .indexing, .optimizing:
+            2
+        }
+    }
 }
 
 enum OperationMascotIdleClip: String, CaseIterable {
@@ -229,7 +240,21 @@ struct OperationMascotAnimationController {
     mutating func setPersistentAnimation(_ animation: OperationMascotAnimation) -> Bool {
         persistentAnimation = animation
 
-        guard activeAnimation.loops, activeAnimation != animation else {
+        guard activeAnimation != animation else {
+            return false
+        }
+
+        if animation.playbackPriority > activeAnimation.playbackPriority || activeAnimation.loops {
+            start(animation)
+            return true
+        }
+
+        return false
+    }
+
+    @discardableResult
+    mutating func playTransient(_ animation: OperationMascotAnimation) -> Bool {
+        guard animation.playbackPriority >= activeAnimation.playbackPriority else {
             return false
         }
 
@@ -640,7 +665,9 @@ final class OperationMascotCoordinator {
     }
 
     func playTransient(_ animation: OperationMascotAnimation) {
-        start(animation)
+        if animationController.playTransient(animation) {
+            didStartPlayback()
+        }
     }
 
     func setDisplaySize(_ size: CGFloat, animated: Bool = false) {

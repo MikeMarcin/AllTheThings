@@ -82,7 +82,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         var width: CGFloat {
             switch self {
-            case .match: 64
+            case .match: 48
             case .name: 220
             case .path: 380
             case .modified: 112
@@ -293,6 +293,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var didRequestInitialRebuild = false
     private var highlightsSearchText: Bool
     private var showsHiddenFiles: Bool
+    private var appFontFamilyName: String?
+    private var appFontSize: CGFloat
 
     private enum DefaultsKey {
         static let sortColumn = "ATTSortColumn"
@@ -334,6 +336,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         self.indexedRoots = AppSettings.indexedRoots(defaults: defaults)
         self.highlightsSearchText = defaults.bool(forKey: AppSettings.highlightSearchTextKey)
         self.showsHiddenFiles = defaults.bool(forKey: AppSettings.showHiddenFilesKey)
+        self.appFontFamilyName = AppSettings.appFontFamilyName(defaults: defaults)
+        self.appFontSize = AppSettings.appFontSize(defaults: defaults)
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -366,6 +370,18 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             self,
             selector: #selector(userDefaultsDidChange(_:)),
             name: UserDefaults.didChangeNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appFontDidChange(_:)),
+            name: AppSettings.appFontDidChangeNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(matchColorsDidChange(_:)),
+            name: AppSettings.matchColorsDidChangeNotification,
             object: nil
         )
         NotificationCenter.default.addObserver(
@@ -432,6 +448,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         let cell = makeCell(for: tableColumn.identifier)
         let textField = cell.textField
+        textField?.font = AppSettings.appFont(defaults: defaults)
 
         switch column {
         case .match:
@@ -443,7 +460,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                 explanation: result.match,
                 baseAttributes: [
                     .foregroundColor: NSColor.labelColor,
-                    .font: NSFont.systemFont(ofSize: 12, weight: .semibold)
+                    .font: AppSettings.appFont(defaults: defaults, weight: .semibold)
                 ]
             )
             textField?.lineBreakMode = .byTruncatingMiddle
@@ -550,7 +567,6 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         searchField.target = self
         searchField.action = #selector(searchFieldDidChange(_:))
         searchField.controlSize = .large
-        searchField.font = .systemFont(ofSize: 16)
         searchField.sendsSearchStringImmediately = true
         searchField.sendsWholeSearchString = false
         searchField.translatesAutoresizingMaskIntoConstraints = false
@@ -578,7 +594,6 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         tableView.dataSource = self
         tableView.usesAlternatingRowBackgroundColors = true
         tableView.rowSizeStyle = .small
-        tableView.rowHeight = 20
         tableView.intercellSpacing = NSSize(width: 3, height: 1)
         tableView.style = .fullWidth
         tableView.allowsMultipleSelection = true
@@ -612,10 +627,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         footer.edgeInsets = NSEdgeInsets(top: 2, left: 14, bottom: 2, right: 14)
         footer.translatesAutoresizingMaskIntoConstraints = false
 
-        countLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         countLabel.textColor = .secondaryLabelColor
         countLabel.lineBreakMode = .byTruncatingTail
-        statusLabel.font = .systemFont(ofSize: 12)
         statusLabel.textColor = .tertiaryLabelColor
         statusLabel.lineBreakMode = .byTruncatingMiddle
         statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -635,6 +648,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         configureIndexingSetupOverlay()
         configureLoadingOverlay()
         configureExpandedMascotOverlay()
+        applyFontSettings()
 
         NSLayoutConstraint.activate([
             rootStack.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
@@ -666,6 +680,15 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         updateSetupSuggestions()
         updateLoadingOverlay()
         updateExpandedMascotForOperation(animated: false)
+    }
+
+    private func applyFontSettings() {
+        let baseSize = AppSettings.appFontSize(defaults: defaults)
+        searchField.font = AppSettings.appFont(defaults: defaults, sizeDelta: 4)
+        tableView.rowHeight = max(20, baseSize + 8)
+        countLabel.font = AppSettings.appFont(defaults: defaults)
+        statusLabel.font = AppSettings.appFont(defaults: defaults)
+        loadingLabel.font = AppSettings.appFont(defaults: defaults, sizeDelta: 2, weight: .medium)
     }
 
     private func configureMascotSlotView() {
@@ -1051,7 +1074,6 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         )
 
         loadingLabel.translatesAutoresizingMaskIntoConstraints = false
-        loadingLabel.font = .systemFont(ofSize: 14, weight: .medium)
         loadingLabel.textColor = .secondaryLabelColor
         loadingLabel.alignment = .center
         loadingLabel.lineBreakMode = .byWordWrapping
@@ -1177,7 +1199,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         textField.translatesAutoresizingMaskIntoConstraints = false
         textField.usesSingleLineMode = true
         textField.lineBreakMode = .byTruncatingMiddle
-        textField.font = .systemFont(ofSize: 12)
+        textField.font = AppSettings.appFont(defaults: defaults)
         cell.addSubview(textField)
         cell.textField = textField
 
@@ -1190,29 +1212,35 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         return cell
     }
 
-    private func makeMatchCell(for identifier: NSUserInterfaceItemIdentifier) -> MatchTableCellView {
-        if let reusable = tableView.makeView(withIdentifier: identifier, owner: self) as? MatchTableCellView {
+    private func makeMatchCell(for identifier: NSUserInterfaceItemIdentifier) -> MatchIconCellView {
+        if let reusable = tableView.makeView(withIdentifier: identifier, owner: self) as? MatchIconCellView {
             return reusable
         }
 
-        let cell = MatchTableCellView()
+        let cell = MatchIconCellView()
         cell.identifier = identifier
-        cell.textField = cell.label
         return cell
     }
 
-    private func configureMatchCell(_ cell: MatchTableCellView, explanation: MatchExplanation?) {
+    private func configureMatchCell(_ cell: MatchIconCellView, explanation: MatchExplanation?) {
         guard let explanation else {
-            cell.label.stringValue = ""
-            cell.swatch.color = .tertiaryLabelColor
-            cell.toolTip = nil
+            cell.configure(icon: nil, color: .clear, placard: nil)
             return
         }
 
-        cell.label.stringValue = matchLabel(for: explanation.matchClass)
-        cell.label.textColor = .labelColor
-        cell.swatch.color = matchColor(for: explanation.quality)
-        cell.toolTip = explanation.reason
+        let label = matchLabel(for: explanation.matchClass)
+        let color = matchColor(for: explanation.quality)
+        let placard = MatchPlacard(
+            title: "\(label) match",
+            scoreText: "Score \(explanation.score.formatted())",
+            reason: explanation.reason,
+            color: color
+        )
+        cell.configure(
+            icon: matchIcon(for: explanation.matchClass, accessibilityDescription: label),
+            color: color,
+            placard: placard
+        )
     }
 
     private func scheduleSearch(force: Bool = false) {
@@ -1455,6 +1483,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func playMascotTransient(_ animation: OperationMascotAnimation) {
+        guard !isMascotFlightInProgress else { return }
+
         mascotCoordinator?.playTransient(animation)
         expandedMascotCoordinator?.playTransient(animation)
         loadingMascotCoordinator?.playTransient(animation)
@@ -1627,9 +1657,18 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private func settingsDidChange() {
         let updatedHighlightsSearchText = defaults.bool(forKey: AppSettings.highlightSearchTextKey)
         let updatedShowsHiddenFiles = defaults.bool(forKey: AppSettings.showHiddenFilesKey)
+        let updatedAppFontFamilyName = AppSettings.appFontFamilyName(defaults: defaults)
+        let updatedAppFontSize = AppSettings.appFontSize(defaults: defaults)
 
         if updatedHighlightsSearchText != highlightsSearchText {
             highlightsSearchText = updatedHighlightsSearchText
+            tableView.reloadData()
+        }
+
+        if updatedAppFontFamilyName != appFontFamilyName || updatedAppFontSize != appFontSize {
+            appFontFamilyName = updatedAppFontFamilyName
+            appFontSize = updatedAppFontSize
+            applyFontSettings()
             tableView.reloadData()
         }
 
@@ -1642,6 +1681,14 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     @objc private func userDefaultsDidChange(_ notification: Notification) {
         settingsDidChange()
         updateSetupSuggestions()
+    }
+
+    @objc private func appFontDidChange(_ notification: Notification) {
+        settingsDidChange()
+    }
+
+    @objc private func matchColorsDidChange(_ notification: Notification) {
+        tableView.reloadData()
     }
 
     @objc private func indexedRootsDidChange(_ notification: Notification) {
@@ -1837,7 +1884,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let displayPath = AppSettings.displayPath(directoryPath)
         let attributes: [NSAttributedString.Key: Any] = [
             .foregroundColor: NSColor.secondaryLabelColor,
-            .font: NSFont.systemFont(ofSize: 12)
+            .font: AppSettings.appFont(defaults: defaults)
         ]
         return highlightedText(
             displayPath,
@@ -1896,18 +1943,18 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         case .contiguous:
             return [
                 .foregroundColor: color,
-                .font: NSFont.systemFont(ofSize: 12, weight: .bold)
+                .font: AppSettings.appFont(defaults: defaults, weight: .bold)
             ]
         case .subsequence:
             return [
                 .foregroundColor: color,
-                .font: NSFont.systemFont(ofSize: 12, weight: .bold),
+                .font: AppSettings.appFont(defaults: defaults, weight: .bold),
                 .underlineStyle: NSUnderlineStyle.single.rawValue
             ]
         case .typo:
             return [
                 .foregroundColor: color,
-                .font: NSFont.systemFont(ofSize: 12, weight: .bold),
+                .font: AppSettings.appFont(defaults: defaults, weight: .bold),
                 .backgroundColor: color.withAlphaComponent(0.18)
             ]
         }
@@ -1928,17 +1975,37 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
     }
 
-    private func matchColor(for quality: MatchQuality) -> NSColor {
-        let base: NSColor = switch quality.matchClass {
-        case .exact: .systemGreen
-        case .prefix: .systemBlue
-        case .substring: .systemYellow
-        case .near: .systemOrange
-        case .weakPath: .systemPurple
-        case .metadata: .systemGray
+    private func matchIcon(for matchClass: MatchClass, accessibilityDescription: String) -> NSImage? {
+        let candidates: [String] = switch matchClass {
+        case .exact:
+            ["checkmark.circle.fill", "checkmark.circle"]
+        case .prefix:
+            ["arrow.right.circle.fill", "arrow.right.circle"]
+        case .substring:
+            ["magnifyingglass.circle.fill", "magnifyingglass.circle", "magnifyingglass"]
+        case .near:
+            ["sparkles", "wand.and.stars", "waveform.path.ecg"]
+        case .weakPath:
+            ["folder.fill", "folder"]
+        case .metadata:
+            ["tag.fill", "tag"]
         }
-        let alpha = 0.45 + (CGFloat(quality.scoreBin) * 0.12)
-        return base.withAlphaComponent(min(alpha, 1))
+
+        for symbolName in candidates {
+            if let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: accessibilityDescription) {
+                image.isTemplate = true
+                return image
+            }
+        }
+        return nil
+    }
+
+    private func matchColor(for quality: MatchQuality) -> NSColor {
+        AppSettings.matchColor(
+            for: quality.matchClass,
+            isDark: AppTheme.isDarkAppearance(for: view),
+            defaults: defaults
+        )
     }
 
     private func sortSpec(for descriptor: NSSortDescriptor) -> SortSpec {
@@ -2362,9 +2429,18 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 }
 
-private final class MatchTableCellView: NSTableCellView {
-    let swatch = MatchSwatchView()
-    let label = NSTextField(labelWithString: "")
+private struct MatchPlacard {
+    let title: String
+    let scoreText: String
+    let reason: String
+    let color: NSColor
+}
+
+private final class MatchIconCellView: NSTableCellView {
+    let iconView = NSImageView()
+    private var placard: MatchPlacard?
+    private var trackingArea: NSTrackingArea?
+    private weak var placardView: MatchPlacardView?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -2376,39 +2452,224 @@ private final class MatchTableCellView: NSTableCellView {
         configure()
     }
 
-    private func configure() {
-        swatch.translatesAutoresizingMaskIntoConstraints = false
-        label.translatesAutoresizingMaskIntoConstraints = false
-        label.usesSingleLineMode = true
-        label.lineBreakMode = .byTruncatingTail
-        label.font = .systemFont(ofSize: 11, weight: .medium)
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
 
-        addSubview(swatch)
-        addSubview(label)
+        let trackingArea = NSTrackingArea(
+            rect: .zero,
+            options: [.activeAlways, .inVisibleRect, .mouseEnteredAndExited],
+            owner: self
+        )
+        addTrackingArea(trackingArea)
+        self.trackingArea = trackingArea
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        showPlacard()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hidePlacard()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            hidePlacard()
+        }
+    }
+
+    func configure(icon: NSImage?, color: NSColor, placard: MatchPlacard?) {
+        hidePlacard()
+        self.placard = placard
+        removeAllToolTips()
+        iconView.removeAllToolTips()
+        toolTip = nil
+        iconView.toolTip = nil
+        iconView.image = Self.tintedImage(icon, color: color)
+        iconView.isHidden = icon == nil
+        setAccessibilityLabel(placard?.title)
+        iconView.setAccessibilityLabel(placard?.title)
+    }
+
+    func hidePlacard() {
+        placardView?.removeFromSuperview()
+        placardView = nil
+    }
+
+    private func configure() {
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+        iconView.imageScaling = .scaleProportionallyDown
+        iconView.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 16, weight: .bold)
+        iconView.setAccessibilityRole(.image)
+
+        addSubview(iconView)
+        NSLayoutConstraint.activate([
+            iconView.centerXAnchor.constraint(equalTo: centerXAnchor),
+            iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
+            iconView.widthAnchor.constraint(equalToConstant: 18),
+            iconView.heightAnchor.constraint(equalToConstant: 18)
+        ])
+    }
+
+    private func showPlacard() {
+        guard let placard, let contentView = window?.contentView else { return }
+
+        let placardView = placardView ?? MatchPlacardView()
+        placardView.configure(placard)
+        for visiblePlacardView in contentView.subviews.compactMap({ $0 as? MatchPlacardView }) where visiblePlacardView !== placardView {
+            visiblePlacardView.removeFromSuperview()
+        }
+        if placardView.superview == nil {
+            contentView.addSubview(placardView)
+        }
+        self.placardView = placardView
+
+        let size = NSSize(width: 284, height: 112)
+        let anchor = convert(bounds, to: contentView)
+        let maxX = contentView.bounds.maxX - size.width - 10
+        let preferredX = anchor.maxX + 8
+        let x = max(10, min(preferredX, maxX))
+        let y = max(10, min(anchor.midY - size.height / 2, contentView.bounds.maxY - size.height - 10))
+        placardView.frame = NSRect(origin: NSPoint(x: x, y: y), size: size)
+    }
+
+    private static func tintedImage(_ image: NSImage?, color: NSColor) -> NSImage? {
+        guard let image else { return nil }
+
+        let size = NSSize(width: 18, height: 18)
+        let tinted = NSImage(size: size)
+        tinted.lockFocus()
+        NSGraphicsContext.current?.imageInterpolation = .high
+        let rect = NSRect(origin: .zero, size: size)
+        image.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1)
+        color.set()
+        rect.fill(using: .sourceAtop)
+        tinted.unlockFocus()
+        tinted.isTemplate = false
+        return tinted
+    }
+}
+
+private final class MatchPlacardView: NSView {
+    private let swatchView = MatchSwatchView()
+    private let titleLabel = NSTextField(labelWithString: "")
+    private let scoreLabel = NSTextField(labelWithString: "")
+    private let reasonLabel = NSTextField(wrappingLabelWithString: "")
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        configure()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configure()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateLayerColors()
+    }
+
+    func configure(_ placard: MatchPlacard) {
+        swatchView.color = placard.color
+        titleLabel.stringValue = placard.title
+        scoreLabel.stringValue = placard.scoreText
+        reasonLabel.stringValue = placard.reason
+        updateLayerColors()
+    }
+
+    private func configure() {
+        wantsLayer = true
+        layer?.cornerRadius = 8
+        layer?.borderWidth = 1
+        layer?.shadowOpacity = 0.28
+        layer?.shadowRadius = 14
+        layer?.shadowOffset = NSSize(width: 0, height: -4)
+
+        swatchView.translatesAutoresizingMaskIntoConstraints = false
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        scoreLabel.translatesAutoresizingMaskIntoConstraints = false
+        reasonLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        titleLabel.font = AppSettings.appFont(sizeDelta: 0, weight: .semibold)
+        scoreLabel.font = AppSettings.appFont(sizeDelta: -1, weight: .medium)
+        scoreLabel.textColor = .secondaryLabelColor
+        reasonLabel.font = AppSettings.appFont(sizeDelta: -1)
+        reasonLabel.textColor = .secondaryLabelColor
+        reasonLabel.maximumNumberOfLines = 3
+        reasonLabel.lineBreakMode = .byTruncatingTail
+
+        addSubview(swatchView)
+        addSubview(titleLabel)
+        addSubview(scoreLabel)
+        addSubview(reasonLabel)
 
         NSLayoutConstraint.activate([
-            swatch.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
-            swatch.centerYAnchor.constraint(equalTo: centerYAnchor),
-            swatch.widthAnchor.constraint(equalToConstant: 8),
-            swatch.heightAnchor.constraint(equalToConstant: 8),
-            label.leadingAnchor.constraint(equalTo: swatch.trailingAnchor, constant: 5),
-            label.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -4),
-            label.centerYAnchor.constraint(equalTo: centerYAnchor)
+            swatchView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+            swatchView.topAnchor.constraint(equalTo: topAnchor, constant: 14),
+            swatchView.widthAnchor.constraint(equalToConstant: 10),
+            swatchView.heightAnchor.constraint(equalToConstant: 40),
+
+            titleLabel.leadingAnchor.constraint(equalTo: swatchView.trailingAnchor, constant: 12),
+            titleLabel.topAnchor.constraint(equalTo: topAnchor, constant: 12),
+            titleLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+
+            scoreLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            scoreLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 3),
+            scoreLabel.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
+
+            reasonLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            reasonLabel.topAnchor.constraint(equalTo: scoreLabel.bottomAnchor, constant: 10),
+            reasonLabel.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
+            reasonLabel.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -12)
         ])
+
+        updateLayerColors()
+    }
+
+    private func updateLayerColors() {
+        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        layer?.backgroundColor = (isDark
+            ? NSColor(calibratedWhite: 0.12, alpha: 0.98)
+            : NSColor(calibratedWhite: 0.97, alpha: 0.98)
+        ).cgColor
+        layer?.borderColor = (isDark
+            ? NSColor(calibratedWhite: 1.0, alpha: 0.16)
+            : NSColor(calibratedWhite: 0.0, alpha: 0.12)
+        ).cgColor
     }
 }
 
 private final class MatchSwatchView: NSView {
-    var color: NSColor = .tertiaryLabelColor {
+    var color: NSColor = .clear {
         didSet {
             needsDisplay = true
         }
     }
 
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
+        let rect = bounds.insetBy(dx: 0.5, dy: 0.5)
+        let path = NSBezierPath(roundedRect: rect, xRadius: min(3, rect.width / 2), yRadius: min(3, rect.width / 2))
         color.setFill()
-        bounds.insetBy(dx: 1, dy: 1).fill()
+        path.fill()
+        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        (isDark
+            ? NSColor.white.withAlphaComponent(0.55)
+            : NSColor.black.withAlphaComponent(0.18)
+        ).setStroke()
+        path.lineWidth = 1
+        path.stroke()
     }
 }
 
@@ -2442,7 +2703,7 @@ private final class IndexingSetupOverlayView: NSView {
 
         let titleLabel = NSTextField(labelWithString: "Get Started")
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
-        titleLabel.font = .systemFont(ofSize: 17, weight: .semibold)
+        titleLabel.font = AppSettings.appFont(sizeDelta: 5, weight: .semibold)
         titleLabel.textColor = .labelColor
         titleLabel.alignment = .center
 
@@ -2452,7 +2713,7 @@ private final class IndexingSetupOverlayView: NSView {
         Start with the default folders, or choose your own.
         """)
         detailLabel.translatesAutoresizingMaskIntoConstraints = false
-        detailLabel.font = .systemFont(ofSize: 13)
+        detailLabel.font = AppSettings.appFont(sizeDelta: 1)
         detailLabel.textColor = .secondaryLabelColor
         detailLabel.alignment = .center
         detailLabel.lineBreakMode = .byWordWrapping
@@ -2501,7 +2762,7 @@ private final class IndexingSetupOverlayView: NSView {
         button.imagePosition = .imageLeading
         button.bezelStyle = .rounded
         button.controlSize = .regular
-        button.font = .systemFont(ofSize: 13, weight: .regular)
+        button.font = AppSettings.appFont(sizeDelta: 1)
         button.setContentHuggingPriority(.required, for: .horizontal)
         button.setContentCompressionResistancePriority(.required, for: .horizontal)
         return button
@@ -2655,7 +2916,7 @@ private final class SetupSuggestionPanelView: NSView {
     private static func makeTitleLabel(_ value: String) -> NSTextField {
         let label = NSTextField(labelWithString: value)
         label.translatesAutoresizingMaskIntoConstraints = false
-        label.font = .systemFont(ofSize: 12, weight: .semibold)
+        label.font = AppSettings.appFont(weight: .semibold)
         label.textColor = .labelColor
         label.lineBreakMode = .byTruncatingTail
         return label
@@ -2664,7 +2925,7 @@ private final class SetupSuggestionPanelView: NSView {
     private static func makeDetailLabel(_ value: String) -> NSTextField {
         let label = NSTextField(labelWithString: value)
         label.translatesAutoresizingMaskIntoConstraints = false
-        label.font = .systemFont(ofSize: 12, weight: .regular)
+        label.font = AppSettings.appFont()
         label.textColor = .secondaryLabelColor
         label.lineBreakMode = .byTruncatingTail
         label.maximumNumberOfLines = 2
@@ -2680,7 +2941,7 @@ private final class SetupSuggestionPanelView: NSView {
         button.imagePosition = .imageLeading
         button.bezelStyle = .rounded
         button.controlSize = .small
-        button.font = .systemFont(ofSize: 12, weight: .regular)
+        button.font = AppSettings.appFont()
         button.setContentHuggingPriority(.required, for: .horizontal)
         button.setContentCompressionResistancePriority(.required, for: .horizontal)
         return button
