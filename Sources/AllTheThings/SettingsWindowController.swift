@@ -8,7 +8,7 @@ final class SettingsWindowController: NSWindowController {
         let contentSize = NSSize(width: 780, height: 640)
         let viewController = SettingsViewController(defaults: defaults)
         viewController.preferredContentSize = contentSize
-        let window = NSWindow(
+        let window = SettingsWindow(
             contentRect: NSRect(origin: .zero, size: contentSize),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
@@ -27,6 +27,30 @@ final class SettingsWindowController: NSWindowController {
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+}
+
+private final class SettingsWindow: NSWindow {
+    override func sendEvent(_ event: NSEvent) {
+        if shouldClose(for: event) {
+            close()
+            return
+        }
+
+        super.sendEvent(event)
+    }
+
+    private func shouldClose(for event: NSEvent) -> Bool {
+        guard
+            event.type == .keyDown,
+            event.keyCode == UInt16(kVK_Escape),
+            event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty,
+            !(firstResponder is HotKeyRecorderView)
+        else {
+            return false
+        }
+
+        return true
     }
 }
 
