@@ -2322,6 +2322,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             return
         }
 
+        startWatchingIfNeeded()
         activeFSEventReplay?.cancel()
         let reconciliationID = UUID()
         activeFSEventReconciliationID = reconciliationID
@@ -2343,17 +2344,18 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             self.fseventCatchUpStartedAt = nil
 
             switch action {
-            case let .reconcile(rootPaths):
+            case let .reconcile(paths):
                 DiagnosticLogger.shared.log(
                     category: "fsevents",
                     event: "fsevents.reconciliationReconcile",
                     fields: [
-                        "rootCount": .publicInt(rootPaths.count),
-                        "roots": .pathArray(rootPaths)
+                        "pathCount": .publicInt(paths.count),
+                        "paths": .pathArray(paths)
                     ]
                 )
-                let rootURLs = rootPaths.map { URL(fileURLWithPath: $0, isDirectory: true) }
-                self.index.reconcileIndexedRootsInBackground(rootURLs: rootURLs)
+                self.index.reconcileIndexedRootsInBackground(
+                    rootURLs: paths.map { URL(fileURLWithPath: $0, isDirectory: true) }
+                )
             case let .upToDate(baselineEventID):
                 DiagnosticLogger.shared.log(
                     category: "fsevents",
@@ -2363,19 +2365,20 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                     ]
                 )
                 self.fseventCursorStore.markBaseline(for: self.rootPaths(roots), eventID: baselineEventID)
+                self.startWatchingIfNeeded()
                 self.updateStatus()
-            case let .fullReconcile(rootPaths):
+            case let .fullReconcile(paths):
                 DiagnosticLogger.shared.log(
                     level: .warning,
                     category: "fsevents",
                     event: "fsevents.reconciliationFullReconcile",
                     fields: [
-                        "rootCount": .publicInt(rootPaths?.count ?? 0),
-                        "roots": .pathArray(rootPaths ?? [])
+                        "pathCount": .publicInt(paths?.count ?? 0),
+                        "paths": .pathArray(paths ?? [])
                     ]
                 )
                 self.index.recordRecursiveRescan()
-                let rootURLs = rootPaths?.map { URL(fileURLWithPath: $0, isDirectory: true) }
+                let rootURLs = paths?.map { URL(fileURLWithPath: $0, isDirectory: true) }
                 self.index.reconcileIndexedRootsInBackground(rootURLs: rootURLs)
             }
         }

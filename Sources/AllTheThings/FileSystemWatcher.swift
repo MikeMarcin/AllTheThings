@@ -21,6 +21,10 @@ struct FileSystemEvent {
         flags & FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs) != 0
             || historyIsUnsafe
     }
+
+    var itemIsDirectory: Bool {
+        flags & FSEventStreamEventFlags(kFSEventStreamEventFlagItemIsDir) != 0
+    }
 }
 
 final class FileSystemWatcher {
@@ -39,10 +43,15 @@ final class FileSystemWatcher {
     }
 
     func start(roots: [URL], eventHandler: @escaping @MainActor @Sendable ([FileSystemEvent]) -> Void) {
-        stop()
-
         let paths = roots.map { $0.standardizedFileURL.path }
         guard !paths.isEmpty else { return }
+
+        if stream != nil, paths == rootPaths {
+            self.eventHandler = eventHandler
+            return
+        }
+
+        stop()
 
         self.eventHandler = eventHandler
         self.rootPaths = paths
@@ -162,9 +171,9 @@ final class FSEventStreamHistoryReplaySource: FSEventHistoryReplaySource {
 }
 
 enum FSEventReconciliationAction: Equatable, Sendable {
-    case reconcile(rootPaths: [String])
+    case reconcile(paths: [String])
     case upToDate(baselineEventID: UInt64)
-    case fullReconcile(rootPaths: [String]?)
+    case fullReconcile(paths: [String]?)
 }
 
 final class FSEventReconciliationCoordinator: @unchecked Sendable {
@@ -198,7 +207,7 @@ final class FSEventReconciliationCoordinator: @unchecked Sendable {
 
         let cursors = cursorStore.eventIDs(for: rootPaths)
         guard cursors.count == rootPaths.count, let sinceEventID = cursors.values.min(), sinceEventID > 0 else {
-            Task { @MainActor in completion(.fullReconcile(rootPaths: nil)) }
+            Task { @MainActor in completion(.fullReconcile(paths: nil)) }
             return nil
         }
 
@@ -217,7 +226,7 @@ final class FSEventReconciliationCoordinator: @unchecked Sendable {
                 }
             }
         ) else {
-            Task { @MainActor in completion(.fullReconcile(rootPaths: nil)) }
+            Task { @MainActor in completion(.fullReconcile(paths: nil)) }
             return nil
         }
 
@@ -230,8 +239,7 @@ private final class FSEventHistoryReplayCollector: @unchecked Sendable {
 
     private let rootPaths: [String]
     private let lock = NSLock()
-    private var changedPaths = Set<String>()
-    private var changedRootPaths = Set<String>()
+    private var reconciliationPaths = Set<String>()
     private var fallbackRootPaths = Set<String>()
     private var requiresGlobalFallback = false
     private var sawHistoryDone = false
@@ -255,7 +263,7 @@ private final class FSEventHistoryReplayCollector: @unchecked Sendable {
                 continue
             }
 
-            changedRootPaths.insert(rootPath)
+            reconciliationPaths.insert(reconciliationScope(for: event, rootPath: rootPath))
 
             if requiresGlobalFallback {
                 continue
@@ -264,12 +272,11 @@ private final class FSEventHistoryReplayCollector: @unchecked Sendable {
             if event.historyIsUnsafe || event.requiresRecursiveRescan {
                 fallbackRootPaths.insert(rootPath)
             } else {
-                guard changedPaths.count < Self.maximumHistoricalReconciliationPaths else {
-                    changedPaths.removeAll(keepingCapacity: false)
+                guard reconciliationPaths.count < Self.maximumHistoricalReconciliationPaths else {
+                    reconciliationPaths.removeAll(keepingCapacity: false)
                     requiresGlobalFallback = true
                     continue
                 }
-                changedPaths.insert(event.path)
             }
         }
     }
@@ -279,26 +286,52 @@ private final class FSEventHistoryReplayCollector: @unchecked Sendable {
         defer { lock.unlock() }
 
         guard completion == .completed, sawHistoryDone else {
-            return .fullReconcile(rootPaths: nil)
+            return .fullReconcile(paths: nil)
         }
 
         if requiresGlobalFallback {
-            return .fullReconcile(rootPaths: nil)
+            return .fullReconcile(paths: nil)
         }
 
         if !fallbackRootPaths.isEmpty {
-            return .fullReconcile(rootPaths: fallbackRootPaths.union(changedRootPaths).sorted())
+            return .fullReconcile(paths: Self.collapsedPaths(fallbackRootPaths.union(reconciliationPaths)))
         }
 
-        if changedPaths.isEmpty {
+        if reconciliationPaths.isEmpty {
             return .upToDate(baselineEventID: currentEventID)
         }
 
-        return .reconcile(rootPaths: changedRootPaths.sorted())
+        return .reconcile(paths: Self.collapsedPaths(reconciliationPaths))
     }
 
     private func matchingRoot(for path: String) -> String? {
         rootPaths.first { path == $0 || path.hasPrefix($0 + "/") }
+    }
+
+    private func reconciliationScope(for event: FileSystemEvent, rootPath: String) -> String {
+        let path = URL(fileURLWithPath: event.path).standardizedFileURL.path
+        guard path != rootPath else { return rootPath }
+
+        if event.itemIsDirectory {
+            return path
+        }
+
+        let parent = URL(fileURLWithPath: path).deletingLastPathComponent().standardizedFileURL.path
+        guard parent != "/", parent == rootPath || parent.hasPrefix(rootPath + "/") else {
+            return rootPath
+        }
+        return parent
+    }
+
+    private static func collapsedPaths(_ paths: Set<String>) -> [String] {
+        var collapsed: [String] = []
+        for path in paths.sorted(by: { $0.count < $1.count }) {
+            guard !collapsed.contains(where: { path == $0 || path.hasPrefix($0 + "/") }) else {
+                continue
+            }
+            collapsed.append(path)
+        }
+        return collapsed
     }
 }
 
