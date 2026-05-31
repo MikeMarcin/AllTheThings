@@ -4,7 +4,7 @@ AllTheThings is a native macOS file-search app built for one fast loop: type a f
 
 <picture>
   <source srcset="docs/images/allthethings-demo.webp" type="image/webp">
-  <img src="docs/images/allthethings-demo.png" alt="AllTheThings filtering a sample project folder with atlas *.swift">
+  <img src="docs/images/allthethings-demo.png" alt="AllTheThings filtering a safe demo folder for atlas Swift files with match indicators">
 </picture>
 
 ## Requirements

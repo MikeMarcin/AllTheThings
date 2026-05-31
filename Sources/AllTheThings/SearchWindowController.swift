@@ -82,7 +82,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         var width: CGFloat {
             switch self {
-            case .match: 48
+            case .match: 40
             case .name: 220
             case .path: 380
             case .modified: 112
