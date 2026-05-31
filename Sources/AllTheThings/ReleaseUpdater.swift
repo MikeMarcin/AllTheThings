@@ -1,4 +1,5 @@
 import AppKit
+import ATTCore
 import Darwin
 import Foundation
 import Security
@@ -224,6 +225,13 @@ final class ReleaseUpdater {
     }
 
     func checkForUpdates(presentingWindow: NSWindow?, userInitiated: Bool) {
+        DiagnosticLogger.shared.log(
+            category: "updates",
+            event: "updates.checkRequested",
+            fields: [
+                "userInitiated": .publicBool(userInitiated)
+            ]
+        )
         activeCheck?.cancel()
         activeCheck = Task { [weak self, weak presentingWindow] in
             await self?.performCheck(presentingWindow: presentingWindow, userInitiated: userInitiated)
@@ -236,17 +244,44 @@ final class ReleaseUpdater {
             guard !Task.isCancelled else { return }
 
             defaults.set(Date(), forKey: DefaultsKey.lastCheckDate)
+            DiagnosticLogger.shared.log(
+                category: "updates",
+                event: "updates.checkFinished",
+                fields: [
+                    "userInitiated": .publicBool(userInitiated),
+                    "tagName": .publicString(release.tagName),
+                    "assetCount": .publicInt(release.assets.count),
+                    "hasInstallAsset": .publicBool(release.installAsset != nil)
+                ]
+            )
             handle(release: release, presentingWindow: presentingWindow, userInitiated: userInitiated)
         } catch UpdateError.noPublishedReleases {
             guard !Task.isCancelled else { return }
 
             defaults.set(Date(), forKey: DefaultsKey.lastCheckDate)
+            DiagnosticLogger.shared.log(
+                level: .warning,
+                category: "updates",
+                event: "updates.noPublishedReleases",
+                fields: [
+                    "userInitiated": .publicBool(userInitiated)
+                ]
+            )
             if userInitiated {
                 showNoReleasesAlert(presentingWindow: presentingWindow)
             }
         } catch {
             guard !Task.isCancelled else { return }
 
+            DiagnosticLogger.shared.log(
+                level: .error,
+                category: "updates",
+                event: "updates.checkFailed",
+                fields: [
+                    "userInitiated": .publicBool(userInitiated),
+                    "error": .errorText(error.localizedDescription)
+                ]
+            )
             if userInitiated {
                 showUpdateCheckFailedAlert(error: error, presentingWindow: presentingWindow)
             }

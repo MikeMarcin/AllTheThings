@@ -64,6 +64,8 @@ AllTheThings indexes file metadata needed for search: paths, names, extensions, 
 
 macOS protects locations such as Desktop, Documents, Downloads, some external or cloud folders, and other privacy-sensitive folders. AllTheThings can index folders you explicitly choose without Full Disk Access, but macOS may prompt when the app indexes or refreshes protected locations. Broad indexing works best after granting Full Disk Access in **System Settings > Privacy & Security > Full Disk Access**.
 
+AllTheThings keeps structured diagnostic logs only on your Mac under its local Application Support folder. These raw logs may include search queries, file paths, file action context, and error messages so local diagnosis has enough detail to be useful. Logs are capped to about 50 MB and 30 days, are not sent over the network, and are not attached to update checks. Use **AllTheThings > Export Anonymized Diagnostic Log...** to create a shareable JSONL export that replaces sensitive strings such as paths and queries with deterministic same-length gibberish. **Export Raw Diagnostic Log...** preserves the local raw values and should be shared only when you intend to disclose that detail.
+
 Use **AllTheThings > Settings > General** to check Full Disk Access status or open the matching System Settings pane. Use **AllTheThings > Settings > Indexed Folders** to add or remove indexed folders.
 
 Be careful when sharing screenshots or recordings. A file-search window can expose usernames, project names, client names, cloud folder names, and recently touched files.

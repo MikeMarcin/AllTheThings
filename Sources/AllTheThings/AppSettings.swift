@@ -107,6 +107,13 @@ enum AppSettings {
 
         defaults.set(preference.rawValue, forKey: themePreferenceKey)
         defaults.synchronize()
+        DiagnosticLogger.shared.log(
+            category: "settings",
+            event: "settings.themeChanged",
+            fields: [
+                "theme": .publicString(preference.rawValue)
+            ]
+        )
         NotificationCenter.default.post(name: themePreferenceDidChangeNotification, object: defaults)
     }
 
@@ -137,6 +144,15 @@ enum AppSettings {
         defaults.set(Int(hotKey.keyCode), forKey: globalSearchHotKeyKeyCodeKey)
         defaults.set(Int(hotKey.modifiers), forKey: globalSearchHotKeyModifierFlagsKey)
         defaults.synchronize()
+        DiagnosticLogger.shared.log(
+            category: "settings",
+            event: "settings.globalSearchHotKeyChanged",
+            fields: [
+                "enabled": .publicBool(enabled),
+                "keyCode": .publicInt(Int(hotKey.keyCode)),
+                "modifiers": .publicInt(Int(hotKey.modifiers))
+            ]
+        )
         NotificationCenter.default.post(name: globalSearchHotKeyDidChangeNotification, object: defaults)
     }
 
@@ -149,6 +165,13 @@ enum AppSettings {
 
         defaults.set(enabled, forKey: menuBarIconEnabledKey)
         defaults.synchronize()
+        DiagnosticLogger.shared.log(
+            category: "settings",
+            event: "settings.menuBarIconChanged",
+            fields: [
+                "enabled": .publicBool(enabled)
+            ]
+        )
         NotificationCenter.default.post(name: menuBarIconDidChangeNotification, object: defaults)
     }
 
@@ -178,6 +201,14 @@ enum AppSettings {
         defaults.set(paths, forKey: indexedRootsKey)
         defaults.set(true, forKey: indexedRootsInitializedKey)
         defaults.synchronize()
+        DiagnosticLogger.shared.log(
+            category: "settings",
+            event: "settings.indexedRootsChanged",
+            fields: [
+                "rootCount": .publicInt(paths.count),
+                "roots": .pathArray(paths)
+            ]
+        )
         NotificationCenter.default.post(name: indexedRootsDidChangeNotification, object: defaults)
     }
 
@@ -204,6 +235,14 @@ enum AppSettings {
     static func saveExclusionPatterns(_ patterns: [String], defaults: UserDefaults = .standard) {
         defaults.set(patterns, forKey: exclusionPatternsKey)
         defaults.synchronize()
+        DiagnosticLogger.shared.log(
+            category: "settings",
+            event: "settings.exclusionPatternsChanged",
+            fields: [
+                "patternCount": .publicInt(patterns.count),
+                "patterns": .privateString(patterns.joined(separator: "\n"))
+            ]
+        )
         NotificationCenter.default.post(name: exclusionPatternsDidChangeNotification, object: defaults)
     }
 

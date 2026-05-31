@@ -953,6 +953,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     @objc private func openSuggestedFullDiskAccessSettings(_ sender: NSButton) {
+        DiagnosticLogger.shared.log(category: "privacy", event: "fullDiskAccess.openSettingsFromSuggestion")
         markFullDiskAccessOnboardingShown()
         FullDiskAccessController.openSystemSettings()
         updateSetupSuggestions()
@@ -968,6 +969,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     @objc private func dismissSuggestedFullDiskAccess(_ sender: NSButton) {
+        DiagnosticLogger.shared.log(category: "privacy", event: "fullDiskAccess.dismissSuggestion")
         markFullDiskAccessOnboardingShown()
         updateSetupSuggestions()
     }
@@ -1639,6 +1641,31 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         updateLoadingOverlay()
         updateActionButtons()
         updateMascotPersistentAnimation()
+
+        if isFinal {
+            let profile = response.executionProfile
+            DiagnosticLogger.shared.log(
+                category: "search",
+                event: "search.displayed",
+                fields: [
+                    "query": .query(signature.query),
+                    "sortColumn": .publicString(signature.sort.column.rawValue),
+                    "sortAscending": .publicBool(signature.sort.ascending),
+                    "includeHidden": .publicBool(signature.includeHidden),
+                    "displayedResultCount": .publicInt(response.results.count),
+                    "totalMatches": .publicInt(response.totalMatches),
+                    "uiLatencySeconds": .publicDouble(elapsed),
+                    "indexLatencySeconds": .publicDouble(response.elapsed),
+                    "usesIndexedCandidates": .publicBool(response.usesIndexedCandidates),
+                    "executionPath": .publicString(profile.executionPath.rawValue),
+                    "indexesUsed": .publicStringArray(profile.indexesUsed.map(\.rawValue).sorted()),
+                    "candidateCount": .publicInt(profile.candidateCount),
+                    "scannedRowCount": .publicInt(profile.scannedRowCount),
+                    "fallbackToFullScan": .publicBool(profile.didFallbackToFullScan),
+                    "staleRetry": .publicBool(profile.wasStaleRetry)
+                ]
+            )
+        }
     }
 
     private func clearSearchTokenIfCurrent(_ token: SearchCancellationToken) {
@@ -2281,6 +2308,14 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let reconciliationID = UUID()
         activeFSEventReconciliationID = reconciliationID
         fseventCatchUpStartedAt = Date()
+        DiagnosticLogger.shared.log(
+            category: "fsevents",
+            event: "fsevents.reconciliationStarted",
+            fields: [
+                "rootCount": .publicInt(roots.count),
+                "roots": .pathArray(rootPaths(roots))
+            ]
+        )
         updateStatus()
 
         activeFSEventReplay = fseventReconciler.reconcile(roots: roots) { @MainActor @Sendable [weak self] action in
@@ -2291,6 +2326,15 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
             switch action {
             case let .refresh(paths, cursorUpdates):
+                DiagnosticLogger.shared.log(
+                    category: "fsevents",
+                    event: "fsevents.reconciliationRefresh",
+                    fields: [
+                        "pathCount": .publicInt(paths.count),
+                        "paths": .pathArray(paths),
+                        "cursorUpdateCount": .publicInt(cursorUpdates.count)
+                    ]
+                )
                 guard !paths.isEmpty else {
                     self.fseventCursorStore.markBaseline(for: self.rootPaths(roots))
                     self.updateStatus()
@@ -2299,9 +2343,25 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                 self.index.refresh(paths: paths)
                 self.fseventCursorStore.update(cursorUpdates)
             case let .upToDate(baselineEventID):
+                DiagnosticLogger.shared.log(
+                    category: "fsevents",
+                    event: "fsevents.reconciliationUpToDate",
+                    fields: [
+                        "baselineEventID": .publicUInt64(baselineEventID)
+                    ]
+                )
                 self.fseventCursorStore.markBaseline(for: self.rootPaths(roots), eventID: baselineEventID)
                 self.updateStatus()
             case let .fullReconcile(rootPaths):
+                DiagnosticLogger.shared.log(
+                    level: .warning,
+                    category: "fsevents",
+                    event: "fsevents.reconciliationFullReconcile",
+                    fields: [
+                        "rootCount": .publicInt(rootPaths?.count ?? 0),
+                        "roots": .pathArray(rootPaths ?? [])
+                    ]
+                )
                 self.index.recordRecursiveRescan()
                 let rootURLs = rootPaths?.map { URL(fileURLWithPath: $0, isDirectory: true) }
                 self.index.reconcileIndexedRootsInBackground(rootURLs: rootURLs)
@@ -2319,6 +2379,15 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private func coalesceFSEvents(_ events: [FileSystemEvent]) {
         pendingEventPaths.formUnion(events.map(\.path))
         pendingRecursiveEventPaths.formUnion(events.filter(\.requiresRecursiveRescan).map(\.path))
+        DiagnosticLogger.shared.log(
+            category: "fsevents",
+            event: "fsevents.eventsReceived",
+            fields: [
+                "eventCount": .publicInt(events.count),
+                "recursiveEventCount": .publicInt(events.filter(\.requiresRecursiveRescan).count),
+                "paths": .pathArray(events.map(\.path))
+            ]
+        )
         eventDebounce?.cancel()
 
         let workItem = DispatchWorkItem { [weak self] in
@@ -2726,10 +2795,34 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         saveVisibleColumns()
     }
 
+    private func logFileAction(
+        _ action: String,
+        records: [FileRecord],
+        level: DiagnosticLogLevel = .info,
+        extraFields: [String: DiagnosticLogFieldValue] = [:]
+    ) {
+        var fields = extraFields
+        fields["action"] = .publicString(action)
+        fields["selectionCount"] = .publicInt(records.count)
+        fields["paths"] = .pathArray(records.map(\.path))
+        DiagnosticLogger.shared.log(
+            level: level,
+            category: "fileAction",
+            event: "fileAction.\(action)",
+            fields: fields
+        )
+    }
+
     @objc private func openSelected(_ sender: Any?) {
         guard let record = selectedRecord() else { return }
         index.recordFileAction(.open)
-        NSWorkspace.shared.open(record.url)
+        let opened = NSWorkspace.shared.open(record.url)
+        logFileAction(
+            "open",
+            records: [record],
+            level: opened ? .info : .warning,
+            extraFields: ["success": .publicBool(opened)]
+        )
     }
 
     @objc private func openSelectedWithApplication(_ sender: NSMenuItem) {
@@ -2768,25 +2861,44 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func openSelectedRecords(with applicationURL: URL) {
-        let urls = selectedRecords().map(\.url)
+        let records = selectedRecords()
+        let urls = records.map(\.url)
         guard !urls.isEmpty else { return }
 
         index.recordFileAction(.open)
+        logFileAction(
+            "openWithApplication",
+            records: records,
+            extraFields: [
+                "applicationPath": .path(applicationURL.path)
+            ]
+        )
         NSWorkspace.shared.open(
             urls,
             withApplicationAt: applicationURL,
             configuration: NSWorkspace.OpenConfiguration()
         ) { [weak self] _, error in
             if let error {
+                self?.logFileAction(
+                    "openWithApplicationFailed",
+                    records: records,
+                    level: .error,
+                    extraFields: [
+                        "applicationPath": .path(applicationURL.path),
+                        "error": .errorText(error.localizedDescription)
+                    ]
+                )
                 self?.presentError("Could not open item.", informativeText: error.localizedDescription)
             }
         }
     }
 
     @objc private func revealSelected(_ sender: Any?) {
-        let urls = selectedRecords().map(\.url)
+        let records = selectedRecords()
+        let urls = records.map(\.url)
         guard !urls.isEmpty else { return }
         index.recordFileAction(.reveal)
+        logFileAction("reveal", records: records)
         NSWorkspace.shared.activateFileViewerSelecting(urls)
     }
 
@@ -2801,6 +2913,14 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                 try FileManager.default.trashItem(at: record.url, resultingItemURL: &trashedURL)
                 changedPaths.append(record.path)
             } catch {
+                logFileAction(
+                    "moveToTrashFailed",
+                    records: [record],
+                    level: .error,
+                    extraFields: [
+                        "error": .errorText(error.localizedDescription)
+                    ]
+                )
                 presentError("Could not move item to Trash.", informativeText: error.localizedDescription)
                 break
             }
@@ -2808,6 +2928,15 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         if !changedPaths.isEmpty {
             index.recordFileAction(.moveToTrash)
+            DiagnosticLogger.shared.log(
+                category: "fileAction",
+                event: "fileAction.moveToTrash",
+                fields: [
+                    "action": .publicString("moveToTrash"),
+                    "selectionCount": .publicInt(changedPaths.count),
+                    "paths": .pathArray(changedPaths)
+                ]
+            )
             playMascotTransient(.fileChanged)
             index.refresh(paths: changedPaths)
             scheduleSearch(force: true)
@@ -2827,9 +2956,18 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         var error: NSDictionary?
         NSAppleScript(source: source)?.executeAndReturnError(&error)
         if let error {
+            logFileAction(
+                "getInfoFailed",
+                records: [record],
+                level: .error,
+                extraFields: [
+                    "error": .errorText(error.description)
+                ]
+            )
             presentError("Could not show item info.", informativeText: error.description)
         } else {
             index.recordFileAction(.getInfo)
+            logFileAction("getInfo", records: [record])
         }
     }
 
@@ -2863,12 +3001,30 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let newName = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !newName.isEmpty, newName != record.name else { return }
         guard !newName.contains("/") else {
+            logFileAction(
+                "renameRejected",
+                records: [record],
+                level: .warning,
+                extraFields: [
+                    "reason": .publicString("slashInName"),
+                    "requestedName": .privateString(newName)
+                ]
+            )
             presentError("Could not rename item.", informativeText: "Names cannot contain slashes.")
             return
         }
 
         let destination = URL(fileURLWithPath: record.directoryPath, isDirectory: true).appendingPathComponent(newName)
         guard !FileManager.default.fileExists(atPath: destination.path) else {
+            logFileAction(
+                "renameRejected",
+                records: [record],
+                level: .warning,
+                extraFields: [
+                    "reason": .publicString("destinationExists"),
+                    "destination": .path(destination.path)
+                ]
+            )
             presentError("Could not rename item.", informativeText: "An item named \"\(newName)\" already exists.")
             return
         }
@@ -2876,16 +3032,33 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         do {
             try FileManager.default.moveItem(at: record.url, to: destination)
             index.recordFileAction(.rename)
+            logFileAction(
+                "rename",
+                records: [record],
+                extraFields: [
+                    "destination": .path(destination.path)
+                ]
+            )
             playMascotTransient(.fileChanged)
             index.refresh(paths: [record.path, destination.path])
             scheduleSearch(force: true)
         } catch {
+            logFileAction(
+                "renameFailed",
+                records: [record],
+                level: .error,
+                extraFields: [
+                    "destination": .path(destination.path),
+                    "error": .errorText(error.localizedDescription)
+                ]
+            )
             presentError("Could not rename item.", informativeText: error.localizedDescription)
         }
     }
 
     @objc private func quickLookSelected(_ sender: Any?) {
-        let paths = selectedRecords().map(\.path)
+        let records = selectedRecords()
+        let paths = records.map(\.path)
         guard !paths.isEmpty else { return }
 
         let process = Process()
@@ -2895,7 +3068,16 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         do {
             try process.run()
             index.recordFileAction(.quickLook)
+            logFileAction("quickLook", records: records)
         } catch {
+            logFileAction(
+                "quickLookFailed",
+                records: records,
+                level: .error,
+                extraFields: [
+                    "error": .errorText(error.localizedDescription)
+                ]
+            )
             presentError("Could not Quick Look item.", informativeText: error.localizedDescription)
         }
     }
@@ -2915,7 +3097,25 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         pasteboard.setPropertyList([directoryPath], forType: NSPasteboard.PasteboardType("NSFilenamesPboardType"))
 
         if !NSPerformService(serviceTitle, pasteboard) {
+            logFileAction(
+                "openTerminalFailed",
+                records: [record],
+                level: .error,
+                extraFields: [
+                    "serviceTitle": .publicString(serviceTitle),
+                    "directoryPath": .path(directoryPath)
+                ]
+            )
             presentError("Could not open terminal here.", informativeText: "\(serviceTitle) is not available from Services.")
+        } else {
+            logFileAction(
+                "openTerminal",
+                records: [record],
+                extraFields: [
+                    "serviceTitle": .publicString(serviceTitle),
+                    "directoryPath": .path(directoryPath)
+                ]
+            )
         }
     }
 
@@ -2932,6 +3132,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         pasteboard.writeObjects(records.map { $0.url as NSURL })
         pasteboard.setString(records.map(\.path).joined(separator: "\n"), forType: .string)
         index.recordFileAction(.copyFile)
+        logFileAction("copyFile", records: records)
     }
 
     @objc private func copySelectedPath(_ sender: Any?) {
@@ -2941,6 +3142,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(records.map(\.path).joined(separator: "\n"), forType: .string)
         index.recordFileAction(.copyPath)
+        logFileAction("copyPath", records: records)
     }
 
     private func terminalDirectoryPath(for record: FileRecord) -> String {

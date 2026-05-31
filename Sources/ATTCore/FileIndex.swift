@@ -2127,6 +2127,15 @@ public final class FileIndex: @unchecked Sendable {
             publishRootLimitFailure(count: canonicalRoots.count)
             return
         }
+        DiagnosticLogger.shared.log(
+            category: "index",
+            event: "index.rebuildRequested",
+            fields: [
+                "mode": .publicString(Self.diagnosticRebuildModeString(mode)),
+                "rootCount": .publicInt(canonicalRoots.count),
+                "roots": .pathArray(canonicalRoots.map(\.path))
+            ]
+        )
         let rebuildStarted = Date()
         let currentGeneration = lock.withLock { () -> UInt64 in
             generation &+= 1
@@ -2155,6 +2164,7 @@ public final class FileIndex: @unchecked Sendable {
     @discardableResult
     public func loadSnapshotInBackground() -> Bool {
         guard beginSnapshotLoad() else { return false }
+        DiagnosticLogger.shared.log(category: "index", event: "index.snapshotLoadRequested")
         let generationAtStart = currentGeneration()
 
         indexQueue.async { [weak self] in
@@ -2197,6 +2207,15 @@ public final class FileIndex: @unchecked Sendable {
             return
         }
         let reconcilesAllRoots = rootURLs.count == allRootURLs.count
+        DiagnosticLogger.shared.log(
+            category: "index",
+            event: "index.reconcileRequested",
+            fields: [
+                "reconcilesAllRoots": .publicBool(reconcilesAllRoots),
+                "rootCount": .publicInt(rootURLs.count),
+                "roots": .pathArray(rootURLs.map(\.path))
+            ]
+        )
 
         let currentGeneration = lock.withLock { () -> UInt64 in
             generation &+= 1
@@ -2226,6 +2245,14 @@ public final class FileIndex: @unchecked Sendable {
     public func refresh(paths rawPaths: [String]) {
         let paths = Set(rawPaths.map { URL(fileURLWithPath: $0).standardizedFileURL.path })
         guard !paths.isEmpty else { return }
+        DiagnosticLogger.shared.log(
+            category: "index",
+            event: "index.refreshQueued",
+            fields: [
+                "pathCount": .publicInt(paths.count),
+                "paths": .pathArray(Array(paths))
+            ]
+        )
 
         let shouldSchedule = lock.withLock { () -> Bool in
             pendingRefreshPaths.formUnion(paths)
@@ -4363,6 +4390,8 @@ public final class FileIndex: @unchecked Sendable {
         let jobID = beginIndexJob("loadSnapshot")
         defer { endIndexJob("loadSnapshot", jobID: jobID) }
 
+        let started = Date()
+        DiagnosticLogger.shared.log(category: "index", event: "index.snapshotLoadBegin")
         MemoryTelemetry.log("snapshot.load.begin", activeIndexJobs: currentActiveIndexJobCount())
 
         guard let persisted = loadPersistedSnapshot() else {
@@ -4387,6 +4416,13 @@ public final class FileIndex: @unchecked Sendable {
             if didUpdate {
                 publishStats()
             }
+            DiagnosticLogger.shared.log(
+                category: "index",
+                event: "index.snapshotLoadNoPersistedSnapshot",
+                fields: [
+                    "durationSeconds": .publicDouble(Date().timeIntervalSince(started))
+                ]
+            )
             return
         }
 
@@ -4449,6 +4485,17 @@ public final class FileIndex: @unchecked Sendable {
 
         if didApply, didLoadUsableSnapshot {
             removeSupersededScanCheckpoint(finalSavedAt: persisted.manifest.savedAt)
+            DiagnosticLogger.shared.log(
+                category: "index",
+                event: "index.snapshotLoadApplied",
+                fields: [
+                    "recordCount": .publicInt(snapshot.resultCount),
+                    "rootCount": .publicInt(persisted.manifest.roots.count),
+                    "roots": .pathArray(persisted.manifest.roots),
+                    "optimizedForSearch": .publicBool(loadedOptimized),
+                    "durationSeconds": .publicDouble(Date().timeIntervalSince(started))
+                ]
+            )
             MemoryTelemetry.log(
                 "snapshot.load.applied",
                 records: metrics,
@@ -4491,6 +4538,17 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         MemoryTelemetry.log("rebuild.scan.begin", activeIndexJobs: currentActiveIndexJobCount())
+        DiagnosticLogger.shared.log(
+            category: "index",
+            event: "index.rebuildBegin",
+            fields: [
+                "mode": .publicString(Self.diagnosticRebuildModeString(mode)),
+                "rootCount": .publicInt(rootPaths.count),
+                "roots": .pathArray(rootPaths),
+                "resumedFromCheckpoint": .publicBool(checkpoint != nil),
+                "workerCount": .publicInt(Self.scanWorkerCount())
+            ]
+        )
 
         guard let scanResult = scanConcurrently(
             roots: rootURLs,
@@ -4502,6 +4560,15 @@ public final class FileIndex: @unchecked Sendable {
             workerQoS: .utility,
             progress: publishPrimary
         ) else {
+            DiagnosticLogger.shared.log(
+                level: .warning,
+                category: "index",
+                event: "index.rebuildCancelled",
+                fields: [
+                    "mode": .publicString(Self.diagnosticRebuildModeString(mode)),
+                    "durationSeconds": .publicDouble(Date().timeIntervalSince(started))
+                ]
+            )
             return
         }
 
@@ -4518,6 +4585,16 @@ public final class FileIndex: @unchecked Sendable {
         )
         guard isCurrentGeneration(currentGeneration) else { return }
         recordFullRebuild(duration: Date().timeIntervalSince(started))
+        DiagnosticLogger.shared.log(
+            category: "index",
+            event: "index.rebuildFinished",
+            fields: [
+                "mode": .publicString(Self.diagnosticRebuildModeString(mode)),
+                "recordCount": .publicInt(scanResult.records.count),
+                "visitedCount": .publicInt(scanResult.visited),
+                "durationSeconds": .publicDouble(Date().timeIntervalSince(started))
+            ]
+        )
     }
 
     private func reconcile(
@@ -4535,6 +4612,16 @@ public final class FileIndex: @unchecked Sendable {
         let previousRecords = reconcilesAllRoots ? [] : lock.withLock { searchSnapshot.store.allRecords() }
 
         MemoryTelemetry.log("reconcile.scan.begin", activeIndexJobs: currentActiveIndexJobCount())
+        DiagnosticLogger.shared.log(
+            category: "index",
+            event: "index.reconcileBegin",
+            fields: [
+                "reconcilesAllRoots": .publicBool(reconcilesAllRoots),
+                "rootCount": .publicInt(rootURLs.count),
+                "roots": .pathArray(scannedRootPaths),
+                "workerCount": .publicInt(Self.refreshScanWorkerCount())
+            ]
+        )
         guard let scanResult = scanConcurrently(
             roots: rootURLs,
             exclusions: exclusions,
@@ -4547,6 +4634,14 @@ public final class FileIndex: @unchecked Sendable {
             workerQoS: .utility,
             progress: { _, _, _ in }
         ) else {
+            DiagnosticLogger.shared.log(
+                level: .warning,
+                category: "index",
+                event: "index.reconcileCancelled",
+                fields: [
+                    "durationSeconds": .publicDouble(Date().timeIntervalSince(started))
+                ]
+            )
             return
         }
 
@@ -4578,6 +4673,15 @@ public final class FileIndex: @unchecked Sendable {
         )
         guard isCurrentGeneration(currentGeneration) else { return }
         recordFullRebuild(duration: Date().timeIntervalSince(started))
+        DiagnosticLogger.shared.log(
+            category: "index",
+            event: "index.reconcileFinished",
+            fields: [
+                "recordCount": .publicInt(recordsByPath.count),
+                "visitedCount": .publicInt(scanResult.visited),
+                "durationSeconds": .publicDouble(Date().timeIntervalSince(started))
+            ]
+        )
     }
 
     private func scanConcurrently(
@@ -5246,6 +5350,14 @@ public final class FileIndex: @unchecked Sendable {
             refreshBatchSize: paths.count,
             activeIndexJobs: currentActiveIndexJobCount()
         )
+        DiagnosticLogger.shared.log(
+            category: "index",
+            event: "index.refreshBegin",
+            fields: [
+                "pathCount": .publicInt(paths.count),
+                "paths": .pathArray(paths)
+            ]
+        )
 
         let indexState = lock.withLock {
             (
@@ -5300,6 +5412,14 @@ public final class FileIndex: @unchecked Sendable {
                 activeIndexJobs: currentActiveIndexJobCount()
             )
             recordIncrementalRefresh(duration: Date().timeIntervalSince(refreshStarted))
+            DiagnosticLogger.shared.log(
+                category: "index",
+                event: "index.refreshNoop",
+                fields: [
+                    "pathCount": .publicInt(paths.count),
+                    "durationSeconds": .publicDouble(Date().timeIntervalSince(refreshStarted))
+                ]
+            )
             return
         }
 
@@ -5339,6 +5459,17 @@ public final class FileIndex: @unchecked Sendable {
                 structures: updatedSnapshot.diagnostics,
                 refreshBatchSize: paths.count,
                 activeIndexJobs: currentActiveIndexJobCount()
+            )
+            DiagnosticLogger.shared.log(
+                category: "index",
+                event: "index.refreshMetadataApplied",
+                fields: [
+                    "pathCount": .publicInt(paths.count),
+                    "upsertCount": .publicInt(upserts.count),
+                    "recordCount": .publicInt(updatedSnapshot.resultCount),
+                    "requiresDirectoryReconciliation": .publicBool(requiresDirectoryReconciliation),
+                    "durationSeconds": .publicDouble(Date().timeIntervalSince(refreshStarted))
+                ]
             )
             if requiresDirectoryReconciliation {
                 reconcileIndexedRootsInBackground()
@@ -5410,6 +5541,17 @@ public final class FileIndex: @unchecked Sendable {
                 activeIndexJobs: currentActiveIndexJobCount()
             )
             recordIncrementalRefresh(duration: Date().timeIntervalSince(refreshStarted))
+            DiagnosticLogger.shared.log(
+                category: "index",
+                event: "index.refreshOverlayDeferred",
+                fields: [
+                    "pathCount": .publicInt(paths.count),
+                    "upsertCount": .publicInt(upserts.count),
+                    "deletedPrefixCount": .publicInt(deletedPrefixes.count),
+                    "changedPathCount": .publicInt(changedPathCount),
+                    "durationSeconds": .publicDouble(Date().timeIntervalSince(refreshStarted))
+                ]
+            )
             reconcileIndexedRootsInBackground()
             return
         }
@@ -5454,6 +5596,19 @@ public final class FileIndex: @unchecked Sendable {
             activeIndexJobs: currentActiveIndexJobCount()
         )
         recordIncrementalRefresh(duration: Date().timeIntervalSince(refreshStarted))
+        DiagnosticLogger.shared.log(
+            category: "index",
+            event: "index.refreshOverlayApplied",
+            fields: [
+                "pathCount": .publicInt(paths.count),
+                "upsertCount": .publicInt(upserts.count),
+                "deletedPrefixCount": .publicInt(deletedPrefixes.count),
+                "changedPathCount": .publicInt(changedPathCount),
+                "recordCount": .publicInt(snapshot.resultCount),
+                "requiresDirectoryReconciliation": .publicBool(requiresDirectoryReconciliation),
+                "durationSeconds": .publicDouble(Date().timeIntervalSince(refreshStarted))
+            ]
+        )
         if requiresDirectoryReconciliation {
             reconcileIndexedRootsInBackground()
         }
@@ -5590,12 +5745,22 @@ public final class FileIndex: @unchecked Sendable {
         let jobID = beginIndexJob("persist")
         defer { endIndexJob("persist", jobID: jobID) }
 
+        let started = Date()
         let metrics = Self.countOnlyMetrics(for: snapshotData.snapshot.store)
         MemoryTelemetry.log(
             "snapshot.persist.begin",
             records: metrics,
             structures: lock.withLock { searchSnapshot.diagnostics },
             activeIndexJobs: currentActiveIndexJobCount()
+        )
+        DiagnosticLogger.shared.log(
+            category: "index",
+            event: "index.snapshotPersistBegin",
+            fields: [
+                "rootCount": .publicInt(snapshotData.roots.count),
+                "recordCount": .publicInt(metrics.recordCount),
+                "storeKind": .publicString(snapshotData.snapshot.store.kind.rawValue)
+            ]
         )
 
         do {
@@ -5614,6 +5779,14 @@ public final class FileIndex: @unchecked Sendable {
                 records: metrics,
                 structures: persistedSnapshot.diagnostics,
                 activeIndexJobs: currentActiveIndexJobCount()
+            )
+            DiagnosticLogger.shared.log(
+                category: "index",
+                event: "index.snapshotPersistFinished",
+                fields: [
+                    "recordCount": .publicInt(metrics.recordCount),
+                    "durationSeconds": .publicDouble(Date().timeIntervalSince(started))
+                ]
             )
             if snapshotData.snapshot.store.kind == .overlay || snapshotData.snapshot.store.kind == .heapPaged {
                 lock.withLock {
@@ -5636,6 +5809,16 @@ public final class FileIndex: @unchecked Sendable {
                 lastUpdated = Date()
             }
             recordPersistFailure()
+            DiagnosticLogger.shared.log(
+                level: .error,
+                category: "index",
+                event: "index.snapshotPersistFailed",
+                fields: [
+                    "recordCount": .publicInt(metrics.recordCount),
+                    "durationSeconds": .publicDouble(Date().timeIntervalSince(started)),
+                    "error": .errorText(error.localizedDescription)
+                ]
+            )
             publishStats()
             return false
         }
@@ -5784,8 +5967,29 @@ public final class FileIndex: @unchecked Sendable {
                     "checkpoint.persisted",
                     activeIndexJobs: currentActiveIndexJobCount()
                 )
+                DiagnosticLogger.shared.log(
+                    category: "index",
+                    event: "index.checkpointPersisted",
+                    fields: [
+                        "rootCount": .publicInt(roots.count),
+                        "recordCount": .publicInt(mappedStore.count),
+                        "pendingDirectoryCount": .publicInt(progress.pendingDirectories.count),
+                        "activeDirectoryCount": .publicInt(progress.activeDirectories.count),
+                        "completedDirectoryCount": .publicInt(progress.completedDirectories.count)
+                    ]
+                )
             } catch {
                 MemoryTelemetry.log("checkpoint.persist.failed", activeIndexJobs: currentActiveIndexJobCount())
+                DiagnosticLogger.shared.log(
+                    level: .error,
+                    category: "index",
+                    event: "index.checkpointPersistFailed",
+                    fields: [
+                        "rootCount": .publicInt(roots.count),
+                        "recordCount": .publicInt(progress.store.count),
+                        "error": .errorText(error.localizedDescription)
+                    ]
+                )
                 try? fileManager.removeItem(at: temporaryURL)
             }
         }
@@ -6911,6 +7115,15 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         return lhs.path < rhs.path
+    }
+
+    private static func diagnosticRebuildModeString(_ mode: RebuildMode) -> String {
+        switch mode {
+        case .resumeIfAvailable:
+            return "resumeIfAvailable"
+        case .fresh:
+            return "fresh"
+        }
     }
 }
 
