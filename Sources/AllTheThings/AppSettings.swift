@@ -32,6 +32,7 @@ enum AppSettings {
     static let darkMatchColorsKey = "ATTDarkMatchColors"
     static let indexedRootsKey = "ATTIndexedRoots"
     static let indexedRootsInitializedKey = "ATTIndexedRootsInitialized"
+    static let indexingSetupCompletedKey = "ATTIndexingSetupCompleted"
     static let exclusionPatternsKey = "ATTExclusionPatterns"
     static let exclusionDefaultsVersionKey = "ATTExclusionDefaultsVersion"
     static let globalSearchHotKeyDidChangeNotification = Notification.Name("com.allthethings.settings.globalSearchHotKeyDidChange")
@@ -164,6 +165,14 @@ enum AppSettings {
             || !(defaults.array(forKey: indexedRootsKey) as? [String] ?? []).isEmpty
     }
 
+    static func indexingSetupCompleted(defaults: UserDefaults = .standard) -> Bool {
+        guard defaults.object(forKey: indexingSetupCompletedKey) != nil else {
+            return indexedRootsConfigured(defaults: defaults)
+        }
+
+        return defaults.bool(forKey: indexingSetupCompletedKey)
+    }
+
     static func saveIndexedRoots(_ roots: [URL], defaults: UserDefaults = .standard) {
         let paths = uniqueRoots(roots).map(\.path)
         defaults.set(paths, forKey: indexedRootsKey)
@@ -179,7 +188,13 @@ enum AppSettings {
     static func initializeIndexedRootsWithDefaultsIfNeeded(defaults: UserDefaults = .standard) {
         guard !indexedRootsConfigured(defaults: defaults) else { return }
 
+        defaults.set(false, forKey: indexingSetupCompletedKey)
         resetIndexedRoots(defaults: defaults)
+    }
+
+    static func markIndexingSetupCompleted(defaults: UserDefaults = .standard) {
+        defaults.set(true, forKey: indexingSetupCompletedKey)
+        defaults.synchronize()
     }
 
     static func exclusionPatterns(defaults: UserDefaults = .standard) -> [String] {

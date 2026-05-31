@@ -906,7 +906,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func updateSetupSuggestions() {
-        let needsIndexingSetup = !AppSettings.indexedRootsConfigured(defaults: defaults)
+        let needsIndexingSetup = !AppSettings.indexingSetupCompleted(defaults: defaults)
         let needsGlobalHotKey = AppSettings.globalSearchHotKeyNeedsConfirmation(defaults: defaults)
         let needsFullDiskAccess = !defaults.bool(forKey: AppSettings.fullDiskAccessOnboardingShownKey)
             && (needsIndexingSetup || !FullDiskAccessController.protectedDefaultFoldersCovered(by: indexedRoots).isEmpty)
@@ -970,11 +970,14 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     @objc private func startSuggestedIndexing(_ sender: NSButton) {
-        let roots = AppSettings.suggestedDefaultIndexedRoots()
+        let roots = AppSettings.indexedRootsConfigured(defaults: defaults)
+            ? AppSettings.indexedRoots(defaults: defaults)
+            : AppSettings.suggestedDefaultIndexedRoots()
         beginSetupMascotTuckAwayIfPossible()
         indexedRoots = roots
         refreshRootDisplayNames()
         saveRoots()
+        AppSettings.markIndexingSetupCompleted(defaults: defaults)
         startWatchingIfNeeded()
         rebuildIndexForCurrentSettings()
         updateSetupSuggestions()
@@ -1684,7 +1687,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         updateStatus()
         updateLoadingOverlay()
 
-        guard AppSettings.indexedRootsConfigured(defaults: defaults), !indexedRoots.isEmpty else {
+        guard AppSettings.indexingSetupCompleted(defaults: defaults), !indexedRoots.isEmpty else {
             return
         }
 
@@ -1735,7 +1738,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         didRequestInitialSnapshotLoad = true
         updateLoadingOverlay()
 
-        guard AppSettings.indexedRootsConfigured(defaults: defaults), !indexedRoots.isEmpty else {
+        guard AppSettings.indexingSetupCompleted(defaults: defaults), !indexedRoots.isEmpty else {
             updateStatus()
             updateSetupSuggestions()
             return
@@ -1762,7 +1765,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         guard
             didRequestInitialSnapshotLoad,
             !didRequestInitialRebuild,
-            AppSettings.indexedRootsConfigured(defaults: defaults),
+            AppSettings.indexingSetupCompleted(defaults: defaults),
             !indexedRoots.isEmpty
         else {
             return
@@ -1774,7 +1777,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func updateLoadingOverlay() {
-        guard AppSettings.indexedRootsConfigured(defaults: defaults), !indexedRoots.isEmpty else {
+        guard AppSettings.indexingSetupCompleted(defaults: defaults), !indexedRoots.isEmpty else {
             loadingOverlaySawActiveLoad = false
             loadingOverlay.isHidden = true
             updateMascotPlacementVisibility()
@@ -2162,6 +2165,13 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         refreshRootDisplayNames()
         didRequestInitialRebuild = false
         startWatchingIfNeeded()
+        guard AppSettings.indexingSetupCompleted(defaults: defaults) else {
+            updateSetupSuggestions()
+            updateStatus()
+            updateActionButtons()
+            return
+        }
+
         rebuildIndexForCurrentSettings()
         updateSetupSuggestions()
         updateActionButtons()
@@ -2172,7 +2182,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         guard patterns != index.allExclusionPatterns() else { return }
 
         index.updateExclusionPatterns(patterns)
-        guard AppSettings.indexedRootsConfigured(defaults: defaults) else { return }
+        guard AppSettings.indexingSetupCompleted(defaults: defaults) else { return }
         rebuildIndexForCurrentSettings()
     }
 
@@ -2194,7 +2204,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         updateActionButtons()
         updateMascotPersistentAnimation()
 
-        guard AppSettings.indexedRootsConfigured(defaults: defaults) else {
+        guard AppSettings.indexingSetupCompleted(defaults: defaults) else {
             updateStatus()
             updateLoadingOverlay()
             updateActionButtons()
@@ -2242,7 +2252,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func startWatchingIfNeeded() {
-        guard AppSettings.indexedRootsConfigured(defaults: defaults), !indexedRoots.isEmpty else {
+        guard AppSettings.indexingSetupCompleted(defaults: defaults), !indexedRoots.isEmpty else {
             cancelFSEventCatchUp()
             watcher.stop()
             return
@@ -2257,7 +2267,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let roots = roots.map(\.standardizedFileURL)
         guard
             !roots.isEmpty,
-            AppSettings.indexedRootsConfigured(defaults: defaults),
+            AppSettings.indexingSetupCompleted(defaults: defaults),
             rootPaths(roots) == rootPaths(indexedRoots),
             index.allExclusionPatterns() == AppSettings.exclusionPatterns(defaults: defaults)
         else {
@@ -2361,7 +2371,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             refreshMemoryStatus()
         }
 
-        guard AppSettings.indexedRootsConfigured(defaults: defaults) else {
+        guard AppSettings.indexingSetupCompleted(defaults: defaults) else {
             countLabel.stringValue = "0 shown / 0 matches • 0 indexed"
             statusLabel.stringValue = "Setup needed • Choose what AllTheThings can search • \(memoryStatusText)"
             return
@@ -2443,7 +2453,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         openButton.isEnabled = enabled
         revealButton.isEnabled = enabled
         copyButton.isEnabled = enabled
-        reindexButton.isEnabled = AppSettings.indexedRootsConfigured(defaults: defaults) && !indexedRoots.isEmpty
+        reindexButton.isEnabled = AppSettings.indexingSetupCompleted(defaults: defaults) && !indexedRoots.isEmpty
     }
 
     private func selectedRecord() -> FileRecord? {
@@ -2660,6 +2670,13 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         indexedRoots.append(contentsOf: additions)
         refreshRootDisplayNames()
         saveRoots()
+        guard AppSettings.indexingSetupCompleted(defaults: defaults) else {
+            updateSetupSuggestions()
+            updateStatus()
+            updateActionButtons()
+            return
+        }
+
         didRequestInitialSnapshotLoad = true
         didRequestInitialRebuild = true
         startWatchingIfNeeded()
@@ -2671,7 +2688,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     @objc private func reindex(_ sender: Any?) {
-        guard AppSettings.indexedRootsConfigured(defaults: defaults), !indexedRoots.isEmpty else { return }
+        guard AppSettings.indexingSetupCompleted(defaults: defaults), !indexedRoots.isEmpty else { return }
         didRequestInitialSnapshotLoad = true
         didRequestInitialRebuild = true
         cancelFSEventCatchUp()

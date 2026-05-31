@@ -16,8 +16,10 @@ struct AppSettingsTests {
         AppSettings.registerDefaults(defaults)
 
         #expect(!AppSettings.indexedRootsConfigured(defaults: defaults))
+        #expect(!AppSettings.indexingSetupCompleted(defaults: defaults))
         #expect(AppSettings.indexedRoots(defaults: defaults).isEmpty)
         #expect(!AppSettings.indexedRootsConfigured(defaults: defaults))
+        #expect(!AppSettings.indexingSetupCompleted(defaults: defaults))
         #expect(defaults.object(forKey: AppSettings.indexedRootsKey) == nil)
         #expect(defaults.object(forKey: AppSettings.indexedRootsInitializedKey) == nil)
     }
@@ -33,6 +35,7 @@ struct AppSettingsTests {
         AppSettings.saveIndexedRoots([root], defaults: defaults)
 
         #expect(AppSettings.indexedRootsConfigured(defaults: defaults))
+        #expect(AppSettings.indexingSetupCompleted(defaults: defaults))
         #expect(AppSettings.indexedRoots(defaults: defaults) == [root.standardizedFileURL])
     }
 
@@ -46,6 +49,7 @@ struct AppSettingsTests {
         AppSettings.saveIndexedRoots([], defaults: defaults)
 
         #expect(AppSettings.indexedRootsConfigured(defaults: defaults))
+        #expect(AppSettings.indexingSetupCompleted(defaults: defaults))
         #expect(AppSettings.indexedRoots(defaults: defaults).isEmpty)
     }
 
@@ -59,7 +63,37 @@ struct AppSettingsTests {
         AppSettings.initializeIndexedRootsWithDefaultsIfNeeded(defaults: defaults)
 
         #expect(AppSettings.indexedRootsConfigured(defaults: defaults))
+        #expect(!AppSettings.indexingSetupCompleted(defaults: defaults))
         #expect(AppSettings.indexedRoots(defaults: defaults) == AppSettings.suggestedDefaultIndexedRoots())
+    }
+
+    @Test("setup folder edits stay pending until indexing starts")
+    func setupFolderEditsStayPendingUntilIndexingStarts() throws {
+        let (defaults, suiteName) = try makeDefaults()
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        AppSettings.initializeIndexedRootsWithDefaultsIfNeeded(defaults: defaults)
+        let root = URL(fileURLWithPath: "/tmp/AllTheThingsTests", isDirectory: true)
+        AppSettings.saveIndexedRoots([root], defaults: defaults)
+
+        #expect(AppSettings.indexedRootsConfigured(defaults: defaults))
+        #expect(!AppSettings.indexingSetupCompleted(defaults: defaults))
+        #expect(AppSettings.indexedRoots(defaults: defaults) == [root.standardizedFileURL])
+    }
+
+    @Test("marking indexing setup complete allows configured roots to index")
+    func markingIndexingSetupCompleteAllowsConfiguredRootsToIndex() throws {
+        let (defaults, suiteName) = try makeDefaults()
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        AppSettings.initializeIndexedRootsWithDefaultsIfNeeded(defaults: defaults)
+        AppSettings.markIndexingSetupCompleted(defaults: defaults)
+
+        #expect(AppSettings.indexingSetupCompleted(defaults: defaults))
     }
 
     @Test("default indexed root initialization preserves configured roots")

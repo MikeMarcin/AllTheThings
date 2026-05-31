@@ -331,7 +331,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 clearCachedIndexHandler: { [weak self] in
                     guard let self else { return }
                     try self.fileIndex.clearPersistedIndexData()
-                    guard AppSettings.indexedRootsConfigured(defaults: self.defaults) else { return }
+                    guard AppSettings.indexingSetupCompleted(defaults: self.defaults) else { return }
                     let roots = AppSettings.indexedRoots(defaults: self.defaults)
                     guard !roots.isEmpty else { return }
                     self.fileIndex.setPublishesSearchableSnapshotsDuringScan(false)

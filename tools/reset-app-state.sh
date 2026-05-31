@@ -4,6 +4,7 @@ set -euo pipefail
 APP_NAME="AllTheThings"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INFO_PLIST="${ROOT_DIR}/Resources/Info.plist"
+LEGACY_BUNDLE_IDS=("com.gamecoretech.AllTheThings")
 
 DRY_RUN=0
 YES=0
@@ -25,6 +26,7 @@ Options:
 This removes:
   - ~/Library/Application Support/AllTheThings
   - AllTheThings user defaults for com.gamecoretech.allthethings
+    (including indexed folders and first-run indexing setup state)
   - app caches, HTTP storage, saved window state, and sandbox container state
 
 macOS privacy approvals and Login Items approval are owned by the OS and are not
@@ -168,6 +170,11 @@ delete_defaults_domain() {
         if defaults read "${BUNDLE_ID}" >/dev/null 2>&1; then
             log "would delete defaults domain ${BUNDLE_ID}"
         fi
+        for legacy_bundle_id in "${LEGACY_BUNDLE_IDS[@]}"; do
+            if defaults read "${legacy_bundle_id}" >/dev/null 2>&1; then
+                log "would delete legacy defaults domain ${legacy_bundle_id}"
+            fi
+        done
         return 0
     fi
 
@@ -175,6 +182,13 @@ delete_defaults_domain() {
         log "deleting defaults domain ${BUNDLE_ID}"
         defaults delete "${BUNDLE_ID}" >/dev/null 2>&1 || true
     fi
+
+    for legacy_bundle_id in "${LEGACY_BUNDLE_IDS[@]}"; do
+        if defaults read "${legacy_bundle_id}" >/dev/null 2>&1; then
+            log "deleting legacy defaults domain ${legacy_bundle_id}"
+            defaults delete "${legacy_bundle_id}" >/dev/null 2>&1 || true
+        fi
+    done
 }
 
 main() {
@@ -189,6 +203,16 @@ main() {
     remove_path "${home}/Library/Application Support/${APP_NAME}"
     remove_path "${home}/Library/Caches/${BUNDLE_ID}"
     remove_path "${home}/Library/Caches/${APP_NAME}"
+    for legacy_bundle_id in "${LEGACY_BUNDLE_IDS[@]}"; do
+        remove_path "${home}/Library/Caches/${legacy_bundle_id}"
+        remove_path "${home}/Library/HTTPStorages/${legacy_bundle_id}"
+        remove_path "${home}/Library/HTTPStorages/${legacy_bundle_id}.binarycookies"
+        remove_path "${home}/Library/Saved Application State/${legacy_bundle_id}.savedState"
+        remove_path "${preferences_dir}/${legacy_bundle_id}.plist"
+        remove_matching_files "${preferences_dir}/ByHost" "${legacy_bundle_id}.*.plist"
+        remove_path "${home}/Library/Containers/${legacy_bundle_id}"
+        remove_path "${home}/Library/Group Containers/${legacy_bundle_id}"
+    done
     remove_path "${home}/Library/HTTPStorages/${BUNDLE_ID}"
     remove_path "${home}/Library/HTTPStorages/${BUNDLE_ID}.binarycookies"
     remove_path "${home}/Library/Saved Application State/${BUNDLE_ID}.savedState"
