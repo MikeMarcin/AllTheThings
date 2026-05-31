@@ -625,32 +625,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         appMenu.addItem(.separator())
 
-        let exportAnonymizedLogItem = NSMenuItem(
-            title: "Export Anonymized Diagnostic Log...",
-            action: #selector(exportAnonymizedDiagnosticLog(_:)),
-            keyEquivalent: ""
-        )
-        exportAnonymizedLogItem.target = self
-        appMenu.addItem(exportAnonymizedLogItem)
-
-        let exportRawLogItem = NSMenuItem(
-            title: "Export Raw Diagnostic Log...",
-            action: #selector(exportRawDiagnosticLog(_:)),
-            keyEquivalent: ""
-        )
-        exportRawLogItem.target = self
-        appMenu.addItem(exportRawLogItem)
-
-        let clearDiagnosticLogsItem = NSMenuItem(
-            title: "Clear Local Diagnostic Logs",
-            action: #selector(clearLocalDiagnosticLogs(_:)),
-            keyEquivalent: ""
-        )
-        clearDiagnosticLogsItem.target = self
-        appMenu.addItem(clearDiagnosticLogsItem)
-
-        appMenu.addItem(.separator())
-
         let checkUpdatesItem = NSMenuItem(
             title: "Check for Updates...",
             action: #selector(checkForUpdates(_:)),
@@ -710,6 +684,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
         noticesItem.target = self
         helpMenu.addItem(noticesItem)
+
+        helpMenu.addItem(.separator())
+
+        let exportAnonymizedLogItem = NSMenuItem(
+            title: "Export Anonymized Diagnostic Log...",
+            action: #selector(exportAnonymizedDiagnosticLog(_:)),
+            keyEquivalent: ""
+        )
+        exportAnonymizedLogItem.target = self
+        helpMenu.addItem(exportAnonymizedLogItem)
+
+        let exportRawLogItem = NSMenuItem(
+            title: "Export Raw Diagnostic Log...",
+            action: #selector(exportRawDiagnosticLog(_:)),
+            keyEquivalent: ""
+        )
+        exportRawLogItem.target = self
+        helpMenu.addItem(exportRawLogItem)
+
+        let clearDiagnosticLogsItem = NSMenuItem(
+            title: "Clear Local Diagnostic Logs",
+            action: #selector(clearLocalDiagnosticLogs(_:)),
+            keyEquivalent: ""
+        )
+        clearDiagnosticLogsItem.target = self
+        helpMenu.addItem(clearDiagnosticLogsItem)
         helpItem.submenu = helpMenu
         mainMenu.addItem(helpItem)
 
