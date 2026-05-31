@@ -42,7 +42,7 @@ enum AppSettings {
     static let indexedRootsDidChangeNotification = Notification.Name("com.allthethings.settings.indexedRootsDidChange")
     static let exclusionPatternsDidChangeNotification = Notification.Name("com.allthethings.settings.exclusionPatternsDidChange")
 
-    private static let currentExclusionDefaultsVersion = 3
+    private static let currentExclusionDefaultsVersion = 4
     private static let versionOneDefaultExclusionPatterns = [
         "node_modules/",
         "DerivedData/",
@@ -270,7 +270,12 @@ enum AppSettings {
     }
 
     private static func defaultExclusionPatternsAdded(after version: Int) -> [String] {
-        guard version < 2 else { return [] }
-        return FileExclusionRules.defaultPatterns.filter { !versionOneDefaultExclusionPatterns.contains($0) }
+        if version < 2 {
+            return FileExclusionRules.defaultPatterns.filter { !versionOneDefaultExclusionPatterns.contains($0) }
+        }
+        if version < 4 {
+            return ["Engine/Binaries/ThirdParty/DotNet/"]
+        }
+        return []
     }
 }

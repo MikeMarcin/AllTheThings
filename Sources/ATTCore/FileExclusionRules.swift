@@ -14,6 +14,7 @@ public struct FileExclusionRules: @unchecked Sendable {
         ".next/cache/",
         ".parcel-cache/",
         ".turbo/",
+        "Engine/Binaries/ThirdParty/DotNet/",
         "__pycache__/",
         ".pytest_cache/",
         ".mypy_cache/",

@@ -3,6 +3,37 @@ import ATTCore
 import QuartzCore
 import UniformTypeIdentifiers
 
+enum AppRuntimeStatusFormatter {
+    static func windowTitle(version: String?, build: String?) -> String {
+        switch (version, build) {
+        case let (version?, _) where !version.isEmpty:
+            return "AllTheThings \(version)"
+        case let (_, build?) where !build.isEmpty:
+            return "AllTheThings \(build)"
+        default:
+            return "AllTheThings"
+        }
+    }
+
+    static func operationElapsed(_ elapsed: TimeInterval) -> String {
+        let totalSeconds = max(Int(elapsed.rounded()), 0)
+        let hours = totalSeconds / 3_600
+        let minutes = (totalSeconds % 3_600) / 60
+        let seconds = totalSeconds % 60
+        if hours > 0 {
+            return "\(hours)h \(String(format: "%02dm", minutes))"
+        }
+        if minutes > 0 {
+            return "\(minutes)m \(String(format: "%02ds", seconds))"
+        }
+        return "\(seconds)s"
+    }
+
+    static func catchUpStatus(elapsed: TimeInterval) -> String {
+        "Catching up changes • \(operationElapsed(elapsed))"
+    }
+}
+
 final class SearchWindowController: NSWindowController {
     private enum WindowLayout {
         static let preferredContentSize = NSSize(width: 1_180, height: 720)
@@ -18,7 +49,7 @@ final class SearchWindowController: NSWindowController {
             backing: .buffered,
             defer: false
         )
-        window.title = "AllTheThings"
+        window.title = Self.windowTitle()
         window.titlebarAppearsTransparent = true
         window.collectionBehavior.insert(.moveToActiveSpace)
         window.isRestorable = false
@@ -26,6 +57,12 @@ final class SearchWindowController: NSWindowController {
         window.contentViewController = viewController
         window.center()
         super.init(window: window)
+    }
+
+    private static func windowTitle() -> String {
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+        return AppRuntimeStatusFormatter.windowTitle(version: version, build: build)
     }
 
     @available(*, unavailable)
@@ -186,6 +223,27 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let includeHidden: Bool
     }
 
+    private enum SearchScheduling {
+        static let unoptimizedIndexingSearchBudget: TimeInterval = 0.75
+    }
+
+    private final class SearchBudgetTimeout: @unchecked Sendable {
+        private let lock = NSLock()
+        private var timedOut = false
+
+        var didTimeOut: Bool {
+            lock.withLock {
+                timedOut
+            }
+        }
+
+        func markTimedOut() {
+            lock.withLock {
+                timedOut = true
+            }
+        }
+    }
+
     private enum MascotFlightPlayback {
         case animation(OperationMascotAnimation)
         case standalone(OperationMascotStandaloneClip)
@@ -230,7 +288,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private let index: FileIndex
-    private let watcher = FileSystemWatcher()
+    private let fseventCursorStore = FSEventCursorStore.default
+    private lazy var watcher = FileSystemWatcher(cursorStore: fseventCursorStore)
+    private lazy var fseventReconciler = FSEventReconciliationCoordinator(cursorStore: fseventCursorStore)
     private let searchQueue = DispatchQueue(label: "att.search", qos: .userInitiated)
     private let defaults = UserDefaults.standard
 
@@ -270,6 +330,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var pendingEventPaths = Set<String>()
     private var pendingRecursiveEventPaths = Set<String>()
     private var eventDebounce: DispatchWorkItem?
+    private var activeFSEventReplay: FSEventHistoryReplayCancellable?
+    private var activeFSEventReconciliationID: UUID?
+    private var fseventCatchUpStartedAt: Date?
     private var memoryStatusTask: Task<Void, Never>?
     private var memoryStatusText = ProcessMemoryFormatter.label(for: ProcessMemorySampler.currentUsage())
     private var mascotCoordinator: OperationMascotCoordinator?
@@ -342,6 +405,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     deinit {
+        activeFSEventReplay?.cancel()
         memoryStatusTask?.cancel()
         NotificationCenter.default.removeObserver(self)
     }
@@ -365,6 +429,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         index.onStatsChanged = { @MainActor @Sendable [weak self] stats in
             self?.handleStatsChanged(stats)
+        }
+        index.onBackgroundReconciliationRequested = { @MainActor @Sendable [weak self] roots in
+            self?.runFSEventsBackedReconciliation(roots: roots)
         }
         NotificationCenter.default.addObserver(
             self,
@@ -1279,6 +1346,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         queryGeneration &+= 1
         let generation = queryGeneration
         let index = self.index
+        let shouldBudgetSearch = shouldBudgetSearchDuringIndexing(request: request)
+        let searchStartedAt = Date()
+        let budgetTimeout = SearchBudgetTimeout()
 
         searchQueue.async {
             guard !token.isCancelled else {
@@ -1288,9 +1358,25 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                 return
             }
 
-            guard let response = index.search(request, shouldCancel: { token.isCancelled }) else {
+            guard let response = index.search(request, shouldCancel: {
+                if token.isCancelled {
+                    return true
+                }
+                if
+                    shouldBudgetSearch,
+                    Date().timeIntervalSince(searchStartedAt) >= SearchScheduling.unoptimizedIndexingSearchBudget
+                {
+                    budgetTimeout.markTimedOut()
+                    return true
+                }
+                return false
+            }) else {
                 DispatchQueue.main.async { [weak self] in
-                    self?.clearSearchTokenIfCurrent(token)
+                    guard let self else { return }
+                    self.clearSearchTokenIfCurrent(token)
+                    if budgetTimeout.didTimeOut, !self.shouldBudgetSearchDuringIndexing(request: request) {
+                        self.scheduleSearch(force: true)
+                    }
                 }
                 return
             }
@@ -1327,8 +1413,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func handleStatsChanged(_ stats: IndexStats) {
-        let previousPhase = indexStats.phase
+        let previousStats = indexStats
+        let previousPhase = previousStats.phase
         indexStats = stats
+        markFSEventBaselineIfNeeded(previous: previousStats, current: stats)
         handleMascotTransition(from: previousPhase, to: stats.phase)
         updateStatus(refreshesMemory: true)
         updateLoadingOverlay()
@@ -1349,7 +1437,22 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             return
         }
 
-        scheduleSearch(force: true)
+        let request = SearchRequest(query: currentSearchText(), sort: sortSpec, includeHidden: showsHiddenFiles)
+        if stats.snapshotRevision != previousStats.snapshotRevision, shouldBudgetSearchDuringIndexing(request: request, stats: stats) {
+            scheduleSearch()
+        } else if stats.snapshotRevision != previousStats.snapshotRevision {
+            scheduleSearch(force: true)
+        } else {
+            scheduleSearch()
+        }
+    }
+
+    private func shouldBudgetSearchDuringIndexing(request: SearchRequest, stats: IndexStats? = nil) -> Bool {
+        let stats = stats ?? indexStats
+        let trimmedQuery = request.query.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !trimmedQuery.isEmpty
+            && stats.isIndexing
+            && stats.optimizedCount < stats.searchableCount
     }
 
     private func startIndexingAfterFirstPaint() {
@@ -1365,6 +1468,11 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         if indexStats.indexedCount > 0 {
             scheduleSearch(force: true)
+            return
+        }
+
+        if index.hasResumableCheckpoint(for: indexedRoots) {
+            startInitialRebuildIfNeeded()
             return
         }
 
@@ -1386,7 +1494,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
 
         didRequestInitialRebuild = true
-        index.replaceRootsAndRebuild(indexedRoots)
+        index.replaceRootsAndRebuild(indexedRoots, mode: .resumeIfAvailable)
     }
 
     private func updateLoadingOverlay() {
@@ -1741,7 +1849,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         didRequestInitialSnapshotLoad = true
         didRequestInitialRebuild = true
-        index.replaceRootsAndRebuild(indexedRoots)
+        cancelFSEventCatchUp()
+        fseventCursorStore.invalidate(roots: rootPaths(indexedRoots))
+        index.replaceRootsAndRebuild(indexedRoots, mode: .fresh)
     }
 
     private func indexSettingsMatchConfiguredSettings() -> Bool {
@@ -1761,8 +1871,20 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         roots.map(\.standardizedFileURL.path)
     }
 
+    private func markFSEventBaselineIfNeeded(previous: IndexStats, current: IndexStats) {
+        guard previous.isIndexing, !current.isIndexing, current.phase == .ready else { return }
+        let completedFreshIndex = current.status.hasPrefix("Indexed") && !previous.resumedFromCheckpoint
+        let completedFullReconcile = current.status.hasPrefix("Refreshed")
+        guard completedFreshIndex || completedFullReconcile else { return }
+
+        let rootPaths = rootPaths(index.allRoots())
+        guard !rootPaths.isEmpty else { return }
+        fseventCursorStore.markBaseline(for: rootPaths)
+    }
+
     private func startWatchingIfNeeded() {
         guard AppSettings.indexedRootsConfigured(defaults: defaults), !indexedRoots.isEmpty else {
+            cancelFSEventCatchUp()
             watcher.stop()
             return
         }
@@ -1770,6 +1892,56 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         watcher.start(roots: indexedRoots) { @MainActor @Sendable [weak self] events in
             self?.coalesceFSEvents(events)
         }
+    }
+
+    private func runFSEventsBackedReconciliation(roots: [URL]) {
+        let roots = roots.map(\.standardizedFileURL)
+        guard
+            !roots.isEmpty,
+            AppSettings.indexedRootsConfigured(defaults: defaults),
+            rootPaths(roots) == rootPaths(indexedRoots),
+            index.allExclusionPatterns() == AppSettings.exclusionPatterns(defaults: defaults)
+        else {
+            return
+        }
+
+        activeFSEventReplay?.cancel()
+        let reconciliationID = UUID()
+        activeFSEventReconciliationID = reconciliationID
+        fseventCatchUpStartedAt = Date()
+        updateStatus()
+
+        activeFSEventReplay = fseventReconciler.reconcile(roots: roots) { @MainActor @Sendable [weak self] action in
+            guard let self, self.activeFSEventReconciliationID == reconciliationID else { return }
+            self.activeFSEventReplay = nil
+            self.activeFSEventReconciliationID = nil
+            self.fseventCatchUpStartedAt = nil
+
+            switch action {
+            case let .refresh(paths, cursorUpdates):
+                guard !paths.isEmpty else {
+                    self.fseventCursorStore.markBaseline(for: self.rootPaths(roots))
+                    self.updateStatus()
+                    return
+                }
+                self.index.refresh(paths: paths)
+                self.fseventCursorStore.update(cursorUpdates)
+            case let .upToDate(baselineEventID):
+                self.fseventCursorStore.markBaseline(for: self.rootPaths(roots), eventID: baselineEventID)
+                self.updateStatus()
+            case let .fullReconcile(rootPaths):
+                self.index.recordRecursiveRescan()
+                let rootURLs = rootPaths?.map { URL(fileURLWithPath: $0, isDirectory: true) }
+                self.index.reconcileIndexedRootsInBackground(rootURLs: rootURLs)
+            }
+        }
+    }
+
+    private func cancelFSEventCatchUp() {
+        activeFSEventReplay?.cancel()
+        activeFSEventReplay = nil
+        activeFSEventReconciliationID = nil
+        fseventCatchUpStartedAt = nil
     }
 
     private func coalesceFSEvents(_ events: [FileSystemEvent]) {
@@ -1788,8 +1960,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             if recursivePaths.isEmpty {
                 self.index.refresh(paths: paths)
             } else {
+                self.cancelFSEventCatchUp()
                 self.index.recordRecursiveRescan()
-                self.index.replaceRootsAndRebuild(self.indexedRoots)
+                self.index.replaceRootsAndRebuild(self.indexedRoots, mode: .fresh)
             }
         }
 
@@ -1848,22 +2021,34 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             return "No folders"
         }
 
+        if let fseventCatchUpStartedAt {
+            let elapsed = max(Date().timeIntervalSince(fseventCatchUpStartedAt), 0)
+            return AppRuntimeStatusFormatter.catchUpStatus(elapsed: elapsed)
+        }
+
         switch indexStats.phase {
         case .idle:
             return indexStats.status
         case .loading:
             return "Loading • \(indexStats.status)"
         case .scanning:
-            return "Indexing \(indexStats.discoveredCount.formatted()) discovered • \(indexStats.searchableCount.formatted()) searchable"
+            let verb = indexStats.status.hasPrefix("Refreshing") ? "Refreshing" : "Indexing"
+            return "\(verb) \(indexStats.discoveredCount.formatted()) discovered • \(indexStats.searchableCount.formatted()) searchable\(operationElapsedSuffix())"
         case .optimizing:
-            return "\(indexStats.status) • \(indexStats.searchableCount.formatted()) searchable"
+            return "\(indexStats.status) • \(indexStats.searchableCount.formatted()) searchable\(operationElapsedSuffix())"
         case .saving:
-            return "Saving index • \(indexStats.searchableCount.formatted()) searchable"
+            return "Saving index • \(indexStats.searchableCount.formatted()) searchable\(operationElapsedSuffix())"
         case .ready:
             return "Ready • \(indexStats.status)"
         case .failed:
             return indexStats.status
         }
+    }
+
+    private func operationElapsedSuffix() -> String {
+        guard let startedAt = indexStats.activeOperationStartedAt else { return "" }
+        let elapsed = max(Date().timeIntervalSince(startedAt), 0)
+        return " • \(AppRuntimeStatusFormatter.operationElapsed(elapsed))"
     }
 
     private func updateActionButtons() {
@@ -2090,7 +2275,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         didRequestInitialSnapshotLoad = true
         didRequestInitialRebuild = true
         startWatchingIfNeeded()
-        index.replaceRootsAndRebuild(indexedRoots)
+        cancelFSEventCatchUp()
+        fseventCursorStore.invalidate(roots: rootPaths(indexedRoots))
+        index.replaceRootsAndRebuild(indexedRoots, mode: .fresh)
         updateSetupSuggestions()
     }
 
@@ -2098,7 +2285,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         guard AppSettings.indexedRootsConfigured(defaults: defaults), !indexedRoots.isEmpty else { return }
         didRequestInitialSnapshotLoad = true
         didRequestInitialRebuild = true
-        index.replaceRootsAndRebuild(indexedRoots)
+        cancelFSEventCatchUp()
+        fseventCursorStore.invalidate(roots: rootPaths(indexedRoots))
+        index.replaceRootsAndRebuild(indexedRoots, mode: .fresh)
     }
 
     @objc private func searchFieldDidChange(_ sender: NSSearchField) {
