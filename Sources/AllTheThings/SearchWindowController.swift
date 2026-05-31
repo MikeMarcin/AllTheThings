@@ -354,7 +354,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var expandedMascotCoordinator: OperationMascotCoordinator?
     private var loadingMascotCoordinator: OperationMascotCoordinator?
     private var setupMascotCoordinator: StandaloneMascotCoordinator?
-    private var expandedMascotLeadingConstraint: NSLayoutConstraint?
+    private var expandedMascotCenterXConstraint: NSLayoutConstraint?
     private var expandedMascotImageBottomConstraint: NSLayoutConstraint?
     private var mascotFlightPlayback: MascotFlightPlayback?
     private var mascotFlightFallbackImage: NSImage?
@@ -363,6 +363,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var isExpandedMascotVisible = false
     private var isMascotFlightInProgress = false
     private var isSetupMascotTuckInProgress = false
+    private nonisolated(unsafe) var pendingMascotExpansion: DispatchWorkItem?
     private var loadingOverlaySawActiveLoad = false
     private var userExpandedMascot = false
     private var userCollapsedExpandedMascotDuringOperation = false
@@ -382,8 +383,13 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private enum ExpandedMascotLayout {
-        static let leadingOffset: CGFloat = -24
+        static let visibleLeadingInset: CGFloat = 14
+        static let autoExpandDelay: TimeInterval = 0.75
         static let spriteFrameAspectRatio: CGFloat = 96.0 / 160.0
+
+        static func anchorX(for displaySize: CGFloat) -> CGFloat {
+            visibleLeadingInset + (displaySize * spriteFrameAspectRatio / 2)
+        }
     }
 
     private static let defaultSortSpec = SortSpec(column: .name, ascending: true)
@@ -423,6 +429,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         activeFSEventReplay?.cancel()
         memoryStatusTask?.cancel()
         activeExplanationToken.cancel()
+        pendingMascotExpansion?.cancel()
         NotificationCenter.default.removeObserver(self)
     }
 
@@ -820,19 +827,19 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         )
 
         view.addSubview(expandedMascotView)
-        let leadingConstraint = expandedMascotView.leadingAnchor.constraint(
+        let centerXConstraint = expandedMascotView.centerXAnchor.constraint(
             equalTo: view.leadingAnchor,
-            constant: ExpandedMascotLayout.leadingOffset
+            constant: expandedMascotAnchorX()
         )
-        expandedMascotLeadingConstraint = leadingConstraint
+        expandedMascotCenterXConstraint = centerXConstraint
         let imageBottomConstraint = expandedMascotImageView.bottomAnchor.constraint(equalTo: expandedMascotView.bottomAnchor)
         expandedMascotImageBottomConstraint = imageBottomConstraint
         NSLayoutConstraint.activate([
-            leadingConstraint,
+            centerXConstraint,
             expandedMascotView.bottomAnchor.constraint(equalTo: mascotImageView.bottomAnchor),
             expandedMascotView.widthAnchor.constraint(equalToConstant: OperationMascotCoordinator.expandedDisplaySize),
             expandedMascotView.heightAnchor.constraint(equalToConstant: OperationMascotCoordinator.expandedDisplaySize),
-            expandedMascotImageView.leadingAnchor.constraint(equalTo: expandedMascotView.leadingAnchor),
+            expandedMascotImageView.centerXAnchor.constraint(equalTo: expandedMascotView.centerXAnchor),
             imageBottomConstraint
         ])
 
@@ -1145,7 +1152,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let targetSize = OperationMascotCoordinator.expandedDisplaySize
         let targetBottom = footerFrame.minY + expandedMascotImageBottomOffset(for: targetSize)
         return NSRect(
-            x: ExpandedMascotLayout.leadingOffset,
+            x: expandedMascotAnchorX(for: targetSize) - (targetSize / 2),
             y: targetBottom - targetSize,
             width: targetSize,
             height: targetSize
@@ -1821,7 +1828,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     private func handleMascotTransition(from previousPhase: IndexPhase, to nextPhase: IndexPhase) {
         updateMascotPersistentAnimation()
-        updateExpandedMascotForOperation(animated: true)
+        updateExpandedMascotForOperation(from: previousPhase, animated: true)
 
         if nextPhase == .failed {
             playMascotTransient(.error)
@@ -1869,23 +1876,83 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         setExpandedMascotVisible(true, animated: true)
     }
 
-    private func updateExpandedMascotForOperation(animated: Bool) {
+    private func updateExpandedMascotForOperation(from previousPhase: IndexPhase? = nil, animated: Bool) {
         let importantOperationActive = isImportantMascotOperation(indexStats.phase)
+        let wasOperationActive = wasImportantMascotOperationActive
 
-        if importantOperationActive && !wasImportantMascotOperationActive {
+        if importantOperationActive && !wasOperationActive {
             userCollapsedExpandedMascotDuringOperation = false
         }
         wasImportantMascotOperationActive = importantOperationActive
 
         if importantOperationActive {
-            if !userCollapsedExpandedMascotDuringOperation {
-                setExpandedMascotVisible(true, animated: animated)
+            if !userCollapsedExpandedMascotDuringOperation,
+               shouldAutoExpandMascotForOperation(from: previousPhase, to: indexStats.phase, wasOperationActive: wasOperationActive) {
+                scheduleAutoMascotExpansion(animated: animated)
             }
         } else {
+            cancelPendingMascotExpansion()
             userCollapsedExpandedMascotDuringOperation = false
             if !userExpandedMascot {
                 setExpandedMascotVisible(false, animated: animated)
             }
+        }
+    }
+
+    private func scheduleAutoMascotExpansion(animated: Bool) {
+        guard !isExpandedMascotVisible, !userExpandedMascot else {
+            setExpandedMascotVisible(true, animated: animated)
+            return
+        }
+        guard pendingMascotExpansion == nil else { return }
+
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.pendingMascotExpansion = nil
+
+            guard
+                self.isImportantMascotOperation(self.indexStats.phase),
+                !self.userCollapsedExpandedMascotDuringOperation
+            else {
+                return
+            }
+
+            if self.isMascotFlightInProgress || !self.loadingOverlay.isHidden || !self.indexingSetupOverlay.isHidden {
+                self.scheduleAutoMascotExpansion(animated: animated)
+                return
+            }
+
+            self.setExpandedMascotVisible(true, animated: animated)
+        }
+
+        pendingMascotExpansion = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + ExpandedMascotLayout.autoExpandDelay, execute: workItem)
+    }
+
+    private func cancelPendingMascotExpansion() {
+        pendingMascotExpansion?.cancel()
+        pendingMascotExpansion = nil
+    }
+
+    private func shouldAutoExpandMascotForOperation(
+        from previousPhase: IndexPhase?,
+        to nextPhase: IndexPhase,
+        wasOperationActive: Bool
+    ) -> Bool {
+        if isExpandedMascotVisible || userExpandedMascot {
+            return true
+        }
+
+        switch nextPhase {
+        case .scanning, .saving:
+            return true
+        case .optimizing:
+            if let previousPhase {
+                return previousPhase == .scanning || previousPhase == .saving
+            }
+            return wasOperationActive
+        case .idle, .loading, .ready, .failed:
+            return false
         }
     }
 
@@ -1898,9 +1965,13 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
     }
 
-    private func footerMascotLeadingOffset() -> CGFloat {
+    private func footerMascotAnchorX() -> CGFloat {
         view.layoutSubtreeIfNeeded()
-        return mascotImageView.convert(mascotImageView.bounds, to: view).minX
+        return mascotImageView.convert(mascotImageView.bounds, to: view).midX
+    }
+
+    private func expandedMascotAnchorX(for displaySize: CGFloat = OperationMascotCoordinator.expandedDisplaySize) -> CGFloat {
+        ExpandedMascotLayout.anchorX(for: displaySize)
     }
 
     private func expandedMascotImageBottomOffset(for displaySize: CGFloat) -> CGFloat {
@@ -1932,11 +2003,11 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         let collapsedSize = OperationMascotCoordinator.statusDisplaySize
         let targetSize = visible ? OperationMascotCoordinator.expandedDisplaySize : collapsedSize
-        let footerLeadingOffset = footerMascotLeadingOffset()
-        let targetLeadingOffset = visible ? ExpandedMascotLayout.leadingOffset : footerLeadingOffset
+        let footerAnchorX = footerMascotAnchorX()
+        let targetAnchorX = visible ? expandedMascotAnchorX(for: targetSize) : footerAnchorX
         let targetBottomOffset = expandedMascotImageBottomOffset(for: targetSize)
         if visible && !loadingOverlay.isHidden {
-            expandedMascotLeadingConstraint?.constant = ExpandedMascotLayout.leadingOffset
+            expandedMascotCenterXConstraint?.constant = expandedMascotAnchorX(for: targetSize)
             expandedMascotImageBottomConstraint?.constant = targetBottomOffset
             expandedMascotCoordinator?.setDisplaySize(targetSize)
             updateMascotPlacementVisibility()
@@ -1944,7 +2015,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
 
         if visible {
-            expandedMascotLeadingConstraint?.constant = footerLeadingOffset
+            expandedMascotCenterXConstraint?.constant = footerAnchorX
             expandedMascotImageBottomConstraint?.constant = expandedMascotImageBottomOffset(for: collapsedSize)
             expandedMascotCoordinator?.setDisplaySize(collapsedSize)
             expandedMascotView.isHidden = false
@@ -1953,7 +2024,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
 
         guard animated else {
-            expandedMascotLeadingConstraint?.constant = targetLeadingOffset
+            expandedMascotCenterXConstraint?.constant = targetAnchorX
             expandedMascotImageBottomConstraint?.constant = targetBottomOffset
             expandedMascotCoordinator?.setDisplaySize(targetSize)
             updateMascotPlacementVisibility()
@@ -1968,7 +2039,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.22
             context.allowsImplicitAnimation = true
-            self.expandedMascotLeadingConstraint?.animator().constant = targetLeadingOffset
+            self.expandedMascotCenterXConstraint?.animator().constant = targetAnchorX
             self.expandedMascotImageBottomConstraint?.animator().constant = targetBottomOffset
             self.expandedMascotCoordinator?.setDisplaySize(targetSize, animated: true)
             self.view.layoutSubtreeIfNeeded()
@@ -1977,7 +2048,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                 self.updateMascotPlacementVisibility()
                 self.expandedMascotCoordinator?.setDisplaySize(collapsedSize)
                 self.expandedMascotImageBottomConstraint?.constant = self.expandedMascotImageBottomOffset(for: collapsedSize)
-                self.expandedMascotLeadingConstraint?.constant = ExpandedMascotLayout.leadingOffset
+                self.expandedMascotCenterXConstraint?.constant = self.expandedMascotAnchorX()
                 return
             }
             self.updateMascotPlacementVisibility()
