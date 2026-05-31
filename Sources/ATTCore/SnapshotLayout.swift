@@ -1,7 +1,7 @@
 import Foundation
 
 enum SnapshotLayout {
-    static let schemaVersion = 6
+    static let schemaVersion = 7
     static let packageName = "filename-index-v\(schemaVersion).attindex"
     static let temporaryPackagePrefix = "filename-index-v\(schemaVersion)-"
     static let temporaryPackageSuffix = ".attindex.tmp"
@@ -9,6 +9,8 @@ enum SnapshotLayout {
     static let temporaryCheckpointPackagePrefix = "filename-index-v\(schemaVersion)-checkpoint-"
 
     static let obsoletePackageNames = [
+        "filename-index-v6.attindex",
+        "filename-index-v6-checkpoint.attindex",
         "filename-index-v5.attindex",
         "filename-index-v4.attindex"
     ]
@@ -30,6 +32,8 @@ enum SnapshotLayout {
         static let visible = "visible.bitset"
         static let subtreeEnd = "subtreeEnd.i32"
         static let depth = "depth.u16"
+        static let rootID = "rootID.u16"
+        static let roots = "roots.json"
         static let modifiedOrder = "modifiedOrder.bin"
         static let visibleModifiedOrder = "visibleModifiedOrder.i32"
         static let namePostings = "namePostings.bin"
@@ -71,7 +75,8 @@ enum SnapshotLayout {
     }
 
     static func isObsoleteTemporaryName(_ name: String) -> Bool {
-        (name.hasPrefix("filename-index-v5-") && name.hasSuffix(".attindex.tmp"))
+        (name.hasPrefix("filename-index-v6-") && name.hasSuffix(".attindex.tmp"))
+            || (name.hasPrefix("filename-index-v5-") && name.hasSuffix(".attindex.tmp"))
             || (name.hasPrefix("filename-index-v4-") && name.hasSuffix(".attindex.tmp"))
             || (name.hasPrefix("filename-index-v2-") && name.hasSuffix(".jsonl.tmp"))
     }

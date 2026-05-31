@@ -13,6 +13,11 @@ protocol SearchRecordReadable {
     var volumeName: String { get }
     var normalizedName: String { get }
     var normalizedPath: String { get }
+    var rootPath: String? { get }
+}
+
+extension SearchRecordReadable {
+    var rootPath: String? { nil }
 }
 
 extension FileRecord: SearchRecordReadable {}

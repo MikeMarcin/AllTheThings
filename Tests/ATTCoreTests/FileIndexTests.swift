@@ -151,8 +151,9 @@ struct FileIndexTests {
 
     @Test("large refresh defers unoptimized overlay so log and log.rb searches stay indexed")
     func largeRefreshDefersUnoptimizedOverlaySoLogAndLogRBSearchesStayIndexed() async throws {
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
         let index = FileIndex(
-            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            applicationName: applicationName,
             loadsSnapshotImmediately: false
         )
         let fileCount = 100_000
@@ -381,8 +382,9 @@ struct FileIndexTests {
         let acronymPath = "/tmp/allthethings-tests/reports/PhotoSyncReport.final.pdf"
         let typoPath = "/tmp/allthethings-tests/docs/README.md"
         let exactPath = "/tmp/allthethings-tests/docs/redme-notes.txt"
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
         let index = FileIndex(
-            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            applicationName: applicationName,
             loadsSnapshotImmediately: false
         )
         index.replaceRecordsForTesting([
@@ -432,6 +434,8 @@ struct FileIndexTests {
         #expect(FileManager.default.fileExists(atPath: packageURL.appendingPathComponent(SnapshotLayout.FileName.flags).path))
         #expect(FileManager.default.fileExists(atPath: packageURL.appendingPathComponent(SnapshotLayout.FileName.visible).path))
         #expect(FileManager.default.fileExists(atPath: packageURL.appendingPathComponent(SnapshotLayout.FileName.subtreeEnd).path))
+        #expect(FileManager.default.fileExists(atPath: packageURL.appendingPathComponent(SnapshotLayout.FileName.rootID).path))
+        #expect(FileManager.default.fileExists(atPath: packageURL.appendingPathComponent(SnapshotLayout.FileName.roots).path))
         #expect(FileManager.default.fileExists(atPath: packageURL.appendingPathComponent(SnapshotLayout.FileName.componentPostings).path))
         #expect(FileManager.default.fileExists(atPath: packageURL.appendingPathComponent(SnapshotLayout.FileName.visibleModifiedOrder).path))
         #expect(reloaded.search(SearchRequest(
@@ -440,8 +444,8 @@ struct FileIndexTests {
         ), maxResults: 5).results.contains { $0.record.name == "SearchWindowController.swift" })
     }
 
-    @Test("v6 cutover removes obsolete index artifacts")
-    func v6CutoverRemovesObsoleteIndexArtifacts() throws {
+    @Test("v7 cutover removes obsolete index artifacts")
+    func v7CutoverRemovesObsoleteIndexArtifacts() throws {
         let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
         let supportDirectory = supportDirectory(applicationName: applicationName)
         try FileManager.default.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
@@ -450,6 +454,10 @@ struct FileIndexTests {
         }
 
         let obsoletePackages = [
+            supportDirectory.appendingPathComponent("filename-index-v6.attindex", isDirectory: true),
+            supportDirectory.appendingPathComponent("filename-index-v6-checkpoint.attindex", isDirectory: true),
+            supportDirectory.appendingPathComponent("filename-index-v6-\(UUID().uuidString).attindex.tmp", isDirectory: true),
+            supportDirectory.appendingPathComponent("filename-index-v6-checkpoint-\(UUID().uuidString).attindex.tmp", isDirectory: true),
             supportDirectory.appendingPathComponent("filename-index-v5.attindex", isDirectory: true),
             supportDirectory.appendingPathComponent("filename-index-v4.attindex", isDirectory: true),
             supportDirectory.appendingPathComponent("filename-index-v5-\(UUID().uuidString).attindex.tmp", isDirectory: true),
@@ -476,8 +484,8 @@ struct FileIndexTests {
         }
     }
 
-    @Test("missing v6 sidecars invalidate persisted snapshots")
-    func missingV6SidecarsInvalidatePersistedSnapshots() throws {
+    @Test("missing v7 sidecars invalidate persisted snapshots")
+    func missingV7SidecarsInvalidatePersistedSnapshots() throws {
         let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
         let supportDirectory = supportDirectory(applicationName: applicationName)
         defer {
@@ -491,7 +499,7 @@ struct FileIndexTests {
         index.persistSnapshotForTesting()
 
         let packageURL = SnapshotLayout.packageURL(in: supportDirectory)
-        try FileManager.default.removeItem(at: packageURL.appendingPathComponent(SnapshotLayout.FileName.visible))
+        try FileManager.default.removeItem(at: packageURL.appendingPathComponent(SnapshotLayout.FileName.rootID))
 
         let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
         let diagnostics = reloaded.currentDiagnostics()
@@ -915,6 +923,44 @@ struct FileIndexTests {
 
         #expect(secondStats.snapshotRevision > firstStats.snapshotRevision)
         #expect(secondResponse.snapshotRevision == secondStats.snapshotRevision)
+    }
+
+    @Test("search results expose root path and sort by root")
+    func searchResultsExposeRootPathAndSortByRoot() {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsRootSort-\(UUID().uuidString)", isDirectory: true)
+        let rootA = root.appendingPathComponent("A-Root", isDirectory: true)
+        let rootB = root.appendingPathComponent("B-Root", isDirectory: true)
+        try? fileManager.createDirectory(at: rootA, withIntermediateDirectories: true)
+        try? fileManager.createDirectory(at: rootB, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        let index = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        index.replaceRecordsForTesting(
+            [
+                makeRecord(path: rootB.appendingPathComponent("Aardvark.txt").path),
+                makeRecord(path: rootA.appendingPathComponent("Zebra.txt").path)
+            ],
+            roots: [rootA, rootB]
+        )
+        index.persistSnapshotForTesting()
+
+        let response = index.search(SearchRequest(
+            query: "",
+            sort: SortSpec(column: .root, ascending: true)
+        ), maxResults: 10)
+
+        #expect(response.results.map(\.rootPath) == [
+            rootA.standardizedFileURL.path,
+            rootB.standardizedFileURL.path
+        ])
+        #expect(response.results.map(\.record.name) == ["Zebra.txt", "Aardvark.txt"])
     }
 
     @Test("search responses identify indexed candidate searches")

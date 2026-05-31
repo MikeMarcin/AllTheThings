@@ -44,10 +44,73 @@ struct FileIndexInsightsTests {
         #expect(snapshot.roots.count == 2)
         #expect(snapshot.roots.map(\.path).contains(rootA.standardizedFileURL.path))
         #expect(snapshot.roots.map(\.path).contains(rootB.standardizedFileURL.path))
+        #expect(snapshot.roots.allSatisfy { $0.attributionSource == .persistedExact })
         #expect(snapshot.roots.reduce(0) { $0 + $1.trackedFileCount } >= 2)
         #expect(snapshot.roots.reduce(UInt64(0)) { $0 + $1.indexedContentBytes } >= 384)
         #expect(snapshot.storage.indexPackageBytes > 0)
         #expect(snapshot.roots.reduce(UInt64(0)) { $0 + $1.estimatedIndexBytes } > 0)
+    }
+
+    @Test("nested roots attribute descendants to deepest configured root")
+    func nestedRootsAttributeDescendantsToDeepestConfiguredRoot() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsNestedRoots-\(UUID().uuidString)", isDirectory: true)
+        let childRoot = root.appendingPathComponent("App", isDirectory: true)
+        try fileManager.createDirectory(at: childRoot, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        try "parent".write(
+            to: root.appendingPathComponent("ParentOnly.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "child".write(
+            to: childRoot.appendingPathComponent("ChildOnly.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let applicationName = "AllTheThingsInsights-\(UUID().uuidString)"
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        defer {
+            try? fileManager.removeItem(at: index.dataDirectoryURL)
+        }
+
+        index.replaceRootsAndRebuild([root, childRoot])
+        try await waitUntil {
+            let stats = index.currentStats()
+            return !stats.isIndexing && stats.phase == .ready
+        }
+
+        let roots = Dictionary(uniqueKeysWithValues: index.currentInsightsSnapshot().roots.map { ($0.path, $0) })
+        let parentInsight = try #require(roots[root.standardizedFileURL.path])
+        let childInsight = try #require(roots[childRoot.standardizedFileURL.path])
+
+        #expect(parentInsight.attributionSource == .persistedExact)
+        #expect(childInsight.attributionSource == .persistedExact)
+        #expect(parentInsight.trackedFileCount == 1)
+        #expect(childInsight.trackedFileCount == 1)
+        #expect(parentInsight.indexedContentBytes >= 6)
+        #expect(childInsight.indexedContentBytes >= 5)
+    }
+
+    @Test("root attribution rejects more roots than fit in UInt16")
+    func rootAttributionRejectsMoreRootsThanFitInUInt16() throws {
+        let roots = (0...FileIndex.maximumIndexedRootCount).map { "/tmp/allthethings-root-\($0)" }
+
+        do {
+            _ = try RootAttributionTable.build(roots: roots, rowCount: 0) { _ in
+                RootAttributionInput(path: "/tmp/unused", isResultRow: true, isDirectory: false, isHidden: false, sizeBytes: 0)
+            }
+            Issue.record("Expected root attribution to reject too many roots")
+        } catch RootAttributionError.tooManyRoots(let count) {
+            #expect(count == FileIndex.maximumIndexedRootCount + 1)
+        } catch {
+            Issue.record("Expected tooManyRoots, got \(error)")
+        }
     }
 
     @Test("successful rebuild does not record indexing failures")

@@ -51,6 +51,7 @@ enum DiagnosticsReportBuilder {
         lines.append("- ATT Data: \(byteString(snapshot.storage.totalATTDataBytes))")
         lines.append("- Index Package: \(byteString(snapshot.storage.indexPackageBytes))")
         lines.append("- Caches: \(byteString(snapshot.storage.cacheBytes))")
+        lines.append("- Measurement: \(storageMeasurementString(snapshot.storage))")
         for location in snapshot.storage.locations {
             lines.append("- \(location.label): \(byteString(location.allocatedBytes))")
         }
@@ -62,7 +63,7 @@ enum DiagnosticsReportBuilder {
         } else {
             for (index, root) in snapshot.roots.enumerated() {
                 let label = includeRootPaths ? root.path : "Root \(index + 1)"
-                lines.append("- \(label): files=\(root.trackedFileCount), directories=\(root.directoryCount), hidden=\(root.hiddenCount), content=\(byteString(root.indexedContentBytes)), estimatedIndex=\(byteString(root.estimatedIndexBytes))")
+                lines.append("- \(label): source=\(root.attributionSource.rawValue), files=\(root.trackedFileCount), directories=\(root.directoryCount), hidden=\(root.hiddenCount), content=\(byteString(root.indexedContentBytes)), estimatedIndex=\(byteString(root.estimatedIndexBytes))")
             }
         }
         lines.append("")
@@ -208,5 +209,12 @@ enum DiagnosticsReportBuilder {
         formatter.countStyle = .file
         formatter.allowsNonnumericFormatting = false
         return formatter.string(fromByteCount: Int64(min(bytes, UInt64(Int64.max))))
+    }
+
+    private static func storageMeasurementString(_ storage: IndexStorageInsights) -> String {
+        if storage.isMeasuring {
+            return storage.measuredAt.map { "refreshing; last measured \(dateString($0))" } ?? "measuring"
+        }
+        return storage.measuredAt.map { "measured \(dateString($0))" } ?? "not measured"
     }
 }
