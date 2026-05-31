@@ -84,8 +84,8 @@ struct FileSystemWatcherTests {
         #expect(mustScan.requiresRecursiveRescan)
     }
 
-    @Test("FSEvent reconciliation refreshes normal historical paths")
-    func fseventReconciliationRefreshesNormalHistoricalPaths() async {
+    @Test("FSEvent reconciliation updates normal historical paths")
+    func fseventReconciliationUpdatesNormalHistoricalPaths() async {
         let root = URL(fileURLWithPath: "/tmp/allthethings/root-a", isDirectory: true)
         let changedPath = root.appendingPathComponent("log.txt").path
         let store = memoryCursorStore()
@@ -109,11 +109,11 @@ struct FileSystemWatcherTests {
 
         let action = await actionFromCoordinator(coordinator, roots: [root])
         #expect(source.requestedSinceEventID == 40)
-        #expect(action == .refresh(paths: [changedPath], cursorUpdates: [root.path: 41]))
+        #expect(action == .update(paths: [changedPath], cursorUpdates: [root.path: 41]))
     }
 
-    @Test("FSEvent reconciliation falls back for large historical refreshes")
-    func fseventReconciliationFallsBackForLargeHistoricalRefreshes() async {
+    @Test("FSEvent reconciliation falls back for large historical updates")
+    func fseventReconciliationFallsBackForLargeHistoricalUpdates() async {
         let root = URL(fileURLWithPath: "/tmp/allthethings/root-a", isDirectory: true)
         let store = memoryCursorStore()
         store.markBaseline(for: [root.path], eventID: 40)

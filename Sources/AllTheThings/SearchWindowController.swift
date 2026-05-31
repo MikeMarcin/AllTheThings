@@ -983,7 +983,6 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         refreshRootDisplayNames()
         saveRoots()
         AppSettings.markIndexingSetupCompleted(defaults: defaults)
-        startWatchingIfNeeded()
         rebuildIndexForCurrentSettings()
         updateSetupSuggestions()
     }
@@ -1743,6 +1742,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private func shouldSuppressEmptySearchDuringIndexing(request: SearchRequest, stats: IndexStats? = nil) -> Bool {
         let stats = stats ?? indexStats
         return stats.isIndexing
+            && !stats.isRefreshing
+            && stats.searchableCount == 0
             && request.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
@@ -1802,6 +1803,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
 
         didRequestInitialRebuild = true
+        if !index.hasResumableCheckpoint(for: indexedRoots) {
+            prepareFSEventsForFreshIndexBuild()
+        }
         updateScanSnapshotPublishingPreference()
         index.replaceRootsAndRebuild(indexedRoots, mode: .resumeIfAvailable)
     }
@@ -2194,8 +2198,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         indexedRoots = updatedRoots
         refreshRootDisplayNames()
         didRequestInitialRebuild = false
-        startWatchingIfNeeded()
         guard AppSettings.indexingSetupCompleted(defaults: defaults) else {
+            startWatchingIfNeeded()
             updateSetupSuggestions()
             updateStatus()
             updateActionButtons()
@@ -2243,8 +2247,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         didRequestInitialSnapshotLoad = true
         didRequestInitialRebuild = true
-        cancelFSEventCatchUp()
-        fseventCursorStore.invalidate(roots: rootPaths(indexedRoots))
+        prepareFSEventsForFreshIndexBuild()
         updateScanSnapshotPublishingPreference()
         index.replaceRootsAndRebuild(indexedRoots, mode: .fresh)
     }
@@ -2278,7 +2281,12 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         let rootPaths = rootPaths(index.allRoots())
         guard !rootPaths.isEmpty else { return }
-        fseventCursorStore.markBaseline(for: rootPaths)
+        if completedFreshIndex {
+            runFSEventsBackedReconciliation(roots: index.allRoots())
+        } else {
+            fseventCursorStore.markBaseline(for: rootPaths)
+            startWatchingIfNeeded()
+        }
     }
 
     private func startWatchingIfNeeded() {
@@ -2291,6 +2299,16 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         watcher.start(roots: indexedRoots) { @MainActor @Sendable [weak self] events in
             self?.coalesceFSEvents(events)
         }
+    }
+
+    private func prepareFSEventsForFreshIndexBuild() {
+        eventDebounce?.cancel()
+        eventDebounce = nil
+        pendingEventPaths.removeAll(keepingCapacity: false)
+        pendingRecursiveEventPaths.removeAll(keepingCapacity: false)
+        cancelFSEventCatchUp()
+        fseventCursorStore.markBaseline(for: rootPaths(indexedRoots))
+        startWatchingIfNeeded()
     }
 
     private func runFSEventsBackedReconciliation(roots: [URL]) {
@@ -2325,10 +2343,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             self.fseventCatchUpStartedAt = nil
 
             switch action {
-            case let .refresh(paths, cursorUpdates):
+            case let .update(paths, cursorUpdates):
                 DiagnosticLogger.shared.log(
                     category: "fsevents",
-                    event: "fsevents.reconciliationRefresh",
+                    event: "fsevents.reconciliationUpdate",
                     fields: [
                         "pathCount": .publicInt(paths.count),
                         "paths": .pathArray(paths),
@@ -2340,7 +2358,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                     self.updateStatus()
                     return
                 }
-                self.index.refresh(paths: paths)
+                self.index.update(paths: paths)
                 self.fseventCursorStore.update(cursorUpdates)
             case let .upToDate(baselineEventID):
                 DiagnosticLogger.shared.log(
@@ -2398,13 +2416,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             self.pendingRecursiveEventPaths.removeAll(keepingCapacity: false)
             guard !paths.isEmpty else { return }
             self.playMascotTransient(.fileChanged)
-            if recursivePaths.isEmpty {
-                self.index.refresh(paths: paths)
-            } else {
-                self.cancelFSEventCatchUp()
+            self.index.update(paths: paths)
+            if !recursivePaths.isEmpty {
                 self.index.recordRecursiveRescan()
-                self.updateScanSnapshotPublishingPreference()
-                self.index.replaceRootsAndRebuild(self.indexedRoots, mode: .fresh)
             }
         }
 
@@ -2498,10 +2512,13 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         case .loading:
             return "Loading • \(indexStats.status)"
         case .scanning:
+            if indexStats.isUpdating {
+                return "\(indexStats.status) • \(indexStats.searchableCount.formatted()) searchable\(operationElapsedSuffix())"
+            }
             if indexStats.status == "Refreshing changed paths" {
                 return "\(indexStats.status) • \(indexStats.searchableCount.formatted()) searchable\(operationElapsedSuffix())"
             }
-            let verb = indexStats.status.hasPrefix("Refreshing") ? "Refreshing" : "Indexing"
+            let verb = indexStats.isRefreshing ? "Refreshing" : "Indexing"
             return "\(verb) \(indexStats.discoveredCount.formatted()) discovered • \(indexStats.searchableCount.formatted()) searchable\(operationElapsedSuffix())"
         case .optimizing:
             return "\(indexStats.status) • \(indexStats.searchableCount.formatted()) searchable\(operationElapsedSuffix())"
@@ -2751,9 +2768,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         didRequestInitialSnapshotLoad = true
         didRequestInitialRebuild = true
-        startWatchingIfNeeded()
-        cancelFSEventCatchUp()
-        fseventCursorStore.invalidate(roots: rootPaths(indexedRoots))
+        prepareFSEventsForFreshIndexBuild()
         updateScanSnapshotPublishingPreference()
         index.replaceRootsAndRebuild(indexedRoots, mode: .fresh)
         updateSetupSuggestions()
@@ -2763,8 +2778,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         guard AppSettings.indexingSetupCompleted(defaults: defaults), !indexedRoots.isEmpty else { return }
         didRequestInitialSnapshotLoad = true
         didRequestInitialRebuild = true
-        cancelFSEventCatchUp()
-        fseventCursorStore.invalidate(roots: rootPaths(indexedRoots))
+        prepareFSEventsForFreshIndexBuild()
         updateScanSnapshotPublishingPreference()
         index.replaceRootsAndRebuild(indexedRoots, mode: .fresh)
     }
@@ -2938,7 +2952,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                 ]
             )
             playMascotTransient(.fileChanged)
-            index.refresh(paths: changedPaths)
+            index.update(paths: changedPaths)
             scheduleSearch(force: true)
         }
     }
@@ -3040,7 +3054,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                 ]
             )
             playMascotTransient(.fileChanged)
-            index.refresh(paths: [record.path, destination.path])
+            index.update(paths: [record.path, destination.path])
             scheduleSearch(force: true)
         } catch {
             logFileAction(
