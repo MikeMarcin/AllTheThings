@@ -17,6 +17,7 @@ struct FileExclusionRulesTests {
             "/tmp/project/DerivedData/Build/Products/App.app",
             "/tmp/project/.next/cache/webpack/client.js",
             "/tmp/project/.gradle/caches/modules-2/files-2.1/package.bin",
+            "/tmp/project/Engine/Binaries/ThirdParty/DotNet/8.0.412/win-arm64/sdk/tool.dll",
             "/tmp/project/__pycache__/module.pyc",
             "/tmp/project/Library/Caches/com.example/cache.db"
         ]

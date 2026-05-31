@@ -363,6 +363,200 @@ struct FileIndexTests {
         #expect(!FileManager.default.fileExists(atPath: packageURL.path))
     }
 
+    @Test("partial checkpoints load with fast searchable structures")
+    func partialCheckpointsLoadWithFastSearchableStructures() throws {
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let root = URL(fileURLWithPath: "/tmp/allthethings-checkpoint-fast", isDirectory: true)
+        let records = [
+            makeRecord(path: "\(root.path)/LogViewer.swift"),
+            makeRecord(path: "\(root.path)/Other.txt")
+        ]
+
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        index.persistCheckpointForTesting(
+            records: records,
+            roots: [root],
+            pendingDirectories: []
+        )
+
+        let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        #expect(reloaded.loadCheckpointForTesting(roots: [root]))
+        let stats = reloaded.currentStats()
+        #expect(stats.resumedFromCheckpoint)
+        #expect(stats.lastCheckpointAt != nil)
+        #expect(stats.activeOperationStartedAt == Date(timeIntervalSince1970: 0))
+
+        let response = reloaded.search(SearchRequest(
+            query: "LogViewer",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10)
+        #expect(response.usesIndexedCandidates)
+        #expect(response.results.map(\.record.name) == ["LogViewer.swift"])
+    }
+
+    @Test("resumed checkpoints continue pending directories and clean up after final install")
+    func resumedCheckpointsContinuePendingDirectoriesAndCleanUp() async throws {
+        let fileManager = FileManager.default
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        let pendingDirectory = root.appendingPathComponent("pending", isDirectory: true)
+        try fileManager.createDirectory(at: pendingDirectory, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+            try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName))
+        }
+
+        let existingFile = root.appendingPathComponent("Existing.log")
+        let pendingFile = pendingDirectory.appendingPathComponent("Pending.log")
+        try "existing".write(to: existingFile, atomically: true, encoding: .utf8)
+        try "pending".write(to: pendingFile, atomically: true, encoding: .utf8)
+
+        let checkpointRecords = [root, existingFile].compactMap { FileRecord(url: $0) }
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        index.persistCheckpointForTesting(
+            records: checkpointRecords,
+            roots: [root],
+            pendingDirectories: [pendingDirectory],
+            completedDirectories: [root]
+        )
+        #expect(index.checkpointExistsForTesting())
+
+        let resumed = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        resumed.replaceRootsAndRebuild([root], mode: .resumeIfAvailable)
+
+        try await waitUntil {
+            let stats = resumed.currentStats()
+            return !stats.isIndexing && stats.indexedCount >= 3
+        }
+
+        let response = resumed.search(SearchRequest(
+            query: "Pending",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10)
+        #expect(response.results.contains { $0.record.path == pendingFile.path })
+        #expect(!resumed.checkpointExistsForTesting())
+    }
+
+    @Test("checkpoint cleanup covers settings mismatch fresh rebuild and final snapshot install")
+    func checkpointCleanupCoversMismatchFreshRebuildAndFinalInstall() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        let file = root.appendingPathComponent("Cleanup.log")
+        try "cleanup".write(to: file, atomically: true, encoding: .utf8)
+        let records = [root, file].compactMap { FileRecord(url: $0) }
+
+        let mismatchApp = "AllTheThingsTests-\(UUID().uuidString)"
+        let mismatchIndex = FileIndex(
+            applicationName: mismatchApp,
+            loadsSnapshotImmediately: false,
+            exclusionPatterns: ["ignored/"]
+        )
+        mismatchIndex.persistCheckpointForTesting(records: records, roots: [root], pendingDirectories: [root])
+        let mismatchReload = FileIndex(
+            applicationName: mismatchApp,
+            loadsSnapshotImmediately: false,
+            exclusionPatterns: ["different/"]
+        )
+        #expect(!mismatchReload.hasResumableCheckpoint(for: [root]))
+        #expect(!mismatchReload.checkpointExistsForTesting())
+
+        let freshApp = "AllTheThingsTests-\(UUID().uuidString)"
+        let freshIndex = FileIndex(applicationName: freshApp, loadsSnapshotImmediately: false)
+        freshIndex.persistCheckpointForTesting(records: records, roots: [root], pendingDirectories: [root])
+        freshIndex.replaceRootsAndRebuild([root], mode: .fresh)
+
+        try await waitUntil {
+            let stats = freshIndex.currentStats()
+            return !stats.isIndexing && stats.indexedCount >= 2
+        }
+
+        #expect(!freshIndex.checkpointExistsForTesting())
+    }
+
+    @Test("loaded snapshots reconcile changes made while app was closed")
+    func loadedSnapshotsReconcileChangesMadeWhileAppWasClosed() async throws {
+        let fileManager = FileManager.default
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+            try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName))
+        }
+
+        let originalFile = root.appendingPathComponent("Original.log")
+        try "original".write(to: originalFile, atomically: true, encoding: .utf8)
+
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil {
+            let stats = index.currentStats()
+            return !stats.isIndexing && stats.indexedCount >= 2
+        }
+
+        let closedAppFile = root.appendingPathComponent("ClosedApp.log")
+        try "closed".write(to: closedAppFile, atomically: true, encoding: .utf8)
+
+        let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
+        try await waitUntil(timeout: .seconds(10)) {
+            let response = reloaded.search(SearchRequest(
+                query: "ClosedApp",
+                sort: SortSpec(column: .relevance, ascending: false)
+            ), maxResults: 10)
+            return response.results.contains { $0.record.path == closedAppFile.path }
+        }
+    }
+
+    @Test("scoped reconciliation preserves records from unchanged roots")
+    func scopedReconciliationPreservesRecordsFromUnchangedRoots() async throws {
+        let fileManager = FileManager.default
+        let rootA = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)-a", isDirectory: true)
+        let rootB = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)-b", isDirectory: true)
+        try fileManager.createDirectory(at: rootA, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: rootB, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: rootA)
+            try? fileManager.removeItem(at: rootB)
+        }
+
+        let removedFile = rootA.appendingPathComponent("Removed.log")
+        let retainedFile = rootB.appendingPathComponent("Retained.log")
+        try "removed".write(to: removedFile, atomically: true, encoding: .utf8)
+        try "retained".write(to: retainedFile, atomically: true, encoding: .utf8)
+
+        let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)", loadsSnapshotImmediately: false)
+        index.replaceRootsAndRebuild([rootA, rootB], mode: .fresh)
+        try await waitUntil {
+            let stats = index.currentStats()
+            return !stats.isIndexing && stats.indexedCount >= 4
+        }
+
+        try fileManager.removeItem(at: removedFile)
+        index.reconcileIndexedRootsInBackground(rootURLs: [rootA])
+
+        try await waitUntil(timeout: .seconds(10)) {
+            let removed = index.search(SearchRequest(
+                query: "Removed",
+                sort: SortSpec(column: .relevance, ascending: false)
+            ), maxResults: 10)
+            let retained = index.search(SearchRequest(
+                query: "Retained",
+                sort: SortSpec(column: .relevance, ascending: false)
+            ), maxResults: 10)
+            return removed.results.isEmpty && retained.results.contains { $0.record.path == retainedFile.path }
+        }
+    }
+
     @Test("visible bitset hides descendants of hidden parent rows")
     func visibleBitsetHidesDescendantsOfHiddenParentRows() throws {
         let applicationName = "AllTheThingsTests-\(UUID().uuidString)"

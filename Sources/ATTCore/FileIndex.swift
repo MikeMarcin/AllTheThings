@@ -192,6 +192,11 @@ public enum IndexPhase: String, Codable, Sendable {
     case failed
 }
 
+public enum RebuildMode: Sendable {
+    case resumeIfAvailable
+    case fresh
+}
+
 public struct IndexStats: Codable, Equatable, Sendable {
     public let indexedCount: Int
     public let isIndexing: Bool
@@ -203,6 +208,9 @@ public struct IndexStats: Codable, Equatable, Sendable {
     public let snapshotRevision: UInt64
     public let status: String
     public let lastUpdated: Date
+    public let activeOperationStartedAt: Date?
+    public let lastCheckpointAt: Date?
+    public let resumedFromCheckpoint: Bool
 
     public init(
         indexedCount: Int,
@@ -214,7 +222,10 @@ public struct IndexStats: Codable, Equatable, Sendable {
         optimizedCount: Int? = nil,
         snapshotRevision: UInt64 = 0,
         status: String,
-        lastUpdated: Date
+        lastUpdated: Date,
+        activeOperationStartedAt: Date? = nil,
+        lastCheckpointAt: Date? = nil,
+        resumedFromCheckpoint: Bool = false
     ) {
         self.indexedCount = indexedCount
         self.isIndexing = isIndexing
@@ -226,6 +237,9 @@ public struct IndexStats: Codable, Equatable, Sendable {
         self.snapshotRevision = snapshotRevision
         self.status = status
         self.lastUpdated = lastUpdated
+        self.activeOperationStartedAt = activeOperationStartedAt
+        self.lastCheckpointAt = lastCheckpointAt
+        self.resumedFromCheckpoint = resumedFromCheckpoint
     }
 }
 
@@ -262,12 +276,20 @@ struct FileIndexDiagnostics: Sendable {
     let fallbackScanCount: UInt64
     let scannedRowCount: UInt64
     let pathMaterializationCount: UInt64
+    let lastCheckpointAt: Date?
+    let resumedFromCheckpoint: Bool
 }
 
 public final class FileIndex: @unchecked Sendable {
     private static let maximumRefreshBatchPaths = 512
     private static let primaryPublishRecordInterval = 25_000
     private static let primaryPublishTimeInterval: TimeInterval = 1
+    private static let scanStatusPublishRecordInterval = 1_000
+    private static let scanStatusPublishTimeInterval: TimeInterval = 0.25
+    private static let initialCheckpointRecordInterval = 5_000
+    private static let initialCheckpointTimeInterval: TimeInterval = 10
+    private static let checkpointRecordInterval = 25_000
+    private static let checkpointTimeInterval: TimeInterval = 60
     private static let pathGramRecordLimit = 200_000
     private static let pathGramTotalPathByteLimit = 24 * 1024 * 1024
     private static let exactEmptyQuerySortLimit = 100_000
@@ -285,8 +307,44 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
+    public var onBackgroundReconciliationRequested: (@MainActor @Sendable ([URL]) -> Void)? {
+        get {
+            lock.withLock {
+                backgroundReconciliationHandler
+            }
+        }
+        set {
+            lock.withLock {
+                backgroundReconciliationHandler = newValue
+            }
+        }
+    }
+
     private struct LoadedMappedSnapshot {
         let manifest: CompactSnapshotManifest
+        let store: MappedRecordStore
+        let searchStructures: PersistedSearchStructures
+    }
+
+    private struct ScanCheckpointState: Codable, Sendable {
+        let schemaVersion: Int
+        let savedAt: Date
+        let operationStartedAt: Date
+        let roots: [String]
+        let exclusionPatterns: [String]
+        let pendingDirectories: [String]
+        let activeDirectories: [String]
+        let completedDirectories: [String]
+        let discoveredCount: Int
+        let recordCount: Int
+
+        var resumableDirectories: [String] {
+            pendingDirectories + activeDirectories
+        }
+    }
+
+    private struct LoadedScanCheckpoint {
+        let state: ScanCheckpointState
         let store: MappedRecordStore
         let searchStructures: PersistedSearchStructures
     }
@@ -464,25 +522,60 @@ public final class FileIndex: @unchecked Sendable {
         let visited: Int
     }
 
+    private struct ScanCheckpointProgress {
+        let store: HeapPagedRecordStore
+        let visited: Int
+        let pendingDirectories: [String]
+        let activeDirectories: [String]
+        let completedDirectories: [String]
+        let operationStartedAt: Date
+    }
+
     private final class ConcurrentScanState: @unchecked Sendable {
         private let condition = NSCondition()
         private var pendingDirectories: [URL] = []
-        private var activeDirectories = 0
+        private var activeDirectories: Set<String> = []
+        private var completedDirectories: Set<String>
         private var shouldStop = false
         private var records: [String: FileRecord]
         private let builder: HeapPagedRecordStore.Builder
         private var visited = 0
+        private var lastStatusPublishedCount = 0
+        private var lastStatusPublishedAt = Date.distantPast
         private var lastPublishedCount = 0
         private var lastPublishedAt = Date.distantPast
+        private var lastCheckpointCount = 0
+        private var lastCheckpointAt = Date.distantPast
+        private let operationStartedAt: Date
 
-        init(reservedCapacity: Int) {
+        init(
+            reservedCapacity: Int,
+            existingRecords: [FileRecord] = [],
+            pendingDirectories: [URL] = [],
+            completedDirectories: Set<String> = [],
+            operationStartedAt: Date
+        ) {
+            self.completedDirectories = completedDirectories
+            self.operationStartedAt = operationStartedAt
             records = [:]
-            records.reserveCapacity(reservedCapacity)
+            records.reserveCapacity(max(reservedCapacity, existingRecords.count))
             builder = HeapPagedRecordStore.Builder(reservedCapacity: reservedCapacity)
+            for record in existingRecords {
+                records[record.path] = record
+                builder.append(record)
+            }
+            visited = existingRecords.count
+            for directory in pendingDirectories where !completedDirectories.contains(directory.path) {
+                self.pendingDirectories.append(directory)
+            }
         }
 
         func enqueue(_ directory: URL) {
             condition.lock()
+            guard !completedDirectories.contains(directory.path) else {
+                condition.unlock()
+                return
+            }
             pendingDirectories.append(directory)
             condition.signal()
             condition.unlock()
@@ -490,9 +583,12 @@ public final class FileIndex: @unchecked Sendable {
 
         func addInitialRecord(_ record: FileRecord) {
             condition.lock()
+            let isNew = records[record.path] == nil
             records[record.path] = record
             builder.append(record)
-            visited += 1
+            if isNew {
+                visited += 1
+            }
             condition.unlock()
         }
 
@@ -507,22 +603,24 @@ public final class FileIndex: @unchecked Sendable {
             condition.lock()
             defer { condition.unlock() }
 
-            while pendingDirectories.isEmpty, activeDirectories > 0, !shouldStop {
+            while pendingDirectories.isEmpty, !activeDirectories.isEmpty, !shouldStop {
                 condition.wait()
             }
 
-            guard !shouldStop, !(pendingDirectories.isEmpty && activeDirectories == 0) else {
+            guard !shouldStop, !(pendingDirectories.isEmpty && activeDirectories.isEmpty) else {
                 return nil
             }
 
-            activeDirectories += 1
-            return pendingDirectories.removeLast()
+            let directory = pendingDirectories.removeLast()
+            activeDirectories.insert(directory.path)
+            return directory
         }
 
-        func finishDirectory() {
+        func finishDirectory(_ directory: URL) {
             condition.lock()
-            activeDirectories -= 1
-            if shouldStop || (pendingDirectories.isEmpty && activeDirectories == 0) {
+            activeDirectories.remove(directory.path)
+            completedDirectories.insert(directory.path)
+            if shouldStop || (pendingDirectories.isEmpty && activeDirectories.isEmpty) {
                 condition.broadcast()
             } else {
                 condition.signal()
@@ -535,11 +633,33 @@ public final class FileIndex: @unchecked Sendable {
 
             condition.lock()
             for record in batch {
+                let isNew = records[record.path] == nil
                 records[record.path] = record
                 builder.append(record)
-                visited += 1
+                if isNew {
+                    visited += 1
+                }
             }
             condition.unlock()
+        }
+
+        func statusIfNeeded(force: Bool) -> Int? {
+            condition.lock()
+            defer { condition.unlock() }
+
+            guard force || visited != lastStatusPublishedCount else {
+                return nil
+            }
+
+            let now = Date()
+            let shouldPublish = force
+                || visited - lastStatusPublishedCount >= FileIndex.scanStatusPublishRecordInterval
+                || now.timeIntervalSince(lastStatusPublishedAt) >= FileIndex.scanStatusPublishTimeInterval
+            guard shouldPublish else { return nil }
+
+            lastStatusPublishedCount = visited
+            lastStatusPublishedAt = now
+            return visited
         }
 
         func publishSnapshotIfNeeded(force: Bool) -> ScanProgress? {
@@ -555,6 +675,31 @@ public final class FileIndex: @unchecked Sendable {
             lastPublishedCount = records.count
             lastPublishedAt = now
             return ScanProgress(store: builder.snapshot(includesPathIndex: false), visited: visited)
+        }
+
+        func checkpointIfNeeded(force: Bool) -> ScanCheckpointProgress? {
+            condition.lock()
+            defer { condition.unlock() }
+
+            let now = Date()
+            let firstCheckpointDue = lastCheckpointCount == 0
+                && (records.count >= FileIndex.initialCheckpointRecordInterval || now.timeIntervalSince(operationStartedAt) >= FileIndex.initialCheckpointTimeInterval)
+            let checkpointDue = force
+                || firstCheckpointDue
+                || records.count - lastCheckpointCount >= FileIndex.checkpointRecordInterval
+                || now.timeIntervalSince(lastCheckpointAt) >= FileIndex.checkpointTimeInterval
+            guard checkpointDue else { return nil }
+
+            lastCheckpointCount = records.count
+            lastCheckpointAt = now
+            return ScanCheckpointProgress(
+                store: builder.snapshot(includesPathIndex: true),
+                visited: visited,
+                pendingDirectories: pendingDirectories.map(\.path),
+                activeDirectories: activeDirectories.sorted(),
+                completedDirectories: completedDirectories.sorted(),
+                operationStartedAt: operationStartedAt
+            )
         }
 
         func result() -> (ScanResult, Bool) {
@@ -1690,8 +1835,10 @@ public final class FileIndex: @unchecked Sendable {
     private let fileManager: FileManager
     private let supportDirectory: URL
     private let snapshotURL: URL
+    private let checkpointURL: URL
     private let metricsURL: URL
     private let indexQueue = DispatchQueue(label: "att.index.work", qos: .utility)
+    private let checkpointPersistenceLock = NSLock()
     private var recordsByPath: [String: FileRecord] = [:]
     private var searchSnapshot = SearchSnapshot.empty
     private var searchSnapshotRevision: UInt64 = 0
@@ -1716,7 +1863,11 @@ public final class FileIndex: @unchecked Sendable {
     private var optimizedCount = 0
     private var status = "Starting"
     private var lastUpdated = Date()
+    private var activeOperationStartedAt: Date?
+    private var lastCheckpointAt: Date?
+    private var resumedFromCheckpoint = false
     private var statsChangedHandler: (@MainActor @Sendable (IndexStats) -> Void)?
+    private var backgroundReconciliationHandler: (@MainActor @Sendable ([URL]) -> Void)?
 
     public init(
         fileManager: FileManager = .default,
@@ -1733,6 +1884,7 @@ public final class FileIndex: @unchecked Sendable {
         try? fileManager.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
         self.supportDirectory = supportDirectory
         self.snapshotURL = SnapshotLayout.packageURL(in: supportDirectory)
+        self.checkpointURL = SnapshotLayout.checkpointPackageURL(in: supportDirectory)
         self.metricsURL = supportDirectory.appendingPathComponent("index-metrics.json", isDirectory: false)
         self.usageMetrics = Self.loadUsageMetrics(from: metricsURL, fileManager: fileManager)
         cleanupStaleTemporaryFiles()
@@ -1867,12 +2019,15 @@ public final class FileIndex: @unchecked Sendable {
                 phase = .idle
                 status = "Cached index cleared"
                 lastUpdated = Date()
+                activeOperationStartedAt = nil
+                lastCheckpointAt = nil
+                resumedFromCheckpoint = false
             }
         }
         publishStats()
     }
 
-    public func replaceRootsAndRebuild(_ rootURLs: [URL]) {
+    public func replaceRootsAndRebuild(_ rootURLs: [URL], mode: RebuildMode = .fresh) {
         let canonicalRoots = canonicalizedRoots(rootURLs)
         let rebuildStarted = Date()
         let currentGeneration = lock.withLock { () -> UInt64 in
@@ -1886,13 +2041,16 @@ public final class FileIndex: @unchecked Sendable {
             optimizedCount = 0
             status = "Indexing \(canonicalRoots.count) scope\(canonicalRoots.count == 1 ? "" : "s")"
             lastUpdated = Date()
+            activeOperationStartedAt = rebuildStarted
+            lastCheckpointAt = nil
+            resumedFromCheckpoint = false
             return generation
         }
 
         publishStats()
 
         indexQueue.async { [weak self] in
-            self?.rebuild(roots: canonicalRoots, generation: currentGeneration, started: rebuildStarted)
+            self?.rebuild(roots: canonicalRoots, mode: mode, generation: currentGeneration, started: rebuildStarted)
         }
     }
 
@@ -1906,6 +2064,60 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         return true
+    }
+
+    public func hasResumableCheckpoint(for rootURLs: [URL]) -> Bool {
+        let canonicalRoots = canonicalizedRoots(rootURLs)
+        let checkpoint = matchingScanCheckpointState(
+            roots: canonicalRoots.map(\.path),
+            exclusionPatterns: lock.withLock { exclusionRules.patterns },
+            removesInvalidCheckpoint: true
+        )
+        return checkpoint != nil
+    }
+
+    public func reconcileIndexedRootsInBackground(rootURLs requestedRootURLs: [URL]? = nil) {
+        let reconcileStarted = Date()
+        let state = lock.withLock {
+            (
+                rootPaths: roots,
+                exclusions: exclusionRules
+            )
+        }
+        let allRootURLs = state.rootPaths.map { URL(fileURLWithPath: $0, isDirectory: true) }
+        let rootURLs: [URL]
+        if let requestedRootURLs {
+            let requestedPaths = Set(requestedRootURLs.map { $0.standardizedFileURL.path })
+            rootURLs = allRootURLs.filter { requestedPaths.contains($0.path) }
+        } else {
+            rootURLs = allRootURLs
+        }
+        guard !rootURLs.isEmpty else { return }
+        let reconcilesAllRoots = rootURLs.count == allRootURLs.count
+
+        let currentGeneration = lock.withLock { () -> UInt64 in
+            generation &+= 1
+            indexing = true
+            phase = .scanning
+            status = reconcilesAllRoots ? "Refreshing index" : "Refreshing changed folders"
+            discoveredCount = searchSnapshot.resultCount
+            searchableCount = searchSnapshot.resultCount
+            activeOperationStartedAt = reconcileStarted
+            resumedFromCheckpoint = false
+            lastUpdated = Date()
+            return generation
+        }
+        publishStats()
+
+        indexQueue.async { [weak self] in
+            self?.reconcile(
+                roots: rootURLs,
+                allRootPaths: state.rootPaths,
+                exclusions: state.exclusions,
+                generation: currentGeneration,
+                started: reconcileStarted
+            )
+        }
     }
 
     public func refresh(paths rawPaths: [String]) {
@@ -1925,6 +2137,26 @@ public final class FileIndex: @unchecked Sendable {
 
         indexQueue.asyncAfter(deadline: .now() + 0.15) { [weak self] in
             self?.drainRefreshQueue()
+        }
+    }
+
+    private func requestBackgroundReconciliation() {
+        let state = lock.withLock {
+            (
+                rootPaths: roots,
+                handler: backgroundReconciliationHandler
+            )
+        }
+        let rootURLs = state.rootPaths.map { URL(fileURLWithPath: $0, isDirectory: true) }
+        guard !rootURLs.isEmpty else { return }
+
+        guard let handler = state.handler else {
+            reconcileIndexedRootsInBackground()
+            return
+        }
+
+        Task { @MainActor in
+            handler(rootURLs)
         }
     }
 
@@ -2092,7 +2324,7 @@ public final class FileIndex: @unchecked Sendable {
                 scannedRowCount &+= UInt64(snapshot.count)
             }
             for index in 0..<snapshot.count {
-                if index.isMultiple(of: 512), shouldCancel() {
+                if index.isMultiple(of: 64), shouldCancel() {
                     return nil
                 }
                 guard snapshot.store.isResultRow(at: index) else { continue }
@@ -3726,9 +3958,13 @@ public final class FileIndex: @unchecked Sendable {
             searchableCount = 0
             optimizedCount = 0
             lastUpdated = Date()
+            activeOperationStartedAt = nil
+            lastCheckpointAt = nil
+            resumedFromCheckpoint = false
             persistRevision &+= 1
         }
         try? fileManager.removeItem(at: snapshotURL)
+        removeScanCheckpoint()
         cleanupObsoleteIndexFiles()
         cleanupStaleTemporaryFiles()
         publishStats()
@@ -3744,6 +3980,7 @@ public final class FileIndex: @unchecked Sendable {
             phase = .loading
             status = "Loading saved index"
             lastUpdated = Date()
+            activeOperationStartedAt = nil
             return true
         }
 
@@ -3774,6 +4011,8 @@ public final class FileIndex: @unchecked Sendable {
                 searchableCount = 0
                 optimizedCount = 0
                 lastUpdated = Date()
+                activeOperationStartedAt = nil
+                resumedFromCheckpoint = false
                 return true
             }
 
@@ -3792,6 +4031,8 @@ public final class FileIndex: @unchecked Sendable {
             structures: snapshot.diagnostics,
             activeIndexJobs: currentActiveIndexJobCount()
         )
+        var didLoadUsableSnapshot = false
+        var shouldRemoveCheckpointForSettingsChange = false
         let didApply = lock.withLock { () -> Bool in
             guard generation == generationAtStart else {
                 return false
@@ -3806,6 +4047,9 @@ public final class FileIndex: @unchecked Sendable {
                 searchableCount = 0
                 optimizedCount = 0
                 lastUpdated = Date()
+                activeOperationStartedAt = nil
+                resumedFromCheckpoint = false
+                shouldRemoveCheckpointForSettingsChange = true
                 return true
             }
 
@@ -3821,11 +4065,22 @@ public final class FileIndex: @unchecked Sendable {
             searchableCount = snapshot.resultCount
             optimizedCount = loadedOptimized ? snapshot.resultCount : 0
             lastUpdated = persisted.manifest.savedAt
+            activeOperationStartedAt = nil
+            resumedFromCheckpoint = false
+            didLoadUsableSnapshot = true
             return true
         }
 
         if didApply {
             publishStats()
+        }
+
+        if shouldRemoveCheckpointForSettingsChange {
+            removeScanCheckpoint()
+        }
+
+        if didApply, didLoadUsableSnapshot {
+            removeSupersededScanCheckpoint(finalSavedAt: persisted.manifest.savedAt)
             MemoryTelemetry.log(
                 "snapshot.load.applied",
                 records: metrics,
@@ -3837,15 +4092,32 @@ public final class FileIndex: @unchecked Sendable {
                 indexQueue.async { [weak self] in
                     self?.optimizeLoadedSnapshot(generation: generationAtStart)
                 }
+            } else {
+                requestBackgroundReconciliation()
             }
         }
     }
 
-    private func rebuild(roots rootURLs: [URL], generation currentGeneration: UInt64, started: Date) {
+    private func rebuild(roots rootURLs: [URL], mode: RebuildMode, generation currentGeneration: UInt64, started: Date) {
         let jobID = beginIndexJob("rebuild")
         defer { endIndexJob("rebuild", jobID: jobID) }
 
         let exclusions = lock.withLock { exclusionRules }
+        let rootPaths = rootURLs.map(\.path)
+        let checkpoint: LoadedScanCheckpoint?
+        let operationStartedAt: Date
+        if mode == .resumeIfAvailable {
+            checkpoint = loadResumableScanCheckpoint(roots: rootPaths, exclusionPatterns: exclusions.patterns)
+            operationStartedAt = checkpoint?.state.operationStartedAt ?? started
+            if let checkpoint {
+                applyLoadedScanCheckpoint(checkpoint, generation: currentGeneration)
+            }
+        } else {
+            removeScanCheckpoint()
+            checkpoint = nil
+            operationStartedAt = started
+        }
+
         let publishPrimary: @Sendable (_ store: HeapPagedRecordStore, _ visited: Int, _ force: Bool) -> Void = { [weak self] store, visited, _ in
             self?.publishPrimarySnapshot(store, visited: visited, generation: currentGeneration)
         }
@@ -3856,6 +4128,8 @@ public final class FileIndex: @unchecked Sendable {
             roots: rootURLs,
             exclusions: exclusions,
             generation: currentGeneration,
+            checkpoint: checkpoint,
+            operationStartedAt: operationStartedAt,
             progress: publishPrimary
         ) else {
             return
@@ -3868,29 +4142,113 @@ public final class FileIndex: @unchecked Sendable {
         recordFullRebuild(duration: Date().timeIntervalSince(started))
     }
 
+    private func reconcile(
+        roots rootURLs: [URL],
+        allRootPaths: [String],
+        exclusions: FileExclusionRules,
+        generation currentGeneration: UInt64,
+        started: Date
+    ) {
+        let jobID = beginIndexJob("reconcile")
+        defer { endIndexJob("reconcile", jobID: jobID) }
+
+        let scannedRootPaths = rootURLs.map(\.path)
+        let reconcilesAllRoots = Set(scannedRootPaths) == Set(allRootPaths)
+        let previousRecords = reconcilesAllRoots ? [] : lock.withLock { searchSnapshot.store.allRecords() }
+
+        MemoryTelemetry.log("reconcile.scan.begin", activeIndexJobs: currentActiveIndexJobCount())
+        guard let scanResult = scanConcurrently(
+            roots: rootURLs,
+            exclusions: exclusions,
+            generation: currentGeneration,
+            checkpoint: nil,
+            operationStartedAt: started,
+            writesCheckpoints: false,
+            publishesScanStatus: false,
+            progress: { _, _, _ in }
+        ) else {
+            return
+        }
+
+        guard isCurrentGeneration(currentGeneration) else { return }
+        let recordsByPath: [String: FileRecord]
+        let initialStore: HeapPagedRecordStore
+        if reconcilesAllRoots {
+            recordsByPath = scanResult.records
+            initialStore = scanResult.store
+        } else {
+            var mergedRecords = Dictionary(
+                uniqueKeysWithValues: previousRecords
+                    .filter { !Self.path($0.path, isContainedIn: scannedRootPaths) }
+                    .map { ($0.path, $0) }
+            )
+            for (path, record) in scanResult.records {
+                mergedRecords[path] = record
+            }
+            recordsByPath = mergedRecords
+            initialStore = HeapPagedRecordStore(records: Array(mergedRecords.values))
+        }
+
+        optimizeAndPublish(
+            recordsByPath: recordsByPath,
+            initialStore: initialStore,
+            generation: currentGeneration,
+            publishesIntermediateSnapshots: false,
+            completionStatusPrefix: "Refreshed"
+        )
+        guard isCurrentGeneration(currentGeneration) else { return }
+        recordFullRebuild(duration: Date().timeIntervalSince(started))
+    }
+
     private func scanConcurrently(
         roots rootURLs: [URL],
         exclusions: FileExclusionRules,
         generation currentGeneration: UInt64,
+        checkpoint: LoadedScanCheckpoint?,
+        operationStartedAt: Date,
+        writesCheckpoints: Bool = true,
+        publishesScanStatus: Bool = true,
         progress: @escaping @Sendable (_ store: HeapPagedRecordStore, _ visited: Int, _ force: Bool) -> Void
     ) -> ScanResult? {
         let rootPaths = rootURLs.map(\.path)
         let currentCount = lock.withLock { searchSnapshot.count }
-        let state = ConcurrentScanState(reservedCapacity: max(8_192, currentCount))
+        let state = ConcurrentScanState(
+            reservedCapacity: max(8_192, currentCount, checkpoint?.store.count ?? 0),
+            existingRecords: checkpoint?.store.allRecords() ?? [],
+            pendingDirectories: checkpoint?.state.resumableDirectories.map { URL(fileURLWithPath: $0, isDirectory: true) } ?? [],
+            completedDirectories: Set(checkpoint?.state.completedDirectories ?? []),
+            operationStartedAt: operationStartedAt
+        )
 
         let publish: @Sendable (_ result: ScanProgress?, _ force: Bool) -> Void = { result, force in
             guard let result else { return }
             progress(result.store, result.visited, force)
         }
+        let publishStatus: @Sendable (_ visited: Int?) -> Void = { [weak self] visited in
+            guard publishesScanStatus, let self, let visited else { return }
+            self.publishScanStatus(visited: visited, generation: currentGeneration)
+        }
 
-        for root in rootURLs {
-            guard fileManager.fileExists(atPath: root.path), !shouldExclude(root, exclusions: exclusions, rootPaths: rootPaths, isDirectory: true) else {
-                continue
+        let checkpointProgress: @Sendable (_ result: ScanCheckpointProgress?) -> Void = { [weak self] result in
+            guard writesCheckpoints, let self, let result else { return }
+            self.persistScanCheckpoint(
+                result,
+                roots: rootPaths,
+                exclusionPatterns: exclusions.patterns,
+                generation: currentGeneration
+            )
+        }
+
+        if checkpoint == nil {
+            for root in rootURLs {
+                guard fileManager.fileExists(atPath: root.path), !shouldExclude(root, exclusions: exclusions, rootPaths: rootPaths, isDirectory: true) else {
+                    continue
+                }
+                if let rootRecord = FileRecord(url: root) {
+                    state.addInitialRecord(rootRecord)
+                }
+                state.enqueue(root)
             }
-            if let rootRecord = FileRecord(url: root) {
-                state.addInitialRecord(rootRecord)
-            }
-            state.enqueue(root)
         }
 
         let workerCount = Self.scanWorkerCount()
@@ -3909,13 +4267,13 @@ public final class FileIndex: @unchecked Sendable {
                 var batch: [FileRecord] = []
                 batch.reserveCapacity(256)
 
-                while true {
-                    guard let directory = state.nextDirectory() else { break }
-                    guard self.isCurrentGeneration(currentGeneration) else {
-                        state.finishDirectory()
-                        state.markStopped()
-                        break
-                    }
+                    while true {
+                        guard let directory = state.nextDirectory() else { break }
+                        guard self.isCurrentGeneration(currentGeneration) else {
+                            state.finishDirectory(directory)
+                            state.markStopped()
+                            break
+                        }
 
                     let children = (try? self.fileManager.contentsOfDirectory(
                         at: directory,
@@ -3952,23 +4310,29 @@ public final class FileIndex: @unchecked Sendable {
                         if batch.count >= 256 {
                             state.append(batch)
                             batch.removeAll(keepingCapacity: true)
+                            publishStatus(state.statusIfNeeded(force: false))
                             publish(state.publishSnapshotIfNeeded(force: false), false)
+                            checkpointProgress(state.checkpointIfNeeded(force: false))
                         }
                     }
 
                     if !batch.isEmpty {
                         state.append(batch)
                         batch.removeAll(keepingCapacity: true)
+                        publishStatus(state.statusIfNeeded(force: false))
                         publish(state.publishSnapshotIfNeeded(force: false), false)
+                        checkpointProgress(state.checkpointIfNeeded(force: false))
                     }
 
-                    state.finishDirectory()
+                    state.finishDirectory(directory)
                 }
             }
         }
 
         workers.wait()
+        publishStatus(state.statusIfNeeded(force: true))
         publish(state.publishSnapshotIfNeeded(force: true), true)
+        checkpointProgress(state.checkpointIfNeeded(force: true))
 
         let (result, wasStopped) = state.result()
         return wasStopped && !isCurrentGeneration(currentGeneration) ? nil : result
@@ -4006,7 +4370,30 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
-    private func optimizeAndPublish(recordsByPath: [String: FileRecord], initialStore: HeapPagedRecordStore, generation currentGeneration: UInt64) {
+    private func publishScanStatus(visited: Int, generation currentGeneration: UInt64) {
+        let didApply = lock.withLock { () -> Bool in
+            guard generation == currentGeneration, indexing, phase == .scanning else {
+                return false
+            }
+
+            discoveredCount = max(discoveredCount, visited)
+            status = "Indexing \(discoveredCount.formatted()) discovered"
+            lastUpdated = Date()
+            return true
+        }
+
+        if didApply {
+            publishStats()
+        }
+    }
+
+    private func optimizeAndPublish(
+        recordsByPath: [String: FileRecord],
+        initialStore: HeapPagedRecordStore,
+        generation currentGeneration: UInt64,
+        publishesIntermediateSnapshots: Bool = true,
+        completionStatusPrefix: String = "Indexed"
+    ) {
         let records = Array(recordsByPath.values)
         var snapshot = SearchSnapshot(store: initialStore, buildsSearchStructures: false)
         var pendingMappedPackageURL: URL?
@@ -4040,51 +4427,91 @@ public final class FileIndex: @unchecked Sendable {
             let mappedStore = try MappedRecordStore(packageURL: packageURL, schemaVersion: SnapshotLayout.schemaVersion)
             pendingMappedPackageURL = packageURL
             snapshot = SearchSnapshot(store: mappedStore, buildsSearchStructures: false)
-            publishOptimizedSnapshot(
-                snapshot,
-                status: "Optimizing names",
-                optimized: 0,
-                generation: currentGeneration
-            )
+            if publishesIntermediateSnapshots {
+                publishOptimizedSnapshot(
+                    snapshot,
+                    status: "Optimizing names",
+                    optimized: 0,
+                    generation: currentGeneration
+                )
+            }
         } catch {
             failIndexing("Could not build compact index: \(error.localizedDescription)", generation: currentGeneration)
             return
         }
 
         snapshot = snapshot.addingNameGramIndex()
-        publishOptimizedSnapshot(
-            snapshot,
-            status: "Optimizing extensions",
-            optimized: 0,
-            generation: currentGeneration
-        )
+        if publishesIntermediateSnapshots {
+            publishOptimizedSnapshot(
+                snapshot,
+                status: "Optimizing extensions",
+                optimized: 0,
+                generation: currentGeneration
+            )
+        } else {
+            publishRebuildStatus(
+                phase: .optimizing,
+                status: "Optimizing extensions",
+                discovered: records.count,
+                searchable: lock.withLock { searchSnapshot.resultCount },
+                optimized: 0,
+                isIndexing: true,
+                generation: currentGeneration
+            )
+        }
 
         guard isCurrentGeneration(currentGeneration) else { return }
         snapshot = snapshot.addingExtensionIndex()
-        publishOptimizedSnapshot(
-            snapshot,
-            status: "Optimizing modified sort",
-            optimized: 0,
-            generation: currentGeneration
-        )
+        if publishesIntermediateSnapshots {
+            publishOptimizedSnapshot(
+                snapshot,
+                status: "Optimizing modified sort",
+                optimized: 0,
+                generation: currentGeneration
+            )
+        } else {
+            publishRebuildStatus(
+                phase: .optimizing,
+                status: "Optimizing modified sort",
+                discovered: records.count,
+                searchable: lock.withLock { searchSnapshot.resultCount },
+                optimized: 0,
+                isIndexing: true,
+                generation: currentGeneration
+            )
+        }
 
         guard isCurrentGeneration(currentGeneration) else { return }
         snapshot = snapshot.addingModifiedSortOrder()
-        publishOptimizedSnapshot(
-            snapshot,
-            status: "Optimizing paths",
-            optimized: 0,
-            generation: currentGeneration
-        )
+        if publishesIntermediateSnapshots {
+            publishOptimizedSnapshot(
+                snapshot,
+                status: "Optimizing paths",
+                optimized: 0,
+                generation: currentGeneration
+            )
+        } else {
+            publishRebuildStatus(
+                phase: .optimizing,
+                status: "Optimizing paths",
+                discovered: records.count,
+                searchable: lock.withLock { searchSnapshot.resultCount },
+                optimized: 0,
+                isIndexing: true,
+                generation: currentGeneration
+            )
+        }
 
         guard isCurrentGeneration(currentGeneration) else { return }
         snapshot = snapshot.addingPathGramIndexIfBudgetAllows()
-        publishOptimizedSnapshot(
-            snapshot,
-            status: "Saving index",
-            optimized: snapshot.resultCount,
-            generation: currentGeneration
-        )
+        if publishesIntermediateSnapshots {
+            publishOptimizedSnapshot(
+                snapshot,
+                status: "Saving index",
+                optimized: snapshot.resultCount,
+                generation: currentGeneration
+            )
+        }
 
         guard isCurrentGeneration(currentGeneration) else { return }
         publishRebuildStatus(
@@ -4109,19 +4536,26 @@ public final class FileIndex: @unchecked Sendable {
             guard persistSnapshot() else { return }
         }
 
+        let shouldReconcileAfterFinish = lock.withLock {
+            resumedFromCheckpoint && completionStatusPrefix == "Indexed"
+        }
         let didFinish = lock.withLock { () -> Bool in
             guard generation == currentGeneration else {
                 return false
             }
 
             self.recordsByPath.removeAll(keepingCapacity: false)
+            searchSnapshot = snapshot
+            searchSnapshotRevision &+= 1
             indexing = false
             phase = .ready
             discoveredCount = records.count
             searchableCount = snapshot.resultCount
             optimizedCount = snapshot.resultCount
-            status = "Indexed \(records.count.formatted()) files"
+            status = "\(completionStatusPrefix) \(records.count.formatted()) files"
             lastUpdated = Date()
+            activeOperationStartedAt = nil
+            resumedFromCheckpoint = false
             completedSnapshotRebuilds &+= 1
             return true
         }
@@ -4134,6 +4568,9 @@ public final class FileIndex: @unchecked Sendable {
                 structures: snapshot.diagnostics,
                 activeIndexJobs: currentActiveIndexJobCount()
             )
+            if shouldReconcileAfterFinish {
+                requestBackgroundReconciliation()
+            }
         }
     }
 
@@ -4203,11 +4640,14 @@ public final class FileIndex: @unchecked Sendable {
             optimizedCount = snapshot.resultCount
             status = "Loaded \(snapshot.resultCount) indexed files"
             lastUpdated = Date()
+            activeOperationStartedAt = nil
+            resumedFromCheckpoint = false
             return true
         }
 
         if didFinish {
             publishStats()
+            requestBackgroundReconciliation()
         }
     }
 
@@ -4251,6 +4691,7 @@ public final class FileIndex: @unchecked Sendable {
                 try fileManager.removeItem(at: snapshotURL)
             }
             try fileManager.moveItem(at: packageURL, to: snapshotURL)
+            removeScanCheckpoint()
             cleanupObsoleteIndexFiles()
             return true
         } catch {
@@ -4269,6 +4710,8 @@ public final class FileIndex: @unchecked Sendable {
             phase = .failed
             status = message
             lastUpdated = Date()
+            activeOperationStartedAt = nil
+            resumedFromCheckpoint = false
             return true
         }
 
@@ -4349,6 +4792,16 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         let refreshStarted = Date()
+        lock.withLock {
+            indexing = true
+            phase = .scanning
+            status = "Refreshing changed paths"
+            activeOperationStartedAt = refreshStarted
+            resumedFromCheckpoint = false
+            lastUpdated = Date()
+        }
+        publishStats()
+
         let jobID = beginIndexJob("refresh")
         defer { endIndexJob("refresh", jobID: jobID) }
 
@@ -4395,6 +4848,14 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         guard !upserts.isEmpty || !deletedPrefixes.isEmpty || !shallowDirectoryChildren.isEmpty else {
+            lock.withLock {
+                indexing = false
+                phase = .ready
+                status = "No file changes"
+                activeOperationStartedAt = nil
+                lastUpdated = Date()
+            }
+            publishStats()
             MemoryTelemetry.log(
                 "refresh.noop",
                 refreshBatchSize: paths.count,
@@ -4424,6 +4885,7 @@ public final class FileIndex: @unchecked Sendable {
                 optimizedCount = updatedSnapshot.isOptimizedForSearch ? updatedSnapshot.resultCount : 0
                 recordsByPath.removeAll(keepingCapacity: false)
                 lastUpdated = Date()
+                activeOperationStartedAt = nil
                 completedRefreshBatches &+= 1
             }
 
@@ -4480,6 +4942,7 @@ public final class FileIndex: @unchecked Sendable {
             optimizedCount = snapshot.isOptimizedForSearch ? snapshot.resultCount : 0
             recordsByPath.removeAll(keepingCapacity: false)
             lastUpdated = Date()
+            activeOperationStartedAt = nil
             completedRefreshBatches &+= 1
         }
 
@@ -4551,6 +5014,8 @@ public final class FileIndex: @unchecked Sendable {
             optimizedCount = isIndexing ? 0 : snapshot.resultCount
             self.status = status
             lastUpdated = Date()
+            activeOperationStartedAt = isIndexing ? Date() : nil
+            resumedFromCheckpoint = false
             if !isIndexing {
                 completedSnapshotRebuilds &+= 1
             }
@@ -4662,6 +5127,7 @@ public final class FileIndex: @unchecked Sendable {
             try fileManager.removeItem(at: snapshotURL)
         }
         try fileManager.moveItem(at: temporaryURL, to: snapshotURL)
+        removeScanCheckpoint()
         cleanupObsoleteIndexFiles()
         return try MappedRecordStore(packageURL: snapshotURL, schemaVersion: SnapshotLayout.schemaVersion)
     }
@@ -4706,6 +5172,216 @@ public final class FileIndex: @unchecked Sendable {
             try gramIndex.write(to: pathPostingsURL)
         } else {
             try Data().write(to: pathPostingsURL, options: .atomic)
+        }
+    }
+
+    private func persistScanCheckpoint(
+        _ progress: ScanCheckpointProgress,
+        roots: [String],
+        exclusionPatterns: [String],
+        generation currentGeneration: UInt64
+    ) {
+        guard isCurrentGeneration(currentGeneration) else { return }
+
+        checkpointPersistenceLock.withLock {
+            guard isCurrentGeneration(currentGeneration) else { return }
+
+            let savedAt = Date()
+            let temporaryURL = SnapshotLayout.temporaryCheckpointPackageURL(in: supportDirectory)
+            defer {
+                if fileManager.fileExists(atPath: temporaryURL.path) {
+                    try? fileManager.removeItem(at: temporaryURL)
+                }
+            }
+
+            do {
+                try MappedRecordStore.writePackage(
+                    records: progress.store.allRecords(),
+                    roots: roots,
+                    exclusionPatterns: exclusionPatterns,
+                    packageURL: temporaryURL,
+                    savedAt: savedAt,
+                    fileManager: fileManager
+                )
+                let mappedStore = try MappedRecordStore(packageURL: temporaryURL, schemaVersion: SnapshotLayout.schemaVersion)
+                var snapshot = SearchSnapshot(store: mappedStore, buildsSearchStructures: false)
+                snapshot = snapshot.addingNameGramIndex()
+                snapshot = snapshot.addingModifiedSortOrder()
+                try persistSearchStructures(for: snapshot, packageURL: temporaryURL)
+
+                let state = ScanCheckpointState(
+                    schemaVersion: SnapshotLayout.schemaVersion,
+                    savedAt: savedAt,
+                    operationStartedAt: progress.operationStartedAt,
+                    roots: roots,
+                    exclusionPatterns: exclusionPatterns,
+                    pendingDirectories: progress.pendingDirectories,
+                    activeDirectories: progress.activeDirectories,
+                    completedDirectories: progress.completedDirectories,
+                    discoveredCount: progress.visited,
+                    recordCount: mappedStore.count
+                )
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                try encoder.encode(state).write(
+                    to: temporaryURL.appendingPathComponent(SnapshotLayout.FileName.scanState, isDirectory: false),
+                    options: .atomic
+                )
+
+                if fileManager.fileExists(atPath: checkpointURL.path) {
+                    try fileManager.removeItem(at: checkpointURL)
+                }
+                try fileManager.moveItem(at: temporaryURL, to: checkpointURL)
+                cleanupStaleTemporaryFiles()
+
+                let didUpdate = lock.withLock { () -> Bool in
+                    guard generation == currentGeneration else { return false }
+                    lastCheckpointAt = savedAt
+                    lastUpdated = Date()
+                    return true
+                }
+                if didUpdate {
+                    publishStats()
+                }
+                MemoryTelemetry.log(
+                    "checkpoint.persisted",
+                    records: Self.metrics(for: mappedStore),
+                    structures: snapshot.diagnostics,
+                    activeIndexJobs: currentActiveIndexJobCount()
+                )
+            } catch {
+                MemoryTelemetry.log("checkpoint.persist.failed", activeIndexJobs: currentActiveIndexJobCount())
+                try? fileManager.removeItem(at: temporaryURL)
+            }
+        }
+    }
+
+    private func loadResumableScanCheckpoint(roots: [String], exclusionPatterns: [String]) -> LoadedScanCheckpoint? {
+        guard let state = matchingScanCheckpointState(
+            roots: roots,
+            exclusionPatterns: exclusionPatterns,
+            removesInvalidCheckpoint: true
+        ) else {
+            return nil
+        }
+
+        do {
+            let store = try MappedRecordStore(packageURL: checkpointURL, schemaVersion: SnapshotLayout.schemaVersion)
+            guard store.count == state.recordCount else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            guard let searchStructures = loadPersistedSearchStructures(packageURL: checkpointURL, store: store) else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            return LoadedScanCheckpoint(state: state, store: store, searchStructures: searchStructures)
+        } catch {
+            removeScanCheckpoint()
+            recordSnapshotLoadFailure(corruptSnapshotRemoved: true)
+            MemoryTelemetry.log("checkpoint.load.failed", activeIndexJobs: currentActiveIndexJobCount())
+            return nil
+        }
+    }
+
+    private func matchingScanCheckpointState(
+        roots: [String],
+        exclusionPatterns: [String],
+        removesInvalidCheckpoint: Bool
+    ) -> ScanCheckpointState? {
+        guard fileManager.fileExists(atPath: checkpointURL.path) else {
+            return nil
+        }
+
+        do {
+            let stateURL = checkpointURL.appendingPathComponent(SnapshotLayout.FileName.scanState, isDirectory: false)
+            let state = try JSONDecoder().decode(ScanCheckpointState.self, from: Data(contentsOf: stateURL))
+            guard
+                state.schemaVersion == SnapshotLayout.schemaVersion,
+                state.roots == roots,
+                state.exclusionPatterns == exclusionPatterns,
+                state.recordCount >= 0,
+                state.discoveredCount >= 0
+            else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+
+            if let finalSavedAt = finalSnapshotSavedAt(), finalSavedAt >= state.savedAt {
+                if removesInvalidCheckpoint {
+                    removeScanCheckpoint()
+                }
+                return nil
+            }
+
+            return state
+        } catch {
+            if removesInvalidCheckpoint {
+                removeScanCheckpoint()
+            }
+            return nil
+        }
+    }
+
+    private func finalSnapshotSavedAt() -> Date? {
+        guard fileManager.fileExists(atPath: snapshotURL.path) else {
+            return nil
+        }
+
+        let manifestURL = snapshotURL.appendingPathComponent(SnapshotLayout.FileName.manifest, isDirectory: false)
+        guard
+            let data = try? Data(contentsOf: manifestURL),
+            let manifest = try? JSONDecoder().decode(CompactSnapshotManifest.self, from: data),
+            manifest.schemaVersion == SnapshotLayout.schemaVersion
+        else {
+            return nil
+        }
+        return manifest.savedAt
+    }
+
+    private func removeSupersededScanCheckpoint(finalSavedAt: Date) {
+        guard fileManager.fileExists(atPath: checkpointURL.path) else {
+            return
+        }
+
+        let stateURL = checkpointURL.appendingPathComponent(SnapshotLayout.FileName.scanState, isDirectory: false)
+        guard
+            let data = try? Data(contentsOf: stateURL),
+            let state = try? JSONDecoder().decode(ScanCheckpointState.self, from: data)
+        else {
+            removeScanCheckpoint()
+            return
+        }
+
+        if state.schemaVersion != SnapshotLayout.schemaVersion || finalSavedAt >= state.savedAt {
+            removeScanCheckpoint()
+        }
+    }
+
+    private func applyLoadedScanCheckpoint(_ checkpoint: LoadedScanCheckpoint, generation currentGeneration: UInt64) {
+        let snapshot = SearchSnapshot(store: checkpoint.store, persistedStructures: checkpoint.searchStructures)
+        let didApply = lock.withLock { () -> Bool in
+            guard generation == currentGeneration else { return false }
+            searchSnapshot = snapshot
+            searchSnapshotRevision &+= 1
+            indexing = true
+            phase = .scanning
+            discoveredCount = checkpoint.state.discoveredCount
+            searchableCount = snapshot.resultCount
+            optimizedCount = snapshot.isOptimizedForSearch ? snapshot.resultCount : 0
+            status = "Indexing from \(snapshot.resultCount.formatted()) checkpoint records"
+            activeOperationStartedAt = checkpoint.state.operationStartedAt
+            lastCheckpointAt = checkpoint.state.savedAt
+            resumedFromCheckpoint = true
+            lastUpdated = Date()
+            return true
+        }
+
+        if didApply {
+            publishStats()
+            MemoryTelemetry.log(
+                "checkpoint.load.applied",
+                records: Self.metrics(for: snapshot.store),
+                structures: snapshot.diagnostics,
+                activeIndexJobs: currentActiveIndexJobCount()
+            )
         }
     }
 
@@ -4933,7 +5609,9 @@ public final class FileIndex: @unchecked Sendable {
             virtualRowCount: searchSnapshot.virtualRowCount,
             fallbackScanCount: fallbackScanCount,
             scannedRowCount: scannedRowCount,
-            pathMaterializationCount: pathMaterializationCount
+            pathMaterializationCount: pathMaterializationCount,
+            lastCheckpointAt: lastCheckpointAt,
+            resumedFromCheckpoint: resumedFromCheckpoint
         )
     }
 
@@ -4987,6 +5665,9 @@ public final class FileIndex: @unchecked Sendable {
                 optimizedCount = buildsSearchStructures ? snapshot.resultCount : 0
                 self.status = status ?? "Indexed \(records.count.formatted()) test files"
                 lastUpdated = Date()
+                activeOperationStartedAt = indexing ? Date() : nil
+                lastCheckpointAt = nil
+                resumedFromCheckpoint = false
                 if phase == .ready {
                     completedSnapshotRebuilds &+= 1
                 }
@@ -4999,6 +5680,58 @@ public final class FileIndex: @unchecked Sendable {
         _ = indexQueue.sync {
             persistSnapshot()
         }
+    }
+
+    func persistCheckpointForTesting(
+        records: [FileRecord],
+        roots rootURLs: [URL],
+        pendingDirectories: [URL],
+        activeDirectories: [URL] = [],
+        completedDirectories: [URL] = [],
+        operationStartedAt: Date = Date(timeIntervalSince1970: 0)
+    ) {
+        indexQueue.sync {
+            let canonicalRoots = canonicalizedRoots(rootURLs)
+            let store = HeapPagedRecordStore(records: records)
+            let progress = ScanCheckpointProgress(
+                store: store,
+                visited: records.count,
+                pendingDirectories: pendingDirectories.map { $0.standardizedFileURL.path },
+                activeDirectories: activeDirectories.map { $0.standardizedFileURL.path },
+                completedDirectories: completedDirectories.map { $0.standardizedFileURL.path },
+                operationStartedAt: operationStartedAt
+            )
+            persistScanCheckpoint(
+                progress,
+                roots: canonicalRoots.map(\.path),
+                exclusionPatterns: lock.withLock { exclusionRules.patterns },
+                generation: currentGeneration()
+            )
+        }
+    }
+
+    func loadCheckpointForTesting(roots rootURLs: [URL]) -> Bool {
+        let canonicalRoots = canonicalizedRoots(rootURLs)
+        let generation = lock.withLock { () -> UInt64 in
+            self.generation &+= 1
+            roots = canonicalRoots.map(\.path)
+            indexing = true
+            phase = .scanning
+            activeOperationStartedAt = Date()
+            return self.generation
+        }
+        guard let checkpoint = loadResumableScanCheckpoint(
+            roots: canonicalRoots.map(\.path),
+            exclusionPatterns: lock.withLock { exclusionRules.patterns }
+        ) else {
+            return false
+        }
+        applyLoadedScanCheckpoint(checkpoint, generation: generation)
+        return true
+    }
+
+    func checkpointExistsForTesting() -> Bool {
+        fileManager.fileExists(atPath: checkpointURL.path)
     }
 
     private func publishStats() {
@@ -5014,7 +5747,10 @@ public final class FileIndex: @unchecked Sendable {
                     optimizedCount: optimizedCount,
                     snapshotRevision: searchSnapshotRevision,
                     status: status,
-                    lastUpdated: lastUpdated
+                    lastUpdated: lastUpdated,
+                    activeOperationStartedAt: activeOperationStartedAt,
+                    lastCheckpointAt: lastCheckpointAt,
+                    resumedFromCheckpoint: resumedFromCheckpoint
                 ),
                 handler: statsChangedHandler
             )
@@ -5044,7 +5780,10 @@ public final class FileIndex: @unchecked Sendable {
             optimizedCount: optimizedCount,
             snapshotRevision: searchSnapshotRevision,
             status: status,
-            lastUpdated: lastUpdated
+            lastUpdated: lastUpdated,
+            activeOperationStartedAt: activeOperationStartedAt,
+            lastCheckpointAt: lastCheckpointAt,
+            resumedFromCheckpoint: resumedFromCheckpoint
         )
     }
 
@@ -5142,9 +5881,19 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
+    private func removeScanCheckpoint() {
+        guard fileManager.fileExists(atPath: checkpointURL.path) else { return }
+        if (try? fileManager.removeItem(at: checkpointURL)) != nil {
+            recordTempCleanup(count: 1)
+        }
+    }
+
     private func removePersistedIndexFiles() throws {
         if fileManager.fileExists(atPath: snapshotURL.path) {
             try fileManager.removeItem(at: snapshotURL)
+        }
+        if fileManager.fileExists(atPath: checkpointURL.path) {
+            try fileManager.removeItem(at: checkpointURL)
         }
 
         guard
@@ -5353,6 +6102,10 @@ public final class FileIndex: @unchecked Sendable {
             seen.insert(standardized.path)
             return standardized
         }
+    }
+
+    private static func path(_ path: String, isContainedIn rootPaths: [String]) -> Bool {
+        rootPaths.contains { path == $0 || path.hasPrefix($0 + "/") }
     }
 
     private func shouldExclude(

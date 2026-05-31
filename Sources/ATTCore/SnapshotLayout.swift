@@ -5,6 +5,8 @@ enum SnapshotLayout {
     static let packageName = "filename-index-v\(schemaVersion).attindex"
     static let temporaryPackagePrefix = "filename-index-v\(schemaVersion)-"
     static let temporaryPackageSuffix = ".attindex.tmp"
+    static let checkpointPackageName = "filename-index-v\(schemaVersion)-checkpoint.attindex"
+    static let temporaryCheckpointPackagePrefix = "filename-index-v\(schemaVersion)-checkpoint-"
 
     static let obsoletePackageNames = [
         "filename-index-v5.attindex",
@@ -34,6 +36,7 @@ enum SnapshotLayout {
         static let componentPostings = "componentPostings.bin"
         static let pathPostings = "pathPostings.bin"
         static let extensionPostings = "extensionPostings.bin"
+        static let scanState = "scan-state.json"
     }
 
     static func packageURL(in supportDirectory: URL) -> URL {
@@ -47,8 +50,24 @@ enum SnapshotLayout {
         )
     }
 
+    static func checkpointPackageURL(in supportDirectory: URL) -> URL {
+        supportDirectory.appendingPathComponent(checkpointPackageName, isDirectory: true)
+    }
+
+    static func temporaryCheckpointPackageURL(in supportDirectory: URL, id: UUID = UUID()) -> URL {
+        supportDirectory.appendingPathComponent(
+            "\(temporaryCheckpointPackagePrefix)\(id.uuidString)\(temporaryPackageSuffix)",
+            isDirectory: true
+        )
+    }
+
     static func isCurrentTemporaryPackageName(_ name: String) -> Bool {
-        name.hasPrefix(temporaryPackagePrefix) && name.hasSuffix(temporaryPackageSuffix)
+        (name.hasPrefix(temporaryPackagePrefix) || name.hasPrefix(temporaryCheckpointPackagePrefix))
+            && name.hasSuffix(temporaryPackageSuffix)
+    }
+
+    static func isCheckpointPackageName(_ name: String) -> Bool {
+        name == checkpointPackageName
     }
 
     static func isObsoleteTemporaryName(_ name: String) -> Bool {

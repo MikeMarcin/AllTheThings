@@ -49,6 +49,25 @@ struct AppSettingsTests {
         #expect(AppSettings.indexedRoots(defaults: defaults).isEmpty)
     }
 
+    @Test("exclusion defaults migration adds Unreal DotNet SDK noise")
+    func exclusionDefaultsMigrationAddsUnrealDotNetSDKNoise() throws {
+        let (defaults, suiteName) = try makeDefaults()
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        defaults.set(3, forKey: AppSettings.exclusionDefaultsVersionKey)
+        defaults.set([
+            ".git/objects/",
+            "node_modules/",
+            "DerivedData/"
+        ], forKey: AppSettings.exclusionPatternsKey)
+
+        AppSettings.registerDefaults(defaults)
+
+        #expect(AppSettings.exclusionPatterns(defaults: defaults).contains("Engine/Binaries/ThirdParty/DotNet/"))
+    }
+
     @Test("match colors can be overridden and reset per appearance")
     func matchColorsCanBeOverriddenAndResetPerAppearance() throws {
         let (defaults, suiteName) = try makeDefaults()
