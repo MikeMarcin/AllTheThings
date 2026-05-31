@@ -228,7 +228,7 @@ struct MemoryBudgetTests {
         let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
         let diagnostics = reloaded.currentDiagnostics()
 
-        #expect(diagnostics.schemaVersion == 6)
+        #expect(diagnostics.schemaVersion == SnapshotLayout.schemaVersion)
         #expect(diagnostics.indexedCount == records.count)
         #expect(diagnostics.resultCount == records.count)
         #expect(diagnostics.virtualRowCount > 0)
@@ -249,17 +249,17 @@ struct MemoryBudgetTests {
     func corruptMmapSnapshotsAreIgnored() throws {
         let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
         let supportDirectory = try applicationSupportDirectory(for: applicationName)
-        let packageURL = supportDirectory.appendingPathComponent("filename-index-v6.attindex", isDirectory: true)
+        let packageURL = SnapshotLayout.packageURL(in: supportDirectory)
         try FileManager.default.createDirectory(at: packageURL, withIntermediateDirectories: true)
         let manifest = CompactSnapshotManifest(
-            schemaVersion: 6,
+            schemaVersion: SnapshotLayout.schemaVersion,
             savedAt: Date(),
             roots: [],
             exclusionPatterns: FileExclusionRules.defaultPatterns,
             recordCount: 1
         )
-        try JSONEncoder().encode(manifest).write(to: packageURL.appendingPathComponent("manifest.json"))
-        try Data([1, 2, 3]).write(to: packageURL.appendingPathComponent("records.bin"))
+        try JSONEncoder().encode(manifest).write(to: packageURL.appendingPathComponent(SnapshotLayout.FileName.manifest))
+        try Data([1, 2, 3]).write(to: packageURL.appendingPathComponent(SnapshotLayout.FileName.records))
 
         let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
         #expect(index.currentStats().indexedCount == 0)

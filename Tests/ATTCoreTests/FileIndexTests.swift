@@ -290,14 +290,13 @@ struct FileIndexTests {
         #expect(diagnostics.visibleCount == diagnostics.indexedCount)
         #expect(diagnostics.visibleModifiedOrderCount == diagnostics.indexedCount)
         #expect(diagnostics.simdTextVerificationEnabled)
-        let packageURL = supportDirectory(applicationName: applicationName)
-            .appendingPathComponent("filename-index-v6.attindex", isDirectory: true)
-        #expect(FileManager.default.fileExists(atPath: packageURL.appendingPathComponent("parent.i32").path))
-        #expect(FileManager.default.fileExists(atPath: packageURL.appendingPathComponent("flags.u8").path))
-        #expect(FileManager.default.fileExists(atPath: packageURL.appendingPathComponent("visible.bitset").path))
-        #expect(FileManager.default.fileExists(atPath: packageURL.appendingPathComponent("subtreeEnd.i32").path))
-        #expect(FileManager.default.fileExists(atPath: packageURL.appendingPathComponent("componentPostings.bin").path))
-        #expect(FileManager.default.fileExists(atPath: packageURL.appendingPathComponent("visibleModifiedOrder.i32").path))
+        let packageURL = SnapshotLayout.packageURL(in: supportDirectory(applicationName: applicationName))
+        #expect(FileManager.default.fileExists(atPath: packageURL.appendingPathComponent(SnapshotLayout.FileName.parent).path))
+        #expect(FileManager.default.fileExists(atPath: packageURL.appendingPathComponent(SnapshotLayout.FileName.flags).path))
+        #expect(FileManager.default.fileExists(atPath: packageURL.appendingPathComponent(SnapshotLayout.FileName.visible).path))
+        #expect(FileManager.default.fileExists(atPath: packageURL.appendingPathComponent(SnapshotLayout.FileName.subtreeEnd).path))
+        #expect(FileManager.default.fileExists(atPath: packageURL.appendingPathComponent(SnapshotLayout.FileName.componentPostings).path))
+        #expect(FileManager.default.fileExists(atPath: packageURL.appendingPathComponent(SnapshotLayout.FileName.visibleModifiedOrder).path))
         #expect(reloaded.search(SearchRequest(
             query: "swc",
             sort: SortSpec(column: .relevance, ascending: false)
@@ -354,8 +353,8 @@ struct FileIndexTests {
         ])
         index.persistSnapshotForTesting()
 
-        let packageURL = supportDirectory.appendingPathComponent("filename-index-v6.attindex", isDirectory: true)
-        try FileManager.default.removeItem(at: packageURL.appendingPathComponent("visible.bitset"))
+        let packageURL = SnapshotLayout.packageURL(in: supportDirectory)
+        try FileManager.default.removeItem(at: packageURL.appendingPathComponent(SnapshotLayout.FileName.visible))
 
         let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
         let diagnostics = reloaded.currentDiagnostics()

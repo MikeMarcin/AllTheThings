@@ -255,7 +255,6 @@ struct FileIndexDiagnostics: Sendable {
 }
 
 public final class FileIndex: @unchecked Sendable {
-    private static let snapshotSchemaVersion = 6
     private static let maximumRefreshBatchPaths = 512
     private static let primaryPublishRecordInterval = 25_000
     private static let primaryPublishTimeInterval: TimeInterval = 1
@@ -1213,7 +1212,7 @@ public final class FileIndex: @unchecked Sendable {
                 return candidates
             }
 
-            guard store.schemaVersion < FileIndex.snapshotSchemaVersion else {
+            guard store.schemaVersion < SnapshotLayout.schemaVersion else {
                 return nil
             }
 
@@ -1304,7 +1303,7 @@ public final class FileIndex: @unchecked Sendable {
                 return candidates
             }
 
-            guard store.schemaVersion < FileIndex.snapshotSchemaVersion else {
+            guard store.schemaVersion < SnapshotLayout.schemaVersion else {
                 return nil
             }
 
@@ -1721,7 +1720,7 @@ public final class FileIndex: @unchecked Sendable {
         let supportDirectory = supportRoot.appendingPathComponent(applicationName, isDirectory: true)
         try? fileManager.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
         self.supportDirectory = supportDirectory
-        self.snapshotURL = supportDirectory.appendingPathComponent("filename-index-v6.attindex", isDirectory: true)
+        self.snapshotURL = SnapshotLayout.packageURL(in: supportDirectory)
         cleanupStaleTemporaryFiles()
         cleanupObsoleteIndexFiles()
 
@@ -2006,7 +2005,7 @@ public final class FileIndex: @unchecked Sendable {
         shouldCancel: @Sendable () -> Bool
     ) -> SearchResponse? {
         guard
-            snapshot.store.schemaVersion >= snapshotSchemaVersion,
+            snapshot.store.schemaVersion >= SnapshotLayout.schemaVersion,
             request.sort.column == .name,
             maxResults > 0,
             parsedQuery.negative.isEmpty,
@@ -3057,7 +3056,7 @@ public final class FileIndex: @unchecked Sendable {
             return nil
         }
 
-        guard snapshot.store.schemaVersion < Self.snapshotSchemaVersion else {
+        guard snapshot.store.schemaVersion < SnapshotLayout.schemaVersion else {
             return nil
         }
 
@@ -3769,7 +3768,7 @@ public final class FileIndex: @unchecked Sendable {
         )
 
         do {
-            let packageURL = supportDirectory.appendingPathComponent("filename-index-v6-\(UUID().uuidString).attindex.tmp", isDirectory: true)
+            let packageURL = SnapshotLayout.temporaryPackageURL(in: supportDirectory)
             let snapshotSettings = lock.withLock {
                 (
                     roots: roots,
@@ -3783,7 +3782,7 @@ public final class FileIndex: @unchecked Sendable {
                 packageURL: packageURL,
                 fileManager: fileManager
             )
-            let mappedStore = try MappedRecordStore(packageURL: packageURL, schemaVersion: Self.snapshotSchemaVersion)
+            let mappedStore = try MappedRecordStore(packageURL: packageURL, schemaVersion: SnapshotLayout.schemaVersion)
             pendingMappedPackageURL = packageURL
             snapshot = SearchSnapshot(store: mappedStore, buildsSearchStructures: false)
             publishOptimizedSnapshot(
@@ -4384,7 +4383,7 @@ public final class FileIndex: @unchecked Sendable {
 
     private func persistMappedSnapshot(roots: [String], exclusionPatterns: [String], store: RecordStore) throws -> MappedRecordStore {
         cleanupStaleTemporaryFiles()
-        let temporaryURL = supportDirectory.appendingPathComponent("filename-index-v6-\(UUID().uuidString).attindex.tmp", isDirectory: true)
+        let temporaryURL = SnapshotLayout.temporaryPackageURL(in: supportDirectory)
         defer {
             if fileManager.fileExists(atPath: temporaryURL.path) {
                 try? fileManager.removeItem(at: temporaryURL)
@@ -4404,11 +4403,11 @@ public final class FileIndex: @unchecked Sendable {
         }
         try fileManager.moveItem(at: temporaryURL, to: snapshotURL)
         cleanupObsoleteIndexFiles()
-        return try MappedRecordStore(packageURL: snapshotURL, schemaVersion: Self.snapshotSchemaVersion)
+        return try MappedRecordStore(packageURL: snapshotURL, schemaVersion: SnapshotLayout.schemaVersion)
     }
 
     private func persistSearchStructures(for snapshot: SearchSnapshot, packageURL: URL) throws {
-        let modifiedOrderURL = packageURL.appendingPathComponent("modifiedOrder.bin", isDirectory: false)
+        let modifiedOrderURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.modifiedOrder, isDirectory: false)
         if snapshot.hasSortedOrder {
             try CompactSearchStructureFiles.writeModifiedOrder(
                 snapshot.modifiedDescending,
@@ -4418,7 +4417,7 @@ public final class FileIndex: @unchecked Sendable {
             try Data().write(to: modifiedOrderURL, options: .atomic)
         }
 
-        let visibleModifiedOrderURL = packageURL.appendingPathComponent("visibleModifiedOrder.i32", isDirectory: false)
+        let visibleModifiedOrderURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.visibleModifiedOrder, isDirectory: false)
         if snapshot.hasSortedOrder {
             try CompactSearchStructureFiles.writeModifiedOrder(
                 snapshot.visibleModifiedDescending,
@@ -4428,21 +4427,21 @@ public final class FileIndex: @unchecked Sendable {
             try Data().write(to: visibleModifiedOrderURL, options: .atomic)
         }
 
-        let namePostingsURL = packageURL.appendingPathComponent("namePostings.bin", isDirectory: false)
+        let namePostingsURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.namePostings, isDirectory: false)
         if let nameGramIndex = snapshot.nameGramIndex {
             try nameGramIndex.write(to: namePostingsURL)
         } else {
             try Data().write(to: namePostingsURL, options: .atomic)
         }
 
-        let componentPostingsURL = packageURL.appendingPathComponent("componentPostings.bin", isDirectory: false)
+        let componentPostingsURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.componentPostings, isDirectory: false)
         if let componentGramIndex = snapshot.componentGramIndex {
             try componentGramIndex.write(to: componentPostingsURL)
         } else {
             try Data().write(to: componentPostingsURL, options: .atomic)
         }
 
-        let pathPostingsURL = packageURL.appendingPathComponent("pathPostings.bin", isDirectory: false)
+        let pathPostingsURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.pathPostings, isDirectory: false)
         if let gramIndex = snapshot.gramIndex {
             try gramIndex.write(to: pathPostingsURL)
         } else {
@@ -4455,9 +4454,9 @@ public final class FileIndex: @unchecked Sendable {
             return nil
         }
         do {
-            let manifestURL = snapshotURL.appendingPathComponent("manifest.json", isDirectory: false)
+            let manifestURL = snapshotURL.appendingPathComponent(SnapshotLayout.FileName.manifest, isDirectory: false)
             let manifest = try JSONDecoder().decode(CompactSnapshotManifest.self, from: Data(contentsOf: manifestURL))
-            guard manifest.schemaVersion == Self.snapshotSchemaVersion else {
+            guard manifest.schemaVersion == SnapshotLayout.schemaVersion else {
                 throw CocoaError(.fileReadCorruptFile)
             }
             let store = try MappedRecordStore(packageURL: snapshotURL, schemaVersion: manifest.schemaVersion)
@@ -4481,7 +4480,7 @@ public final class FileIndex: @unchecked Sendable {
 
     private func loadPersistedSearchStructures(packageURL: URL, store: MappedRecordStore) -> PersistedSearchStructures? {
         guard let modifiedDescending = CompactSearchStructureFiles.loadModifiedOrder(
-            from: packageURL.appendingPathComponent("modifiedOrder.bin", isDirectory: false),
+            from: packageURL.appendingPathComponent(SnapshotLayout.FileName.modifiedOrder, isDirectory: false),
             expectedCount: store.storedResultCount ?? store.count,
             rowIDUpperBound: store.count,
             fileManager: fileManager
@@ -4489,7 +4488,7 @@ public final class FileIndex: @unchecked Sendable {
             return nil
         }
         guard let visibleModifiedDescending = CompactSearchStructureFiles.loadModifiedOrder(
-            from: packageURL.appendingPathComponent("visibleModifiedOrder.i32", isDirectory: false),
+            from: packageURL.appendingPathComponent(SnapshotLayout.FileName.visibleModifiedOrder, isDirectory: false),
             expectedCount: store.storedVisibleCount ?? 0,
             rowIDUpperBound: store.count,
             fileManager: fileManager
@@ -4497,15 +4496,15 @@ public final class FileIndex: @unchecked Sendable {
             return nil
         }
         let nameGramIndex = try? MappedIntPostingIndex.load(
-            from: packageURL.appendingPathComponent("namePostings.bin", isDirectory: false),
+            from: packageURL.appendingPathComponent(SnapshotLayout.FileName.namePostings, isDirectory: false),
             fileManager: fileManager
         )
         let pathGramIndex = try? MappedIntPostingIndex.load(
-            from: packageURL.appendingPathComponent("pathPostings.bin", isDirectory: false),
+            from: packageURL.appendingPathComponent(SnapshotLayout.FileName.pathPostings, isDirectory: false),
             fileManager: fileManager
         )
         let componentGramIndex = try? MappedIntPostingIndex.load(
-            from: packageURL.appendingPathComponent("componentPostings.bin", isDirectory: false),
+            from: packageURL.appendingPathComponent(SnapshotLayout.FileName.componentPostings, isDirectory: false),
             fileManager: fileManager
         )
 
@@ -4533,7 +4532,7 @@ public final class FileIndex: @unchecked Sendable {
         for url in contents {
             let name = url.lastPathComponent
             let isTemporary = name.hasPrefix(".dat.nosync")
-                || (name.hasPrefix("filename-index-v6-") && name.hasSuffix(".attindex.tmp"))
+                || SnapshotLayout.isCurrentTemporaryPackageName(name)
             guard isTemporary else { continue }
 
             let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
@@ -4543,14 +4542,7 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     private func cleanupObsoleteIndexFiles() {
-        let obsoleteNames = [
-            "filename-index-v5.attindex",
-            "filename-index-v4.attindex",
-            "filename-index-v2.jsonl",
-            "filename-index.json",
-            "filename-index.json.tmp"
-        ]
-        for name in obsoleteNames {
+        for name in SnapshotLayout.obsoletePackageNames + SnapshotLayout.obsoleteFileNames {
             try? fileManager.removeItem(at: supportDirectory.appendingPathComponent(name))
         }
 
@@ -4564,10 +4556,7 @@ public final class FileIndex: @unchecked Sendable {
 
         for url in contents {
             let name = url.lastPathComponent
-            let isObsoleteTemporary = (name.hasPrefix("filename-index-v5-") && name.hasSuffix(".attindex.tmp"))
-                || (name.hasPrefix("filename-index-v4-") && name.hasSuffix(".attindex.tmp"))
-                || (name.hasPrefix("filename-index-v2-") && name.hasSuffix(".jsonl.tmp"))
-            if isObsoleteTemporary {
+            if SnapshotLayout.isObsoleteTemporaryName(name) {
                 try? fileManager.removeItem(at: url)
             }
         }
