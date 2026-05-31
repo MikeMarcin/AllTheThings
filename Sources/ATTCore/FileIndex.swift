@@ -230,7 +230,7 @@ public enum RebuildMode: Sendable {
 public struct IndexStats: Codable, Equatable, Sendable {
     public let indexedCount: Int
     public let isIndexing: Bool
-    public let isRefreshing: Bool
+    public let isReconciling: Bool
     public let isUpdating: Bool
     public let isLoadingSnapshot: Bool
     public let phase: IndexPhase
@@ -247,6 +247,7 @@ public struct IndexStats: Codable, Equatable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case indexedCount
         case isIndexing
+        case isReconciling
         case isRefreshing
         case isUpdating
         case isLoadingSnapshot
@@ -265,7 +266,7 @@ public struct IndexStats: Codable, Equatable, Sendable {
     public init(
         indexedCount: Int,
         isIndexing: Bool,
-        isRefreshing: Bool = false,
+        isReconciling: Bool = false,
         isUpdating: Bool = false,
         isLoadingSnapshot: Bool = false,
         phase: IndexPhase? = nil,
@@ -281,7 +282,7 @@ public struct IndexStats: Codable, Equatable, Sendable {
     ) {
         self.indexedCount = indexedCount
         self.isIndexing = isIndexing
-        self.isRefreshing = isRefreshing
+        self.isReconciling = isReconciling
         self.isUpdating = isUpdating
         self.isLoadingSnapshot = isLoadingSnapshot
         self.phase = phase ?? (isLoadingSnapshot ? .loading : (isIndexing ? .scanning : .ready))
@@ -303,7 +304,9 @@ public struct IndexStats: Codable, Equatable, Sendable {
         let isLoadingSnapshot = try container.decodeIfPresent(Bool.self, forKey: .isLoadingSnapshot) ?? false
         self.indexedCount = indexedCount
         self.isIndexing = isIndexing
-        self.isRefreshing = try container.decodeIfPresent(Bool.self, forKey: .isRefreshing) ?? false
+        self.isReconciling = try container.decodeIfPresent(Bool.self, forKey: .isReconciling)
+            ?? container.decodeIfPresent(Bool.self, forKey: .isRefreshing)
+            ?? false
         self.isUpdating = try container.decodeIfPresent(Bool.self, forKey: .isUpdating) ?? false
         self.isLoadingSnapshot = isLoadingSnapshot
         self.phase = try container.decodeIfPresent(IndexPhase.self, forKey: .phase)
@@ -317,6 +320,25 @@ public struct IndexStats: Codable, Equatable, Sendable {
         self.activeOperationStartedAt = try container.decodeIfPresent(Date.self, forKey: .activeOperationStartedAt)
         self.lastCheckpointAt = try container.decodeIfPresent(Date.self, forKey: .lastCheckpointAt)
         self.resumedFromCheckpoint = try container.decodeIfPresent(Bool.self, forKey: .resumedFromCheckpoint) ?? false
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(indexedCount, forKey: .indexedCount)
+        try container.encode(isIndexing, forKey: .isIndexing)
+        try container.encode(isReconciling, forKey: .isReconciling)
+        try container.encode(isUpdating, forKey: .isUpdating)
+        try container.encode(isLoadingSnapshot, forKey: .isLoadingSnapshot)
+        try container.encode(phase, forKey: .phase)
+        try container.encode(discoveredCount, forKey: .discoveredCount)
+        try container.encode(searchableCount, forKey: .searchableCount)
+        try container.encode(optimizedCount, forKey: .optimizedCount)
+        try container.encode(snapshotRevision, forKey: .snapshotRevision)
+        try container.encode(status, forKey: .status)
+        try container.encode(lastUpdated, forKey: .lastUpdated)
+        try container.encodeIfPresent(activeOperationStartedAt, forKey: .activeOperationStartedAt)
+        try container.encodeIfPresent(lastCheckpointAt, forKey: .lastCheckpointAt)
+        try container.encode(resumedFromCheckpoint, forKey: .resumedFromCheckpoint)
     }
 }
 
@@ -2001,7 +2023,7 @@ public final class FileIndex: @unchecked Sendable {
     private var usageMetrics = IndexUsageMetrics()
     private var snapshotLoadState = SnapshotLoadState.notStarted
     private var indexing = false
-    private var refreshing = false
+    private var reconciling = false
     private var updating = false
     private var phase: IndexPhase = .idle
     private var discoveredCount = 0
@@ -2191,7 +2213,7 @@ public final class FileIndex: @unchecked Sendable {
             snapshotLoadState = .finished
             roots = canonicalRoots.map(\.path)
             indexing = true
-            refreshing = false
+            reconciling = false
             updating = false
             phase = .scanning
             discoveredCount = 0
@@ -2271,10 +2293,10 @@ public final class FileIndex: @unchecked Sendable {
         let currentGeneration = lock.withLock { () -> UInt64 in
             generation &+= 1
             indexing = true
-            refreshing = true
+            reconciling = true
             updating = false
             phase = .scanning
-            status = reconcilesAllRoots ? "Refreshing index" : "Refreshing changed folders"
+            status = reconcilesAllRoots ? "Reconciling index" : "Reconciling changed folders"
             discoveredCount = 0
             searchableCount = searchSnapshot.resultCount
             activeOperationStartedAt = reconcileStarted
@@ -4395,7 +4417,7 @@ public final class FileIndex: @unchecked Sendable {
             searchSnapshotRevision &+= 1
             status = "Index deleted"
             indexing = false
-            refreshing = false
+            reconciling = false
             updating = false
             phase = .idle
             discoveredCount = 0
@@ -4421,7 +4443,7 @@ public final class FileIndex: @unchecked Sendable {
             }
 
             snapshotLoadState = .loading
-            refreshing = false
+            reconciling = false
             updating = false
             phase = .loading
             status = "Loading saved index"
@@ -4455,7 +4477,7 @@ public final class FileIndex: @unchecked Sendable {
                 phase = .idle
                 status = "No index yet"
                 indexing = false
-                refreshing = false
+                reconciling = false
                 updating = false
                 discoveredCount = 0
                 searchableCount = 0
@@ -4500,7 +4522,7 @@ public final class FileIndex: @unchecked Sendable {
                 phase = .idle
                 status = "Index settings changed"
                 indexing = false
-                refreshing = false
+                reconciling = false
                 updating = false
                 discoveredCount = 0
                 searchableCount = 0
@@ -4520,7 +4542,7 @@ public final class FileIndex: @unchecked Sendable {
             phase = .ready
             status = "Loaded \(snapshot.resultCount) indexed files"
             indexing = false
-            refreshing = false
+            reconciling = false
             updating = false
             discoveredCount = snapshot.resultCount
             searchableCount = snapshot.resultCount
@@ -4726,7 +4748,7 @@ public final class FileIndex: @unchecked Sendable {
             initialStore: initialStore,
             generation: currentGeneration,
             publishesIntermediateSnapshots: false,
-            completionStatusPrefix: "Refreshed"
+            completionStatusPrefix: "Reconciled"
         )
         guard isCurrentGeneration(currentGeneration) else { return }
         recordFullRebuild(duration: Date().timeIntervalSince(started))
@@ -4912,7 +4934,7 @@ public final class FileIndex: @unchecked Sendable {
             searchSnapshot = snapshot
             searchSnapshotRevision &+= 1
             indexing = true
-            refreshing = false
+            reconciling = false
             updating = false
             phase = .scanning
             discoveredCount = visited
@@ -4942,7 +4964,7 @@ public final class FileIndex: @unchecked Sendable {
                 return false
             }
 
-            let verb = refreshing ? "Refreshing" : "Indexing"
+            let verb = reconciling ? "Reconciling" : "Indexing"
             discoveredCount = visited
             status = "\(verb) \(discoveredCount.formatted()) discovered"
             lastUpdated = Date()
@@ -5116,7 +5138,7 @@ public final class FileIndex: @unchecked Sendable {
             searchSnapshot = snapshot
             searchSnapshotRevision &+= 1
             indexing = false
-            refreshing = false
+            reconciling = false
             updating = false
             phase = .ready
             discoveredCount = records.count
@@ -5204,7 +5226,7 @@ public final class FileIndex: @unchecked Sendable {
             searchSnapshot = snapshot
             searchSnapshotRevision &+= 1
             indexing = false
-            refreshing = false
+            reconciling = false
             updating = false
             phase = .ready
             discoveredCount = snapshot.resultCount
@@ -5279,7 +5301,7 @@ public final class FileIndex: @unchecked Sendable {
             }
 
             indexing = false
-            refreshing = false
+            reconciling = false
             updating = false
             phase = .failed
             status = message
@@ -5299,7 +5321,7 @@ public final class FileIndex: @unchecked Sendable {
         lock.withLock {
             generation &+= 1
             indexing = false
-            refreshing = false
+            reconciling = false
             updating = false
             phase = .failed
             status = "The index supports at most \(Self.maximumIndexedRootCount.formatted()) roots, but \(count.formatted()) were configured."
@@ -5330,7 +5352,7 @@ public final class FileIndex: @unchecked Sendable {
 
             indexing = isIndexing
             if !isIndexing {
-                refreshing = false
+                reconciling = false
                 updating = false
             }
             self.phase = phase
@@ -5421,7 +5443,7 @@ public final class FileIndex: @unchecked Sendable {
             guard !indexing else { return nil }
             generation &+= 1
             indexing = true
-            refreshing = false
+            reconciling = false
             updating = true
             phase = .scanning
             status = "Updating changed paths"
@@ -5505,7 +5527,7 @@ public final class FileIndex: @unchecked Sendable {
             let didApply = lock.withLock { () -> Bool in
                 guard generation == currentGeneration else { return false }
                 indexing = false
-                refreshing = false
+                reconciling = false
                 updating = false
                 phase = .ready
                 status = "No file changes"
@@ -5550,7 +5572,7 @@ public final class FileIndex: @unchecked Sendable {
                 status = "Updated \(changedPathCount) changed path\(changedPathCount == 1 ? "" : "s")"
                 phase = .ready
                 indexing = false
-                refreshing = false
+                reconciling = false
                 updating = false
                 discoveredCount = updatedSnapshot.resultCount
                 searchableCount = updatedSnapshot.resultCount
@@ -5651,7 +5673,7 @@ public final class FileIndex: @unchecked Sendable {
             status = "Updated \(changedPathCount) changed path\(changedPathCount == 1 ? "" : "s")"
             phase = .ready
             indexing = false
-            refreshing = false
+            reconciling = false
             updating = false
             discoveredCount = snapshot.resultCount
             searchableCount = snapshot.resultCount
@@ -5775,7 +5797,7 @@ public final class FileIndex: @unchecked Sendable {
     private func updateIndexingProgress(status: String, indexedCount: Int) {
         lock.withLock {
             indexing = true
-            refreshing = false
+            reconciling = false
             updating = false
             self.status = "\(status) discovered"
             lastUpdated = Date()
@@ -5805,7 +5827,7 @@ public final class FileIndex: @unchecked Sendable {
             searchSnapshot = snapshot
             searchSnapshotRevision &+= 1
             indexing = isIndexing
-            refreshing = false
+            reconciling = false
             updating = false
             phase = isIndexing ? .scanning : .ready
             discoveredCount = snapshot.resultCount
@@ -5928,7 +5950,7 @@ public final class FileIndex: @unchecked Sendable {
             lock.withLock {
                 phase = .failed
                 indexing = false
-                refreshing = false
+                reconciling = false
                 updating = false
                 status = "Could not persist index: \(error.localizedDescription)"
                 lastUpdated = Date()
@@ -6269,7 +6291,7 @@ public final class FileIndex: @unchecked Sendable {
                 optimizedCount = searchSnapshot.isOptimizedForSearch ? searchSnapshot.resultCount : 0
             }
             indexing = true
-            refreshing = false
+            reconciling = false
             updating = false
             phase = .scanning
             discoveredCount = checkpoint.state.discoveredCount
@@ -6586,7 +6608,7 @@ public final class FileIndex: @unchecked Sendable {
                 searchSnapshot = snapshot
                 searchSnapshotRevision &+= 1
                 indexing = phase == .scanning || phase == .optimizing || phase == .saving
-                refreshing = false
+                reconciling = false
                 updating = false
                 self.phase = phase
                 discoveredCount = records.count
@@ -6646,7 +6668,7 @@ public final class FileIndex: @unchecked Sendable {
             self.generation &+= 1
             roots = canonicalRoots.map(\.path)
             indexing = true
-            refreshing = false
+            reconciling = false
             updating = false
             phase = .scanning
             activeOperationStartedAt = Date()
@@ -6672,7 +6694,7 @@ public final class FileIndex: @unchecked Sendable {
                 stats: IndexStats(
                     indexedCount: searchSnapshot.resultCount,
                     isIndexing: indexing,
-                    isRefreshing: refreshing,
+                    isReconciling: reconciling,
                     isUpdating: updating,
                     isLoadingSnapshot: snapshotLoadState == .loading,
                     phase: phase,
@@ -6712,7 +6734,7 @@ public final class FileIndex: @unchecked Sendable {
         IndexStats(
             indexedCount: searchSnapshot.resultCount,
             isIndexing: indexing,
-            isRefreshing: refreshing,
+            isReconciling: reconciling,
             isUpdating: updating,
             isLoadingSnapshot: snapshotLoadState == .loading,
             phase: phase,

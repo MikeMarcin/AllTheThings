@@ -162,7 +162,7 @@ final class FSEventStreamHistoryReplaySource: FSEventHistoryReplaySource {
 }
 
 enum FSEventReconciliationAction: Equatable, Sendable {
-    case update(paths: [String], cursorUpdates: [String: UInt64])
+    case reconcile(rootPaths: [String])
     case upToDate(baselineEventID: UInt64)
     case fullReconcile(rootPaths: [String]?)
 }
@@ -226,14 +226,14 @@ final class FSEventReconciliationCoordinator: @unchecked Sendable {
 }
 
 private final class FSEventHistoryReplayCollector: @unchecked Sendable {
-    private static let maximumIncrementalRefreshPaths = 5_000
+    private static let maximumHistoricalReconciliationPaths = 5_000
 
     private let rootPaths: [String]
     private let lock = NSLock()
     private var changedPaths = Set<String>()
+    private var changedRootPaths = Set<String>()
     private var fallbackRootPaths = Set<String>()
     private var requiresGlobalFallback = false
-    private var cursorUpdates: [String: UInt64] = [:]
     private var sawHistoryDone = false
 
     init(rootPaths: [String]) {
@@ -255,7 +255,7 @@ private final class FSEventHistoryReplayCollector: @unchecked Sendable {
                 continue
             }
 
-            cursorUpdates[rootPath] = max(cursorUpdates[rootPath] ?? 0, UInt64(event.eventID))
+            changedRootPaths.insert(rootPath)
 
             if requiresGlobalFallback {
                 continue
@@ -264,7 +264,7 @@ private final class FSEventHistoryReplayCollector: @unchecked Sendable {
             if event.historyIsUnsafe || event.requiresRecursiveRescan {
                 fallbackRootPaths.insert(rootPath)
             } else {
-                guard changedPaths.count < Self.maximumIncrementalRefreshPaths else {
+                guard changedPaths.count < Self.maximumHistoricalReconciliationPaths else {
                     changedPaths.removeAll(keepingCapacity: false)
                     requiresGlobalFallback = true
                     continue
@@ -287,14 +287,14 @@ private final class FSEventHistoryReplayCollector: @unchecked Sendable {
         }
 
         if !fallbackRootPaths.isEmpty {
-            return .fullReconcile(rootPaths: fallbackRootPaths.sorted())
+            return .fullReconcile(rootPaths: fallbackRootPaths.union(changedRootPaths).sorted())
         }
 
         if changedPaths.isEmpty {
             return .upToDate(baselineEventID: currentEventID)
         }
 
-        return .update(paths: changedPaths.sorted(), cursorUpdates: cursorUpdates)
+        return .reconcile(rootPaths: changedRootPaths.sorted())
     }
 
     private func matchingRoot(for path: String) -> String? {
