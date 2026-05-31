@@ -8,7 +8,7 @@ final class InsightsWindowController: NSWindowController {
         defaults: UserDefaults = .standard,
         clearCachedIndexHandler: @escaping () throws -> Void
     ) {
-        let contentSize = NSSize(width: 980, height: 760)
+        let contentSize = NSSize(width: 980, height: 720)
         let viewController = InsightsViewController(
             index: index,
             defaults: defaults,
@@ -24,7 +24,7 @@ final class InsightsWindowController: NSWindowController {
         )
         window.title = "Insights"
         window.isRestorable = false
-        window.contentMinSize = NSSize(width: 860, height: 640)
+        window.contentMinSize = NSSize(width: 900, height: 620)
         window.contentViewController = viewController
         window.setContentSize(contentSize)
         window.center()
@@ -47,6 +47,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
     private let scrollView = NSScrollView()
     private let contentView = FlippedView()
     private let overviewGrid = NSGridView()
+    private let storageTitleLabel = NSTextField(labelWithString: "")
     private let treemapView = InsightsTreemapView()
     private let activityChartView = InsightsBarChartView()
     private let rootsTableView = NSTableView()
@@ -83,7 +84,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
     }
 
     override func loadView() {
-        view = ThemedBackgroundView(frame: NSRect(x: 0, y: 0, width: 980, height: 760))
+        view = ThemedBackgroundView(frame: NSRect(x: 0, y: 0, width: 980, height: 720))
         buildInterface()
     }
 
@@ -114,7 +115,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
 
         let titleLabel = NSTextField(labelWithString: "Insights")
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
-        titleLabel.font = .systemFont(ofSize: 28, weight: .semibold)
+        titleLabel.font = .systemFont(ofSize: 24, weight: .semibold)
         titleLabel.textColor = .labelColor
 
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -138,21 +139,25 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         buttonStack.spacing = 8
 
         overviewGrid.translatesAutoresizingMaskIntoConstraints = false
-        overviewGrid.rowSpacing = 10
-        overviewGrid.columnSpacing = 10
+        overviewGrid.rowSpacing = 8
+        overviewGrid.columnSpacing = 8
         overviewGrid.xPlacement = .fill
         overviewGrid.yPlacement = .fill
 
         let overviewCard = makeCard(containing: overviewGrid)
 
         let storageLabel = makeSectionLabel("Storage")
+        storageTitleLabel.translatesAutoresizingMaskIntoConstraints = false
+        storageTitleLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+        storageTitleLabel.textColor = .labelColor
+        storageTitleLabel.lineBreakMode = .byTruncatingTail
         treemapView.translatesAutoresizingMaskIntoConstraints = false
         storageSummaryLabel.translatesAutoresizingMaskIntoConstraints = false
         storageSummaryLabel.font = .systemFont(ofSize: 12)
         storageSummaryLabel.textColor = .secondaryLabelColor
         storageSummaryLabel.lineBreakMode = .byWordWrapping
-        storageSummaryLabel.maximumNumberOfLines = 3
-        let storageStack = verticalStack([treemapView, storageSummaryLabel], spacing: 10)
+        storageSummaryLabel.maximumNumberOfLines = 2
+        let storageStack = verticalStack([storageTitleLabel, treemapView, storageSummaryLabel], spacing: 6)
         let storageCard = makeCard(containing: storageStack)
 
         let rootsLabel = makeSectionLabel("Indexed Roots")
@@ -171,24 +176,21 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         performanceSummaryLabel.font = .systemFont(ofSize: 12)
         performanceSummaryLabel.textColor = .secondaryLabelColor
         performanceSummaryLabel.lineBreakMode = .byWordWrapping
-        performanceSummaryLabel.maximumNumberOfLines = 4
-        let activityCard = makeCard(containing: verticalStack([activityChartView, performanceSummaryLabel], spacing: 10))
+        performanceSummaryLabel.maximumNumberOfLines = 2
+        let activityCard = makeCard(containing: verticalStack([activityChartView, performanceSummaryLabel], spacing: 8))
 
         let healthLabel = makeSectionLabel("Performance & Health")
         healthSummaryLabel.translatesAutoresizingMaskIntoConstraints = false
         healthSummaryLabel.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
         healthSummaryLabel.textColor = .secondaryLabelColor
         healthSummaryLabel.lineBreakMode = .byWordWrapping
-        healthSummaryLabel.maximumNumberOfLines = 12
-        let healthCard = makeCard(containing: healthSummaryLabel)
-
-        let lifetimeLabel = makeSectionLabel("Lifetime")
+        healthSummaryLabel.maximumNumberOfLines = 7
         lifetimeSummaryLabel.translatesAutoresizingMaskIntoConstraints = false
         lifetimeSummaryLabel.font = .systemFont(ofSize: 12)
         lifetimeSummaryLabel.textColor = .secondaryLabelColor
         lifetimeSummaryLabel.lineBreakMode = .byWordWrapping
-        lifetimeSummaryLabel.maximumNumberOfLines = 4
-        let lifetimeCard = makeCard(containing: lifetimeSummaryLabel)
+        lifetimeSummaryLabel.maximumNumberOfLines = 2
+        let healthCard = makeCard(containing: verticalStack([healthSummaryLabel, lifetimeSummaryLabel], spacing: 8))
 
         for item in [
             titleLabel,
@@ -202,9 +204,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
             activityLabel,
             activityCard,
             healthLabel,
-            healthCard,
-            lifetimeLabel,
-            lifetimeCard
+            healthCard
         ] {
             contentView.addSubview(item)
         }
@@ -222,60 +222,53 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
             contentView.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
             contentView.heightAnchor.constraint(greaterThanOrEqualTo: scrollView.contentView.heightAnchor),
 
-            titleLabel.topAnchor.constraint(equalTo: contentView.safeAreaLayoutGuide.topAnchor, constant: 26),
-            titleLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 32),
+            titleLabel.topAnchor.constraint(equalTo: contentView.safeAreaLayoutGuide.topAnchor, constant: 18),
+            titleLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 26),
 
             statusLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 4),
             statusLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
-            statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: contentView.trailingAnchor, constant: -32),
+            statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: contentView.trailingAnchor, constant: -26),
 
             buttonStack.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
-            buttonStack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -32),
+            buttonStack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -26),
 
-            overviewCard.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 18),
+            overviewCard.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 12),
             overviewCard.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
-            overviewCard.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -32),
+            overviewCard.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -26),
 
-            storageLabel.topAnchor.constraint(equalTo: overviewCard.bottomAnchor, constant: 26),
+            storageLabel.topAnchor.constraint(equalTo: overviewCard.bottomAnchor, constant: 16),
             storageLabel.leadingAnchor.constraint(equalTo: overviewCard.leadingAnchor),
 
-            storageCard.topAnchor.constraint(equalTo: storageLabel.bottomAnchor, constant: 10),
+            storageCard.topAnchor.constraint(equalTo: storageLabel.bottomAnchor, constant: 8),
             storageCard.leadingAnchor.constraint(equalTo: overviewCard.leadingAnchor),
             storageCard.widthAnchor.constraint(equalTo: overviewCard.widthAnchor, multiplier: 0.48),
-            treemapView.heightAnchor.constraint(equalToConstant: 230),
+            treemapView.heightAnchor.constraint(equalToConstant: 124),
 
             rootsLabel.topAnchor.constraint(equalTo: storageLabel.topAnchor),
             rootsLabel.leadingAnchor.constraint(equalTo: storageCard.trailingAnchor, constant: 18),
 
-            rootsCard.topAnchor.constraint(equalTo: rootsLabel.bottomAnchor, constant: 10),
+            rootsCard.topAnchor.constraint(equalTo: rootsLabel.bottomAnchor, constant: 8),
             rootsCard.leadingAnchor.constraint(equalTo: rootsLabel.leadingAnchor),
             rootsCard.trailingAnchor.constraint(equalTo: overviewCard.trailingAnchor),
             rootsCard.heightAnchor.constraint(equalTo: storageCard.heightAnchor),
-            rootsScrollView.heightAnchor.constraint(equalToConstant: 270),
+            rootsScrollView.heightAnchor.constraint(equalToConstant: 178),
 
-            activityLabel.topAnchor.constraint(equalTo: storageCard.bottomAnchor, constant: 26),
+            activityLabel.topAnchor.constraint(equalTo: storageCard.bottomAnchor, constant: 16),
             activityLabel.leadingAnchor.constraint(equalTo: overviewCard.leadingAnchor),
 
-            activityCard.topAnchor.constraint(equalTo: activityLabel.bottomAnchor, constant: 10),
+            activityCard.topAnchor.constraint(equalTo: activityLabel.bottomAnchor, constant: 8),
             activityCard.leadingAnchor.constraint(equalTo: overviewCard.leadingAnchor),
             activityCard.widthAnchor.constraint(equalTo: storageCard.widthAnchor),
-            activityChartView.heightAnchor.constraint(equalToConstant: 170),
+            activityChartView.heightAnchor.constraint(equalToConstant: 104),
 
             healthLabel.topAnchor.constraint(equalTo: activityLabel.topAnchor),
             healthLabel.leadingAnchor.constraint(equalTo: activityCard.trailingAnchor, constant: 18),
 
-            healthCard.topAnchor.constraint(equalTo: healthLabel.bottomAnchor, constant: 10),
+            healthCard.topAnchor.constraint(equalTo: healthLabel.bottomAnchor, constant: 8),
             healthCard.leadingAnchor.constraint(equalTo: healthLabel.leadingAnchor),
             healthCard.trailingAnchor.constraint(equalTo: overviewCard.trailingAnchor),
             healthCard.heightAnchor.constraint(equalTo: activityCard.heightAnchor),
-
-            lifetimeLabel.topAnchor.constraint(equalTo: activityCard.bottomAnchor, constant: 26),
-            lifetimeLabel.leadingAnchor.constraint(equalTo: overviewCard.leadingAnchor),
-
-            lifetimeCard.topAnchor.constraint(equalTo: lifetimeLabel.bottomAnchor, constant: 10),
-            lifetimeCard.leadingAnchor.constraint(equalTo: overviewCard.leadingAnchor),
-            lifetimeCard.trailingAnchor.constraint(equalTo: overviewCard.trailingAnchor),
-            lifetimeCard.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -28)
+            healthCard.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -18)
         ])
     }
 
@@ -308,30 +301,34 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
 
     private func apply(snapshot: IndexInsightsSnapshot) {
         latestSnapshot = snapshot
-        displayedRoots = snapshot.roots
+        displayedRoots = InsightsRootDisplay.roots(
+            snapshotRoots: snapshot.roots,
+            configuredRootPaths: configuredIndexedRootPaths()
+        )
         sortDisplayedRoots()
 
         statusLabel.stringValue = "\(snapshot.stats.status) - updated \(relativeDateString(snapshot.stats.lastUpdated))"
         clearCachedIndexButton.isEnabled = snapshot.health.canClearCachedIndex
 
-        rebuildOverviewGrid(snapshot)
+        rebuildOverviewGrid(snapshot, displayedRootCount: displayedRoots.count)
         treemapView.roots = displayedRoots
         activityChartView.buckets = Array(snapshot.usage.dailyBuckets.suffix(30))
         rootsTableView.reloadData()
 
-        storageSummaryLabel.stringValue = "ATT data uses \(byteString(snapshot.storage.totalATTDataBytes)). The index package is \(byteString(snapshot.storage.indexPackageBytes)); root attribution is estimated from indexed path weight."
+        storageTitleLabel.stringValue = storageTitleText(roots: displayedRoots)
+        storageSummaryLabel.stringValue = storageSummaryText(snapshot, displayedRoots: displayedRoots)
         performanceSummaryLabel.stringValue = "Searches: \(snapshot.usage.allTimeSearches.completed.formatted()) completed, \(snapshot.usage.allTimeSearches.fallbackScans.formatted()) full fallback scans, average latency \(durationString(snapshot.usage.allTimeSearches.averageLatency))."
         healthSummaryLabel.stringValue = healthText(snapshot)
         lifetimeSummaryLabel.stringValue = lifetimeText(snapshot)
     }
 
-    private func rebuildOverviewGrid(_ snapshot: IndexInsightsSnapshot) {
+    private func rebuildOverviewGrid(_ snapshot: IndexInsightsSnapshot, displayedRootCount: Int) {
         while overviewGrid.numberOfRows > 0 {
             overviewGrid.removeRow(at: 0)
         }
 
         let tiles = [
-            makeMetricTile(title: "Tracked Files", value: snapshot.stats.indexedCount.formatted(), detail: "\(snapshot.roots.count) roots"),
+            makeMetricTile(title: "Tracked Files", value: snapshot.stats.indexedCount.formatted(), detail: "\(displayedRootCount) roots"),
             makeMetricTile(title: "ATT Data", value: byteString(snapshot.storage.totalATTDataBytes), detail: "Index \(byteString(snapshot.storage.indexPackageBytes))"),
             makeMetricTile(title: "Searches", value: snapshot.usage.allTimeSearches.completed.formatted(), detail: "\(snapshot.usage.allTimeSearches.fallbackScans.formatted()) fallbacks"),
             makeMetricTile(title: "Index Updates", value: snapshot.usage.health.incrementalRefreshBatches.formatted(), detail: "\(snapshot.usage.health.fullRebuilds.formatted()) rebuilds"),
@@ -339,8 +336,8 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
             makeMetricTile(title: "Launches", value: snapshot.lifetime.launchCount.formatted(), detail: dateOnlyString(snapshot.lifetime.firstLaunchDate))
         ]
 
-        for rowStart in stride(from: 0, to: tiles.count, by: 3) {
-            let rowViews = Array(tiles[rowStart..<min(rowStart + 3, tiles.count)])
+        for rowStart in stride(from: 0, to: tiles.count, by: 6) {
+            let rowViews = Array(tiles[rowStart..<min(rowStart + 6, tiles.count)])
             overviewGrid.addRow(with: rowViews)
         }
     }
@@ -348,7 +345,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
     private func configureRootsTable() {
         rootsTableView.translatesAutoresizingMaskIntoConstraints = false
         rootsTableView.headerView = NSTableHeaderView()
-        rootsTableView.rowHeight = 34
+        rootsTableView.rowHeight = 26
         rootsTableView.usesAlternatingRowBackgroundColors = false
         rootsTableView.dataSource = self
         rootsTableView.delegate = self
@@ -361,6 +358,54 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         ] {
             rootsTableView.addTableColumn(column)
         }
+    }
+
+    private func storageTitleText(roots: [IndexRootInsight]) -> String {
+        let rootsWithData = roots.filter { root in
+            root.trackedFileCount > 0 || root.directoryCount > 0 || root.pathByteWeight > 0
+        }.count
+        if roots.isEmpty {
+            return "Estimated index package share by root"
+        }
+        return "Estimated index package share by root (\(rootsWithData) of \(roots.count) with indexed data)"
+    }
+
+    private func storageSummaryText(_ snapshot: IndexInsightsSnapshot, displayedRoots: [IndexRootInsight]) -> String {
+        var parts = [
+            "ATT data \(byteString(snapshot.storage.totalATTDataBytes)); index package \(byteString(snapshot.storage.indexPackageBytes)).",
+            "Counts are exact; package bytes are estimated from indexed path weight."
+        ]
+
+        let snapshotRootPaths = Set(snapshot.roots.map(\.path))
+        let pendingRoots = displayedRoots.filter { !snapshotRootPaths.contains($0.path) }.count
+        if pendingRoots > 0 {
+            parts.append("\(pendingRoots) configured root\(pendingRoots == 1 ? "" : "s") waiting for snapshot load or rebuild.")
+        } else {
+            parts.append(storageMeasurementText(snapshot.storage))
+        }
+
+        return parts.joined(separator: " ")
+    }
+
+    private func storageMeasurementText(_ storage: IndexStorageInsights) -> String {
+        if storage.isMeasuring {
+            return "Full data-folder sizing is still measuring."
+        }
+        guard let measuredAt = storage.measuredAt else {
+            return "Showing package sizing until background measurement finishes."
+        }
+        return "Storage measured \(relativeDateString(measuredAt))."
+    }
+
+    private func configuredIndexedRootPaths() -> [String] {
+        var seen = Set<String>()
+        var paths: [String] = []
+        for url in AppSettings.indexedRoots(defaults: defaults) {
+            let path = url.standardizedFileURL.path
+            guard seen.insert(path).inserted else { continue }
+            paths.append(path)
+        }
+        return paths
     }
 
     private func makeTableColumn(_ identifier: String, title: String, width: CGFloat) -> NSTableColumn {
@@ -547,9 +592,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
             "full-scan rows: \(searches.scannedRowsExamined.formatted())",
             "snapshot load failures: \(health.snapshotLoadFailures.formatted())",
             "persist failures: \(health.persistFailures.formatted())",
-            "active jobs: \(snapshot.health.activeIndexJobs)",
-            "schema: \(snapshot.health.schemaVersion)",
-            "path index: \(snapshot.health.pathGramIndexEnabled ? "enabled" : "disabled")"
+            "active jobs: \(snapshot.health.activeIndexJobs), schema: \(snapshot.health.schemaVersion), path index: \(snapshot.health.pathGramIndexEnabled ? "enabled" : "disabled")"
         ].joined(separator: "\n")
     }
 
@@ -584,27 +627,27 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
 
     private func makeMetricTile(title: String, value: String, detail: String) -> NSView {
         let titleLabel = NSTextField(labelWithString: title)
-        titleLabel.font = .systemFont(ofSize: 11, weight: .medium)
+        titleLabel.font = .systemFont(ofSize: 10, weight: .medium)
         titleLabel.textColor = .secondaryLabelColor
 
         let valueLabel = NSTextField(labelWithString: value)
-        valueLabel.font = .monospacedDigitSystemFont(ofSize: 22, weight: .semibold)
+        valueLabel.font = .monospacedDigitSystemFont(ofSize: 18, weight: .semibold)
         valueLabel.textColor = .labelColor
         valueLabel.lineBreakMode = .byTruncatingTail
         valueLabel.maximumNumberOfLines = 1
 
         let detailLabel = NSTextField(labelWithString: detail)
-        detailLabel.font = .systemFont(ofSize: 11, weight: .regular)
+        detailLabel.font = .systemFont(ofSize: 10, weight: .regular)
         detailLabel.textColor = .tertiaryLabelColor
         detailLabel.lineBreakMode = .byTruncatingTail
 
-        let stack = verticalStack([titleLabel, valueLabel, detailLabel], spacing: 3)
+        let stack = verticalStack([titleLabel, valueLabel, detailLabel], spacing: 2)
         stack.wantsLayer = true
         stack.layer?.cornerRadius = 6
         stack.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.55).cgColor
-        stack.edgeInsets = NSEdgeInsets(top: 12, left: 14, bottom: 12, right: 14)
+        stack.edgeInsets = NSEdgeInsets(top: 8, left: 10, bottom: 8, right: 10)
         NSLayoutConstraint.activate([
-            stack.heightAnchor.constraint(greaterThanOrEqualToConstant: 86)
+            stack.heightAnchor.constraint(greaterThanOrEqualToConstant: 62)
         ])
         return stack
     }
@@ -621,10 +664,10 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         content.translatesAutoresizingMaskIntoConstraints = false
         card.addSubview(content)
         NSLayoutConstraint.activate([
-            content.topAnchor.constraint(equalTo: card.topAnchor, constant: 14),
-            content.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
-            content.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
-            content.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -14)
+            content.topAnchor.constraint(equalTo: card.topAnchor, constant: 10),
+            content.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 10),
+            content.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -10),
+            content.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -10)
         ])
         return card
     }
@@ -670,6 +713,45 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
     }
 }
 
+enum InsightsRootDisplay {
+    static func roots(
+        snapshotRoots: [IndexRootInsight],
+        configuredRootPaths: [String]
+    ) -> [IndexRootInsight] {
+        guard !configuredRootPaths.isEmpty else {
+            return snapshotRoots
+        }
+
+        let snapshotByPath = Dictionary(uniqueKeysWithValues: snapshotRoots.map { ($0.path, $0) })
+        var seen = Set<String>()
+        var roots: [IndexRootInsight] = []
+        roots.reserveCapacity(max(snapshotRoots.count, configuredRootPaths.count))
+
+        for path in configuredRootPaths where seen.insert(path).inserted {
+            if let root = snapshotByPath[path] {
+                roots.append(root)
+            } else {
+                roots.append(IndexRootInsight(
+                    path: path,
+                    trackedFileCount: 0,
+                    directoryCount: 0,
+                    hiddenCount: 0,
+                    indexedContentBytes: 0,
+                    pathByteWeight: 0,
+                    estimatedIndexBytes: 0,
+                    attributionSource: .estimated
+                ))
+            }
+        }
+
+        for root in snapshotRoots where seen.insert(root.path).inserted {
+            roots.append(root)
+        }
+
+        return roots
+    }
+}
+
 private final class InsightsTreemapView: NSView {
     var roots: [IndexRootInsight] = [] {
         didSet { needsDisplay = true }
@@ -687,38 +769,31 @@ private final class InsightsTreemapView: NSView {
             return
         }
 
-        let total = roots.reduce(UInt64(0)) { $0 &+ max($1.estimatedIndexBytes, UInt64($1.trackedFileCount)) }
-        guard total > 0 else {
+        let weights = roots.map(Self.layoutWeight(for:))
+        let items = InsightsTreemapLayout.layout(weights: weights, in: bounds.insetBy(dx: 1, dy: 1))
+        guard !items.isEmpty else {
             drawEmpty("No indexed data yet")
             return
         }
 
-        var remaining = bounds.insetBy(dx: 1, dy: 1)
-        let palette: [NSColor] = [.systemBlue, .systemGreen, .systemPink, .systemOrange, .systemPurple, .systemTeal]
+        let total = items.reduce(UInt64(0)) { $0 &+ weights[$1.index] }
+        let labels = Self.compactLabels(for: roots.map(\.path))
+        let palette: [NSColor] = [.systemBlue, .systemGreen, .systemPink, .systemOrange, .systemPurple, .systemTeal, .systemIndigo]
 
-        for (index, root) in roots.enumerated() {
-            let weight = max(root.estimatedIndexBytes, UInt64(root.trackedFileCount))
-            let fraction = CGFloat(Double(weight) / Double(total))
-            let isLast = index == roots.count - 1
-            let rect: NSRect
-            if remaining.width >= remaining.height {
-                let width = isLast ? remaining.width : max(1, floor(remaining.width * fraction))
-                rect = NSRect(x: remaining.minX, y: remaining.minY, width: width, height: remaining.height)
-                remaining.origin.x += width
-                remaining.size.width -= width
-            } else {
-                let height = isLast ? remaining.height : max(1, floor(remaining.height * fraction))
-                rect = NSRect(x: remaining.minX, y: remaining.minY, width: remaining.width, height: height)
-                remaining.origin.y += height
-                remaining.size.height -= height
-            }
-
-            let color = palette[index % palette.count]
+        for item in items {
+            let root = roots[item.index]
+            let rect = item.rect
+            let color = palette[item.index % palette.count]
             color.withAlphaComponent(0.72).setFill()
             NSBezierPath(roundedRect: rect.insetBy(dx: 2, dy: 2), xRadius: 5, yRadius: 5).fill()
+            NSColor.white.withAlphaComponent(0.22).setStroke()
+            NSBezierPath(roundedRect: rect.insetBy(dx: 2.5, dy: 2.5), xRadius: 5, yRadius: 5).stroke()
 
             if rect.width > 84, rect.height > 42 {
-                let label = "Root \(index + 1)\n\(root.trackedFileCount.formatted()) files"
+                let percent = total == 0
+                    ? "0%"
+                    : "\(Int((Double(weights[item.index]) / Double(total) * 100).rounded()))%"
+                let label = "\(labels[item.index])\n\(percent) - \(root.trackedFileCount.formatted()) files"
                 let attributes: [NSAttributedString.Key: Any] = [
                     .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
                     .foregroundColor: NSColor.white
@@ -731,6 +806,36 @@ private final class InsightsTreemapView: NSView {
         }
     }
 
+    nonisolated private static func layoutWeight(for root: IndexRootInsight) -> UInt64 {
+        if root.estimatedIndexBytes > 0 {
+            return root.estimatedIndexBytes
+        }
+        if root.pathByteWeight > 0 {
+            return root.pathByteWeight
+        }
+        return UInt64(max(root.trackedFileCount + root.directoryCount, 0))
+    }
+
+    nonisolated private static func compactLabels(for paths: [String]) -> [String] {
+        let components = paths.map { path -> [String] in
+            let parts = path.split(separator: "/").map(String.init)
+            return parts.isEmpty ? [path] : parts
+        }
+        let maxDepth = max(components.map(\.count).max() ?? 1, 1)
+
+        for depth in 1...maxDepth {
+            let labels = components.map { parts -> String in
+                let suffix = parts.suffix(depth)
+                return suffix.isEmpty ? "/" : suffix.joined(separator: "/")
+            }
+            if Set(labels).count == labels.count {
+                return labels
+            }
+        }
+
+        return paths
+    }
+
     private func drawEmpty(_ text: String) {
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 13, weight: .medium),
@@ -741,6 +846,52 @@ private final class InsightsTreemapView: NSView {
             at: NSPoint(x: bounds.midX - size.width / 2, y: bounds.midY - size.height / 2),
             withAttributes: attributes
         )
+    }
+}
+
+struct InsightsTreemapLayoutItem: Equatable {
+    let index: Int
+    let rect: NSRect
+}
+
+enum InsightsTreemapLayout {
+    static func layout(weights: [UInt64], in bounds: NSRect) -> [InsightsTreemapLayoutItem] {
+        guard bounds.width > 0, bounds.height > 0 else { return [] }
+
+        let activeWeights = weights.enumerated().filter { $0.element > 0 }
+        var remainingWeight = activeWeights.reduce(UInt64(0)) { $0 &+ $1.element }
+        guard remainingWeight > 0 else { return [] }
+
+        var remaining = bounds
+        var items: [InsightsTreemapLayoutItem] = []
+        items.reserveCapacity(activeWeights.count)
+
+        for (offset, entry) in activeWeights.enumerated() {
+            guard remaining.width > 0, remaining.height > 0 else { break }
+
+            let isLast = offset == activeWeights.count - 1
+            let rect: NSRect
+            if remaining.width >= remaining.height {
+                let width = isLast
+                    ? remaining.width
+                    : min(remaining.width, max(1, floor(remaining.width * CGFloat(Double(entry.element) / Double(remainingWeight)))))
+                rect = NSRect(x: remaining.minX, y: remaining.minY, width: width, height: remaining.height)
+                remaining.origin.x += width
+                remaining.size.width -= width
+            } else {
+                let height = isLast
+                    ? remaining.height
+                    : min(remaining.height, max(1, floor(remaining.height * CGFloat(Double(entry.element) / Double(remainingWeight)))))
+                rect = NSRect(x: remaining.minX, y: remaining.minY, width: remaining.width, height: height)
+                remaining.origin.y += height
+                remaining.size.height -= height
+            }
+
+            items.append(InsightsTreemapLayoutItem(index: entry.offset, rect: rect))
+            remainingWeight = remainingWeight > entry.element ? remainingWeight - entry.element : 0
+        }
+
+        return items
     }
 }
 
