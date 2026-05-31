@@ -305,6 +305,201 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
     }
 
+    private struct MascotPresentationContext {
+        let setupMascotVisible: Bool
+        let mascotFlightVisible: Bool
+        let loadingOverlayVisible: Bool
+
+        var transientMascotOwnsPlacement: Bool {
+            setupMascotVisible || mascotFlightVisible
+        }
+
+        var loadingMascotVisible: Bool {
+            loadingOverlayVisible && !transientMascotOwnsPlacement
+        }
+    }
+
+    @MainActor
+    private final class ExpandedMascotPresentationController {
+        private let rootView: NSView
+        private let footerSlotView: NSView
+        private let footerImageView: NSImageView
+        private let expandedView: ClickableMascotView
+        private let expandedImageView: NSImageView
+        private let animationCoordinator: OperationMascotCoordinator
+        private let centerXConstraint: NSLayoutConstraint
+        private let imageBottomConstraint: NSLayoutConstraint
+        private let updateHostPlacement: () -> Void
+
+        private(set) var isExpanded = false
+        private var isTransitionInProgress = false
+        private var transitionID: UInt64 = 0
+
+        var ownsMascotPlacement: Bool {
+            isExpanded || isTransitionInProgress
+        }
+
+        init(
+            rootView: NSView,
+            footerSlotView: NSView,
+            footerImageView: NSImageView,
+            expandedView: ClickableMascotView,
+            expandedImageView: NSImageView,
+            animationCoordinator: OperationMascotCoordinator,
+            centerXConstraint: NSLayoutConstraint,
+            imageBottomConstraint: NSLayoutConstraint,
+            updateHostPlacement: @escaping () -> Void
+        ) {
+            self.rootView = rootView
+            self.footerSlotView = footerSlotView
+            self.footerImageView = footerImageView
+            self.expandedView = expandedView
+            self.expandedImageView = expandedImageView
+            self.animationCoordinator = animationCoordinator
+            self.centerXConstraint = centerXConstraint
+            self.imageBottomConstraint = imageBottomConstraint
+            self.updateHostPlacement = updateHostPlacement
+        }
+
+        func setPersistentAnimation(_ animation: OperationMascotAnimation) {
+            animationCoordinator.setPersistentAnimation(animation)
+        }
+
+        func playTransient(_ animation: OperationMascotAnimation) {
+            animationCoordinator.playTransient(animation)
+        }
+
+        func placementTargetFrame() -> NSRect {
+            rootView.layoutSubtreeIfNeeded()
+            if ownsMascotPlacement {
+                return expandedImageView.convert(expandedImageView.bounds, to: rootView)
+            }
+
+            return footerImageView.convert(footerImageView.bounds, to: rootView)
+        }
+
+        func expandedTargetFrame() -> NSRect {
+            rootView.layoutSubtreeIfNeeded()
+            let footerFrame = footerImageView.convert(footerImageView.bounds, to: rootView)
+            let targetSize = OperationMascotCoordinator.expandedDisplaySize
+            let targetBottom = footerFrame.minY + Self.imageBottomOffset(for: targetSize)
+            return NSRect(
+                x: Self.anchorX(for: targetSize) - (targetSize / 2),
+                y: targetBottom - targetSize,
+                width: targetSize,
+                height: targetSize
+            )
+        }
+
+        func setExpanded(_ visible: Bool, animated: Bool, context: MascotPresentationContext) {
+            guard isExpanded != visible else {
+                updatePlacement(context: context)
+                return
+            }
+
+            isExpanded = visible
+            transitionID &+= 1
+            let currentTransitionID = transitionID
+            updateTooltips(expanded: visible)
+
+            let collapsedSize = OperationMascotCoordinator.statusDisplaySize
+            let targetSize = visible ? OperationMascotCoordinator.expandedDisplaySize : collapsedSize
+            let footerAnchorX = currentFooterAnchorX()
+            let targetAnchorX = visible ? Self.anchorX(for: targetSize) : footerAnchorX
+            let targetBottomOffset = Self.imageBottomOffset(for: targetSize)
+            let shouldTween = shouldTweenTransition(requested: animated)
+
+            if visible && context.loadingOverlayVisible {
+                isTransitionInProgress = false
+                centerXConstraint.constant = Self.anchorX(for: targetSize)
+                imageBottomConstraint.constant = targetBottomOffset
+                animationCoordinator.setDisplaySize(targetSize)
+                updatePlacement(context: context)
+                return
+            }
+
+            if visible {
+                centerXConstraint.constant = footerAnchorX
+                imageBottomConstraint.constant = Self.imageBottomOffset(for: collapsedSize)
+                animationCoordinator.setDisplaySize(collapsedSize)
+                expandedView.isHidden = false
+                footerImageView.isHidden = true
+                rootView.layoutSubtreeIfNeeded()
+            }
+
+            guard shouldTween else {
+                isTransitionInProgress = false
+                centerXConstraint.constant = targetAnchorX
+                imageBottomConstraint.constant = targetBottomOffset
+                animationCoordinator.setDisplaySize(targetSize)
+                updatePlacement(context: context)
+                return
+            }
+
+            if !visible {
+                footerImageView.isHidden = true
+                expandedView.isHidden = false
+            }
+
+            isTransitionInProgress = true
+            NSAnimationContext.runAnimationGroup { animationContext in
+                animationContext.duration = 0.22
+                animationContext.allowsImplicitAnimation = true
+                self.centerXConstraint.animator().constant = targetAnchorX
+                self.imageBottomConstraint.animator().constant = targetBottomOffset
+                self.animationCoordinator.setDisplaySize(targetSize, animated: true)
+                self.rootView.layoutSubtreeIfNeeded()
+            } completionHandler: {
+                guard self.transitionID == currentTransitionID else { return }
+                self.isTransitionInProgress = false
+                if !visible {
+                    self.updateHostPlacement()
+                    self.animationCoordinator.setDisplaySize(collapsedSize)
+                    self.imageBottomConstraint.constant = Self.imageBottomOffset(for: collapsedSize)
+                    self.centerXConstraint.constant = Self.anchorX()
+                    return
+                }
+                self.updateHostPlacement()
+            }
+        }
+
+        func updatePlacement(context: MascotPresentationContext) {
+            let expandedMascotVisible = ownsMascotPlacement
+            expandedView.isHidden = context.transientMascotOwnsPlacement || context.loadingMascotVisible || !expandedMascotVisible
+            footerImageView.isHidden = context.transientMascotOwnsPlacement || context.loadingMascotVisible || expandedMascotVisible
+        }
+
+        private func updateTooltips(expanded: Bool) {
+            let tooltip = expanded ? "Shrink Nib" : "Grow Nib"
+            expandedView.toolTip = tooltip
+            footerSlotView.toolTip = tooltip
+            footerImageView.toolTip = tooltip
+        }
+
+        private func currentFooterAnchorX() -> CGFloat {
+            rootView.layoutSubtreeIfNeeded()
+            return footerImageView.convert(footerImageView.bounds, to: rootView).midX
+        }
+
+        private func shouldTweenTransition(requested animated: Bool) -> Bool {
+            guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
+                return false
+            }
+
+            return animated || rootView.window != nil
+        }
+
+        private static func anchorX(for displaySize: CGFloat = OperationMascotCoordinator.expandedDisplaySize) -> CGFloat {
+            ExpandedMascotLayout.visibleLeadingInset + (displaySize * ExpandedMascotLayout.spriteFrameAspectRatio / 2)
+        }
+
+        private static func imageBottomOffset(for displaySize: CGFloat) -> CGFloat {
+            let visiblePadding = (OperationMascotCoordinator.statusDisplaySize * (1 - ExpandedMascotLayout.spriteFrameAspectRatio)) / 2
+            let targetPadding = (displaySize * (1 - ExpandedMascotLayout.spriteFrameAspectRatio)) / 2
+            return targetPadding - visiblePadding
+        }
+    }
+
     private let index: FileIndex
     private let fseventCursorStore = FSEventCursorStore.default
     private lazy var watcher = FileSystemWatcher(cursorStore: fseventCursorStore)
@@ -365,16 +560,13 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var memoryStatusTask: Task<Void, Never>?
     private var memoryStatusText = ProcessMemoryFormatter.label(for: ProcessMemorySampler.currentUsage())
     private var mascotCoordinator: OperationMascotCoordinator?
-    private var expandedMascotCoordinator: OperationMascotCoordinator?
+    private var expandedMascotPresenter: ExpandedMascotPresentationController?
     private var loadingMascotCoordinator: OperationMascotCoordinator?
     private var setupMascotCoordinator: StandaloneMascotCoordinator?
-    private var expandedMascotCenterXConstraint: NSLayoutConstraint?
-    private var expandedMascotImageBottomConstraint: NSLayoutConstraint?
     private var mascotFlightPlayback: MascotFlightPlayback?
     private var mascotFlightFallbackImage: NSImage?
     private var mascotFlightFrameIndex = 0
     private nonisolated(unsafe) var mascotFlightFrameTimer: Timer?
-    private var isExpandedMascotVisible = false
     private var isMascotFlightInProgress = false
     private var isSetupMascotTuckInProgress = false
     private nonisolated(unsafe) var pendingMascotExpansion: DispatchWorkItem?
@@ -845,7 +1037,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         expandedMascotView.addSubview(expandedMascotImageView)
         expandedMascotImageView.translatesAutoresizingMaskIntoConstraints = false
         expandedMascotImageView.imageAlignment = .alignCenter
-        expandedMascotCoordinator = OperationMascotCoordinator(
+        let coordinator = OperationMascotCoordinator(
             imageView: expandedMascotImageView,
             displaySize: OperationMascotCoordinator.statusDisplaySize
         )
@@ -853,11 +1045,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         view.addSubview(expandedMascotView)
         let centerXConstraint = expandedMascotView.centerXAnchor.constraint(
             equalTo: view.leadingAnchor,
-            constant: expandedMascotAnchorX()
+            constant: ExpandedMascotLayout.anchorX(for: OperationMascotCoordinator.expandedDisplaySize)
         )
-        expandedMascotCenterXConstraint = centerXConstraint
         let imageBottomConstraint = expandedMascotImageView.bottomAnchor.constraint(equalTo: expandedMascotView.bottomAnchor)
-        expandedMascotImageBottomConstraint = imageBottomConstraint
         NSLayoutConstraint.activate([
             centerXConstraint,
             expandedMascotView.bottomAnchor.constraint(equalTo: mascotImageView.bottomAnchor),
@@ -867,7 +1057,20 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             imageBottomConstraint
         ])
 
-        expandedMascotCoordinator?.setPersistentAnimation(persistentMascotAnimation())
+        expandedMascotPresenter = ExpandedMascotPresentationController(
+            rootView: view,
+            footerSlotView: mascotSlotView,
+            footerImageView: mascotImageView,
+            expandedView: expandedMascotView,
+            expandedImageView: expandedMascotImageView,
+            animationCoordinator: coordinator,
+            centerXConstraint: centerXConstraint,
+            imageBottomConstraint: imageBottomConstraint,
+            updateHostPlacement: { [weak self] in
+                self?.updateMascotPlacementVisibility()
+            }
+        )
+        expandedMascotPresenter?.setPersistentAnimation(persistentMascotAnimation())
     }
 
     private func configureSetupSuggestionPanel() {
@@ -1178,16 +1381,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func setupMascotTuckTargetFrame() -> NSRect {
-        view.layoutSubtreeIfNeeded()
-        let footerFrame = mascotImageView.convert(mascotImageView.bounds, to: view)
-        let targetSize = OperationMascotCoordinator.expandedDisplaySize
-        let targetBottom = footerFrame.minY + expandedMascotImageBottomOffset(for: targetSize)
-        return NSRect(
-            x: expandedMascotAnchorX(for: targetSize) - (targetSize / 2),
-            y: targetBottom - targetSize,
-            width: targetSize,
-            height: targetSize
-        )
+        expandedMascotPresenter?.expandedTargetFrame() ?? mascotImageView.convert(mascotImageView.bounds, to: view)
     }
 
     private func configureLoadingOverlay() {
@@ -1904,7 +2098,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private func updateMascotPersistentAnimation() {
         let animation = persistentMascotAnimation()
         mascotCoordinator?.setPersistentAnimation(animation)
-        expandedMascotCoordinator?.setPersistentAnimation(animation)
+        expandedMascotPresenter?.setPersistentAnimation(animation)
         loadingMascotCoordinator?.setPersistentAnimation(animation)
     }
 
@@ -1912,14 +2106,14 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         guard !isMascotFlightInProgress else { return }
 
         mascotCoordinator?.playTransient(animation)
-        expandedMascotCoordinator?.playTransient(animation)
+        expandedMascotPresenter?.playTransient(animation)
         loadingMascotCoordinator?.playTransient(animation)
     }
 
     @objc private func toggleExpandedMascot(_ sender: Any?) {
         let importantOperationActive = isImportantMascotOperation(indexStats)
 
-        if isExpandedMascotVisible {
+        if expandedMascotPresenter?.isExpanded == true {
             userExpandedMascot = false
             if importantOperationActive {
                 userCollapsedExpandedMascotDuringOperation = true
@@ -1960,7 +2154,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func scheduleAutoMascotExpansion(animated: Bool) {
-        guard !isExpandedMascotVisible, !userExpandedMascot else {
+        guard expandedMascotPresenter?.isExpanded != true, !userExpandedMascot else {
             setExpandedMascotVisible(true, animated: animated)
             return
         }
@@ -1999,7 +2193,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         to nextPhase: IndexPhase,
         wasOperationActive: Bool
     ) -> Bool {
-        if isExpandedMascotVisible || userExpandedMascot {
+        if expandedMascotPresenter?.isExpanded == true || userExpandedMascot {
             return true
         }
 
@@ -2030,114 +2224,27 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
     }
 
-    private func footerMascotAnchorX() -> CGFloat {
-        view.layoutSubtreeIfNeeded()
-        return mascotImageView.convert(mascotImageView.bounds, to: view).midX
-    }
-
-    private func expandedMascotAnchorX(for displaySize: CGFloat = OperationMascotCoordinator.expandedDisplaySize) -> CGFloat {
-        ExpandedMascotLayout.anchorX(for: displaySize)
-    }
-
-    private func expandedMascotImageBottomOffset(for displaySize: CGFloat) -> CGFloat {
-        let visiblePadding = (OperationMascotCoordinator.statusDisplaySize * (1 - ExpandedMascotLayout.spriteFrameAspectRatio)) / 2
-        let targetPadding = (displaySize * (1 - ExpandedMascotLayout.spriteFrameAspectRatio)) / 2
-        return targetPadding - visiblePadding
-    }
-
     private func mascotPlacementTargetFrame() -> NSRect {
         view.layoutSubtreeIfNeeded()
-
-        if isExpandedMascotVisible {
-            return expandedMascotImageView.convert(expandedMascotImageView.bounds, to: view)
-        }
-
-        return mascotImageView.convert(mascotImageView.bounds, to: view)
-    }
-
-    private func shouldTweenExpandedMascotTransition(requested animated: Bool) -> Bool {
-        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
-            return false
-        }
-
-        return animated || view.window != nil
+        return expandedMascotPresenter?.placementTargetFrame() ?? mascotImageView.convert(mascotImageView.bounds, to: view)
     }
 
     private func setExpandedMascotVisible(_ visible: Bool, animated: Bool) {
-        guard isExpandedMascotVisible != visible else {
-            updateMascotPlacementVisibility()
-            return
-        }
+        expandedMascotPresenter?.setExpanded(visible, animated: animated, context: currentMascotPresentationContext())
+    }
 
-        isExpandedMascotVisible = visible
-        expandedMascotView.toolTip = visible ? "Shrink Nib" : "Grow Nib"
-        mascotSlotView.toolTip = visible ? "Shrink Nib" : "Grow Nib"
-        mascotImageView.toolTip = visible ? "Shrink Nib" : "Grow Nib"
-
-        let collapsedSize = OperationMascotCoordinator.statusDisplaySize
-        let targetSize = visible ? OperationMascotCoordinator.expandedDisplaySize : collapsedSize
-        let footerAnchorX = footerMascotAnchorX()
-        let targetAnchorX = visible ? expandedMascotAnchorX(for: targetSize) : footerAnchorX
-        let targetBottomOffset = expandedMascotImageBottomOffset(for: targetSize)
-        let shouldTween = shouldTweenExpandedMascotTransition(requested: animated)
-        if visible && !loadingOverlay.isHidden {
-            expandedMascotCenterXConstraint?.constant = expandedMascotAnchorX(for: targetSize)
-            expandedMascotImageBottomConstraint?.constant = targetBottomOffset
-            expandedMascotCoordinator?.setDisplaySize(targetSize)
-            updateMascotPlacementVisibility()
-            return
-        }
-
-        if visible {
-            expandedMascotCenterXConstraint?.constant = footerAnchorX
-            expandedMascotImageBottomConstraint?.constant = expandedMascotImageBottomOffset(for: collapsedSize)
-            expandedMascotCoordinator?.setDisplaySize(collapsedSize)
-            expandedMascotView.isHidden = false
-            mascotImageView.isHidden = true
-            view.layoutSubtreeIfNeeded()
-        }
-
-        guard shouldTween else {
-            expandedMascotCenterXConstraint?.constant = targetAnchorX
-            expandedMascotImageBottomConstraint?.constant = targetBottomOffset
-            expandedMascotCoordinator?.setDisplaySize(targetSize)
-            updateMascotPlacementVisibility()
-            return
-        }
-
-        if !visible {
-            mascotImageView.isHidden = true
-            expandedMascotView.isHidden = false
-        }
-
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.22
-            context.allowsImplicitAnimation = true
-            self.expandedMascotCenterXConstraint?.animator().constant = targetAnchorX
-            self.expandedMascotImageBottomConstraint?.animator().constant = targetBottomOffset
-            self.expandedMascotCoordinator?.setDisplaySize(targetSize, animated: true)
-            self.view.layoutSubtreeIfNeeded()
-        } completionHandler: {
-            if !visible {
-                self.updateMascotPlacementVisibility()
-                self.expandedMascotCoordinator?.setDisplaySize(collapsedSize)
-                self.expandedMascotImageBottomConstraint?.constant = self.expandedMascotImageBottomOffset(for: collapsedSize)
-                self.expandedMascotCenterXConstraint?.constant = self.expandedMascotAnchorX()
-                return
-            }
-            self.updateMascotPlacementVisibility()
-        }
+    private func currentMascotPresentationContext() -> MascotPresentationContext {
+        MascotPresentationContext(
+            setupMascotVisible: !indexingSetupOverlay.isHidden,
+            mascotFlightVisible: !mascotFlightImageView.isHidden,
+            loadingOverlayVisible: !loadingOverlay.isHidden
+        )
     }
 
     private func updateMascotPlacementVisibility() {
-        let setupMascotVisible = !indexingSetupOverlay.isHidden
-        let mascotFlightVisible = !mascotFlightImageView.isHidden
-        let transientMascotOwnsPlacement = setupMascotVisible || mascotFlightVisible
-        let loadingMascotVisible = !loadingOverlay.isHidden && !transientMascotOwnsPlacement
-
-        loadingMascotImageView.isHidden = !loadingMascotVisible
-        expandedMascotView.isHidden = transientMascotOwnsPlacement || loadingMascotVisible || !isExpandedMascotVisible
-        mascotImageView.isHidden = transientMascotOwnsPlacement || loadingMascotVisible || isExpandedMascotVisible
+        let context = currentMascotPresentationContext()
+        loadingMascotImageView.isHidden = !context.loadingMascotVisible
+        expandedMascotPresenter?.updatePlacement(context: context)
     }
 
     private func persistentMascotAnimation() -> OperationMascotAnimation {
