@@ -31,8 +31,8 @@ final class SettingsWindowController: NSWindowController {
 }
 
 enum SettingsSection {
-    case appearance
     case general
+    case appearance
     case indexedFolders
 
     var title: String {
@@ -96,7 +96,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     private let resetExclusionsButton = NSButton()
     private let exclusionHelpButton = NSButton()
     private var pageViews: [SettingsSection: NSView] = [:]
-    private var selectedSection = SettingsSection.appearance
+    private var selectedSection = SettingsSection.general
     private var indexedRoots: [URL] = []
     private var exclusionPatterns: [String] = []
     private var indexedRootsCardHeightConstraint: NSLayoutConstraint?
@@ -130,7 +130,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         view = rootView
         buildInterface()
         updateControls()
-        selectSection(.appearance)
+        selectSection(.general)
     }
 
     override func viewDidLoad() {
@@ -187,7 +187,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         sidebar.blendingMode = .behindWindow
         sidebar.state = .active
 
-        let stack = NSStackView(views: [appearanceSidebarRow, generalSidebarRow, indexedFoldersSidebarRow])
+        let stack = NSStackView(views: [generalSidebarRow, appearanceSidebarRow, indexedFoldersSidebarRow])
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.orientation = .vertical
         stack.alignment = .width
