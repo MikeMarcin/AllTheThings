@@ -1323,6 +1323,13 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
 
     private func updateFullDiskAccessStatus() {
         let status = FullDiskAccessController.currentStatus()
+        DiagnosticLogger.shared.log(
+            category: "privacy",
+            event: "fullDiskAccess.statusChecked",
+            fields: [
+                "status": .publicString(status.displayTitle)
+            ]
+        )
         fullDiskAccessStatusLabel.stringValue = "Full Disk Access: \(status.displayTitle)"
 
         switch status {
@@ -1348,6 +1355,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     }
 
     @objc private func openFullDiskAccessSettings(_ sender: NSButton) {
+        DiagnosticLogger.shared.log(category: "privacy", event: "fullDiskAccess.openSettingsFromSettings")
         FullDiskAccessController.openSystemSettings()
     }
 

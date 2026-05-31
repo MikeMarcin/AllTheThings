@@ -6,6 +6,8 @@ import CoreServices
 // main queue before touching Swift @MainActor AppKit APIs.
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private static let activationRequestNotification = Notification.Name("com.allthethings.app.activateExistingInstance")
+    private static let diagnosticLogMaxTotalBytes: UInt64 = 50 * 1024 * 1024
+    private static let diagnosticLogMaxAge: TimeInterval = 30 * 24 * 60 * 60
 
     private let defaults = UserDefaults.standard
     private lazy var fileIndex = FileIndex(
@@ -80,15 +82,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @MainActor
     private func finishLaunching() {
+        configureDiagnosticLogging()
         configureMainMenu()
         applyMenuBarIconSetting()
-        fileIndex.recordAppLaunch(appVersion: Self.appVersionString)
         let launchedAsLoginItem = Self.launchedAsLoginItem()
+        DiagnosticLogger.shared.log(
+            category: "app",
+            event: "app.launch",
+            fields: [
+                "appVersion": .publicString(Self.appVersionString),
+                "launchedAsLoginItem": .publicBool(launchedAsLoginItem),
+                "processIdentifier": .publicInt(Int(ProcessInfo.processInfo.processIdentifier))
+            ]
+        )
+        fileIndex.recordAppLaunch(appVersion: Self.appVersionString)
         let window = launchedAsLoginItem ? nil : showPrimaryWindow(activate: true)
         configureGlobalHotKey(presentsErrors: !launchedAsLoginItem)
         if !launchedAsLoginItem {
             ReleaseUpdater.shared.checkAutomaticallyIfNeeded(presentingWindow: window)
         }
+    }
+
+    @MainActor
+    private func configureDiagnosticLogging() {
+        let logsURL = fileIndex.dataDirectoryURL.appendingPathComponent("Logs", isDirectory: true)
+        DiagnosticLogger.shared.configure(
+            directoryURL: logsURL,
+            maxTotalBytes: Self.diagnosticLogMaxTotalBytes,
+            maxAge: Self.diagnosticLogMaxAge
+        )
     }
 
     @discardableResult
@@ -140,6 +162,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         performSelector(onMainThread: #selector(showPrimaryWindowFromActivationRequest), with: nil, waitUntilDone: false)
         return true
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        DiagnosticLogger.shared.log(category: "app", event: "app.terminate")
+        DiagnosticLogger.shared.flush()
     }
 
     private var allowsMultipleInstances: Bool {
@@ -244,10 +271,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc @MainActor private func toggleLaunchAtLoginFromStatusItem(_ sender: Any?) {
         do {
             try LaunchAtLoginController.setEnabled(!LaunchAtLoginController.isEnabled)
+            DiagnosticLogger.shared.log(
+                category: "settings",
+                event: "settings.launchAtLoginChanged",
+                fields: [
+                    "enabled": .publicBool(LaunchAtLoginController.isEnabled)
+                ]
+            )
             if LaunchAtLoginController.requiresApproval {
                 presentLaunchAtLoginApprovalAlert()
             }
         } catch {
+            DiagnosticLogger.shared.log(
+                level: .error,
+                category: "settings",
+                event: "settings.launchAtLoginChangeFailed",
+                fields: [
+                    "error": .errorText(error.localizedDescription)
+                ]
+            )
             presentLaunchAtLoginErrorAlert(error)
         }
     }
@@ -303,6 +345,156 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         presentInsightsWindow()
     }
 
+    @objc @MainActor private func exportAnonymizedDiagnosticLog(_ sender: Any?) {
+        presentDiagnosticLogSavePanel(anonymized: true)
+    }
+
+    @objc @MainActor private func exportRawDiagnosticLog(_ sender: Any?) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Export raw diagnostic log?"
+        alert.informativeText = "Raw diagnostic logs may include search queries, file paths, and action context. They remain local unless you choose to share the exported file."
+        alert.addButton(withTitle: "Export Raw Log")
+        alert.addButton(withTitle: "Cancel")
+
+        let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            self?.presentDiagnosticLogSavePanel(anonymized: false)
+        }
+
+        if let window = windowController?.window {
+            alert.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            completion(alert.runModal())
+        }
+    }
+
+    @objc @MainActor private func clearLocalDiagnosticLogs(_ sender: Any?) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Clear local diagnostic logs?"
+        alert.informativeText = "This deletes the local structured diagnostic logs stored by AllTheThings. Index data, settings, and aggregate diagnostics are not changed."
+        alert.addButton(withTitle: "Clear Logs")
+        alert.addButton(withTitle: "Cancel")
+
+        let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard response == .alertFirstButtonReturn, let self else { return }
+            do {
+                try DiagnosticLogger.shared.clearLogs()
+                self.presentDiagnosticLogAlert(message: "Diagnostic logs cleared.", informativeText: "Local structured logs have been deleted.")
+            } catch {
+                self.presentDiagnosticLogAlert(message: "Could not clear diagnostic logs.", informativeText: error.localizedDescription)
+            }
+        }
+
+        if let window = windowController?.window {
+            alert.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            completion(alert.runModal())
+        }
+    }
+
+    @MainActor
+    private func presentDiagnosticLogSavePanel(anonymized: Bool) {
+        let panel = NSSavePanel()
+        panel.title = anonymized ? "Export Anonymized Diagnostic Log" : "Export Raw Diagnostic Log"
+        panel.nameFieldStringValue = anonymized
+            ? "AllTheThings-DiagnosticLog-Anonymized.jsonl"
+            : "AllTheThings-DiagnosticLog-Raw.jsonl"
+        panel.canCreateDirectories = true
+
+        let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard response == .OK, let self, let url = panel.url else { return }
+            self.exportDiagnosticLog(anonymized: anonymized, to: url)
+        }
+
+        if let window = windowController?.window {
+            panel.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            completion(panel.runModal())
+        }
+    }
+
+    @MainActor
+    private func exportDiagnosticLog(anonymized: Bool, to url: URL) {
+        let kind = anonymized ? "anonymized" : "raw"
+        DiagnosticLogger.shared.log(
+            category: "diagnosticLog",
+            event: "diagnosticLog.exportRequested",
+            fields: [
+                "exportKind": .publicString(kind),
+                "destination": .path(url.path)
+            ]
+        )
+
+        let index = fileIndex
+        let exporter = DiagnosticLogExporter(
+            snapshotProvider: {
+                index.currentInsightsSnapshot()
+            }
+        )
+
+        DispatchQueue.global(qos: .utility).async {
+            do {
+                if anonymized {
+                    try exporter.exportAnonymized(to: url)
+                } else {
+                    try exporter.exportRaw(to: url)
+                }
+
+                DiagnosticLogger.shared.log(
+                    category: "diagnosticLog",
+                    event: "diagnosticLog.exportFinished",
+                    fields: [
+                        "exportKind": .publicString(kind),
+                        "destination": .path(url.path)
+                    ]
+                )
+
+                let informativeText = url.path
+                DispatchQueue.main.async {
+                    (NSApp.delegate as? AppDelegate)?.presentDiagnosticLogAlert(
+                        message: "Diagnostic log exported.",
+                        informativeText: informativeText
+                    )
+                }
+            } catch {
+                let informativeText = error.localizedDescription
+                DiagnosticLogger.shared.log(
+                    level: .error,
+                    category: "diagnosticLog",
+                    event: "diagnosticLog.exportFailed",
+                    fields: [
+                        "exportKind": .publicString(kind),
+                        "destination": .path(url.path),
+                        "error": .errorText(error.localizedDescription)
+                    ]
+                )
+
+                DispatchQueue.main.async {
+                    (NSApp.delegate as? AppDelegate)?.presentDiagnosticLogAlert(
+                        message: "Could not export diagnostic log.",
+                        informativeText: informativeText
+                    )
+                }
+            }
+        }
+    }
+
+    @MainActor
+    private func presentDiagnosticLogAlert(message: String, informativeText: String) {
+        let alert = NSAlert()
+        alert.messageText = message
+        alert.informativeText = informativeText
+        alert.addButton(withTitle: "OK")
+
+        if let window = windowController?.window {
+            alert.beginSheetModal(for: window)
+        } else {
+            alert.runModal()
+        }
+    }
+
     @MainActor
     private func presentSettingsWindow(section: SettingsSection = .general) {
         let controller: SettingsWindowController
@@ -350,6 +542,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let showHiddenFiles = !defaults.bool(forKey: AppSettings.showHiddenFilesKey)
         defaults.set(showHiddenFiles, forKey: AppSettings.showHiddenFilesKey)
         defaults.synchronize()
+        DiagnosticLogger.shared.log(
+            category: "settings",
+            event: "settings.showHiddenFilesChanged",
+            fields: [
+                "enabled": .publicBool(showHiddenFiles)
+            ]
+        )
         (sender as? NSMenuItem)?.state = showHiddenFiles ? .on : .off
     }
 
@@ -423,6 +622,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         insightsItem.keyEquivalentModifierMask = [.command, .option]
         insightsItem.target = self
         appMenu.addItem(insightsItem)
+
+        appMenu.addItem(.separator())
+
+        let exportAnonymizedLogItem = NSMenuItem(
+            title: "Export Anonymized Diagnostic Log...",
+            action: #selector(exportAnonymizedDiagnosticLog(_:)),
+            keyEquivalent: ""
+        )
+        exportAnonymizedLogItem.target = self
+        appMenu.addItem(exportAnonymizedLogItem)
+
+        let exportRawLogItem = NSMenuItem(
+            title: "Export Raw Diagnostic Log...",
+            action: #selector(exportRawDiagnosticLog(_:)),
+            keyEquivalent: ""
+        )
+        exportRawLogItem.target = self
+        appMenu.addItem(exportRawLogItem)
+
+        let clearDiagnosticLogsItem = NSMenuItem(
+            title: "Clear Local Diagnostic Logs",
+            action: #selector(clearLocalDiagnosticLogs(_:)),
+            keyEquivalent: ""
+        )
+        clearDiagnosticLogsItem.target = self
+        appMenu.addItem(clearDiagnosticLogsItem)
 
         appMenu.addItem(.separator())
 
