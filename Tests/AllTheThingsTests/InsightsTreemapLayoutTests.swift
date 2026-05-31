@@ -133,23 +133,84 @@ struct InsightsTreemapLayoutTests {
         #expect(documentView.fittingSize.width <= scrollView.contentView.bounds.width + 1)
     }
 
-    @Test("Insights window placement clamps to the visible screen")
+    @Test("Insights opening placement centers in the visible screen")
     @MainActor
-    func insightsWindowPlacementClampsToVisibleScreen() {
+    func insightsOpeningPlacementCentersInVisibleScreen() {
+        let visibleFrame = NSRect(x: 40, y: 30, width: 760, height: 520)
+        let proposedFrame = NSRect(x: -400, y: 10, width: 300, height: 200)
+
+        let frame = InsightsWindowController.openingFrameFittingVisibleScreen(
+            proposedFrame,
+            visibleFrame: visibleFrame
+        )
+
+        #expect(frame.origin == NSPoint(x: 270, y: 190))
+        #expect(frame.size == proposedFrame.size)
+    }
+
+    @Test("Insights opening placement clamps oversized frames")
+    @MainActor
+    func insightsOpeningPlacementClampsOversizedFrames() {
         let visibleFrame = NSRect(x: 40, y: 30, width: 760, height: 520)
         let oversizedFrame = NSRect(x: -400, y: 10, width: 1200, height: 900)
 
-        let frame = InsightsWindowController.frameFittingVisibleScreen(
+        let frame = InsightsWindowController.openingFrameFittingVisibleScreen(
             oversizedFrame,
             visibleFrame: visibleFrame
         )
 
+        #expect(frame == NSRect(x: 58, y: 48, width: 724, height: 484))
         #expect(frame.minX >= visibleFrame.minX)
         #expect(frame.maxX <= visibleFrame.maxX)
         #expect(frame.minY >= visibleFrame.minY)
         #expect(frame.maxY <= visibleFrame.maxY)
         #expect(frame.width <= visibleFrame.width)
         #expect(frame.height <= visibleFrame.height)
+    }
+
+    @Test("Insights resize constraint preserves visible positions")
+    @MainActor
+    func insightsResizeConstraintPreservesVisiblePositions() {
+        let visibleFrame = NSRect(x: 40, y: 30, width: 760, height: 520)
+        let proposedFrame = NSRect(x: 120, y: 100, width: 400, height: 300)
+
+        let frame = InsightsWindowController.constrainedFrameFittingVisibleScreen(
+            proposedFrame,
+            visibleFrame: visibleFrame
+        )
+
+        #expect(frame == proposedFrame)
+    }
+
+    @Test("Insights resize constraint nudges off-screen origins")
+    @MainActor
+    func insightsResizeConstraintNudgesOffScreenOrigins() {
+        let visibleFrame = NSRect(x: 40, y: 30, width: 760, height: 520)
+        let proposedFrame = NSRect(x: -20, y: 400, width: 400, height: 300)
+
+        let frame = InsightsWindowController.constrainedFrameFittingVisibleScreen(
+            proposedFrame,
+            visibleFrame: visibleFrame
+        )
+
+        #expect(frame == NSRect(x: 58, y: 232, width: 400, height: 300))
+        #expect(frame.minX >= visibleFrame.minX)
+        #expect(frame.maxX <= visibleFrame.maxX)
+        #expect(frame.minY >= visibleFrame.minY)
+        #expect(frame.maxY <= visibleFrame.maxY)
+    }
+
+    @Test("activity chart reserves space for the legend")
+    func activityChartReservesSpaceForLegend() {
+        let bounds = NSRect(x: 0, y: 0, width: 420, height: 104)
+
+        let plot = InsightsActivityChartLayout.plotRect(in: bounds)
+        let legend = InsightsActivityChartLayout.legendRect(in: bounds)
+
+        #expect(plot.minY >= bounds.minY)
+        #expect(plot.maxY <= legend.minY)
+        #expect(legend.maxY <= bounds.maxY)
+        #expect(plot.height > legend.height)
     }
 
     private func makeRoot(path: String, trackedFileCount: Int) -> IndexRootInsight {

@@ -13,9 +13,10 @@ final class InsightsWindowController: NSWindowController {
         defaults: UserDefaults = .standard,
         clearCachedIndexHandler: @escaping () throws -> Void
     ) {
+        let initialVisibleFrame = Self.targetVisibleFrame(for: nil)
         let contentSize = Self.clampedContentSize(
             Self.defaultContentSize,
-            visibleFrame: NSScreen.main?.visibleFrame
+            visibleFrame: initialVisibleFrame
         )
         let viewController = InsightsViewController(
             index: index,
@@ -34,38 +35,40 @@ final class InsightsWindowController: NSWindowController {
         window.isRestorable = false
         window.contentMinSize = Self.clampedContentSize(
             Self.minimumContentSize,
-            visibleFrame: NSScreen.main?.visibleFrame
+            visibleFrame: initialVisibleFrame
         )
         window.contentViewController = viewController
         window.setContentSize(contentSize)
-        Self.fitWindowToVisibleScreen(window)
+        Self.placeWindowForOpening(window)
 
         super.init(window: window)
     }
 
     override func showWindow(_ sender: Any?) {
+        if let window {
+            Self.placeWindowForOpening(window)
+        }
         super.showWindow(sender)
         if let window {
-            Self.fitWindowToVisibleScreen(window)
+            Self.constrainWindowToVisibleScreen(window)
         }
     }
 
     static func clampedContentSize(_ size: NSSize, visibleFrame: NSRect?) -> NSSize {
         guard let visibleFrame else { return size }
 
-        let maxWidth = max(480, visibleFrame.width - screenMargin * 2)
-        let maxHeight = max(420, visibleFrame.height - screenMargin * 2)
+        let maxWidth = max(1, visibleFrame.width - screenMargin * 2)
+        let maxHeight = max(1, visibleFrame.height - screenMargin * 2)
         return NSSize(
             width: min(size.width, maxWidth),
             height: min(size.height, maxHeight)
         )
     }
 
-    static func frameFittingVisibleScreen(_ frame: NSRect, visibleFrame: NSRect) -> NSRect {
-        let maxWidth = max(480, visibleFrame.width - screenMargin * 2)
-        let maxHeight = max(420, visibleFrame.height - screenMargin * 2)
-        let width = min(frame.width, maxWidth)
-        let height = min(frame.height, maxHeight)
+    static func openingFrameFittingVisibleScreen(_ frame: NSRect, visibleFrame: NSRect) -> NSRect {
+        let size = sizeFittingVisibleScreen(frame.size, visibleFrame: visibleFrame)
+        let width = size.width
+        let height = size.height
         let centeredX = visibleFrame.midX - width / 2
         let centeredY = visibleFrame.midY - height / 2
         let x = min(max(centeredX, visibleFrame.minX + screenMargin), visibleFrame.maxX - screenMargin - width)
@@ -73,16 +76,67 @@ final class InsightsWindowController: NSWindowController {
         return NSRect(x: x, y: y, width: width, height: height)
     }
 
-    private static func fitWindowToVisibleScreen(_ window: NSWindow) {
-        let visibleFrame = window.screen?.visibleFrame ?? NSScreen.main?.visibleFrame
+    static func constrainedFrameFittingVisibleScreen(_ frame: NSRect, visibleFrame: NSRect) -> NSRect {
+        let size = sizeFittingVisibleScreen(frame.size, visibleFrame: visibleFrame)
+        let x = clampedOrigin(frame.minX, length: size.width, min: visibleFrame.minX, max: visibleFrame.maxX)
+        let y = clampedOrigin(frame.minY, length: size.height, min: visibleFrame.minY, max: visibleFrame.maxY)
+        return NSRect(x: x, y: y, width: size.width, height: size.height)
+    }
+
+    private static func sizeFittingVisibleScreen(_ size: NSSize, visibleFrame: NSRect) -> NSSize {
+        NSSize(
+            width: min(size.width, max(1, visibleFrame.width - screenMargin * 2)),
+            height: min(size.height, max(1, visibleFrame.height - screenMargin * 2))
+        )
+    }
+
+    private static func clampedOrigin(_ origin: CGFloat, length: CGFloat, min: CGFloat, max: CGFloat) -> CGFloat {
+        let lowerBound = min + screenMargin
+        let upperBound = max - screenMargin - length
+        guard upperBound >= lowerBound else {
+            return min + (max - min - length) / 2
+        }
+        return Swift.min(Swift.max(origin, lowerBound), upperBound)
+    }
+
+    private static func placeWindowForOpening(_ window: NSWindow) {
+        let visibleFrame = targetVisibleFrame(for: window)
         guard let visibleFrame else {
             window.center()
             return
         }
         window.setFrame(
-            frameFittingVisibleScreen(window.frame, visibleFrame: visibleFrame),
+            openingFrameFittingVisibleScreen(window.frame, visibleFrame: visibleFrame),
             display: false
         )
+    }
+
+    private static func constrainWindowToVisibleScreen(_ window: NSWindow) {
+        let visibleFrame = window.screen?.visibleFrame ?? targetVisibleFrame(for: window)
+        guard let visibleFrame else {
+            window.center()
+            return
+        }
+        window.setFrame(
+            constrainedFrameFittingVisibleScreen(window.frame, visibleFrame: visibleFrame),
+            display: true
+        )
+    }
+
+    private static func targetVisibleFrame(for window: NSWindow?) -> NSRect? {
+        targetScreen(for: window)?.visibleFrame
+    }
+
+    private static func targetScreen(for window: NSWindow?) -> NSScreen? {
+        let application = NSApplication.shared
+        for candidate in [application.keyWindow, application.mainWindow] {
+            guard let candidate else { continue }
+            if let window, candidate === window { continue }
+            if let screen = candidate.screen {
+                return screen
+            }
+        }
+        return window?.screen ?? NSScreen.main
     }
 
     @available(*, unavailable)
@@ -92,6 +146,17 @@ final class InsightsWindowController: NSWindowController {
 }
 
 private final class InsightsWindow: NSWindow {
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        let constrainedFrame = super.constrainFrameRect(frameRect, to: screen)
+        guard let visibleFrame = screen?.visibleFrame ?? self.screen?.visibleFrame ?? NSScreen.main?.visibleFrame else {
+            return constrainedFrame
+        }
+        return InsightsWindowController.constrainedFrameFittingVisibleScreen(
+            constrainedFrame,
+            visibleFrame: visibleFrame
+        )
+    }
+
     override func sendEvent(_ event: NSEvent) {
         if shouldClose(for: event) {
             close()
@@ -116,7 +181,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
 
     private let scrollView = NSScrollView()
     private let contentView = FlippedView()
-    private let overviewGrid = NSGridView()
+    private let overviewTilesContainer = NSView()
     private let storageTitleLabel = NSTextField(labelWithString: "")
     private let treemapView = InsightsTreemapView()
     private let activityChartView = InsightsBarChartView()
@@ -126,16 +191,18 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
     private let clearCachedIndexButton = NSButton()
     private let copyReportButton = NSButton()
     private let saveReportButton = NSButton()
-    private let storageSummaryLabel = NSTextField(labelWithString: "")
-    private let performanceSummaryLabel = NSTextField(labelWithString: "")
-    private let healthSummaryLabel = NSTextField(labelWithString: "")
-    private let lifetimeSummaryLabel = NSTextField(labelWithString: "")
+    private let storageSummaryLabel = NSTextField(wrappingLabelWithString: "")
+    private let performanceSummaryLabel = NSTextField(wrappingLabelWithString: "")
+    private let healthTilesContainer = NSView()
+    private let lifetimeSummaryLabel = NSTextField(wrappingLabelWithString: "")
 
     private var refreshTimer: Timer?
     private var latestSnapshot: IndexInsightsSnapshot?
     private var displayedRoots: [IndexRootInsight] = []
     private var unrepresentedRootPaths = Set<String>()
     private var isRefreshingInsights = false
+    private var overviewTileConstraints: [NSLayoutConstraint] = []
+    private var healthTileConstraints: [NSLayoutConstraint] = []
 
     init(
         index: FileIndex,
@@ -192,6 +259,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
         statusLabel.font = .systemFont(ofSize: 13, weight: .regular)
         statusLabel.textColor = .secondaryLabelColor
+        allowHorizontalCompression(statusLabel)
 
         configureIconButton(revealDataFolderButton, title: "Reveal Data Folder", symbol: "folder", action: #selector(revealDataFolder(_:)))
         configureIconButton(clearCachedIndexButton, title: "Clear Cached Index...", symbol: "trash", action: #selector(clearCachedIndex(_:)))
@@ -209,25 +277,23 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         buttonStack.alignment = .centerY
         buttonStack.spacing = 8
 
-        overviewGrid.translatesAutoresizingMaskIntoConstraints = false
-        overviewGrid.rowSpacing = 8
-        overviewGrid.columnSpacing = 8
-        overviewGrid.xPlacement = .fill
-        overviewGrid.yPlacement = .fill
+        overviewTilesContainer.translatesAutoresizingMaskIntoConstraints = false
 
-        let overviewCard = makeCard(containing: overviewGrid)
+        let overviewCard = makeCard(containing: overviewTilesContainer)
 
         let storageLabel = makeSectionLabel("Storage")
         storageTitleLabel.translatesAutoresizingMaskIntoConstraints = false
         storageTitleLabel.font = .systemFont(ofSize: 12, weight: .semibold)
         storageTitleLabel.textColor = .labelColor
         storageTitleLabel.lineBreakMode = .byTruncatingTail
+        allowHorizontalCompression(storageTitleLabel)
         treemapView.translatesAutoresizingMaskIntoConstraints = false
         storageSummaryLabel.translatesAutoresizingMaskIntoConstraints = false
         storageSummaryLabel.font = .systemFont(ofSize: 12)
         storageSummaryLabel.textColor = .secondaryLabelColor
         storageSummaryLabel.lineBreakMode = .byWordWrapping
         storageSummaryLabel.maximumNumberOfLines = 2
+        allowHorizontalCompression(storageSummaryLabel)
         let storageStack = verticalStack([storageTitleLabel, treemapView, storageSummaryLabel], spacing: 6)
         let storageCard = makeCard(containing: storageStack)
 
@@ -248,20 +314,33 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         performanceSummaryLabel.textColor = .secondaryLabelColor
         performanceSummaryLabel.lineBreakMode = .byWordWrapping
         performanceSummaryLabel.maximumNumberOfLines = 2
+        allowHorizontalCompression(performanceSummaryLabel)
         let activityCard = makeCard(containing: verticalStack([activityChartView, performanceSummaryLabel], spacing: 8))
 
         let healthLabel = makeSectionLabel("Performance & Health")
-        healthSummaryLabel.translatesAutoresizingMaskIntoConstraints = false
-        healthSummaryLabel.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
-        healthSummaryLabel.textColor = .secondaryLabelColor
-        healthSummaryLabel.lineBreakMode = .byWordWrapping
-        healthSummaryLabel.maximumNumberOfLines = 7
+        healthTilesContainer.translatesAutoresizingMaskIntoConstraints = false
         lifetimeSummaryLabel.translatesAutoresizingMaskIntoConstraints = false
         lifetimeSummaryLabel.font = .systemFont(ofSize: 12)
         lifetimeSummaryLabel.textColor = .secondaryLabelColor
         lifetimeSummaryLabel.lineBreakMode = .byWordWrapping
         lifetimeSummaryLabel.maximumNumberOfLines = 2
-        let healthCard = makeCard(containing: verticalStack([healthSummaryLabel, lifetimeSummaryLabel], spacing: 8))
+        allowHorizontalCompression(lifetimeSummaryLabel)
+        let healthContentView = NSView()
+        healthContentView.translatesAutoresizingMaskIntoConstraints = false
+        healthContentView.addSubview(healthTilesContainer)
+        healthContentView.addSubview(lifetimeSummaryLabel)
+        NSLayoutConstraint.activate([
+            healthTilesContainer.topAnchor.constraint(equalTo: healthContentView.topAnchor),
+            healthTilesContainer.leadingAnchor.constraint(equalTo: healthContentView.leadingAnchor),
+            healthTilesContainer.trailingAnchor.constraint(equalTo: healthContentView.trailingAnchor),
+            healthTilesContainer.heightAnchor.constraint(equalToConstant: 128),
+
+            lifetimeSummaryLabel.topAnchor.constraint(equalTo: healthTilesContainer.bottomAnchor, constant: 8),
+            lifetimeSummaryLabel.leadingAnchor.constraint(equalTo: healthContentView.leadingAnchor),
+            lifetimeSummaryLabel.trailingAnchor.constraint(equalTo: healthContentView.trailingAnchor),
+            lifetimeSummaryLabel.bottomAnchor.constraint(equalTo: healthContentView.bottomAnchor)
+        ])
+        let healthCard = makeCard(containing: healthContentView)
 
         for item in [
             titleLabel,
@@ -307,6 +386,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
             overviewCard.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 12),
             overviewCard.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
             overviewCard.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -26),
+            overviewTilesContainer.heightAnchor.constraint(equalToConstant: 132),
 
             storageLabel.topAnchor.constraint(equalTo: overviewCard.bottomAnchor, constant: 16),
             storageLabel.leadingAnchor.constraint(equalTo: overviewCard.leadingAnchor),
@@ -391,14 +471,14 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         storageTitleLabel.stringValue = storageTitleText(roots: displayedRoots)
         storageSummaryLabel.stringValue = storageSummaryText(snapshot, displayedRoots: displayedRoots)
         performanceSummaryLabel.stringValue = "Searches: \(snapshot.usage.allTimeSearches.completed.formatted()) completed, \(snapshot.usage.allTimeSearches.fallbackScans.formatted()) full fallback scans, average latency \(durationString(snapshot.usage.allTimeSearches.averageLatency))."
-        healthSummaryLabel.stringValue = healthText(snapshot)
+        rebuildHealthGrid(snapshot)
         lifetimeSummaryLabel.stringValue = lifetimeText(snapshot)
     }
 
     private func rebuildOverviewGrid(_ snapshot: IndexInsightsSnapshot, displayedRootCount: Int) {
-        while overviewGrid.numberOfRows > 0 {
-            overviewGrid.removeRow(at: 0)
-        }
+        NSLayoutConstraint.deactivate(overviewTileConstraints)
+        overviewTileConstraints.removeAll()
+        overviewTilesContainer.subviews.forEach { $0.removeFromSuperview() }
 
         let tiles = [
             makeMetricTile(title: "Tracked Files", value: snapshot.stats.indexedCount.formatted(), detail: "\(displayedRootCount) roots"),
@@ -409,10 +489,102 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
             makeMetricTile(title: "Launches", value: snapshot.lifetime.launchCount.formatted(), detail: dateOnlyString(snapshot.lifetime.firstLaunchDate))
         ]
 
-        for rowStart in stride(from: 0, to: tiles.count, by: 3) {
-            let rowViews = Array(tiles[rowStart..<min(rowStart + 3, tiles.count)])
-            overviewGrid.addRow(with: rowViews)
+        overviewTileConstraints = layoutTileGrid(tiles, in: overviewTilesContainer, columns: 3, rowGap: 8, columnGap: 8)
+    }
+
+    private func rebuildHealthGrid(_ snapshot: IndexInsightsSnapshot) {
+        let searches = snapshot.usage.allTimeSearches
+        let health = snapshot.usage.health
+        let failureCount = health.snapshotLoadFailures + health.persistFailures
+        let healthValue = failureCount == 0 ? "OK" : failureCount.formatted()
+        let healthDetail = failureCount == 0
+            ? "jobs \(snapshot.health.activeIndexJobs) · schema \(snapshot.health.schemaVersion)"
+            : "snapshot \(health.snapshotLoadFailures.formatted()) · persist \(health.persistFailures.formatted())"
+
+        let tiles = [
+            makeHealthTile(
+                title: "Search Path",
+                value: "\(searches.indexedCandidateSearches.formatted()) fast",
+                detail: "\(searches.fallbackScans.formatted()) fallbacks"
+            ),
+            makeHealthTile(
+                title: "Latency",
+                value: durationString(searches.averageLatency),
+                detail: "max \(durationString(searches.maxLatency))"
+            ),
+            makeHealthTile(
+                title: "Rows Examined",
+                value: searches.candidateRowsExamined.formatted(),
+                detail: "\(searches.scannedRowsExamined.formatted()) full scan"
+            ),
+            makeHealthTile(
+                title: "Index Health",
+                value: healthValue,
+                detail: healthDetail,
+                isWarning: failureCount > 0
+            )
+        ]
+
+        healthTileConstraints = layoutTileGrid(tiles, in: healthTilesContainer, columns: 2, rowGap: 8, columnGap: 8)
+    }
+
+    private func layoutTileGrid(
+        _ tiles: [NSView],
+        in container: NSView,
+        columns: Int,
+        rowGap: CGFloat,
+        columnGap: CGFloat
+    ) -> [NSLayoutConstraint] {
+        NSLayoutConstraint.deactivate(
+            container === overviewTilesContainer ? overviewTileConstraints : healthTileConstraints
+        )
+        container.subviews.forEach { $0.removeFromSuperview() }
+
+        for tile in tiles {
+            tile.translatesAutoresizingMaskIntoConstraints = false
+            container.addSubview(tile)
         }
+
+        guard !tiles.isEmpty, columns > 0 else { return [] }
+
+        var constraints: [NSLayoutConstraint] = []
+        let rows = Int(ceil(Double(tiles.count) / Double(columns)))
+        let firstTile = tiles[0]
+
+        for (index, tile) in tiles.enumerated() {
+            let row = index / columns
+            let column = index % columns
+
+            if row == 0 {
+                constraints.append(tile.topAnchor.constraint(equalTo: container.topAnchor))
+            } else {
+                let above = tiles[index - columns]
+                constraints.append(tile.topAnchor.constraint(equalTo: above.bottomAnchor, constant: rowGap))
+            }
+
+            if row == rows - 1 {
+                constraints.append(tile.bottomAnchor.constraint(equalTo: container.bottomAnchor))
+            }
+
+            if column == 0 {
+                constraints.append(tile.leadingAnchor.constraint(equalTo: container.leadingAnchor))
+            } else {
+                let previous = tiles[index - 1]
+                constraints.append(tile.leadingAnchor.constraint(equalTo: previous.trailingAnchor, constant: columnGap))
+                constraints.append(tile.widthAnchor.constraint(equalTo: previous.widthAnchor))
+            }
+
+            if column == columns - 1 || index == tiles.count - 1 {
+                constraints.append(tile.trailingAnchor.constraint(equalTo: container.trailingAnchor))
+            }
+
+            if tile !== firstTile {
+                constraints.append(tile.heightAnchor.constraint(equalTo: firstTile.heightAnchor))
+            }
+        }
+
+        NSLayoutConstraint.activate(constraints)
+        return constraints
     }
 
     private func configureRootsTable() {
@@ -671,27 +843,12 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         }
     }
 
-    private func healthText(_ snapshot: IndexInsightsSnapshot) -> String {
-        let searches = snapshot.usage.allTimeSearches
-        let health = snapshot.usage.health
-        return [
-            "fast paths: \(searches.indexedCandidateSearches.formatted())",
-            "fallback scans: \(searches.fallbackScans.formatted())",
-            "latency avg/max: \(durationString(searches.averageLatency)) / \(durationString(searches.maxLatency))",
-            "candidate rows: \(searches.candidateRowsExamined.formatted())",
-            "full-scan rows: \(searches.scannedRowsExamined.formatted())",
-            "snapshot load failures: \(health.snapshotLoadFailures.formatted())",
-            "persist failures: \(health.persistFailures.formatted())",
-            "active jobs: \(snapshot.health.activeIndexJobs), schema: \(snapshot.health.schemaVersion), path index: \(snapshot.health.pathGramIndexEnabled ? "enabled" : "disabled")"
-        ].joined(separator: "\n")
-    }
-
     private func lifetimeText(_ snapshot: IndexInsightsSnapshot) -> String {
         let firstLaunch = dateOnlyString(snapshot.lifetime.firstLaunchDate)
         let versionSeen = dateOnlyString(snapshot.lifetime.currentAppVersionFirstSeenDate)
         let daily = snapshot.usage.dailyBuckets.last
-        let memory = daily.map { "Today memory min/max: \(byteString($0.memory.dailyMinimumBytes)) / \(byteString($0.memory.dailyMaximumBytes))" } ?? "No memory samples yet"
-        return "First launch: \(firstLaunch). Launches: \(snapshot.lifetime.launchCount.formatted()). Current version first seen: \(versionSeen). \(memory)."
+        let memory = daily.map { "Memory today \(byteString($0.memory.dailyMinimumBytes)) - \(byteString($0.memory.dailyMaximumBytes))" } ?? "No memory samples yet"
+        return "First launch \(firstLaunch) · launches \(snapshot.lifetime.launchCount.formatted()) · version seen \(versionSeen) · \(memory)"
     }
 
     private func configureIconButton(_ button: NSButton, title: String, symbol: String, action: Selector) {
@@ -717,6 +874,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         label.translatesAutoresizingMaskIntoConstraints = false
         label.font = .systemFont(ofSize: 13, weight: .semibold)
         label.textColor = .secondaryLabelColor
+        allowHorizontalCompression(label)
         return label
     }
 
@@ -724,25 +882,68 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         let titleLabel = NSTextField(labelWithString: title)
         titleLabel.font = .systemFont(ofSize: 10, weight: .medium)
         titleLabel.textColor = .secondaryLabelColor
+        titleLabel.alignment = .left
+        allowHorizontalCompression(titleLabel)
 
         let valueLabel = NSTextField(labelWithString: value)
         valueLabel.font = .monospacedDigitSystemFont(ofSize: 18, weight: .semibold)
         valueLabel.textColor = .labelColor
+        valueLabel.alignment = .left
         valueLabel.lineBreakMode = .byTruncatingTail
         valueLabel.maximumNumberOfLines = 1
+        allowHorizontalCompression(valueLabel)
 
         let detailLabel = NSTextField(labelWithString: detail)
-        detailLabel.font = .systemFont(ofSize: 10, weight: .regular)
-        detailLabel.textColor = .tertiaryLabelColor
+        detailLabel.font = .systemFont(ofSize: 11, weight: .medium)
+        detailLabel.textColor = .secondaryLabelColor
+        detailLabel.alignment = .left
         detailLabel.lineBreakMode = .byTruncatingTail
+        allowHorizontalCompression(detailLabel)
 
         let stack = verticalStack([titleLabel, valueLabel, detailLabel], spacing: 2)
+        stack.alignment = .leading
         stack.wantsLayer = true
         stack.layer?.cornerRadius = 6
         stack.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.55).cgColor
-        stack.edgeInsets = NSEdgeInsets(top: 8, left: 10, bottom: 8, right: 10)
+        stack.edgeInsets = NSEdgeInsets(top: 5, left: 10, bottom: 5, right: 10)
         NSLayoutConstraint.activate([
             stack.heightAnchor.constraint(greaterThanOrEqualToConstant: 62)
+        ])
+        return stack
+    }
+
+    private func makeHealthTile(title: String, value: String, detail: String, isWarning: Bool = false) -> NSView {
+        let titleLabel = NSTextField(labelWithString: title)
+        titleLabel.font = .systemFont(ofSize: 10, weight: .medium)
+        titleLabel.textColor = .secondaryLabelColor
+        titleLabel.alignment = .left
+        titleLabel.lineBreakMode = .byTruncatingTail
+        allowHorizontalCompression(titleLabel)
+
+        let valueLabel = NSTextField(labelWithString: value)
+        valueLabel.font = .monospacedDigitSystemFont(ofSize: 15, weight: .semibold)
+        valueLabel.textColor = isWarning ? .systemOrange : .labelColor
+        valueLabel.alignment = .left
+        valueLabel.lineBreakMode = .byTruncatingTail
+        valueLabel.maximumNumberOfLines = 1
+        allowHorizontalCompression(valueLabel)
+
+        let detailLabel = NSTextField(labelWithString: detail)
+        detailLabel.font = .systemFont(ofSize: 10, weight: .medium)
+        detailLabel.textColor = .secondaryLabelColor
+        detailLabel.alignment = .left
+        detailLabel.lineBreakMode = .byTruncatingTail
+        detailLabel.maximumNumberOfLines = 1
+        allowHorizontalCompression(detailLabel)
+
+        let stack = verticalStack([titleLabel, valueLabel, detailLabel], spacing: 2)
+        stack.alignment = .leading
+        stack.wantsLayer = true
+        stack.layer?.cornerRadius = 6
+        stack.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.42).cgColor
+        stack.edgeInsets = NSEdgeInsets(top: 7, left: 9, bottom: 7, right: 9)
+        NSLayoutConstraint.activate([
+            stack.heightAnchor.constraint(greaterThanOrEqualToConstant: 54)
         ])
         return stack
     }
@@ -774,6 +975,11 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         stack.alignment = .width
         stack.spacing = spacing
         return stack
+    }
+
+    private func allowHorizontalCompression(_ view: NSView) {
+        view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        view.setContentHuggingPriority(.defaultLow, for: .horizontal)
     }
 
     private func byteString(_ bytes: UInt64) -> String {
@@ -1022,7 +1228,7 @@ private final class InsightsBarChartView: NSView {
 
         let values = buckets.map { max($0.searches.completed, $0.fileActions.values.reduce(UInt64(0), +), $0.health.incrementalRefreshBatches + $0.health.fullRebuilds) }
         let maxValue = max(values.max() ?? 0, 1)
-        let plot = bounds.insetBy(dx: 8, dy: 10)
+        let plot = InsightsActivityChartLayout.plotRect(in: bounds)
         let gap: CGFloat = 3
         let barWidth = max(3, (plot.width - CGFloat(max(buckets.count - 1, 0)) * gap) / CGFloat(max(buckets.count, 1)))
 
@@ -1038,12 +1244,7 @@ private final class InsightsBarChartView: NSView {
             drawBar(x: x, width: barWidth, height: updateHeight, color: .systemOrange.withAlphaComponent(0.8), plot: plot.insetBy(dx: barWidth * 0.42, dy: 0))
         }
 
-        let legend = "Blue searches  Green file actions  Orange index updates"
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 10),
-            .foregroundColor: NSColor.secondaryLabelColor
-        ]
-        legend.draw(at: NSPoint(x: plot.minX, y: bounds.maxY - 14), withAttributes: attributes)
+        drawLegend(in: InsightsActivityChartLayout.legendRect(in: bounds))
     }
 
     private func drawBar(x: CGFloat, width: CGFloat, height: CGFloat, color: NSColor, plot: NSRect) {
@@ -1051,6 +1252,25 @@ private final class InsightsBarChartView: NSView {
         color.setFill()
         let rect = NSRect(x: x, y: plot.maxY - height, width: width, height: height)
         NSBezierPath(roundedRect: rect, xRadius: 2, yRadius: 2).fill()
+    }
+
+    private func drawLegend(in rect: NSRect) {
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 10, weight: .medium),
+            .foregroundColor: NSColor.secondaryLabelColor
+        ]
+        var x = rect.minX
+        for item in InsightsActivityChartLayout.legendItems {
+            item.color.setFill()
+            NSBezierPath(
+                roundedRect: NSRect(x: x, y: rect.minY + 3, width: 8, height: 8),
+                xRadius: 2,
+                yRadius: 2
+            ).fill()
+            x += 12
+            item.title.draw(at: NSPoint(x: x, y: rect.minY), withAttributes: attributes)
+            x += item.title.size(withAttributes: attributes).width + 14
+        }
     }
 
     private func drawEmpty(_ text: String) {
@@ -1062,6 +1282,39 @@ private final class InsightsBarChartView: NSView {
         text.draw(
             at: NSPoint(x: bounds.midX - size.width / 2, y: bounds.midY - size.height / 2),
             withAttributes: attributes
+        )
+    }
+}
+
+enum InsightsActivityChartLayout {
+    static let inset = NSEdgeInsets(top: 10, left: 8, bottom: 10, right: 8)
+    static let legendHeight: CGFloat = 14
+    static let legendGap: CGFloat = 8
+    static let legendItems: [(title: String, color: NSColor)] = [
+        ("Searches", .systemBlue),
+        ("File actions", .systemGreen.withAlphaComponent(0.75)),
+        ("Index updates", .systemOrange.withAlphaComponent(0.8))
+    ]
+
+    static func plotRect(in bounds: NSRect) -> NSRect {
+        let content = bounds.insetBy(dx: inset.left, dy: 0)
+        let y = bounds.minY + inset.top
+        let bottomReserved = inset.bottom + legendHeight + legendGap
+        return NSRect(
+            x: content.minX,
+            y: y,
+            width: max(0, content.width),
+            height: max(0, bounds.height - inset.top - bottomReserved)
+        )
+    }
+
+    static func legendRect(in bounds: NSRect) -> NSRect {
+        let plot = plotRect(in: bounds)
+        return NSRect(
+            x: plot.minX,
+            y: plot.maxY + legendGap,
+            width: plot.width,
+            height: legendHeight
         )
     }
 }
