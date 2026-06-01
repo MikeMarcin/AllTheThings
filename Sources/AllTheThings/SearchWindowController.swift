@@ -82,6 +82,48 @@ final class SearchWindowController: NSWindowController {
         viewController.reindexConfiguredRootsFromSettings()
     }
 
+    nonisolated static func zeroRowRootRecoveryPaths(
+        snapshotRoots: [IndexRootInsight],
+        configuredRootPaths: [String],
+        accessStatus: (String) -> InsightsRootAccessStatus = { InsightsRootAccessStatus.status(for: $0) }
+    ) -> [String] {
+        zeroRowRootRecoveryCandidatePaths(
+            snapshotRoots: snapshotRoots,
+            configuredRootPaths: configuredRootPaths
+        )
+        .filter { accessStatus($0) == .readable }
+    }
+
+    nonisolated static func zeroRowRootRecoveryCandidatePaths(
+        snapshotRoots: [IndexRootInsight],
+        configuredRootPaths: [String]
+    ) -> [String] {
+        guard !configuredRootPaths.isEmpty else { return [] }
+
+        let roots = InsightsRootDisplay.roots(
+            snapshotRoots: snapshotRoots,
+            configuredRootPaths: configuredRootPaths
+        )
+        var rootsByPath: [String: IndexRootInsight] = [:]
+        for root in roots {
+            rootsByPath[root.path] = root
+        }
+        var seen = Set<String>()
+        var paths: [String] = []
+
+        for path in configuredRootPaths where seen.insert(path).inserted {
+            guard
+                let root = rootsByPath[path],
+                InsightsRootDisplay.hasNoIndexedRows(root)
+            else {
+                continue
+            }
+            paths.append(path)
+        }
+
+        return paths
+    }
+
     private static func startupContentSize() -> NSSize {
         guard let visibleFrame = NSScreen.main?.visibleFrame else {
             return WindowLayout.preferredContentSize
@@ -576,6 +618,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var wasImportantMascotOperationActive = false
     private var didRequestInitialSnapshotLoad = false
     private var didRequestInitialRebuild = false
+    private var attemptedZeroRowRootRecoveryPaths = Set<String>()
+    private var zeroRowRootRecoveryCandidatePaths: [String] = []
+    private var zeroRowRootRecoveryCandidateSnapshotRevision: UInt64?
+    private nonisolated(unsafe) var pendingZeroRowRootRecoveryWorkItem: DispatchWorkItem?
     private var highlightsSearchText: Bool
     private var showsHiddenFiles: Bool
     private var appFontFamilyName: String?
@@ -637,6 +683,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         memoryStatusTask?.cancel()
         activeExplanationToken.cancel()
         pendingMascotExpansion?.cancel()
+        pendingZeroRowRootRecoveryWorkItem?.cancel()
         NotificationCenter.default.removeObserver(self)
     }
 
@@ -691,6 +738,12 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             self,
             selector: #selector(exclusionPatternsDidChange(_:)),
             name: AppSettings.exclusionPatternsDidChangeNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(applicationDidBecomeActive(_:)),
+            name: NSApplication.didBecomeActiveNotification,
             object: nil
         )
 
@@ -1931,6 +1984,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             return
         }
 
+        refreshZeroRowRootRecoveryCandidatesIfNeeded(stats: stats)
+        scheduleZeroRowRootRecoveryIfNeeded()
+
         if stats.snapshotRevision != previousStats.snapshotRevision {
             scheduleSearch(force: true)
         } else {
@@ -1975,6 +2031,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
 
         if indexStats.indexedCount > 0 {
+            if indexSettingsMatchConfiguredSettings() {
+                refreshZeroRowRootRecoveryCandidatesIfNeeded(stats: indexStats)
+                scheduleZeroRowRootRecoveryIfNeeded()
+            }
             scheduleSearch(force: true)
             return
         }
@@ -2002,6 +2062,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
 
         didRequestInitialRebuild = true
+        resetZeroRowRootRecoveryState()
         if !index.hasResumableCheckpoint(for: indexedRoots) {
             prepareFSEventsForFreshIndexBuild()
         }
@@ -2327,6 +2388,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         indexedRoots = updatedRoots
         refreshRootDisplayNames()
+        resetZeroRowRootRecoveryState()
         didRequestInitialRebuild = false
         guard AppSettings.indexingSetupCompleted(defaults: defaults) else {
             startWatchingIfNeeded()
@@ -2346,8 +2408,14 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         guard patterns != index.allExclusionPatterns() else { return }
 
         index.updateExclusionPatterns(patterns)
+        resetZeroRowRootRecoveryState()
         guard AppSettings.indexingSetupCompleted(defaults: defaults) else { return }
         rebuildIndexForCurrentSettings()
+    }
+
+    @objc private func applicationDidBecomeActive(_ notification: Notification) {
+        guard !zeroRowRootRecoveryCandidatePaths.isEmpty else { return }
+        scheduleZeroRowRootRecoveryIfNeeded()
     }
 
     private func rebuildIndexForCurrentSettings() {
@@ -2377,6 +2445,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         didRequestInitialSnapshotLoad = true
         didRequestInitialRebuild = true
+        resetZeroRowRootRecoveryState()
         prepareFSEventsForFreshIndexBuild()
         updateScanSnapshotPublishingPreference()
         index.replaceRootsAndRebuild(indexedRoots, mode: .fresh)
@@ -2389,6 +2458,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         guard AppSettings.indexingSetupCompleted(defaults: defaults), !indexedRoots.isEmpty else { return }
         didRequestInitialSnapshotLoad = true
         didRequestInitialRebuild = true
+        resetZeroRowRootRecoveryState()
         prepareFSEventsForFreshIndexBuild()
         updateScanSnapshotPublishingPreference()
         index.replaceRootsAndRebuild(indexedRoots, mode: .fresh)
@@ -2409,6 +2479,93 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     private func rootPaths(_ roots: [URL]) -> [String] {
         roots.map(\.standardizedFileURL.path)
+    }
+
+    private func resetZeroRowRootRecoveryState() {
+        pendingZeroRowRootRecoveryWorkItem?.cancel()
+        pendingZeroRowRootRecoveryWorkItem = nil
+        attemptedZeroRowRootRecoveryPaths.removeAll(keepingCapacity: false)
+        zeroRowRootRecoveryCandidatePaths.removeAll(keepingCapacity: false)
+        zeroRowRootRecoveryCandidateSnapshotRevision = nil
+    }
+
+    private func refreshZeroRowRootRecoveryCandidatesIfNeeded(stats: IndexStats) {
+        guard didRequestInitialSnapshotLoad, !stats.isIndexing, !stats.isLoadingSnapshot, stats.phase != .failed else {
+            return
+        }
+        guard zeroRowRootRecoveryCandidateSnapshotRevision != stats.snapshotRevision else {
+            return
+        }
+
+        let paths = SearchWindowController.zeroRowRootRecoveryCandidatePaths(
+            snapshotRoots: index.currentRootInsights(),
+            configuredRootPaths: rootPaths(indexedRoots)
+        )
+        zeroRowRootRecoveryCandidatePaths = paths
+        zeroRowRootRecoveryCandidateSnapshotRevision = stats.snapshotRevision
+        attemptedZeroRowRootRecoveryPaths = attemptedZeroRowRootRecoveryPaths.intersection(Set(paths))
+    }
+
+    private func scheduleZeroRowRootRecoveryIfNeeded() {
+        guard !zeroRowRootRecoveryCandidatePaths.isEmpty else { return }
+        pendingZeroRowRootRecoveryWorkItem?.cancel()
+
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.pendingZeroRowRootRecoveryWorkItem = nil
+            self.recoverReadableZeroRowRootsIfNeeded(stats: self.indexStats)
+        }
+        pendingZeroRowRootRecoveryWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75, execute: workItem)
+    }
+
+    private func recoverReadableZeroRowRootsIfNeeded(stats: IndexStats) {
+        guard didRequestInitialSnapshotLoad, !stats.isIndexing, !stats.isLoadingSnapshot, stats.phase != .failed else {
+            return
+        }
+        guard !zeroRowRootRecoveryCandidatePaths.isEmpty else { return }
+        guard activeFSEventReplay == nil, activeFSEventReconciliationID == nil, fseventCatchUpStartedAt == nil else {
+            return
+        }
+
+        let unattemptedPaths = zeroRowRootRecoveryCandidatePaths.filter { path in
+            !attemptedZeroRowRootRecoveryPaths.contains(path)
+                && InsightsRootAccessStatus.status(for: path) == .readable
+        }
+        guard !unattemptedPaths.isEmpty else {
+            return
+        }
+
+        for path in unattemptedPaths {
+            attemptedZeroRowRootRecoveryPaths.insert(path)
+        }
+        let recoveredPathSet = Set(unattemptedPaths)
+        zeroRowRootRecoveryCandidatePaths.removeAll { recoveredPathSet.contains($0) }
+
+        DiagnosticLogger.shared.log(
+            category: "index",
+            event: "index.zeroRowRootRecoveryRequested",
+            fields: [
+                "rootCount": .publicInt(unattemptedPaths.count),
+                "roots": .pathArray(unattemptedPaths)
+            ]
+        )
+        index.reconcileIndexedRootsInBackground(
+            rootURLs: unattemptedPaths.map { URL(fileURLWithPath: $0, isDirectory: true) }
+        )
+    }
+
+    private func pathsIncludingReadableZeroRowRecoveryCandidates(_ paths: [String]) -> [String] {
+        guard !zeroRowRootRecoveryCandidatePaths.isEmpty else { return paths }
+
+        var seen = Set(paths)
+        var merged = paths
+        for path in zeroRowRootRecoveryCandidatePaths where !seen.contains(path) {
+            guard InsightsRootAccessStatus.status(for: path) == .readable else { continue }
+            seen.insert(path)
+            merged.append(path)
+        }
+        return merged
     }
 
     private func refreshRootDisplayNames() {
@@ -2487,6 +2644,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
             switch action {
             case let .reconcile(paths):
+                let paths = self.pathsIncludingReadableZeroRowRecoveryCandidates(paths)
                 DiagnosticLogger.shared.log(
                     category: "fsevents",
                     event: "fsevents.reconciliationReconcile",
@@ -2509,6 +2667,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                 self.fseventCursorStore.markBaseline(for: self.rootPaths(roots), eventID: baselineEventID)
                 self.startWatchingIfNeeded()
                 self.updateStatus()
+                self.scheduleZeroRowRootRecoveryIfNeeded()
             case let .fullReconcile(paths):
                 DiagnosticLogger.shared.log(
                     level: .warning,
@@ -2520,7 +2679,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                     ]
                 )
                 self.index.recordRecursiveRescan()
-                let rootURLs = paths?.map { URL(fileURLWithPath: $0, isDirectory: true) }
+                let rootURLs = paths.map(self.pathsIncludingReadableZeroRowRecoveryCandidates)?
+                    .map { URL(fileURLWithPath: $0, isDirectory: true) }
                 self.index.reconcileIndexedRootsInBackground(rootURLs: rootURLs)
             }
         }

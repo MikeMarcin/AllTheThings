@@ -97,6 +97,35 @@ struct InsightsTreemapLayoutTests {
         #expect(!InsightsRootDisplay.isUnrepresented(exactEmptyRoot))
     }
 
+    @Test("root access status identifies readable missing and non-folder roots")
+    func rootAccessStatusIdentifiesReadableMissingAndNonFolderRoots() throws {
+        let fileManager = FileManager.default
+        let directory = fileManager.temporaryDirectory
+            .appendingPathComponent("ATTInsightsRootAccess-\(UUID().uuidString)", isDirectory: true)
+        let file = directory.appendingPathComponent("not-a-folder", isDirectory: false)
+        let missing = directory.appendingPathComponent("missing", isDirectory: true)
+
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data().write(to: file)
+        defer {
+            try? fileManager.removeItem(at: directory)
+        }
+
+        #expect(InsightsRootAccessStatus.status(for: directory.path) == .readable)
+        #expect(InsightsRootAccessStatus.status(for: file.path) == .notDirectory)
+        #expect(InsightsRootAccessStatus.status(for: missing.path) == .missing)
+    }
+
+    @Test("root display uses active indexing placeholders")
+    func rootDisplayUsesActiveIndexingPlaceholders() {
+        #expect(InsightsRootDisplay.activePlaceholderLabel(for: makeStats(isIndexing: false, phase: .ready)) == nil)
+        #expect(InsightsRootDisplay.activePlaceholderLabel(for: makeStats(isIndexing: true, phase: .scanning)) == "Indexing")
+        #expect(InsightsRootDisplay.activePlaceholderLabel(for: makeStats(isIndexing: true, isReconciling: true, phase: .scanning)) == "Reconciling")
+        #expect(InsightsRootDisplay.activePlaceholderLabel(for: makeStats(isIndexing: true, isUpdating: true, phase: .scanning)) == "Updating")
+        #expect(InsightsRootDisplay.activePlaceholderLabel(for: makeStats(isIndexing: true, phase: .optimizing)) == "Optimizing")
+        #expect(InsightsRootDisplay.activePlaceholderLabel(for: makeStats(isIndexing: true, phase: .saving)) == "Saving")
+    }
+
     @Test("default Insights layout fits the initial viewport")
     @MainActor
     func defaultInsightsLayoutFitsInitialViewport() throws {
@@ -223,6 +252,23 @@ struct InsightsTreemapLayoutTests {
             pathByteWeight: 512,
             estimatedIndexBytes: 256,
             attributionSource: .persistedExact
+        )
+    }
+
+    private func makeStats(
+        isIndexing: Bool,
+        isReconciling: Bool = false,
+        isUpdating: Bool = false,
+        phase: IndexPhase
+    ) -> IndexStats {
+        IndexStats(
+            indexedCount: 0,
+            isIndexing: isIndexing,
+            isReconciling: isReconciling,
+            isUpdating: isUpdating,
+            phase: phase,
+            status: "",
+            lastUpdated: Date()
         )
     }
 

@@ -1,6 +1,7 @@
 import AppKit
 import ATTCore
 import Carbon.HIToolbox
+import Darwin
 
 @MainActor
 final class InsightsWindowController: NSWindowController {
@@ -200,6 +201,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
     private var latestSnapshot: IndexInsightsSnapshot?
     private var displayedRoots: [IndexRootInsight] = []
     private var unrepresentedRootPaths = Set<String>()
+    private var rootAccessStatuses: [String: InsightsRootAccessStatus] = [:]
     private var isRefreshingInsights = false
     private var overviewTileConstraints: [NSLayoutConstraint] = []
     private var healthTileConstraints: [NSLayoutConstraint] = []
@@ -457,6 +459,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
             snapshotRoots: snapshot.roots,
             configuredRootPaths: configuredIndexedRootPaths()
         )
+        rootAccessStatuses = InsightsRootAccessStatus.statuses(for: displayedRoots)
         unrepresentedRootPaths = Set(displayedRoots.filter(InsightsRootDisplay.isUnrepresented).map(\.path))
         sortDisplayedRoots()
 
@@ -469,7 +472,12 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         rootsTableView.reloadData()
 
         storageTitleLabel.stringValue = storageTitleText(roots: displayedRoots)
-        storageSummaryLabel.stringValue = storageSummaryText(snapshot, displayedRoots: displayedRoots)
+        storageSummaryLabel.stringValue = storageSummaryText(
+            snapshot,
+            displayedRoots: displayedRoots,
+            accessStatuses: rootAccessStatuses,
+            activePlaceholder: InsightsRootDisplay.activePlaceholderLabel(for: snapshot.stats)
+        )
         performanceSummaryLabel.stringValue = "Searches: \(snapshot.usage.allTimeSearches.completed.formatted()) completed, \(snapshot.usage.allTimeSearches.fallbackScans.formatted()) full fallback scans, average latency \(durationString(snapshot.usage.allTimeSearches.averageLatency))."
         rebuildHealthGrid(snapshot)
         lifetimeSummaryLabel.stringValue = lifetimeText(snapshot)
@@ -615,7 +623,12 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         return "Estimated index package share by root (\(rootsWithData) of \(roots.count) with indexed data)"
     }
 
-    private func storageSummaryText(_ snapshot: IndexInsightsSnapshot, displayedRoots: [IndexRootInsight]) -> String {
+    private func storageSummaryText(
+        _ snapshot: IndexInsightsSnapshot,
+        displayedRoots: [IndexRootInsight],
+        accessStatuses: [String: InsightsRootAccessStatus],
+        activePlaceholder: String?
+    ) -> String {
         var parts = [
             "ATT data \(byteString(snapshot.storage.totalATTDataBytes)); index package \(byteString(snapshot.storage.indexPackageBytes)).",
             "Counts are exact; package bytes are estimated from indexed path weight."
@@ -623,7 +636,20 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
 
         let unrepresentedRoots = displayedRoots.filter(InsightsRootDisplay.isUnrepresented).count
         let noRowRoots = displayedRoots.filter(InsightsRootDisplay.hasNoIndexedRows).count
-        if unrepresentedRoots > 0 {
+        let inaccessibleRoots = displayedRoots.filter { root in
+            InsightsRootDisplay.hasNoIndexedRows(root)
+                && accessStatuses[root.path]?.preventsIndexing == true
+        }.count
+        let pendingRoots = activePlaceholder == nil ? 0 : displayedRoots.filter { root in
+            InsightsRootDisplay.hasNoIndexedRows(root)
+                && accessStatuses[root.path]?.preventsIndexing != true
+        }.count
+
+        if inaccessibleRoots > 0 {
+            parts.append("\(inaccessibleRoots) configured root\(inaccessibleRoots == 1 ? " is" : "s are") not readable by ATT; grant access, then rebuild.")
+        } else if pendingRoots > 0, let activePlaceholder {
+            parts.append("\(pendingRoots) root\(pendingRoots == 1 ? " is" : "s are") still \(activePlaceholder.lowercased()).")
+        } else if unrepresentedRoots > 0 {
             parts.append("\(unrepresentedRoots) configured root\(unrepresentedRoots == 1 ? " is" : "s are") not represented in the current index snapshot.")
         } else if noRowRoots > 0 {
             parts.append("\(noRowRoots) root\(noRowRoots == 1 ? " has" : "s have") no indexed rows; check access, exclusions, or whether they are empty.")
@@ -704,13 +730,26 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         let root = displayedRoots[row]
         let isUnrepresented = unrepresentedRootPaths.contains(root.path)
         let hasNoIndexedRows = InsightsRootDisplay.hasNoIndexedRows(root)
+        let accessStatus = rootAccessStatuses[root.path]
+        let hasAccessProblem = hasNoIndexedRows && accessStatus?.preventsIndexing == true
+        let activePlaceholder = hasNoIndexedRows && !hasAccessProblem
+            ? latestSnapshot.flatMap { InsightsRootDisplay.activePlaceholderLabel(for: $0.stats) }
+            : nil
         let cell = NSTextField(labelWithString: "")
         cell.font = identifier == "root" || isUnrepresented
             ? .systemFont(ofSize: 12, weight: identifier == "root" ? .medium : .regular)
             : .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
-        cell.textColor = (isUnrepresented || hasNoIndexedRows) ? .tertiaryLabelColor : (identifier == "root" ? .labelColor : .secondaryLabelColor)
+        cell.textColor = hasAccessProblem
+            ? .systemOrange
+            : (activePlaceholder != nil
+                ? .secondaryLabelColor
+                : ((isUnrepresented || hasNoIndexedRows) ? .tertiaryLabelColor : (identifier == "root" ? .labelColor : .secondaryLabelColor)))
         cell.lineBreakMode = .byTruncatingMiddle
-        if isUnrepresented {
+        if hasAccessProblem {
+            cell.toolTip = accessStatus?.tooltip
+        } else if let activePlaceholder {
+            cell.toolTip = "This configured root has no indexed rows yet because the index is still \(activePlaceholder.lowercased())."
+        } else if isUnrepresented {
             cell.toolTip = "This configured root is not represented in the current index snapshot. Rebuild or let indexing finish to count it."
         } else if hasNoIndexedRows {
             cell.toolTip = "No files or folders from this root are in the current index. The folder may be empty, inaccessible, or fully excluded."
@@ -719,9 +758,13 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         switch identifier {
         case "root":
             cell.stringValue = AppSettings.displayPath(root.path)
-            cell.toolTip = (isUnrepresented || hasNoIndexedRows) ? cell.toolTip : root.path
+            cell.toolTip = (isUnrepresented || hasNoIndexedRows || hasAccessProblem) ? cell.toolTip : root.path
         case "files":
-            if isUnrepresented {
+            if hasAccessProblem {
+                cell.stringValue = accessStatus?.tableLabel ?? "No access"
+            } else if let activePlaceholder {
+                cell.stringValue = activePlaceholder
+            } else if isUnrepresented {
                 cell.stringValue = "Not indexed"
             } else if hasNoIndexedRows {
                 cell.stringValue = "No rows"
@@ -1028,6 +1071,30 @@ enum InsightsRootDisplay {
             && root.estimatedIndexBytes == 0
     }
 
+    static func activePlaceholderLabel(for stats: IndexStats) -> String? {
+        if stats.isLoadingSnapshot || stats.phase == .loading {
+            return "Loading"
+        }
+        guard stats.isIndexing else { return nil }
+
+        switch stats.phase {
+        case .scanning:
+            if stats.isReconciling {
+                return "Reconciling"
+            }
+            if stats.isUpdating {
+                return "Updating"
+            }
+            return "Indexing"
+        case .optimizing:
+            return "Optimizing"
+        case .saving:
+            return "Saving"
+        case .idle, .ready, .failed, .loading:
+            return nil
+        }
+    }
+
     static func roots(
         snapshotRoots: [IndexRootInsight],
         configuredRootPaths: [String]
@@ -1063,6 +1130,78 @@ enum InsightsRootDisplay {
         }
 
         return roots
+    }
+}
+
+enum InsightsRootAccessStatus: Equatable {
+    case readable
+    case notReadable
+    case missing
+    case notDirectory
+
+    var preventsIndexing: Bool {
+        self != .readable
+    }
+
+    var tableLabel: String {
+        switch self {
+        case .readable:
+            "No rows"
+        case .notReadable:
+            "No access"
+        case .missing:
+            "Missing"
+        case .notDirectory:
+            "Not folder"
+        }
+    }
+
+    var tooltip: String {
+        switch self {
+        case .readable:
+            "No files or folders from this root are in the current index. The folder may be empty or fully excluded."
+        case .notReadable:
+            "AllTheThings cannot read this folder. Grant folder access or Full Disk Access, then rebuild the index."
+        case .missing:
+            "This configured folder no longer exists. Remove it or restore it, then rebuild the index."
+        case .notDirectory:
+            "This configured root is not a folder. Remove it or choose a folder, then rebuild the index."
+        }
+    }
+
+    static func statuses(for roots: [IndexRootInsight]) -> [String: InsightsRootAccessStatus] {
+        Dictionary(uniqueKeysWithValues: roots
+            .filter(InsightsRootDisplay.hasNoIndexedRows)
+            .map { ($0.path, status(for: $0.path)) })
+    }
+
+    static func status(for path: String, fileManager: FileManager = .default) -> InsightsRootAccessStatus {
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: path, isDirectory: &isDirectory) else {
+            return .missing
+        }
+        guard isDirectory.boolValue else {
+            return .notDirectory
+        }
+        guard canEnumerateDirectory(at: path) else {
+            return .notReadable
+        }
+        return .readable
+    }
+
+    private static func canEnumerateDirectory(at path: String) -> Bool {
+        path.withCString { representation -> Bool in
+            let descriptor = open(representation, O_RDONLY | O_DIRECTORY | O_NONBLOCK | O_CLOEXEC)
+            guard descriptor >= 0 else { return false }
+            guard let stream = fdopendir(descriptor) else {
+                close(descriptor)
+                return false
+            }
+            defer { closedir(stream) }
+            errno = 0
+            _ = readdir(stream)
+            return errno == 0
+        }
     }
 }
 
