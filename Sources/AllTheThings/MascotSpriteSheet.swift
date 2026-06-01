@@ -578,7 +578,9 @@ final class StandaloneMascotCoordinator {
         imageView.setAccessibilityLabel(clip.accessibilityLabel)
 
         let widthConstraint = imageView.widthAnchor.constraint(equalToConstant: displaySize)
-        let heightConstraint = imageView.heightAnchor.constraint(equalToConstant: displaySize)
+        let heightConstraint = imageView.heightAnchor.constraint(
+            equalToConstant: OperationMascotCoordinator.displayHeight(for: displaySize)
+        )
         NSLayoutConstraint.activate([widthConstraint, heightConstraint])
     }
 
@@ -635,6 +637,7 @@ final class OperationMascotCoordinator {
     static let footerSlotHeight: CGFloat = 28
     static let heroDisplaySize: CGFloat = 86
     static let expandedDisplaySize: CGFloat = statusDisplaySize * 4
+    nonisolated static let spriteFrameAspectRatio: CGFloat = 96.0 / 160.0
 
     private let imageView: NSImageView
     private let spriteSheet: MascotSpriteSheet
@@ -642,9 +645,14 @@ final class OperationMascotCoordinator {
     private var widthConstraint: NSLayoutConstraint?
     private var heightConstraint: NSLayoutConstraint?
     private var animationController = OperationMascotAnimationController()
+    private var scaleTransitionActive = false
     private nonisolated(unsafe) var frameTimer: Timer?
     private var reduceMotion: Bool {
         NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    }
+
+    nonisolated static func displayHeight(for displayWidth: CGFloat) -> CGFloat {
+        displayWidth * spriteFrameAspectRatio
     }
 
     init(
@@ -676,12 +684,27 @@ final class OperationMascotCoordinator {
     }
 
     func setDisplaySize(_ size: CGFloat, animated: Bool = false) {
+        let height = Self.displayHeight(for: size)
         if animated {
             widthConstraint?.animator().constant = size
-            heightConstraint?.animator().constant = size
+            heightConstraint?.animator().constant = height
         } else {
             widthConstraint?.constant = size
-            heightConstraint?.constant = size
+            heightConstraint?.constant = height
+        }
+    }
+
+    func setScaleTransitionActive(_ active: Bool) {
+        guard scaleTransitionActive != active else { return }
+
+        scaleTransitionActive = active
+        if active {
+            frameTimer?.invalidate()
+            frameTimer = nil
+            clearMotionAccent()
+        } else {
+            configureMotionAccent()
+            configureTimers()
         }
     }
 
@@ -693,7 +716,7 @@ final class OperationMascotCoordinator {
         imageView.setAccessibilityRole(.image)
 
         let widthConstraint = imageView.widthAnchor.constraint(equalToConstant: displaySize)
-        let heightConstraint = imageView.heightAnchor.constraint(equalToConstant: displaySize)
+        let heightConstraint = imageView.heightAnchor.constraint(equalToConstant: Self.displayHeight(for: displaySize))
         self.widthConstraint = widthConstraint
         self.heightConstraint = heightConstraint
         NSLayoutConstraint.activate([widthConstraint, heightConstraint])
@@ -715,7 +738,7 @@ final class OperationMascotCoordinator {
         frameTimer?.invalidate()
         frameTimer = nil
 
-        guard !reduceMotion else { return }
+        guard !reduceMotion, !scaleTransitionActive else { return }
 
         configureFrameTimer()
     }
@@ -755,7 +778,7 @@ final class OperationMascotCoordinator {
     }
 
     private func renderCurrentFrame() {
-        if !reduceMotion, imageView.image != nil {
+        if !reduceMotion, !scaleTransitionActive, imageView.image != nil {
             let transition = CATransition()
             transition.type = .fade
             transition.duration = min(0.08, 0.4 / animationController.currentFramesPerSecond)
@@ -773,10 +796,11 @@ final class OperationMascotCoordinator {
 
     private func configureMotionAccent() {
         guard let layer = imageView.layer else { return }
+        layer.removeAnimation(forKey: "mascotAccentSettle")
         layer.removeAnimation(forKey: "mascotFloat")
         layer.removeAnimation(forKey: "mascotTilt")
 
-        guard !reduceMotion else { return }
+        guard !reduceMotion, !scaleTransitionActive else { return }
 
         let amplitude: CGFloat
         let duration: CFTimeInterval
@@ -817,5 +841,24 @@ final class OperationMascotCoordinator {
         rotate.repeatCount = .infinity
         rotate.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
         layer.add(rotate, forKey: "mascotTilt")
+    }
+
+    private func clearMotionAccent() {
+        guard let layer = imageView.layer else { return }
+
+        let currentTransform = layer.presentation()?.transform ?? layer.transform
+        layer.removeAnimation(forKey: "mascotFloat")
+        layer.removeAnimation(forKey: "mascotTilt")
+        layer.removeAnimation(forKey: "mascotAccentSettle")
+        layer.transform = CATransform3DIdentity
+
+        guard !reduceMotion else { return }
+
+        let settle = CABasicAnimation(keyPath: "transform")
+        settle.fromValue = NSValue(caTransform3D: currentTransform)
+        settle.toValue = NSValue(caTransform3D: CATransform3DIdentity)
+        settle.duration = 0.08
+        settle.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        layer.add(settle, forKey: "mascotAccentSettle")
     }
 }
