@@ -438,6 +438,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             animationCoordinator.playTransient(animation)
         }
 
+        func setPlaybackSuspended(_ suspended: Bool) {
+            animationCoordinator.setPlaybackSuspended(suspended)
+        }
+
         func placementTargetFrame() -> NSRect {
             rootView.layoutSubtreeIfNeeded()
             if ownsMascotPlacement {
@@ -635,6 +639,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var fseventCatchUpStartedAt: Date?
     private var memoryStatusTask: Task<Void, Never>?
     private var memoryStatusText = ProcessMemoryFormatter.label(for: ProcessMemorySampler.currentUsage())
+    private var energyMode: EnergyMode = .interactive
     private var mascotCoordinator: OperationMascotCoordinator?
     private var expandedMascotPresenter: ExpandedMascotPresentationController?
     private var loadingMascotCoordinator: OperationMascotCoordinator?
@@ -666,6 +671,42 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         static let sortAscending = "ATTSortAscending"
         static let visibleColumns = "ATTVisibleColumns"
         static let visibleColumnsSchema = "ATTVisibleColumnsSchema"
+    }
+
+    private enum EnergyMode {
+        case interactive
+        case background
+
+        var watcherConfiguration: FileSystemWatcher.StreamConfiguration {
+            switch self {
+            case .interactive:
+                return .interactive
+            case .background:
+                return .background
+            }
+        }
+
+        var eventDebounceDelay: TimeInterval {
+            switch self {
+            case .interactive:
+                return 0.05
+            case .background:
+                return 3.0
+            }
+        }
+
+        var memoryStatusPollInterval: Duration {
+            switch self {
+            case .interactive:
+                return .seconds(2)
+            case .background:
+                return .seconds(30)
+            }
+        }
+
+        var suspendsMascotPlayback: Bool {
+            self == .background
+        }
     }
 
     private enum ExpandedMascotLayout {
@@ -779,7 +820,14 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             name: NSApplication.didBecomeActiveNotification,
             object: nil
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(applicationDidResignActive(_:)),
+            name: NSApplication.didResignActiveNotification,
+            object: nil
+        )
 
+        applyEnergyMode(Self.currentEnergyMode(), force: true)
         startWatchingIfNeeded()
         startMemoryStatusPolling()
         updateScanSnapshotPublishingPreference()
@@ -1421,7 +1469,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         guard
             let playback,
             playback.frameCount > 1,
-            !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+            !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
+            !energyMode.suspendsMascotPlayback
         else {
             mascotFlightImageView.image = fallbackImage
             return
@@ -1464,6 +1513,20 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             from: MascotSpriteSheet.shared,
             index: mascotFlightFrameIndex
         ) ?? mascotFlightFallbackImage
+    }
+
+    private func updateMascotFlightFramePlaybackForEnergyMode() {
+        guard isMascotFlightInProgress else { return }
+
+        if energyMode.suspendsMascotPlayback {
+            mascotFlightFrameTimer?.invalidate()
+            mascotFlightFrameTimer = nil
+            mascotFlightImageView.image = mascotFlightFallbackImage
+            return
+        }
+
+        guard mascotFlightFrameTimer == nil, let fallbackImage = mascotFlightFallbackImage else { return }
+        startMascotFlightFramePlayback(mascotFlightPlayback, fallbackImage: fallbackImage)
     }
 
     private func setupMascotTuckTargetFrame() -> NSRect {
@@ -2447,8 +2510,40 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     @objc private func applicationDidBecomeActive(_ notification: Notification) {
+        if applyEnergyMode(.interactive) {
+            runFSEventsBackedReconciliation(roots: indexedRoots)
+        }
         guard !zeroRowRootRecoveryCandidatePaths.isEmpty else { return }
         scheduleZeroRowRootRecoveryIfNeeded()
+    }
+
+    @objc private func applicationDidResignActive(_ notification: Notification) {
+        applyEnergyMode(.background)
+    }
+
+    private static func currentEnergyMode() -> EnergyMode {
+        NSApp.isActive ? .interactive : .background
+    }
+
+    @discardableResult
+    private func applyEnergyMode(_ mode: EnergyMode, force: Bool = false) -> Bool {
+        guard force || energyMode != mode else { return false }
+
+        energyMode = mode
+        startWatchingIfNeeded()
+        reschedulePendingFSEventFlushIfNeeded()
+        restartMemoryStatusPolling()
+        applyMascotPlaybackSuspension()
+        return true
+    }
+
+    private func applyMascotPlaybackSuspension() {
+        let suspended = energyMode.suspendsMascotPlayback
+        mascotCoordinator?.setPlaybackSuspended(suspended)
+        expandedMascotPresenter?.setPlaybackSuspended(suspended)
+        loadingMascotCoordinator?.setPlaybackSuspended(suspended)
+        setupMascotCoordinator?.setPlaybackSuspended(suspended)
+        updateMascotFlightFramePlaybackForEnergyMode()
     }
 
     private func rebuildIndexForCurrentSettings() {
@@ -2628,7 +2723,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             return
         }
 
-        watcher.start(roots: indexedRoots) { @MainActor @Sendable [weak self] events in
+        watcher.start(roots: indexedRoots, configuration: energyMode.watcherConfiguration) { @MainActor @Sendable [weak self] events in
             self?.coalesceFSEvents(events)
         }
     }
@@ -2738,24 +2833,35 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                 "paths": .pathArray(events.map(\.path))
             ]
         )
+        scheduleCoalescedFSEventFlush()
+    }
+
+    private func scheduleCoalescedFSEventFlush() {
         eventDebounce?.cancel()
-
         let workItem = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            let paths = Array(self.pendingEventPaths)
-            let recursivePaths = Array(self.pendingRecursiveEventPaths)
-            self.pendingEventPaths.removeAll(keepingCapacity: false)
-            self.pendingRecursiveEventPaths.removeAll(keepingCapacity: false)
-            guard !paths.isEmpty else { return }
-            self.playMascotTransient(.fileChanged)
-            self.index.update(paths: paths)
-            if !recursivePaths.isEmpty {
-                self.index.recordRecursiveRescan()
-            }
+            self?.flushCoalescedFSEvents()
         }
-
         eventDebounce = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: workItem)
+        DispatchQueue.main.asyncAfter(deadline: .now() + energyMode.eventDebounceDelay, execute: workItem)
+    }
+
+    private func reschedulePendingFSEventFlushIfNeeded() {
+        guard eventDebounce != nil, !pendingEventPaths.isEmpty else { return }
+        scheduleCoalescedFSEventFlush()
+    }
+
+    private func flushCoalescedFSEvents() {
+        eventDebounce = nil
+        let paths = Array(pendingEventPaths)
+        let recursivePaths = Array(pendingRecursiveEventPaths)
+        pendingEventPaths.removeAll(keepingCapacity: false)
+        pendingRecursiveEventPaths.removeAll(keepingCapacity: false)
+        guard !paths.isEmpty else { return }
+        playMascotTransient(.fileChanged)
+        index.update(paths: paths)
+        if !recursivePaths.isEmpty {
+            index.recordRecursiveRescan()
+        }
     }
 
     private func startMemoryStatusPolling() {
@@ -2764,11 +2870,18 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         refreshMemoryStatus()
         memoryStatusTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(2))
+                guard let self else { return }
+                try? await Task.sleep(for: self.energyMode.memoryStatusPollInterval)
                 guard !Task.isCancelled else { return }
-                self?.refreshMemoryStatusAndUpdateFooter()
+                self.refreshMemoryStatusAndUpdateFooter()
             }
         }
+    }
+
+    private func restartMemoryStatusPolling() {
+        memoryStatusTask?.cancel()
+        memoryStatusTask = nil
+        startMemoryStatusPolling()
     }
 
     private func refreshMemoryStatusAndUpdateFooter() {

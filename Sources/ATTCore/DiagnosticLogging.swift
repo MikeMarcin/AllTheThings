@@ -336,7 +336,6 @@ public final class DiagnosticLogger: @unchecked Sendable {
 
             prepareLogDirectory(configuration)
             pruneLogs(configuration)
-            startFlushTimer(configuration)
         }
     }
 
@@ -383,6 +382,7 @@ public final class DiagnosticLogger: @unchecked Sendable {
     public func flush() {
         queue.sync {
             guard let configuration = stateLock.withLock({ self.configuration }) else { return }
+            cancelFlushTimer()
             flushBuffer(configuration)
         }
     }
@@ -415,14 +415,25 @@ public final class DiagnosticLogger: @unchecked Sendable {
         }
     }
 
-    private func startFlushTimer(_ configuration: Configuration) {
+    private func scheduleFlushTimerIfNeeded(_ configuration: Configuration) {
+        guard flushTimer == nil, !buffer.isEmpty else { return }
+
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + Self.flushInterval, repeating: Self.flushInterval)
+        let elapsedSinceLastFlush = configuration.clock().timeIntervalSince(lastFlushDate)
+        let delay = max(Self.flushInterval - elapsedSinceLastFlush, 0)
+        timer.schedule(deadline: .now() + delay, leeway: .milliseconds(200))
         timer.setEventHandler { [weak self] in
-            self?.flushBuffer(configuration)
+            guard let self else { return }
+            flushTimer = nil
+            flushBuffer(configuration)
         }
         timer.resume()
         flushTimer = timer
+    }
+
+    private func cancelFlushTimer() {
+        flushTimer?.cancel()
+        flushTimer = nil
     }
 
     private func append(_ event: DiagnosticLogEvent, configuration: Configuration) {
@@ -430,7 +441,10 @@ public final class DiagnosticLogger: @unchecked Sendable {
         let shouldFlush = buffer.count >= Self.flushEventCount
             || configuration.clock().timeIntervalSince(lastFlushDate) >= Self.flushInterval
         if shouldFlush {
+            cancelFlushTimer()
             flushBuffer(configuration)
+        } else {
+            scheduleFlushTimerIfNeeded(configuration)
         }
     }
 

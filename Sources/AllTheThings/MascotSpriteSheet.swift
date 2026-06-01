@@ -527,6 +527,7 @@ final class StandaloneMascotCoordinator {
     private let displaySize: CGFloat
     private var frameIndex = 0
     private var isActive = false
+    private var playbackSuspended = false
     private nonisolated(unsafe) var frameTimer: Timer?
     private var reduceMotion: Bool {
         NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
@@ -554,17 +555,28 @@ final class StandaloneMascotCoordinator {
         guard isActive != active else { return }
 
         isActive = active
-        if active {
+        if active, !playbackSuspended {
             start()
         } else {
             stop()
         }
     }
 
+    func setPlaybackSuspended(_ suspended: Bool) {
+        guard playbackSuspended != suspended else { return }
+
+        playbackSuspended = suspended
+        if suspended {
+            stop()
+        } else if isActive {
+            configureTimer()
+        }
+    }
+
     func restart() {
         frameIndex = 0
         renderCurrentFrame()
-        if isActive {
+        if isActive, !playbackSuspended {
             configureTimer()
         }
     }
@@ -587,6 +599,7 @@ final class StandaloneMascotCoordinator {
     private func start() {
         frameIndex = 0
         renderCurrentFrame()
+        guard !playbackSuspended else { return }
         configureTimer()
     }
 
@@ -599,7 +612,7 @@ final class StandaloneMascotCoordinator {
         frameTimer?.invalidate()
         frameTimer = nil
 
-        guard !reduceMotion, clip.frameCount > 1 else { return }
+        guard !reduceMotion, !playbackSuspended, clip.frameCount > 1 else { return }
 
         let frameInterval = 1 / clip.framesPerSecond
         let timer = Timer(timeInterval: frameInterval, repeats: true) { [weak self] _ in
@@ -618,7 +631,7 @@ final class StandaloneMascotCoordinator {
     }
 
     private func renderCurrentFrame() {
-        if !reduceMotion, imageView.image != nil {
+        if !reduceMotion, !playbackSuspended, imageView.image != nil {
             let transition = CATransition()
             transition.type = .fade
             transition.duration = min(0.08, 0.4 / clip.framesPerSecond)
@@ -646,6 +659,7 @@ final class OperationMascotCoordinator {
     private var heightConstraint: NSLayoutConstraint?
     private var animationController = OperationMascotAnimationController()
     private var scaleTransitionActive = false
+    private var playbackSuspended = false
     private nonisolated(unsafe) var frameTimer: Timer?
     private var reduceMotion: Bool {
         NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
@@ -708,6 +722,21 @@ final class OperationMascotCoordinator {
         }
     }
 
+    func setPlaybackSuspended(_ suspended: Bool) {
+        guard playbackSuspended != suspended else { return }
+
+        playbackSuspended = suspended
+        if suspended {
+            frameTimer?.invalidate()
+            frameTimer = nil
+            clearMotionAccent()
+        } else {
+            configureMotionAccent()
+            renderCurrentFrame()
+            configureTimers()
+        }
+    }
+
     private func configureImageView() {
         imageView.imageScaling = .scaleProportionallyUpOrDown
         imageView.translatesAutoresizingMaskIntoConstraints = false
@@ -738,7 +767,7 @@ final class OperationMascotCoordinator {
         frameTimer?.invalidate()
         frameTimer = nil
 
-        guard !reduceMotion, !scaleTransitionActive else { return }
+        guard !reduceMotion, !scaleTransitionActive, !playbackSuspended else { return }
 
         configureFrameTimer()
     }
@@ -747,7 +776,7 @@ final class OperationMascotCoordinator {
         frameTimer?.invalidate()
         frameTimer = nil
 
-        guard !reduceMotion, animationController.currentPlaybackFrameCount > 1 else { return }
+        guard !reduceMotion, !playbackSuspended, animationController.currentPlaybackFrameCount > 1 else { return }
 
         let frameInterval = 1 / animationController.currentFramesPerSecond
         let timer = Timer(
@@ -778,7 +807,7 @@ final class OperationMascotCoordinator {
     }
 
     private func renderCurrentFrame() {
-        if !reduceMotion, !scaleTransitionActive, imageView.image != nil {
+        if !reduceMotion, !scaleTransitionActive, !playbackSuspended, imageView.image != nil {
             let transition = CATransition()
             transition.type = .fade
             transition.duration = min(0.08, 0.4 / animationController.currentFramesPerSecond)
@@ -800,7 +829,7 @@ final class OperationMascotCoordinator {
         layer.removeAnimation(forKey: "mascotFloat")
         layer.removeAnimation(forKey: "mascotTilt")
 
-        guard !reduceMotion, !scaleTransitionActive else { return }
+        guard !reduceMotion, !scaleTransitionActive, !playbackSuspended else { return }
 
         let amplitude: CGFloat
         let duration: CFTimeInterval
