@@ -39,6 +39,18 @@ struct InsightsTreemapLayoutTests {
         #expect(items.last?.rect.maxX == 300)
     }
 
+    @Test("keeps tiny positive roots visible when space allows")
+    func keepsTinyPositiveRootsVisibleWhenSpaceAllows() {
+        let items = InsightsTreemapLayout.layout(
+            weights: [9_017, 959, 22, 2],
+            in: NSRect(x: 0, y: 0, width: 100, height: 50)
+        )
+
+        #expect(items.count == 4)
+        #expect(items.allSatisfy { $0.rect.width >= 1 })
+        #expect(items.last?.rect.maxX == 100)
+    }
+
     @Test("root display includes configured roots missing from the snapshot")
     func rootDisplayIncludesConfiguredRootsMissingFromSnapshot() {
         let snapshotRoot = makeRoot(path: "/Users/example/Documents", trackedFileCount: 12)

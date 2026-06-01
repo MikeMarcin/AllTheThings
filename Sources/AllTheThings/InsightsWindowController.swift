@@ -1237,10 +1237,20 @@ private final class InsightsTreemapView: NSView {
             let root = roots[item.index]
             let rect = item.rect
             let color = palette[item.index % palette.count]
+            let insetX = rect.width > 4 ? CGFloat(2) : 0
+            let insetY = rect.height > 4 ? CGFloat(2) : 0
+            let fillRect = rect.insetBy(dx: insetX, dy: insetY)
+            guard fillRect.width > 0, fillRect.height > 0 else { continue }
+            let radius = min(CGFloat(5), fillRect.width / 2, fillRect.height / 2)
             color.withAlphaComponent(0.72).setFill()
-            NSBezierPath(roundedRect: rect.insetBy(dx: 2, dy: 2), xRadius: 5, yRadius: 5).fill()
-            NSColor.white.withAlphaComponent(0.22).setStroke()
-            NSBezierPath(roundedRect: rect.insetBy(dx: 2.5, dy: 2.5), xRadius: 5, yRadius: 5).stroke()
+            NSBezierPath(roundedRect: fillRect, xRadius: radius, yRadius: radius).fill()
+            if fillRect.width > 3, fillRect.height > 3 {
+                NSColor.white.withAlphaComponent(0.22).setStroke()
+                let strokeInset = min(CGFloat(0.5), fillRect.width / 5, fillRect.height / 5)
+                let strokeRect = fillRect.insetBy(dx: strokeInset, dy: strokeInset)
+                let strokeRadius = min(radius, strokeRect.width / 2, strokeRect.height / 2)
+                NSBezierPath(roundedRect: strokeRect, xRadius: strokeRadius, yRadius: strokeRadius).stroke()
+            }
 
             if rect.width > 84, rect.height > 42 {
                 let percent = total == 0
@@ -1308,6 +1318,8 @@ struct InsightsTreemapLayoutItem: Equatable {
 }
 
 enum InsightsTreemapLayout {
+    private static let minimumVisibleSpan: CGFloat = 1
+
     static func layout(weights: [UInt64], in bounds: NSRect) -> [InsightsTreemapLayoutItem] {
         guard bounds.width > 0, bounds.height > 0 else { return [] }
 
@@ -1323,18 +1335,33 @@ enum InsightsTreemapLayout {
             guard remaining.width > 0, remaining.height > 0 else { break }
 
             let isLast = offset == activeWeights.count - 1
+            let remainingItemCount = activeWeights.count - offset
             let rect: NSRect
             if remaining.width >= remaining.height {
+                let span = Self.visibleSpan(
+                    totalSpan: remaining.width,
+                    remainingItemCount: remainingItemCount,
+                    entryWeight: entry.element,
+                    remainingWeight: remainingWeight,
+                    isLast: isLast
+                )
                 let width = isLast
                     ? remaining.width
-                    : min(remaining.width, max(1, floor(remaining.width * CGFloat(Double(entry.element) / Double(remainingWeight)))))
+                    : span
                 rect = NSRect(x: remaining.minX, y: remaining.minY, width: width, height: remaining.height)
                 remaining.origin.x += width
                 remaining.size.width -= width
             } else {
+                let span = Self.visibleSpan(
+                    totalSpan: remaining.height,
+                    remainingItemCount: remainingItemCount,
+                    entryWeight: entry.element,
+                    remainingWeight: remainingWeight,
+                    isLast: isLast
+                )
                 let height = isLast
                     ? remaining.height
-                    : min(remaining.height, max(1, floor(remaining.height * CGFloat(Double(entry.element) / Double(remainingWeight)))))
+                    : span
                 rect = NSRect(x: remaining.minX, y: remaining.minY, width: remaining.width, height: height)
                 remaining.origin.y += height
                 remaining.size.height -= height
@@ -1345,6 +1372,25 @@ enum InsightsTreemapLayout {
         }
 
         return items
+    }
+
+    private static func visibleSpan(
+        totalSpan: CGFloat,
+        remainingItemCount: Int,
+        entryWeight: UInt64,
+        remainingWeight: UInt64,
+        isLast: Bool
+    ) -> CGFloat {
+        guard !isLast else { return totalSpan }
+        let proportional = floor(totalSpan * CGFloat(Double(entryWeight) / Double(remainingWeight)))
+        let canReserveMinimums = totalSpan >= CGFloat(remainingItemCount) * minimumVisibleSpan
+        guard canReserveMinimums else {
+            return min(totalSpan, max(1, proportional))
+        }
+
+        let reservedForLater = CGFloat(remainingItemCount - 1) * minimumVisibleSpan
+        let available = max(minimumVisibleSpan, totalSpan - reservedForLater)
+        return min(available, max(minimumVisibleSpan, proportional))
     }
 }
 
