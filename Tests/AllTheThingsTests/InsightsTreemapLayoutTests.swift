@@ -51,6 +51,18 @@ struct InsightsTreemapLayoutTests {
         #expect(items.last?.rect.maxX == 100)
     }
 
+    @Test("hit testing expands tiny treemap slices")
+    func hitTestingExpandsTinyTreemapSlices() {
+        let items = [
+            InsightsTreemapLayoutItem(index: 0, rect: NSRect(x: 0, y: 0, width: 95, height: 50)),
+            InsightsTreemapLayoutItem(index: 1, rect: NSRect(x: 95, y: 0, width: 1, height: 50)),
+            InsightsTreemapLayoutItem(index: 2, rect: NSRect(x: 96, y: 0, width: 4, height: 50))
+        ]
+
+        #expect(InsightsTreemapLayout.hitItemIndex(at: NSPoint(x: 95.4, y: 20), in: items) == 1)
+        #expect(InsightsTreemapLayout.hitItemIndex(at: NSPoint(x: 98, y: 20), in: items) == 2)
+    }
+
     @Test("root display includes configured roots missing from the snapshot")
     func rootDisplayIncludesConfiguredRootsMissingFromSnapshot() {
         let snapshotRoot = makeRoot(path: "/Users/example/Documents", trackedFileCount: 12)

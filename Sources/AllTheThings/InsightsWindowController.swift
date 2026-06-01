@@ -1207,10 +1207,58 @@ enum InsightsRootAccessStatus: Equatable {
 
 private final class InsightsTreemapView: NSView {
     var roots: [IndexRootInsight] = [] {
-        didSet { needsDisplay = true }
+        didSet {
+            hoveredRootIndex = nil
+            hoverPoint = nil
+            needsDisplay = true
+        }
     }
 
     override var isFlipped: Bool { true }
+
+    private var trackingArea: NSTrackingArea?
+    private var hoveredRootIndex: Int?
+    private var hoverPoint: NSPoint?
+    private static let byteFormatter: ByteCountFormatter = {
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useBytes, .useKB, .useMB, .useGB, .useTB]
+        formatter.countStyle = .file
+        formatter.includesUnit = true
+        formatter.isAdaptive = true
+        return formatter
+    }()
+
+    override func updateTrackingAreas() {
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.activeAlways, .inVisibleRect, .mouseEnteredAndExited, .mouseMoved],
+            owner: self,
+            userInfo: nil
+        )
+        trackingArea = area
+        addTrackingArea(area)
+        super.updateTrackingAreas()
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        hoverPoint = point
+        hoveredRootIndex = Self.rootIndex(
+            at: point,
+            roots: roots,
+            bounds: bounds
+        )
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hoveredRootIndex = nil
+        hoverPoint = nil
+        needsDisplay = true
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
@@ -1267,6 +1315,23 @@ private final class InsightsTreemapView: NSView {
                 )
             }
         }
+
+        if let hoveredRootIndex, let hoverPoint, hoveredRootIndex < roots.count {
+            drawPlacard(
+                for: roots[hoveredRootIndex],
+                label: labels[hoveredRootIndex],
+                weight: weights[hoveredRootIndex],
+                totalWeight: total,
+                near: hoverPoint
+            )
+        }
+    }
+
+    nonisolated private static func rootIndex(at point: NSPoint, roots: [IndexRootInsight], bounds: NSRect) -> Int? {
+        guard !roots.isEmpty else { return nil }
+        let weights = roots.map(Self.layoutWeight(for:))
+        let items = InsightsTreemapLayout.layout(weights: weights, in: bounds.insetBy(dx: 1, dy: 1))
+        return InsightsTreemapLayout.hitItemIndex(at: point, in: items)
     }
 
     nonisolated private static func layoutWeight(for root: IndexRootInsight) -> UInt64 {
@@ -1299,6 +1364,80 @@ private final class InsightsTreemapView: NSView {
         return paths
     }
 
+    private func drawPlacard(
+        for root: IndexRootInsight,
+        label: String,
+        weight: UInt64,
+        totalWeight: UInt64,
+        near point: NSPoint
+    ) {
+        let percent = Self.percentString(weight: weight, total: totalWeight)
+        let lines = [
+            label,
+            "\(percent) of estimated index package",
+            "\(root.trackedFileCount.formatted()) files",
+            "\(Self.byteString(root.indexedContentBytes)) content",
+            "\(Self.byteString(root.estimatedIndexBytes)) index estimate"
+        ]
+
+        let titleAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
+            .foregroundColor: NSColor.labelColor
+        ]
+        let detailAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11, weight: .regular),
+            .foregroundColor: NSColor.secondaryLabelColor
+        ]
+
+        let measured = lines.enumerated().map { index, line in
+            line.size(withAttributes: index == 0 ? titleAttributes : detailAttributes)
+        }
+        let width = min(max(measured.map(\.width).max() ?? 0, 160) + 20, bounds.width - 20)
+        let lineHeight: CGFloat = 16
+        let height = CGFloat(lines.count) * lineHeight + 18
+        var origin = NSPoint(x: point.x + 12, y: point.y + 12)
+        if origin.x + width > bounds.maxX - 8 {
+            origin.x = point.x - width - 12
+        }
+        if origin.y + height > bounds.maxY - 8 {
+            origin.y = point.y - height - 12
+        }
+        origin.x = min(max(origin.x, bounds.minX + 8), bounds.maxX - width - 8)
+        origin.y = min(max(origin.y, bounds.minY + 8), bounds.maxY - height - 8)
+
+        let rect = NSRect(origin: origin, size: NSSize(width: width, height: height))
+        NSColor.windowBackgroundColor.withAlphaComponent(0.96).setFill()
+        NSBezierPath(roundedRect: rect, xRadius: 7, yRadius: 7).fill()
+        NSColor.separatorColor.withAlphaComponent(0.85).setStroke()
+        NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), xRadius: 7, yRadius: 7).stroke()
+
+        var y = rect.minY + 9
+        for (index, line) in lines.enumerated() {
+            let attributes = index == 0 ? titleAttributes : detailAttributes
+            line.draw(
+                in: NSRect(x: rect.minX + 10, y: y, width: rect.width - 20, height: lineHeight),
+                withAttributes: attributes
+            )
+            y += lineHeight
+        }
+    }
+
+    nonisolated private static func percentString(weight: UInt64, total: UInt64) -> String {
+        guard total > 0 else { return "0%" }
+        let percent = Double(weight) / Double(total) * 100
+        if percent > 0, percent < 0.1 {
+            return "<0.1%"
+        }
+        if percent < 10 {
+            return String(format: "%.1f%%", percent)
+        }
+        return "\(Int(percent.rounded()))%"
+    }
+
+    private static func byteString(_ bytes: UInt64) -> String {
+        byteFormatter.string(fromByteCount: Int64(clamping: bytes))
+    }
+
     private func drawEmpty(_ text: String) {
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 13, weight: .medium),
@@ -1319,6 +1458,7 @@ struct InsightsTreemapLayoutItem: Equatable {
 
 enum InsightsTreemapLayout {
     private static let minimumVisibleSpan: CGFloat = 1
+    private static let minimumHitSpan: CGFloat = 8
 
     static func layout(weights: [UInt64], in bounds: NSRect) -> [InsightsTreemapLayoutItem] {
         guard bounds.width > 0, bounds.height > 0 else { return [] }
@@ -1374,6 +1514,31 @@ enum InsightsTreemapLayout {
         return items
     }
 
+    static func hitItemIndex(at point: NSPoint, in items: [InsightsTreemapLayoutItem]) -> Int? {
+        if let directHit = bestHit(at: point, in: items, rect: \.rect) {
+            return directHit
+        }
+        return bestHit(at: point, in: items) { hitRect(for: $0.rect) }
+    }
+
+    private static func bestHit(
+        at point: NSPoint,
+        in items: [InsightsTreemapLayoutItem],
+        rect: (InsightsTreemapLayoutItem) -> NSRect
+    ) -> Int? {
+        items
+            .filter { rect($0).contains(point) }
+            .min { lhs, rhs in
+                let lhsArea = lhs.rect.width * lhs.rect.height
+                let rhsArea = rhs.rect.width * rhs.rect.height
+                if lhsArea != rhsArea {
+                    return lhsArea < rhsArea
+                }
+                return lhs.index > rhs.index
+            }?
+            .index
+    }
+
     private static func visibleSpan(
         totalSpan: CGFloat,
         remainingItemCount: Int,
@@ -1391,6 +1556,17 @@ enum InsightsTreemapLayout {
         let reservedForLater = CGFloat(remainingItemCount - 1) * minimumVisibleSpan
         let available = max(minimumVisibleSpan, totalSpan - reservedForLater)
         return min(available, max(minimumVisibleSpan, proportional))
+    }
+
+    private static func hitRect(for rect: NSRect) -> NSRect {
+        var hitRect = rect
+        if hitRect.width < minimumHitSpan {
+            hitRect = hitRect.insetBy(dx: -(minimumHitSpan - hitRect.width) / 2, dy: 0)
+        }
+        if hitRect.height < minimumHitSpan {
+            hitRect = hitRect.insetBy(dx: 0, dy: -(minimumHitSpan - hitRect.height) / 2)
+        }
+        return hitRect
     }
 }
 
