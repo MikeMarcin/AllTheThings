@@ -2152,6 +2152,20 @@ public final class FileIndex: @unchecked Sendable {
         )
     }
 
+    public func currentRootInsights() -> [IndexRootInsight] {
+        let state = lock.withLock {
+            (
+                snapshot: searchSnapshot,
+                roots: roots
+            )
+        }
+        return Self.rootInsights(
+            snapshot: state.snapshot,
+            roots: state.roots,
+            estimatedIndexBytes: 0
+        )
+    }
+
     public enum ClearCachedIndexError: LocalizedError {
         case busy
 
@@ -4829,11 +4843,21 @@ public final class FileIndex: @unchecked Sendable {
 
         if checkpoint == nil {
             for root in rootURLs {
-                guard
-                    fileManager.fileExists(atPath: root.path),
-                    canScanDirectory(root),
-                    !shouldExclude(root, exclusions: exclusions, rootPaths: ruleRootPaths, isDirectory: true)
-                else {
+                var isDirectory: ObjCBool = false
+                guard fileManager.fileExists(atPath: root.path, isDirectory: &isDirectory) else {
+                    logSkippedRoot(root, reason: "missing")
+                    continue
+                }
+                guard isDirectory.boolValue else {
+                    logSkippedRoot(root, reason: "notDirectory")
+                    continue
+                }
+                guard canScanDirectory(root) else {
+                    logSkippedRoot(root, reason: "unreadable")
+                    continue
+                }
+                guard !shouldExclude(root, exclusions: exclusions, rootPaths: ruleRootPaths, isDirectory: true) else {
+                    logSkippedRoot(root, reason: "excluded")
                     continue
                 }
                 if let rootRecord = FileRecord(url: root) {
@@ -4887,7 +4911,7 @@ public final class FileIndex: @unchecked Sendable {
                                 batch.append(record)
                             }
 
-                            if isDirectory && self.canScanDirectory(child) {
+                            if isDirectory {
                                 state.enqueue(child)
                             }
                         }
@@ -5766,16 +5790,7 @@ public final class FileIndex: @unchecked Sendable {
 
     @discardableResult
     private func enumerateShallowChildURLs(in directory: URL, _ body: (URL) -> Bool) -> Bool {
-        guard let stream = directory.withUnsafeFileSystemRepresentation({ representation -> UnsafeMutablePointer<DIR>? in
-            guard let representation else { return nil }
-            let descriptor = open(representation, O_RDONLY | O_DIRECTORY | O_NONBLOCK | O_CLOEXEC)
-            guard descriptor >= 0 else { return nil }
-            guard let stream = fdopendir(descriptor) else {
-                close(descriptor)
-                return nil
-            }
-            return stream
-        }) else {
+        guard let stream = openDirectoryStream(directory) else {
             return false
         }
         defer { closedir(stream) }
@@ -7181,35 +7196,40 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     private func canScanDirectory(_ url: URL) -> Bool {
-        guard fileManager.isReadableFile(atPath: url.path) else { return false }
-        guard Self.isProtectedHomeRoot(url) else { return true }
-        return Self.hasFullDiskAccessFastProbe(fileManager: fileManager)
-    }
-
-    private static func isProtectedHomeRoot(_ url: URL) -> Bool {
-        let home = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path
-        let path = url.standardizedFileURL.path
-        return path == home + "/Desktop"
-            || path == home + "/Documents"
-            || path == home + "/Downloads"
-    }
-
-    private static func hasFullDiskAccessFastProbe(fileManager: FileManager) -> Bool {
-        let home = fileManager.homeDirectoryForCurrentUser
-        let candidates = [
-            home.appendingPathComponent("Library/Safari", isDirectory: true),
-            home.appendingPathComponent("Library/Mail", isDirectory: true),
-            home.appendingPathComponent("Library/Messages", isDirectory: true),
-            home.appendingPathComponent("Library/Calendars", isDirectory: true)
-        ]
-
-        for url in candidates where fileManager.fileExists(atPath: url.path) {
-            if url.path.withCString({ access($0, R_OK | X_OK) }) == 0 {
-                return true
-            }
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            return false
         }
+        guard let stream = openDirectoryStream(url) else { return false }
+        defer { closedir(stream) }
+        errno = 0
+        _ = readdir(stream)
+        return errno == 0
+    }
 
-        return false
+    private func openDirectoryStream(_ directory: URL) -> UnsafeMutablePointer<DIR>? {
+        directory.withUnsafeFileSystemRepresentation { representation -> UnsafeMutablePointer<DIR>? in
+            guard let representation else { return nil }
+            let descriptor = open(representation, O_RDONLY | O_DIRECTORY | O_NONBLOCK | O_CLOEXEC)
+            guard descriptor >= 0 else { return nil }
+            guard let stream = fdopendir(descriptor) else {
+                close(descriptor)
+                return nil
+            }
+            return stream
+        }
+    }
+
+    private func logSkippedRoot(_ root: URL, reason: String) {
+        DiagnosticLogger.shared.log(
+            level: .warning,
+            category: "index",
+            event: "index.rootSkipped",
+            fields: [
+                "reason": .publicString(reason),
+                "root": .path(root.path)
+            ]
+        )
     }
 
     private func isLikelyLoop(_ url: URL) -> Bool {
