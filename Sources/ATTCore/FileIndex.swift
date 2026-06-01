@@ -392,6 +392,7 @@ public final class FileIndex: @unchecked Sendable {
     private static let pathGramRecordLimit = 200_000
     private static let pathGramTotalPathByteLimit = 24 * 1024 * 1024
     private static let exactEmptyQuerySortLimit = 100_000
+    private static let largeOverlayPersistDefaultDelay: TimeInterval = 30
     public static let maximumIndexedRootCount = RootAttributionTable.maximumRootCount
 
     public var onStatsChanged: (@MainActor @Sendable (IndexStats) -> Void)? {
@@ -2002,6 +2003,8 @@ public final class FileIndex: @unchecked Sendable {
     private let checkpointQueue = DispatchQueue(label: "att.index.checkpoint", qos: .utility)
     private let checkpointPersistenceLock = NSLock()
     private let storageInsightsLock = NSLock()
+    private var largeOverlayPersistRecordLimitOverride: Int?
+    private var largeOverlayPersistDelayOverride: TimeInterval?
     private var checkpointWriteInFlight = false
     private var cachedStorageInsights: IndexStorageInsights?
     private var storageInsightsRefreshInFlight = false
@@ -2014,6 +2017,9 @@ public final class FileIndex: @unchecked Sendable {
     private var persistRevision: UInt64 = 0
     private var pendingRefreshPaths = Set<String>()
     private var isRefreshDrainScheduled = false
+    private var pendingReconciliationPaths = Set<String>()
+    private var pendingReconciliationIncludesAllRoots = false
+    private var isReconciliationDrainScheduled = false
     private var completedRefreshBatches: UInt64 = 0
     private var completedSnapshotRebuilds: UInt64 = 0
     private var fallbackScanCount: UInt64 = 0
@@ -2046,6 +2052,8 @@ public final class FileIndex: @unchecked Sendable {
     ) {
         self.fileManager = fileManager
         self.exclusionRules = FileExclusionRules(patterns: exclusionPatterns)
+        self.largeOverlayPersistRecordLimitOverride = nil
+        self.largeOverlayPersistDelayOverride = nil
 
         let supportRoot = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
@@ -2070,6 +2078,25 @@ public final class FileIndex: @unchecked Sendable {
                 lastUpdated = Date()
             }
         }
+    }
+
+    convenience init(
+        fileManager: FileManager = .default,
+        applicationName: String = "AllTheThings",
+        loadsSnapshotImmediately: Bool = false,
+        exclusionPatterns: [String] = FileExclusionRules.defaultPatterns,
+        largeOverlayPersistRecordLimit: Int?,
+        largeOverlayPersistDelay: TimeInterval?
+    ) {
+        precondition(!loadsSnapshotImmediately, "Large overlay persist overrides are only for deferred-load test indexes.")
+        self.init(
+            fileManager: fileManager,
+            applicationName: applicationName,
+            loadsSnapshotImmediately: loadsSnapshotImmediately,
+            exclusionPatterns: exclusionPatterns
+        )
+        self.largeOverlayPersistRecordLimitOverride = largeOverlayPersistRecordLimit.map { max(0, $0) }
+        self.largeOverlayPersistDelayOverride = largeOverlayPersistDelay.map { max(0, $0) }
     }
 
     public func currentStats() -> IndexStats {
@@ -2295,18 +2322,28 @@ public final class FileIndex: @unchecked Sendable {
             publishRootLimitFailure(count: allRootURLs.count)
             return
         }
-        let reconcilesAllRoots = Set(rootURLs.map(\.path)) == Set(state.rootPaths)
+        let scopePaths = rootURLs.map(\.path)
+        let reconcilesAllRoots = Set(scopePaths) == Set(state.rootPaths)
         DiagnosticLogger.shared.log(
             category: "index",
             event: "index.reconcileRequested",
             fields: [
                 "reconcilesAllRoots": .publicBool(reconcilesAllRoots),
                 "scopeCount": .publicInt(rootURLs.count),
-                "scopes": .pathArray(rootURLs.map(\.path))
+                "scopes": .pathArray(scopePaths)
             ]
         )
 
-        let currentGeneration = lock.withLock { () -> UInt64 in
+        var currentGeneration: UInt64?
+        let didStart = lock.withLock { () -> Bool in
+            guard !indexing else {
+                queuePendingReconciliationWithoutLock(
+                    scopePaths: scopePaths,
+                    reconcilesAllRoots: reconcilesAllRoots
+                )
+                return false
+            }
+
             generation &+= 1
             indexing = true
             reconciling = true
@@ -2318,7 +2355,20 @@ public final class FileIndex: @unchecked Sendable {
             activeOperationStartedAt = reconcileStarted
             resumedFromCheckpoint = false
             lastUpdated = Date()
-            return generation
+            currentGeneration = generation
+            return true
+        }
+        guard didStart, let currentGeneration else {
+            DiagnosticLogger.shared.log(
+                category: "index",
+                event: "index.reconcileCoalesced",
+                fields: [
+                    "reconcilesAllRoots": .publicBool(reconcilesAllRoots),
+                    "scopeCount": .publicInt(scopePaths.count),
+                    "scopes": .pathArray(scopePaths)
+                ]
+            )
+            return
         }
         publishStats()
 
@@ -2372,6 +2422,47 @@ public final class FileIndex: @unchecked Sendable {
 
         Task { @MainActor in
             handler(rootURLs)
+        }
+    }
+
+    private func queuePendingReconciliationWithoutLock(scopePaths: [String], reconcilesAllRoots: Bool) {
+        if reconcilesAllRoots {
+            pendingReconciliationIncludesAllRoots = true
+            pendingReconciliationPaths.removeAll(keepingCapacity: false)
+        } else if !pendingReconciliationIncludesAllRoots {
+            pendingReconciliationPaths.formUnion(scopePaths)
+        }
+    }
+
+    private func schedulePendingReconciliationDrainIfNeeded() {
+        let scopeURLs = lock.withLock { () -> [URL]? in
+            guard
+                !indexing,
+                pendingRefreshPaths.isEmpty,
+                !isRefreshDrainScheduled,
+                !isReconciliationDrainScheduled,
+                pendingReconciliationIncludesAllRoots || !pendingReconciliationPaths.isEmpty
+            else {
+                return nil
+            }
+
+            let requestedPaths = pendingReconciliationIncludesAllRoots ? roots : Array(pendingReconciliationPaths)
+            pendingReconciliationIncludesAllRoots = false
+            pendingReconciliationPaths.removeAll(keepingCapacity: false)
+
+            let urls = Self.reconciliationScopeURLs(for: requestedPaths, within: roots)
+            guard !urls.isEmpty else { return nil }
+            isReconciliationDrainScheduled = true
+            return urls
+        }
+
+        guard let scopeURLs else { return }
+        indexQueue.async { [weak self] in
+            guard let self else { return }
+            self.lock.withLock {
+                self.isReconciliationDrainScheduled = false
+            }
+            self.reconcileIndexedRootsInBackground(rootURLs: scopeURLs)
         }
     }
 
@@ -5422,6 +5513,38 @@ public final class FileIndex: @unchecked Sendable {
         return min(2, max(1, ProcessInfo.processInfo.activeProcessorCount / 4))
     }
 
+    private static func configuredLargeOverlayPersistRecordLimit() -> Int {
+        guard
+            let rawValue = ProcessInfo.processInfo.environment["ATT_INDEX_LARGE_OVERLAY_PERSIST_RECORD_LIMIT"],
+            let requested = Int(rawValue),
+            requested >= 0
+        else {
+            return exactEmptyQuerySortLimit
+        }
+
+        return requested
+    }
+
+    private static func configuredLargeOverlayPersistDelay() -> TimeInterval {
+        guard
+            let rawValue = ProcessInfo.processInfo.environment["ATT_INDEX_LARGE_OVERLAY_PERSIST_DELAY_SECONDS"],
+            let requested = TimeInterval(rawValue),
+            requested >= 0
+        else {
+            return largeOverlayPersistDefaultDelay
+        }
+
+        return requested
+    }
+
+    private func largeOverlayPersistRecordLimit() -> Int {
+        largeOverlayPersistRecordLimitOverride ?? Self.configuredLargeOverlayPersistRecordLimit()
+    }
+
+    private func largeOverlayPersistDelay() -> TimeInterval {
+        largeOverlayPersistDelayOverride ?? Self.configuredLargeOverlayPersistDelay()
+    }
+
     private func scheduleUpdateDrainIfNeeded(delay: DispatchTimeInterval) {
         let shouldSchedule = lock.withLock { () -> Bool in
             guard !pendingRefreshPaths.isEmpty, !isRefreshDrainScheduled else {
@@ -5872,26 +5995,37 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     private func scheduleRefreshPersistIfReasonable(_ snapshot: SearchSnapshot) {
-        guard snapshot.store.kind != .overlay || snapshot.count <= Self.exactEmptyQuerySortLimit else {
+        if snapshot.store.kind == .overlay, snapshot.count > largeOverlayPersistRecordLimit() {
+            let delay = largeOverlayPersistDelay()
             MemoryTelemetry.log(
-                "refresh.persist.deferred",
+                "refresh.persist.scheduledLargeOverlay",
                 records: Self.countOnlyMetrics(for: snapshot.store),
                 structures: snapshot.diagnostics,
                 activeIndexJobs: currentActiveIndexJobCount()
             )
+            DiagnosticLogger.shared.log(
+                category: "index",
+                event: "index.snapshotPersistScheduled",
+                fields: [
+                    "recordCount": .publicInt(snapshot.count),
+                    "storeKind": .publicString(snapshot.store.kind.rawValue),
+                    "delaySeconds": .publicDouble(delay)
+                ]
+            )
+            schedulePersist(delay: delay)
             return
         }
 
         schedulePersist()
     }
 
-    private func schedulePersist() {
+    private func schedulePersist(delay: TimeInterval = 1.5) {
         let revision = lock.withLock { () -> UInt64 in
             persistRevision &+= 1
             return persistRevision
         }
 
-        indexQueue.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+        indexQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self, self.isPersistRevisionCurrent(revision) else { return }
             self.persistSnapshot()
         }
@@ -6741,6 +6875,7 @@ public final class FileIndex: @unchecked Sendable {
 
         if !stats.isIndexing {
             scheduleUpdateDrainIfNeeded(delay: .milliseconds(0))
+            schedulePendingReconciliationDrainIfNeeded()
         }
     }
 

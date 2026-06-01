@@ -193,6 +193,103 @@ struct FileIndexTests {
         #expect(response.results.contains { $0.record.path == createdDuringBuild.path })
     }
 
+    @Test("reconciliations queued during indexing coalesce after build finishes")
+    func reconciliationsQueuedDuringIndexingCoalesceAfterBuildFinishes() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        let firstFolder = root.appendingPathComponent("First", isDirectory: true)
+        let secondFolder = root.appendingPathComponent("Second", isDirectory: true)
+        try fileManager.createDirectory(at: firstFolder, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: secondFolder, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        let firstFile = firstFolder.appendingPathComponent("FirstQueued.log")
+        let secondFile = secondFolder.appendingPathComponent("SecondQueued.log")
+        try "first".write(to: firstFile, atomically: true, encoding: .utf8)
+        try "second".write(to: secondFile, atomically: true, encoding: .utf8)
+
+        let rootRecord = try #require(FileRecord(url: root))
+        let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)", loadsSnapshotImmediately: false)
+        index.replaceRecordsForTesting(
+            [rootRecord],
+            roots: [root],
+            phase: .scanning,
+            status: "Indexing test records"
+        )
+
+        index.reconcileIndexedRootsInBackground(rootURLs: [firstFolder])
+        index.reconcileIndexedRootsInBackground(rootURLs: [secondFolder])
+        try await Task.sleep(for: .milliseconds(250))
+        #expect(index.currentStats().status == "Indexing test records")
+
+        let rebuildsBeforeReady = index.currentDiagnostics().completedSnapshotRebuilds
+        index.replaceRecordsForTesting([rootRecord], roots: [root])
+
+        try await waitUntil(timeout: .seconds(10)) {
+            let first = index.search(SearchRequest(
+                query: "FirstQueued",
+                sort: SortSpec(column: .relevance, ascending: false)
+            ), maxResults: 10)
+            let second = index.search(SearchRequest(
+                query: "SecondQueued",
+                sort: SortSpec(column: .relevance, ascending: false)
+            ), maxResults: 10)
+            return first.results.contains { $0.record.path == firstFile.path }
+                && second.results.contains { $0.record.path == secondFile.path }
+        }
+
+        #expect(index.currentDiagnostics().completedSnapshotRebuilds == rebuildsBeforeReady + 2)
+    }
+
+    @Test("large overlay updates schedule mapped snapshot compaction")
+    func largeOverlayUpdatesScheduleMappedSnapshotCompaction() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        let updatedFile = root.appendingPathComponent("Updated.txt")
+        try "old".write(to: updatedFile, atomically: true, encoding: .utf8)
+
+        let index = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false,
+            largeOverlayPersistRecordLimit: 0,
+            largeOverlayPersistDelay: 0.2
+        )
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil {
+            let diagnostics = index.currentDiagnostics()
+            return !index.currentStats().isIndexing
+                && diagnostics.indexedCount >= 2
+                && diagnostics.recordStoreKind == .mapped
+        }
+
+        let before = index.currentDiagnostics()
+        try "new".write(to: updatedFile, atomically: true, encoding: .utf8)
+        index.update(paths: [updatedFile.path])
+
+        try await waitUntil(timeout: .seconds(5)) {
+            let diagnostics = index.currentDiagnostics()
+            return diagnostics.overlayCount > 0
+                && diagnostics.completedRefreshBatches > before.completedRefreshBatches
+        }
+        let overlayRevision = index.currentDiagnostics().snapshotRevision
+
+        try await waitUntil(timeout: .seconds(10)) {
+            let diagnostics = index.currentDiagnostics()
+            return diagnostics.snapshotRevision > overlayRevision
+                && diagnostics.recordStoreKind == .mapped
+                && diagnostics.overlayCount == 0
+        }
+    }
+
     @Test("update applies optimized overlay so log and log.rb searches stay indexed")
     func updateAppliesOptimizedOverlaySoLogAndLogRBSearchesStayIndexed() async throws {
         let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
