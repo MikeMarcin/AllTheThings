@@ -53,6 +53,9 @@ struct MascotSpriteSheetTests {
         #expect(OperationMascotCoordinator.heroDisplaySize > OperationMascotCoordinator.statusDisplaySize * 2)
         #expect(OperationMascotCoordinator.expandedDisplaySize == OperationMascotCoordinator.statusDisplaySize * 4)
         #expect(OperationMascotCoordinator.expandedDisplaySize > OperationMascotCoordinator.heroDisplaySize)
+        #expect(OperationMascotCoordinator.spriteFrameAspectRatio == 0.6)
+        #expect(OperationMascotCoordinator.displayHeight(for: 160) == 96)
+        #expect(OperationMascotCoordinator.displayHeight(for: OperationMascotCoordinator.statusDisplaySize) == 24)
 
         #expect(OperationMascotAnimation.idle.loops)
         #expect(OperationMascotAnimation.indexing.loops)

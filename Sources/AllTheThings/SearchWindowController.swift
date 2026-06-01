@@ -392,6 +392,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         private(set) var isExpanded = false
         private var isTransitionInProgress = false
+        private var deferredPersistentAnimation: OperationMascotAnimation?
+        private var deferredTransientAnimation: OperationMascotAnimation?
         private var transitionID: UInt64 = 0
 
         var ownsMascotPlacement: Bool {
@@ -421,10 +423,18 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
 
         func setPersistentAnimation(_ animation: OperationMascotAnimation) {
+            guard !isTransitionInProgress else {
+                deferredPersistentAnimation = animation
+                return
+            }
             animationCoordinator.setPersistentAnimation(animation)
         }
 
         func playTransient(_ animation: OperationMascotAnimation) {
+            guard !isTransitionInProgress else {
+                deferredTransientAnimation = animation
+                return
+            }
             animationCoordinator.playTransient(animation)
         }
 
@@ -439,14 +449,16 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         func expandedTargetFrame() -> NSRect {
             rootView.layoutSubtreeIfNeeded()
+            let targetCenterX = currentFooterAnchorX()
+            let targetWidth = OperationMascotCoordinator.expandedDisplaySize
+            let targetHeight = OperationMascotCoordinator.displayHeight(for: targetWidth)
             let footerFrame = footerImageView.convert(footerImageView.bounds, to: rootView)
-            let targetSize = OperationMascotCoordinator.expandedDisplaySize
-            let targetBottom = footerFrame.minY + Self.imageBottomOffset(for: targetSize)
+            let targetBottom = footerFrame.minY
             return NSRect(
-                x: Self.anchorX(for: targetSize) - (targetSize / 2),
-                y: targetBottom - targetSize,
-                width: targetSize,
-                height: targetSize
+                x: targetCenterX - (targetWidth / 2),
+                y: targetBottom,
+                width: targetWidth,
+                height: targetHeight
             )
         }
 
@@ -464,14 +476,13 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             let collapsedSize = OperationMascotCoordinator.statusDisplaySize
             let targetSize = visible ? OperationMascotCoordinator.expandedDisplaySize : collapsedSize
             let footerAnchorX = currentFooterAnchorX()
-            let targetAnchorX = visible ? Self.anchorX(for: targetSize) : footerAnchorX
-            let targetBottomOffset = Self.imageBottomOffset(for: targetSize)
+            let targetAnchorX = footerAnchorX
             let shouldTween = shouldTweenTransition(requested: animated)
 
             if visible && context.loadingOverlayVisible {
                 isTransitionInProgress = false
-                centerXConstraint.constant = Self.anchorX(for: targetSize)
-                imageBottomConstraint.constant = targetBottomOffset
+                centerXConstraint.constant = targetAnchorX
+                imageBottomConstraint.constant = 0
                 animationCoordinator.setDisplaySize(targetSize)
                 updatePlacement(context: context)
                 return
@@ -479,7 +490,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
             if visible {
                 centerXConstraint.constant = footerAnchorX
-                imageBottomConstraint.constant = Self.imageBottomOffset(for: collapsedSize)
+                imageBottomConstraint.constant = 0
                 animationCoordinator.setDisplaySize(collapsedSize)
                 expandedView.isHidden = false
                 footerImageView.isHidden = true
@@ -489,7 +500,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             guard shouldTween else {
                 isTransitionInProgress = false
                 centerXConstraint.constant = targetAnchorX
-                imageBottomConstraint.constant = targetBottomOffset
+                imageBottomConstraint.constant = 0
                 animationCoordinator.setDisplaySize(targetSize)
                 updatePlacement(context: context)
                 return
@@ -501,21 +512,23 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             }
 
             isTransitionInProgress = true
+            animationCoordinator.setScaleTransitionActive(true)
             NSAnimationContext.runAnimationGroup { animationContext in
                 animationContext.duration = 0.22
                 animationContext.allowsImplicitAnimation = true
-                self.centerXConstraint.animator().constant = targetAnchorX
-                self.imageBottomConstraint.animator().constant = targetBottomOffset
-                self.animationCoordinator.setDisplaySize(targetSize, animated: true)
-                self.rootView.layoutSubtreeIfNeeded()
+                self.centerXConstraint.constant = targetAnchorX
+                self.imageBottomConstraint.constant = 0
+                self.animationCoordinator.setDisplaySize(targetSize)
+                self.rootView.animator().layoutSubtreeIfNeeded()
             } completionHandler: {
                 guard self.transitionID == currentTransitionID else { return }
                 self.isTransitionInProgress = false
+                self.finishScaleTransition()
                 if !visible {
                     self.updateHostPlacement()
                     self.animationCoordinator.setDisplaySize(collapsedSize)
-                    self.imageBottomConstraint.constant = Self.imageBottomOffset(for: collapsedSize)
-                    self.centerXConstraint.constant = Self.anchorX()
+                    self.imageBottomConstraint.constant = 0
+                    self.centerXConstraint.constant = self.currentFooterAnchorX()
                     return
                 }
                 self.updateHostPlacement()
@@ -548,14 +561,18 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             return animated || rootView.window != nil
         }
 
-        private static func anchorX(for displaySize: CGFloat = OperationMascotCoordinator.expandedDisplaySize) -> CGFloat {
-            ExpandedMascotLayout.visibleLeadingInset + (displaySize * ExpandedMascotLayout.spriteFrameAspectRatio / 2)
-        }
+        private func finishScaleTransition() {
+            animationCoordinator.setScaleTransitionActive(false)
 
-        private static func imageBottomOffset(for displaySize: CGFloat) -> CGFloat {
-            let visiblePadding = (OperationMascotCoordinator.statusDisplaySize * (1 - ExpandedMascotLayout.spriteFrameAspectRatio)) / 2
-            let targetPadding = (displaySize * (1 - ExpandedMascotLayout.spriteFrameAspectRatio)) / 2
-            return targetPadding - visiblePadding
+            if let deferredPersistentAnimation {
+                self.deferredPersistentAnimation = nil
+                animationCoordinator.setPersistentAnimation(deferredPersistentAnimation)
+            }
+
+            if let deferredTransientAnimation {
+                self.deferredTransientAnimation = nil
+                animationCoordinator.playTransient(deferredTransientAnimation)
+            }
         }
     }
 
@@ -654,10 +671,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private enum ExpandedMascotLayout {
         static let visibleLeadingInset: CGFloat = 14
         static let autoExpandDelay: TimeInterval = 0.75
-        static let spriteFrameAspectRatio: CGFloat = 96.0 / 160.0
 
         static func anchorX(for displaySize: CGFloat) -> CGFloat {
-            visibleLeadingInset + (displaySize * spriteFrameAspectRatio / 2)
+            visibleLeadingInset + (OperationMascotCoordinator.displayHeight(for: displaySize) / 2)
         }
     }
 
