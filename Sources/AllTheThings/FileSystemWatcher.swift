@@ -28,11 +28,29 @@ struct FileSystemEvent {
 }
 
 final class FileSystemWatcher {
+    struct StreamConfiguration: Equatable, Sendable {
+        static let interactive = StreamConfiguration(latency: 0.05, usesNoDefer: true)
+        static let background = StreamConfiguration(latency: 3.0, usesNoDefer: false)
+
+        let latency: TimeInterval
+        let usesNoDefer: Bool
+
+        var flags: UInt32 {
+            var flags = UInt32(kFSEventStreamCreateFlagUseCFTypes)
+                | UInt32(kFSEventStreamCreateFlagFileEvents)
+            if usesNoDefer {
+                flags |= UInt32(kFSEventStreamCreateFlagNoDefer)
+            }
+            return flags
+        }
+    }
+
     private let queue = DispatchQueue(label: "att.fsevents", qos: .utility)
     private let cursorStore: FSEventCursorStore
     private var stream: FSEventStreamRef?
     private var eventHandler: (@MainActor @Sendable ([FileSystemEvent]) -> Void)?
     private var rootPaths: [String] = []
+    private var streamConfiguration: StreamConfiguration?
 
     init(cursorStore: FSEventCursorStore = .default) {
         self.cursorStore = cursorStore
@@ -42,11 +60,15 @@ final class FileSystemWatcher {
         stop()
     }
 
-    func start(roots: [URL], eventHandler: @escaping @MainActor @Sendable ([FileSystemEvent]) -> Void) {
+    func start(
+        roots: [URL],
+        configuration: StreamConfiguration = .interactive,
+        eventHandler: @escaping @MainActor @Sendable ([FileSystemEvent]) -> Void
+    ) {
         let paths = roots.map { $0.standardizedFileURL.path }
         guard !paths.isEmpty else { return }
 
-        if stream != nil, paths == rootPaths {
+        if stream != nil, paths == rootPaths, configuration == streamConfiguration {
             self.eventHandler = eventHandler
             return
         }
@@ -55,6 +77,7 @@ final class FileSystemWatcher {
 
         self.eventHandler = eventHandler
         self.rootPaths = paths
+        self.streamConfiguration = configuration
 
         var context = FSEventStreamContext(
             version: 0,
@@ -76,18 +99,14 @@ final class FileSystemWatcher {
             watcher.handle(events: events)
         }
 
-        let flags = UInt32(kFSEventStreamCreateFlagUseCFTypes)
-            | UInt32(kFSEventStreamCreateFlagFileEvents)
-            | UInt32(kFSEventStreamCreateFlagNoDefer)
-
         stream = FSEventStreamCreate(
             kCFAllocatorDefault,
             callback,
             &context,
             paths as CFArray,
             FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
-            0.05,
-            flags
+            configuration.latency,
+            configuration.flags
         )
 
         guard let stream else { return }
@@ -102,6 +121,7 @@ final class FileSystemWatcher {
         FSEventStreamRelease(stream)
         self.stream = nil
         rootPaths = []
+        streamConfiguration = nil
     }
 
     private func handle(events: [FileSystemEvent]) {

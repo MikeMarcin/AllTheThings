@@ -84,6 +84,17 @@ struct FileSystemWatcherTests {
         #expect(mustScan.requiresRecursiveRescan)
     }
 
+    @Test("FSEvent stream configuration defers background delivery")
+    func fseventStreamConfigurationDefersBackgroundDelivery() {
+        let interactive = FileSystemWatcher.StreamConfiguration.interactive
+        let background = FileSystemWatcher.StreamConfiguration.background
+
+        #expect(interactive.latency < background.latency)
+        #expect(interactive.flags & UInt32(kFSEventStreamCreateFlagNoDefer) != 0)
+        #expect(background.flags & UInt32(kFSEventStreamCreateFlagNoDefer) == 0)
+        #expect(background.flags & UInt32(kFSEventStreamCreateFlagFileEvents) != 0)
+    }
+
     @Test("FSEvent reconciliation scopes normal historical file paths to parent folders")
     func fseventReconciliationScopesNormalHistoricalFilePathsToParentFolders() async {
         let root = URL(fileURLWithPath: "/tmp/allthethings/root-a", isDirectory: true)

@@ -203,6 +203,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
     private var unrepresentedRootPaths = Set<String>()
     private var rootAccessStatuses: [String: InsightsRootAccessStatus] = [:]
     private var isRefreshingInsights = false
+    private var isViewVisible = false
     private var overviewTileConstraints: [NSLayoutConstraint] = []
     private var healthTileConstraints: [NSLayoutConstraint] = []
 
@@ -223,6 +224,10 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         fatalError("init(coder:) has not been implemented")
     }
 
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
     override func loadView() {
         view = ThemedBackgroundView(frame: NSRect(origin: .zero, size: InsightsWindowController.defaultContentSize))
         buildInterface()
@@ -230,16 +235,30 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(applicationActivityDidChange(_:)),
+            name: NSApplication.didBecomeActiveNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(applicationActivityDidChange(_:)),
+            name: NSApplication.didResignActiveNotification,
+            object: nil
+        )
         refreshInsights()
     }
 
     override func viewWillAppear() {
         super.viewWillAppear()
+        isViewVisible = true
         startPolling()
     }
 
     override func viewWillDisappear() {
         super.viewWillDisappear()
+        isViewVisible = false
         stopPolling()
     }
 
@@ -428,16 +447,36 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
 
     private func startPolling() {
         guard refreshTimer == nil else { return }
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+        let interval = refreshInterval
+        let timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.refreshInsights()
             }
         }
+        timer.tolerance = min(5, interval * 0.2)
+        refreshTimer = timer
     }
 
     private func stopPolling() {
         refreshTimer?.invalidate()
         refreshTimer = nil
+    }
+
+    private var refreshInterval: TimeInterval {
+        NSApp.isActive ? 5 : 30
+    }
+
+    private func restartPolling() {
+        stopPolling()
+        guard isViewVisible else { return }
+        startPolling()
+    }
+
+    @objc private func applicationActivityDidChange(_ notification: Notification) {
+        restartPolling()
+        if NSApp.isActive {
+            refreshInsights()
+        }
     }
 
     private func refreshInsights() {
