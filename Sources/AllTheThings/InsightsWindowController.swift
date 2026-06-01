@@ -943,11 +943,9 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         detailLabel.lineBreakMode = .byTruncatingTail
         allowHorizontalCompression(detailLabel)
 
-        let stack = verticalStack([titleLabel, valueLabel, detailLabel], spacing: 2)
+        let stack = InsightsTileView(views: [titleLabel, valueLabel, detailLabel], style: .metric)
+        stack.spacing = 2
         stack.alignment = .leading
-        stack.wantsLayer = true
-        stack.layer?.cornerRadius = 6
-        stack.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.55).cgColor
         stack.edgeInsets = NSEdgeInsets(top: 5, left: 10, bottom: 5, right: 10)
         NSLayoutConstraint.activate([
             stack.heightAnchor.constraint(greaterThanOrEqualToConstant: 62)
@@ -979,11 +977,9 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         detailLabel.maximumNumberOfLines = 1
         allowHorizontalCompression(detailLabel)
 
-        let stack = verticalStack([titleLabel, valueLabel, detailLabel], spacing: 2)
+        let stack = InsightsTileView(views: [titleLabel, valueLabel, detailLabel], style: .health)
+        stack.spacing = 2
         stack.alignment = .leading
-        stack.wantsLayer = true
-        stack.layer?.cornerRadius = 6
-        stack.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.42).cgColor
         stack.edgeInsets = NSEdgeInsets(top: 7, left: 9, bottom: 7, right: 9)
         NSLayoutConstraint.activate([
             stack.heightAnchor.constraint(greaterThanOrEqualToConstant: 54)
@@ -992,13 +988,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
     }
 
     private func makeCard(containing content: NSView) -> NSView {
-        let card = NSView()
-        card.translatesAutoresizingMaskIntoConstraints = false
-        card.wantsLayer = true
-        card.layer?.cornerRadius = 8
-        card.layer?.borderWidth = 1
-        card.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.45).cgColor
-        card.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.45).cgColor
+        let card = InsightsCardView()
 
         content.translatesAutoresizingMaskIntoConstraints = false
         card.addSubview(content)
@@ -1205,6 +1195,133 @@ enum InsightsRootAccessStatus: Equatable {
     }
 }
 
+enum InsightsPanelPalette {
+    static func isDarkAppearance(_ appearance: NSAppearance) -> Bool {
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+    }
+
+    static func cardBackgroundColor(isDark: Bool) -> NSColor {
+        isDark
+            ? NSColor(calibratedWhite: 0.14, alpha: 0.72)
+            : NSColor(calibratedWhite: 0.98, alpha: 0.90)
+    }
+
+    static func cardBorderColor(isDark: Bool) -> NSColor {
+        isDark
+            ? NSColor(calibratedWhite: 0.62, alpha: 0.42)
+            : NSColor(calibratedWhite: 0.54, alpha: 0.34)
+    }
+
+    static func tileBackgroundColor(style: InsightsPanelTileStyle, isDark: Bool) -> NSColor {
+        switch (style, isDark) {
+        case (.metric, true):
+            NSColor(calibratedWhite: 0.10, alpha: 0.56)
+        case (.health, true):
+            NSColor(calibratedWhite: 0.10, alpha: 0.44)
+        case (.metric, false):
+            NSColor(calibratedWhite: 0.92, alpha: 0.96)
+        case (.health, false):
+            NSColor(calibratedWhite: 0.93, alpha: 0.92)
+        }
+    }
+
+    static func chartBackgroundColor(isDark: Bool) -> NSColor {
+        isDark
+            ? NSColor(calibratedWhite: 0.10, alpha: 1)
+            : NSColor(calibratedWhite: 1, alpha: 1)
+    }
+
+    static func treemapStrokeColor(isDark: Bool) -> NSColor {
+        isDark
+            ? NSColor.white.withAlphaComponent(0.22)
+            : NSColor.black.withAlphaComponent(0.10)
+    }
+}
+
+enum InsightsPanelTileStyle {
+    case metric
+    case health
+}
+
+private final class InsightsCardView: NSView {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        layer?.cornerRadius = 8
+        layer?.borderWidth = 1
+        updateThemeColors()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateThemeColors()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        updateThemeColors()
+    }
+
+    private func updateThemeColors() {
+        let isDark = InsightsPanelPalette.isDarkAppearance(effectiveAppearance)
+        layer?.backgroundColor = AppTheme.resolvedCGColor(
+            InsightsPanelPalette.cardBackgroundColor(isDark: isDark),
+            for: self
+        )
+        layer?.borderColor = AppTheme.resolvedCGColor(
+            InsightsPanelPalette.cardBorderColor(isDark: isDark),
+            for: self
+        )
+    }
+}
+
+private final class InsightsTileView: NSStackView {
+    private let style: InsightsPanelTileStyle
+
+    init(views: [NSView], style: InsightsPanelTileStyle) {
+        self.style = style
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        orientation = .vertical
+        alignment = .width
+        for view in views {
+            addArrangedSubview(view)
+        }
+        wantsLayer = true
+        layer?.cornerRadius = 6
+        updateThemeColors()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateThemeColors()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        updateThemeColors()
+    }
+
+    private func updateThemeColors() {
+        let isDark = InsightsPanelPalette.isDarkAppearance(effectiveAppearance)
+        layer?.backgroundColor = AppTheme.resolvedCGColor(
+            InsightsPanelPalette.tileBackgroundColor(style: style, isDark: isDark),
+            for: self
+        )
+    }
+}
+
 private final class InsightsTreemapView: NSView {
     var roots: [IndexRootInsight] = [] {
         didSet {
@@ -1240,6 +1357,11 @@ private final class InsightsTreemapView: NSView {
         trackingArea = area
         addTrackingArea(area)
         super.updateTrackingAreas()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
     }
 
     override func mouseMoved(with event: NSEvent) {
@@ -1279,7 +1401,8 @@ private final class InsightsTreemapView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        NSColor.controlBackgroundColor.setFill()
+        let isDark = InsightsPanelPalette.isDarkAppearance(effectiveAppearance)
+        InsightsPanelPalette.chartBackgroundColor(isDark: isDark).setFill()
         bounds.fill()
 
         guard !roots.isEmpty else {
@@ -1310,7 +1433,7 @@ private final class InsightsTreemapView: NSView {
             color.withAlphaComponent(0.72).setFill()
             NSBezierPath(roundedRect: fillRect, xRadius: radius, yRadius: radius).fill()
             if fillRect.width > 3, fillRect.height > 3 {
-                NSColor.white.withAlphaComponent(0.22).setStroke()
+                InsightsPanelPalette.treemapStrokeColor(isDark: isDark).setStroke()
                 let strokeInset = min(CGFloat(0.5), fillRect.width / 5, fillRect.height / 5)
                 let strokeRect = fillRect.insetBy(dx: strokeInset, dy: strokeInset)
                 let strokeRadius = min(radius, strokeRect.width / 2, strokeRect.height / 2)
@@ -1594,9 +1717,16 @@ private final class InsightsBarChartView: NSView {
 
     override var isFlipped: Bool { true }
 
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        NSColor.controlBackgroundColor.setFill()
+        InsightsPanelPalette.chartBackgroundColor(
+            isDark: InsightsPanelPalette.isDarkAppearance(effectiveAppearance)
+        ).setFill()
         bounds.fill()
 
         guard !buckets.isEmpty else {
