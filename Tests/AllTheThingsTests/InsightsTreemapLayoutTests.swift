@@ -266,6 +266,42 @@ struct InsightsTreemapLayoutTests {
         #expect(plot.height > legend.height)
     }
 
+    @Test("Insights panel palette keeps light panels lighter than dark panels")
+    @MainActor
+    func insightsPanelPaletteKeepsLightPanelsLighterThanDarkPanels() throws {
+        let lightAppearance = try #require(NSAppearance(named: .aqua))
+        let darkAppearance = try #require(NSAppearance(named: .darkAqua))
+
+        let lightCard = luminance(
+            InsightsPanelPalette.cardBackgroundColor(isDark: false),
+            appearance: lightAppearance
+        )
+        let darkCard = luminance(
+            InsightsPanelPalette.cardBackgroundColor(isDark: true),
+            appearance: darkAppearance
+        )
+        let lightMetric = luminance(
+            InsightsPanelPalette.tileBackgroundColor(style: .metric, isDark: false),
+            appearance: lightAppearance
+        )
+        let darkMetric = luminance(
+            InsightsPanelPalette.tileBackgroundColor(style: .metric, isDark: true),
+            appearance: darkAppearance
+        )
+        let lightChart = luminance(
+            InsightsPanelPalette.chartBackgroundColor(isDark: false),
+            appearance: lightAppearance
+        )
+        let darkChart = luminance(
+            InsightsPanelPalette.chartBackgroundColor(isDark: true),
+            appearance: darkAppearance
+        )
+
+        #expect(lightCard > darkCard + 0.3)
+        #expect(lightMetric > darkMetric + 0.3)
+        #expect(lightChart > darkChart + 0.3)
+    }
+
     private func makeRoot(path: String, trackedFileCount: Int) -> IndexRootInsight {
         IndexRootInsight(
             path: path,
@@ -308,5 +344,16 @@ struct InsightsTreemapLayoutTests {
             }
         }
         return nil
+    }
+
+    @MainActor
+    private func luminance(_ color: NSColor, appearance: NSAppearance) -> CGFloat {
+        var resolved = color
+        appearance.performAsCurrentDrawingAppearance {
+            resolved = color.usingColorSpace(.deviceRGB) ?? color
+        }
+        return 0.2126 * resolved.redComponent
+            + 0.7152 * resolved.greenComponent
+            + 0.0722 * resolved.blueComponent
     }
 }
