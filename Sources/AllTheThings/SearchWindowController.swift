@@ -4,6 +4,8 @@ import QuartzCore
 import UniformTypeIdentifiers
 
 enum AppRuntimeStatusFormatter {
+    static let transientReadyStatusDisplayDuration: TimeInterval = 5
+
     static func windowTitle(version: String?, build: String?) -> String {
         switch (version, build) {
         case let (version?, _) where !version.isEmpty:
@@ -31,6 +33,21 @@ enum AppRuntimeStatusFormatter {
 
     static func catchUpStatus(elapsed: TimeInterval) -> String {
         "Catching up changes • \(operationElapsed(elapsed))"
+    }
+
+    static func readyStatus(status: String, lastUpdated: Date, now: Date = Date()) -> String {
+        guard isTransientReadyStatus(status) else {
+            return "Ready • \(status)"
+        }
+
+        let statusAge = max(now.timeIntervalSince(lastUpdated), 0)
+        return statusAge <= transientReadyStatusDisplayDuration ? "Ready • \(status)" : "Ready"
+    }
+
+    private static func isTransientReadyStatus(_ status: String) -> Bool {
+        status == "No file changes"
+            || (status.hasPrefix("Updated ")
+                && (status.hasSuffix(" changed path") || status.hasSuffix(" changed paths")))
     }
 }
 
@@ -2824,7 +2841,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         case .saving:
             return "Saving index • \(indexStats.searchableCount.formatted()) searchable\(operationElapsedSuffix())"
         case .ready:
-            return "Ready • \(indexStats.status)"
+            return AppRuntimeStatusFormatter.readyStatus(status: indexStats.status, lastUpdated: indexStats.lastUpdated)
         case .failed:
             return indexStats.status
         }
