@@ -1208,8 +1208,7 @@ enum InsightsRootAccessStatus: Equatable {
 private final class InsightsTreemapView: NSView {
     var roots: [IndexRootInsight] = [] {
         didSet {
-            hoveredRootIndex = nil
-            hoverPoint = nil
+            refreshHoverAfterContentUpdate()
             needsDisplay = true
         }
     }
@@ -1245,12 +1244,7 @@ private final class InsightsTreemapView: NSView {
 
     override func mouseMoved(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        hoverPoint = point
-        hoveredRootIndex = Self.rootIndex(
-            at: point,
-            roots: roots,
-            bounds: bounds
-        )
+        updateHover(at: point)
         needsDisplay = true
     }
 
@@ -1258,6 +1252,29 @@ private final class InsightsTreemapView: NSView {
         hoveredRootIndex = nil
         hoverPoint = nil
         needsDisplay = true
+    }
+
+    private func refreshHoverAfterContentUpdate() {
+        guard
+            let hoverPoint,
+            bounds.contains(hoverPoint),
+            window?.isKeyWindow != false
+        else {
+            hoveredRootIndex = nil
+            self.hoverPoint = nil
+            return
+        }
+
+        updateHover(at: hoverPoint)
+    }
+
+    private func updateHover(at point: NSPoint) {
+        hoverPoint = point
+        hoveredRootIndex = Self.rootIndex(
+            at: point,
+            roots: roots,
+            bounds: bounds
+        )
     }
 
     override func draw(_ dirtyRect: NSRect) {
