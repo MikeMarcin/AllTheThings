@@ -227,6 +227,18 @@ public enum RebuildMode: Sendable {
     case fresh
 }
 
+public enum IndexActivityPresentation: String, Codable, Equatable, Sendable {
+    case foreground
+    case backgroundCatchUp
+}
+
+public enum ReconciliationRequestResult: Equatable, Sendable {
+    case ignored
+    case started
+    case queued
+    case coveredByActive
+}
+
 public struct IndexStats: Codable, Equatable, Sendable {
     public let indexedCount: Int
     public let isIndexing: Bool
@@ -243,6 +255,7 @@ public struct IndexStats: Codable, Equatable, Sendable {
     public let activeOperationStartedAt: Date?
     public let lastCheckpointAt: Date?
     public let resumedFromCheckpoint: Bool
+    public let activityPresentation: IndexActivityPresentation
 
     private enum CodingKeys: String, CodingKey {
         case indexedCount
@@ -261,6 +274,7 @@ public struct IndexStats: Codable, Equatable, Sendable {
         case activeOperationStartedAt
         case lastCheckpointAt
         case resumedFromCheckpoint
+        case activityPresentation
     }
 
     public init(
@@ -278,7 +292,8 @@ public struct IndexStats: Codable, Equatable, Sendable {
         lastUpdated: Date,
         activeOperationStartedAt: Date? = nil,
         lastCheckpointAt: Date? = nil,
-        resumedFromCheckpoint: Bool = false
+        resumedFromCheckpoint: Bool = false,
+        activityPresentation: IndexActivityPresentation = .foreground
     ) {
         self.indexedCount = indexedCount
         self.isIndexing = isIndexing
@@ -295,6 +310,7 @@ public struct IndexStats: Codable, Equatable, Sendable {
         self.activeOperationStartedAt = activeOperationStartedAt
         self.lastCheckpointAt = lastCheckpointAt
         self.resumedFromCheckpoint = resumedFromCheckpoint
+        self.activityPresentation = activityPresentation
     }
 
     public init(from decoder: Decoder) throws {
@@ -320,6 +336,7 @@ public struct IndexStats: Codable, Equatable, Sendable {
         self.activeOperationStartedAt = try container.decodeIfPresent(Date.self, forKey: .activeOperationStartedAt)
         self.lastCheckpointAt = try container.decodeIfPresent(Date.self, forKey: .lastCheckpointAt)
         self.resumedFromCheckpoint = try container.decodeIfPresent(Bool.self, forKey: .resumedFromCheckpoint) ?? false
+        self.activityPresentation = try container.decodeIfPresent(IndexActivityPresentation.self, forKey: .activityPresentation) ?? .foreground
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -339,6 +356,7 @@ public struct IndexStats: Codable, Equatable, Sendable {
         try container.encodeIfPresent(activeOperationStartedAt, forKey: .activeOperationStartedAt)
         try container.encodeIfPresent(lastCheckpointAt, forKey: .lastCheckpointAt)
         try container.encode(resumedFromCheckpoint, forKey: .resumedFromCheckpoint)
+        try container.encode(activityPresentation, forKey: .activityPresentation)
     }
 }
 
@@ -2019,6 +2037,9 @@ public final class FileIndex: @unchecked Sendable {
     private var isRefreshDrainScheduled = false
     private var pendingReconciliationPaths = Set<String>()
     private var pendingReconciliationIncludesAllRoots = false
+    private var pendingReconciliationPresentation: IndexActivityPresentation = .foreground
+    private var activeReconciliationPaths = Set<String>()
+    private var activeReconciliationIncludesAllRoots = false
     private var isReconciliationDrainScheduled = false
     private var completedRefreshBatches: UInt64 = 0
     private var completedSnapshotRebuilds: UInt64 = 0
@@ -2040,6 +2061,7 @@ public final class FileIndex: @unchecked Sendable {
     private var activeOperationStartedAt: Date?
     private var lastCheckpointAt: Date?
     private var resumedFromCheckpoint = false
+    private var activityPresentation: IndexActivityPresentation = .foreground
     private var publishesSearchableSnapshotsDuringScan = true
     private var statsChangedHandler: (@MainActor @Sendable (IndexStats) -> Void)?
     private var backgroundReconciliationHandler: (@MainActor @Sendable ([URL]) -> Void)?
@@ -2256,6 +2278,8 @@ public final class FileIndex: @unchecked Sendable {
             indexing = true
             reconciling = false
             updating = false
+            activityPresentation = .foreground
+            clearActiveReconciliationWithoutLock()
             phase = .scanning
             discoveredCount = 0
             searchableCount = 0
@@ -2299,7 +2323,11 @@ public final class FileIndex: @unchecked Sendable {
         return checkpoint != nil
     }
 
-    public func reconcileIndexedRootsInBackground(rootURLs requestedRootURLs: [URL]? = nil) {
+    @discardableResult
+    public func reconcileIndexedRootsInBackground(
+        rootURLs requestedRootURLs: [URL]? = nil,
+        activityPresentation requestedPresentation: IndexActivityPresentation = .foreground
+    ) -> ReconciliationRequestResult {
         let reconcileStarted = Date()
         let state = lock.withLock {
             (
@@ -2317,10 +2345,10 @@ public final class FileIndex: @unchecked Sendable {
         } else {
             rootURLs = allRootURLs
         }
-        guard !rootURLs.isEmpty else { return }
+        guard !rootURLs.isEmpty else { return .ignored }
         guard allRootURLs.count <= Self.maximumIndexedRootCount else {
             publishRootLimitFailure(count: allRootURLs.count)
-            return
+            return .ignored
         }
         let scopePaths = rootURLs.map(\.path)
         let reconcilesAllRoots = Set(scopePaths) == Set(state.rootPaths)
@@ -2329,46 +2357,63 @@ public final class FileIndex: @unchecked Sendable {
             event: "index.reconcileRequested",
             fields: [
                 "reconcilesAllRoots": .publicBool(reconcilesAllRoots),
+                "activityPresentation": .publicString(requestedPresentation.rawValue),
                 "scopeCount": .publicInt(rootURLs.count),
                 "scopes": .pathArray(scopePaths)
             ]
         )
 
         var currentGeneration: UInt64?
-        let didStart = lock.withLock { () -> Bool in
+        let result = lock.withLock { () -> ReconciliationRequestResult in
             guard !indexing else {
-                queuePendingReconciliationWithoutLock(
+                let uncoveredScopePaths = uncoveredReconciliationPathsWithoutLock(
                     scopePaths: scopePaths,
                     reconcilesAllRoots: reconcilesAllRoots
                 )
-                return false
+                guard !uncoveredScopePaths.isEmpty else {
+                    return .coveredByActive
+                }
+                queuePendingReconciliationWithoutLock(
+                    scopePaths: reconcilesAllRoots ? scopePaths : uncoveredScopePaths,
+                    reconcilesAllRoots: reconcilesAllRoots,
+                    activityPresentation: requestedPresentation
+                )
+                return .queued
             }
 
             generation &+= 1
             indexing = true
             reconciling = true
             updating = false
+            activityPresentation = requestedPresentation
             phase = .scanning
-            status = reconcilesAllRoots ? "Reconciling index" : "Reconciling changed folders"
+            status = Self.reconciliationStatus(
+                reconcilesAllRoots: reconcilesAllRoots,
+                activityPresentation: requestedPresentation
+            )
             discoveredCount = 0
             searchableCount = searchSnapshot.resultCount
             activeOperationStartedAt = reconcileStarted
             resumedFromCheckpoint = false
             lastUpdated = Date()
+            activeReconciliationPaths = Set(scopePaths)
+            activeReconciliationIncludesAllRoots = reconcilesAllRoots
             currentGeneration = generation
-            return true
+            return .started
         }
-        guard didStart, let currentGeneration else {
+        guard result == .started, let currentGeneration else {
+            let event = result == .coveredByActive ? "index.reconcileCoveredByActive" : "index.reconcileCoalesced"
             DiagnosticLogger.shared.log(
                 category: "index",
-                event: "index.reconcileCoalesced",
+                event: event,
                 fields: [
                     "reconcilesAllRoots": .publicBool(reconcilesAllRoots),
+                    "activityPresentation": .publicString(requestedPresentation.rawValue),
                     "scopeCount": .publicInt(scopePaths.count),
                     "scopes": .pathArray(scopePaths)
                 ]
             )
-            return
+            return result
         }
         publishStats()
 
@@ -2378,9 +2423,11 @@ public final class FileIndex: @unchecked Sendable {
                 allRootPaths: state.rootPaths,
                 exclusions: state.exclusions,
                 generation: currentGeneration,
-                started: reconcileStarted
+                started: reconcileStarted,
+                activityPresentation: requestedPresentation
             )
         }
+        return .started
     }
 
     public func update(paths rawPaths: [String]) {
@@ -2425,7 +2472,55 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
-    private func queuePendingReconciliationWithoutLock(scopePaths: [String], reconcilesAllRoots: Bool) {
+    private static func reconciliationStatus(
+        reconcilesAllRoots: Bool,
+        activityPresentation: IndexActivityPresentation
+    ) -> String {
+        switch activityPresentation {
+        case .foreground:
+            reconcilesAllRoots ? "Reconciling index" : "Reconciling changed folders"
+        case .backgroundCatchUp:
+            "Catching up changes"
+        }
+    }
+
+    private static func mergedPresentation(
+        _ lhs: IndexActivityPresentation,
+        _ rhs: IndexActivityPresentation
+    ) -> IndexActivityPresentation {
+        lhs == .foreground || rhs == .foreground ? .foreground : .backgroundCatchUp
+    }
+
+    private func uncoveredReconciliationPathsWithoutLock(
+        scopePaths: [String],
+        reconcilesAllRoots: Bool
+    ) -> [String] {
+        guard reconciling else { return scopePaths }
+        guard !activeReconciliationIncludesAllRoots else { return [] }
+        guard !activeReconciliationPaths.isEmpty else { return scopePaths }
+        guard !reconcilesAllRoots else { return scopePaths }
+
+        return scopePaths.filter { scopePath in
+            !activeReconciliationPaths.contains { activePath in
+                scopePath == activePath || scopePath.hasPrefix(activePath + "/")
+            }
+        }
+    }
+
+    private func clearActiveReconciliationWithoutLock() {
+        activeReconciliationPaths.removeAll(keepingCapacity: false)
+        activeReconciliationIncludesAllRoots = false
+    }
+
+    private func queuePendingReconciliationWithoutLock(
+        scopePaths: [String],
+        reconcilesAllRoots: Bool,
+        activityPresentation: IndexActivityPresentation
+    ) {
+        pendingReconciliationPresentation = Self.mergedPresentation(
+            pendingReconciliationPresentation,
+            activityPresentation
+        )
         if reconcilesAllRoots {
             pendingReconciliationIncludesAllRoots = true
             pendingReconciliationPaths.removeAll(keepingCapacity: false)
@@ -2435,7 +2530,7 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     private func schedulePendingReconciliationDrainIfNeeded() {
-        let scopeURLs = lock.withLock { () -> [URL]? in
+        let pending = lock.withLock { () -> (scopeURLs: [URL], activityPresentation: IndexActivityPresentation)? in
             guard
                 !indexing,
                 pendingRefreshPaths.isEmpty,
@@ -2447,22 +2542,27 @@ public final class FileIndex: @unchecked Sendable {
             }
 
             let requestedPaths = pendingReconciliationIncludesAllRoots ? roots : Array(pendingReconciliationPaths)
+            let presentation = pendingReconciliationPresentation
             pendingReconciliationIncludesAllRoots = false
             pendingReconciliationPaths.removeAll(keepingCapacity: false)
+            pendingReconciliationPresentation = .foreground
 
             let urls = Self.reconciliationScopeURLs(for: requestedPaths, within: roots)
             guard !urls.isEmpty else { return nil }
             isReconciliationDrainScheduled = true
-            return urls
+            return (urls, presentation)
         }
 
-        guard let scopeURLs else { return }
+        guard let pending else { return }
         indexQueue.async { [weak self] in
             guard let self else { return }
             self.lock.withLock {
                 self.isReconciliationDrainScheduled = false
             }
-            self.reconcileIndexedRootsInBackground(rootURLs: scopeURLs)
+            self.reconcileIndexedRootsInBackground(
+                rootURLs: pending.scopeURLs,
+                activityPresentation: pending.activityPresentation
+            )
         }
     }
 
@@ -4526,6 +4626,8 @@ public final class FileIndex: @unchecked Sendable {
             indexing = false
             reconciling = false
             updating = false
+            activityPresentation = .foreground
+            clearActiveReconciliationWithoutLock()
             phase = .idle
             discoveredCount = 0
             searchableCount = 0
@@ -4552,6 +4654,8 @@ public final class FileIndex: @unchecked Sendable {
             snapshotLoadState = .loading
             reconciling = false
             updating = false
+            activityPresentation = .foreground
+            clearActiveReconciliationWithoutLock()
             phase = .loading
             status = "Loading saved index"
             lastUpdated = Date()
@@ -4788,7 +4892,8 @@ public final class FileIndex: @unchecked Sendable {
         allRootPaths: [String],
         exclusions: FileExclusionRules,
         generation currentGeneration: UInt64,
-        started: Date
+        started: Date,
+        activityPresentation: IndexActivityPresentation
     ) {
         let jobID = beginIndexJob("reconcile")
         defer { endIndexJob("reconcile", jobID: jobID) }
@@ -4803,6 +4908,7 @@ public final class FileIndex: @unchecked Sendable {
             event: "index.reconcileBegin",
             fields: [
                 "reconcilesAllRoots": .publicBool(reconcilesAllRoots),
+                "activityPresentation": .publicString(activityPresentation.rawValue),
                 "scopeCount": .publicInt(rootURLs.count),
                 "scopes": .pathArray(scannedRootPaths),
                 "workerCount": .publicInt(Self.refreshScanWorkerCount())
@@ -4821,6 +4927,11 @@ public final class FileIndex: @unchecked Sendable {
             workerQoS: .utility,
             progress: { _, _, _ in }
         ) else {
+            lock.withLock {
+                if generation == currentGeneration {
+                    clearActiveReconciliationWithoutLock()
+                }
+            }
             DiagnosticLogger.shared.log(
                 level: .warning,
                 category: "index",
@@ -4856,7 +4967,7 @@ public final class FileIndex: @unchecked Sendable {
             initialStore: initialStore,
             generation: currentGeneration,
             publishesIntermediateSnapshots: false,
-            completionStatusPrefix: "Reconciled"
+            completionStatusPrefix: activityPresentation == .backgroundCatchUp ? "Caught up" : "Reconciled"
         )
         guard isCurrentGeneration(currentGeneration) else { return }
         recordFullRebuild(duration: Date().timeIntervalSince(started))
@@ -5084,9 +5195,13 @@ public final class FileIndex: @unchecked Sendable {
                 return false
             }
 
-            let verb = reconciling ? "Reconciling" : "Indexing"
             discoveredCount = visited
-            status = "\(verb) \(discoveredCount.formatted()) discovered"
+            if activityPresentation == .backgroundCatchUp, reconciling {
+                status = "Catching up changes"
+            } else {
+                let verb = reconciling ? "Reconciling" : "Indexing"
+                status = "\(verb) \(discoveredCount.formatted()) discovered"
+            }
             lastUpdated = Date()
             return true
         }
@@ -5258,6 +5373,9 @@ public final class FileIndex: @unchecked Sendable {
             searchSnapshot = snapshot
             searchSnapshotRevision &+= 1
             indexing = false
+            if reconciling {
+                clearActiveReconciliationWithoutLock()
+            }
             reconciling = false
             updating = false
             phase = .ready
@@ -5423,6 +5541,7 @@ public final class FileIndex: @unchecked Sendable {
             indexing = false
             reconciling = false
             updating = false
+            clearActiveReconciliationWithoutLock()
             phase = .failed
             status = message
             lastUpdated = Date()
@@ -5443,6 +5562,8 @@ public final class FileIndex: @unchecked Sendable {
             indexing = false
             reconciling = false
             updating = false
+            activityPresentation = .foreground
+            clearActiveReconciliationWithoutLock()
             phase = .failed
             status = "The index supports at most \(Self.maximumIndexedRootCount.formatted()) roots, but \(count.formatted()) were configured."
             discoveredCount = 0
@@ -5597,6 +5718,8 @@ public final class FileIndex: @unchecked Sendable {
             indexing = true
             reconciling = false
             updating = true
+            activityPresentation = .foreground
+            clearActiveReconciliationWithoutLock()
             phase = .scanning
             status = "Updating changed paths"
             activeOperationStartedAt = updateStarted
@@ -6764,6 +6887,8 @@ public final class FileIndex: @unchecked Sendable {
                 indexing = phase == .scanning || phase == .optimizing || phase == .saving
                 reconciling = false
                 updating = false
+                activityPresentation = .foreground
+                clearActiveReconciliationWithoutLock()
                 self.phase = phase
                 discoveredCount = records.count
                 searchableCount = snapshot.resultCount
@@ -6860,7 +6985,8 @@ public final class FileIndex: @unchecked Sendable {
                     lastUpdated: lastUpdated,
                     activeOperationStartedAt: activeOperationStartedAt,
                     lastCheckpointAt: lastCheckpointAt,
-                    resumedFromCheckpoint: resumedFromCheckpoint
+                    resumedFromCheckpoint: resumedFromCheckpoint,
+                    activityPresentation: activityPresentation
                 ),
                 handler: statsChangedHandler
             )
@@ -6901,7 +7027,8 @@ public final class FileIndex: @unchecked Sendable {
             lastUpdated: lastUpdated,
             activeOperationStartedAt: activeOperationStartedAt,
             lastCheckpointAt: lastCheckpointAt,
-            resumedFromCheckpoint: resumedFromCheckpoint
+            resumedFromCheckpoint: resumedFromCheckpoint,
+            activityPresentation: activityPresentation
         )
     }
 

@@ -121,7 +121,7 @@ struct FileSystemWatcherTests {
 
         let action = await actionFromCoordinator(coordinator, roots: [root])
         #expect(source.requestedSinceEventID == 40)
-        #expect(action == .reconcile(paths: [folder.path]))
+        #expect(action == .reconcile(paths: [folder.path], baselineEventID: 42))
     }
 
     @Test("FSEvent reconciliation scopes normal historical directory paths directly")
@@ -152,7 +152,7 @@ struct FileSystemWatcherTests {
         )
 
         let action = await actionFromCoordinator(coordinator, roots: [root])
-        #expect(action == .reconcile(paths: [folder.path]))
+        #expect(action == .reconcile(paths: [folder.path], baselineEventID: 42))
     }
 
     @Test("FSEvent reconciliation collapses large historical file sets to parent scopes")
@@ -180,7 +180,7 @@ struct FileSystemWatcherTests {
         )
 
         let action = await actionFromCoordinator(coordinator, roots: [root])
-        #expect(action == .reconcile(paths: [root.path]))
+        #expect(action == .reconcile(paths: [root.path], baselineEventID: 6_000))
     }
 
     @Test("FSEvent reconciliation falls back when a cursor is missing")

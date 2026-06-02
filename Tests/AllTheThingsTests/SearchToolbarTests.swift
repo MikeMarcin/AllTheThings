@@ -73,6 +73,65 @@ struct SearchToolbarTests {
         #expect(paths == ["/Users/example/Desktop", "/Users/example/Downloads"])
     }
 
+    @Test("background catch up does not present as foreground reconcile")
+    func backgroundCatchUpDoesNotPresentAsForegroundReconcile() {
+        let startedAt = Date(timeIntervalSince1970: 1_000)
+        let now = Date(timeIntervalSince1970: 1_012)
+        let stats = IndexStats(
+            indexedCount: 10,
+            isIndexing: true,
+            isReconciling: true,
+            phase: .scanning,
+            discoveredCount: 4,
+            searchableCount: 10,
+            status: "Catching up changes",
+            lastUpdated: now,
+            activeOperationStartedAt: startedAt,
+            activityPresentation: .backgroundCatchUp
+        )
+
+        let status = SearchWindowPresentation.indexStatusText(
+            indexedRootsIsEmpty: false,
+            fseventCatchUpStartedAt: nil,
+            stats: stats,
+            now: now
+        )
+
+        #expect(status.contains("Catching up changes"))
+        #expect(!status.contains("Reconciling"))
+        #expect(!SearchWindowPresentation.isImportantMascotOperation(stats))
+        #expect(SearchWindowPresentation.persistentMascotAnimation(stats: stats, hasActiveSearch: false) == .idle)
+        #expect(SearchWindowPresentation.persistentMascotAnimation(stats: stats, hasActiveSearch: true) == .searching)
+    }
+
+    @Test("foreground reconcile still presents as important reconcile")
+    func foregroundReconcileStillPresentsAsImportantReconcile() {
+        let now = Date(timeIntervalSince1970: 1_000)
+        let stats = IndexStats(
+            indexedCount: 10,
+            isIndexing: true,
+            isReconciling: true,
+            phase: .scanning,
+            discoveredCount: 4,
+            searchableCount: 10,
+            status: "Reconciling changed folders",
+            lastUpdated: now,
+            activeOperationStartedAt: now,
+            activityPresentation: .foreground
+        )
+
+        let status = SearchWindowPresentation.indexStatusText(
+            indexedRootsIsEmpty: false,
+            fseventCatchUpStartedAt: nil,
+            stats: stats,
+            now: now
+        )
+
+        #expect(status.contains("Reconciling"))
+        #expect(SearchWindowPresentation.isImportantMascotOperation(stats))
+        #expect(SearchWindowPresentation.persistentMascotAnimation(stats: stats, hasActiveSearch: false) == .indexing)
+    }
+
     @MainActor
     private func buttons(in view: NSView?) -> [NSButton] {
         guard let view else { return [] }

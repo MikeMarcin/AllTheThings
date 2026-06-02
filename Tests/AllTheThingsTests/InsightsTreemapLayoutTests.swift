@@ -145,6 +145,7 @@ struct InsightsTreemapLayoutTests {
         #expect(InsightsRootDisplay.activePlaceholderLabel(for: makeStats(isIndexing: false, phase: .ready)) == nil)
         #expect(InsightsRootDisplay.activePlaceholderLabel(for: makeStats(isIndexing: true, phase: .scanning)) == "Indexing")
         #expect(InsightsRootDisplay.activePlaceholderLabel(for: makeStats(isIndexing: true, isReconciling: true, phase: .scanning)) == "Reconciling")
+        #expect(InsightsRootDisplay.activePlaceholderLabel(for: makeStats(isIndexing: true, isReconciling: true, phase: .scanning, activityPresentation: .backgroundCatchUp)) == "Catching up")
         #expect(InsightsRootDisplay.activePlaceholderLabel(for: makeStats(isIndexing: true, isUpdating: true, phase: .scanning)) == "Updating")
         #expect(InsightsRootDisplay.activePlaceholderLabel(for: makeStats(isIndexing: true, phase: .optimizing)) == "Optimizing")
         #expect(InsightsRootDisplay.activePlaceholderLabel(for: makeStats(isIndexing: true, phase: .saving)) == "Saving")
@@ -319,7 +320,8 @@ struct InsightsTreemapLayoutTests {
         isIndexing: Bool,
         isReconciling: Bool = false,
         isUpdating: Bool = false,
-        phase: IndexPhase
+        phase: IndexPhase,
+        activityPresentation: IndexActivityPresentation = .foreground
     ) -> IndexStats {
         IndexStats(
             indexedCount: 0,
@@ -328,7 +330,8 @@ struct InsightsTreemapLayoutTests {
             isUpdating: isUpdating,
             phase: phase,
             status: "",
-            lastUpdated: Date()
+            lastUpdated: Date(),
+            activityPresentation: activityPresentation
         )
     }
 

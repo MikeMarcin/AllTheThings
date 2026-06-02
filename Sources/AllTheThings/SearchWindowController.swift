@@ -51,6 +51,105 @@ enum AppRuntimeStatusFormatter {
     }
 }
 
+enum SearchWindowPresentation {
+    nonisolated static func isImportantMascotOperation(_ stats: IndexStats) -> Bool {
+        guard !stats.isUpdating else { return false }
+        guard stats.activityPresentation != .backgroundCatchUp else { return false }
+        return isImportantMascotOperation(stats.phase)
+    }
+
+    nonisolated static func persistentMascotAnimation(
+        stats: IndexStats,
+        hasActiveSearch: Bool
+    ) -> OperationMascotAnimation {
+        if stats.activityPresentation == .backgroundCatchUp {
+            return hasActiveSearch ? .searching : .idle
+        }
+
+        if stats.isUpdating {
+            return .updating
+        }
+
+        switch stats.phase {
+        case .loading, .scanning:
+            return .indexing
+        case .optimizing, .saving:
+            return .optimizing
+        case .idle, .ready, .failed:
+            break
+        }
+
+        return hasActiveSearch ? .searching : .idle
+    }
+
+    nonisolated static func indexStatusText(
+        indexedRootsIsEmpty: Bool,
+        fseventCatchUpStartedAt: Date?,
+        stats indexStats: IndexStats,
+        now: Date = Date()
+    ) -> String {
+        if indexedRootsIsEmpty {
+            return "No folders"
+        }
+
+        if let fseventCatchUpStartedAt {
+            let elapsed = max(now.timeIntervalSince(fseventCatchUpStartedAt), 0)
+            return AppRuntimeStatusFormatter.catchUpStatus(elapsed: elapsed)
+        }
+
+        switch indexStats.phase {
+        case .idle:
+            return indexStats.status
+        case .loading:
+            return "Loading • \(indexStats.status)"
+        case .scanning:
+            let elapsedSuffix = operationElapsedSuffix(startedAt: indexStats.activeOperationStartedAt, now: now)
+            if indexStats.activityPresentation == .backgroundCatchUp {
+                return "\(indexStats.status) • \(indexStats.searchableCount.formatted()) searchable\(elapsedSuffix)"
+            }
+            if indexStats.isUpdating {
+                return "\(indexStats.status) • \(indexStats.searchableCount.formatted()) searchable\(elapsedSuffix)"
+            }
+            if indexStats.status == "Reconciling changed folders" {
+                return "\(indexStats.status) • \(indexStats.searchableCount.formatted()) searchable\(elapsedSuffix)"
+            }
+            let verb = indexStats.isReconciling ? "Reconciling" : "Indexing"
+            return "\(verb) \(indexStats.discoveredCount.formatted()) discovered • \(indexStats.searchableCount.formatted()) searchable\(elapsedSuffix)"
+        case .optimizing:
+            let elapsedSuffix = operationElapsedSuffix(startedAt: indexStats.activeOperationStartedAt, now: now)
+            if indexStats.activityPresentation == .backgroundCatchUp {
+                return "Catching up changes • \(indexStats.searchableCount.formatted()) searchable\(elapsedSuffix)"
+            }
+            return "\(indexStats.status) • \(indexStats.searchableCount.formatted()) searchable\(elapsedSuffix)"
+        case .saving:
+            let elapsedSuffix = operationElapsedSuffix(startedAt: indexStats.activeOperationStartedAt, now: now)
+            if indexStats.activityPresentation == .backgroundCatchUp {
+                return "Catching up changes • \(indexStats.searchableCount.formatted()) searchable\(elapsedSuffix)"
+            }
+            return "Saving index • \(indexStats.searchableCount.formatted()) searchable\(elapsedSuffix)"
+        case .ready:
+            return AppRuntimeStatusFormatter.readyStatus(status: indexStats.status, lastUpdated: indexStats.lastUpdated)
+        case .failed:
+            return indexStats.status
+        }
+    }
+
+    nonisolated private static func isImportantMascotOperation(_ phase: IndexPhase) -> Bool {
+        switch phase {
+        case .scanning, .optimizing, .saving:
+            return true
+        case .idle, .loading, .ready, .failed:
+            return false
+        }
+    }
+
+    nonisolated private static func operationElapsedSuffix(startedAt: Date?, now: Date = Date()) -> String {
+        guard let startedAt else { return "" }
+        let elapsed = max(now.timeIntervalSince(startedAt), 0)
+        return " • \(AppRuntimeStatusFormatter.operationElapsed(elapsed))"
+    }
+}
+
 final class SearchWindowController: NSWindowController {
     private enum WindowLayout {
         static let preferredContentSize = NSSize(width: 1_180, height: 720)
@@ -637,6 +736,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var activeFSEventReplay: FSEventHistoryReplayCancellable?
     private var activeFSEventReconciliationID: UUID?
     private var fseventCatchUpStartedAt: Date?
+    private var pendingFSEventCatchUpRoots: [URL]?
+    private var activeFSEventScopedCatchUpBaseline: (rootPaths: [String], eventID: UInt64)?
+    private var queuedFSEventScopedCatchUpBaseline: (rootPaths: [String], eventID: UInt64)?
     private var memoryStatusTask: Task<Void, Never>?
     private var memoryStatusText = ProcessMemoryFormatter.label(for: ProcessMemorySampler.currentUsage())
     private var energyMode: EnergyMode = .interactive
@@ -2060,6 +2162,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let previousStats = indexStats
         indexStats = stats
         markFSEventBaselineIfNeeded(previous: previousStats, current: stats)
+        activateQueuedFSEventCatchUpBaselineIfNeeded(previous: previousStats, current: stats)
+        markScopedFSEventCatchUpBaselineIfNeeded(previous: previousStats, current: stats)
+        runPendingFSEventCatchUpIfNeeded(stats: stats)
         handleMascotTransition(from: previousStats, to: stats)
         updateStatus()
         updateLoadingOverlay()
@@ -2247,7 +2352,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
 
         let completedPhases: Set<IndexPhase> = [.scanning, .optimizing, .saving]
-        if completedPhases.contains(previousStats.phase), nextStats.phase == .ready, !previousStats.isUpdating {
+        if completedPhases.contains(previousStats.phase),
+           nextStats.phase == .ready,
+           !previousStats.isUpdating,
+           previousStats.activityPresentation != .backgroundCatchUp {
             playMascotTransient(.success)
         }
     }
@@ -2368,17 +2476,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func isImportantMascotOperation(_ stats: IndexStats) -> Bool {
-        guard !stats.isUpdating else { return false }
-        return isImportantMascotOperation(stats.phase)
-    }
-
-    private func isImportantMascotOperation(_ phase: IndexPhase) -> Bool {
-        switch phase {
-        case .scanning, .optimizing, .saving:
-            return true
-        case .idle, .loading, .ready, .failed:
-            return false
-        }
+        SearchWindowPresentation.isImportantMascotOperation(stats)
     }
 
     private func mascotPlacementTargetFrame() -> NSRect {
@@ -2405,20 +2503,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func persistentMascotAnimation() -> OperationMascotAnimation {
-        if indexStats.isUpdating {
-            return .updating
-        }
-
-        switch indexStats.phase {
-        case .loading, .scanning:
-            return .indexing
-        case .optimizing, .saving:
-            return .optimizing
-        case .idle, .ready, .failed:
-            break
-        }
-
-        return activeSearchToken == nil ? .idle : .searching
+        SearchWindowPresentation.persistentMascotAnimation(stats: indexStats, hasActiveSearch: activeSearchToken != nil)
     }
 
     private func currentSearchText() -> String {
@@ -2716,6 +2801,54 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
     }
 
+    private func activateQueuedFSEventCatchUpBaselineIfNeeded(previous: IndexStats, current: IndexStats) {
+        guard
+            !previous.isIndexing,
+            current.isIndexing,
+            current.activityPresentation == .backgroundCatchUp,
+            activeFSEventScopedCatchUpBaseline == nil,
+            let queuedBaseline = queuedFSEventScopedCatchUpBaseline
+        else {
+            return
+        }
+
+        queuedFSEventScopedCatchUpBaseline = nil
+        activeFSEventScopedCatchUpBaseline = queuedBaseline
+    }
+
+    private func markScopedFSEventCatchUpBaselineIfNeeded(previous: IndexStats, current: IndexStats) {
+        guard
+            previous.isIndexing,
+            !current.isIndexing,
+            current.phase == .ready,
+            current.activityPresentation == .backgroundCatchUp,
+            current.status.hasPrefix("Caught up"),
+            let baseline = activeFSEventScopedCatchUpBaseline
+        else {
+            return
+        }
+
+        activeFSEventScopedCatchUpBaseline = nil
+        fseventCursorStore.markBaseline(for: baseline.rootPaths, eventID: baseline.eventID)
+        startWatchingIfNeeded()
+        scheduleZeroRowRootRecoveryIfNeeded()
+    }
+
+    private func runPendingFSEventCatchUpIfNeeded(stats: IndexStats) {
+        guard
+            !stats.isIndexing,
+            !stats.isLoadingSnapshot,
+            activeFSEventReplay == nil,
+            activeFSEventReconciliationID == nil,
+            let roots = pendingFSEventCatchUpRoots
+        else {
+            return
+        }
+
+        pendingFSEventCatchUpRoots = nil
+        runFSEventsBackedReconciliation(roots: roots)
+    }
+
     private func startWatchingIfNeeded() {
         guard AppSettings.indexingSetupCompleted(defaults: defaults), !indexedRoots.isEmpty else {
             cancelFSEventCatchUp()
@@ -2750,7 +2883,21 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
 
         startWatchingIfNeeded()
-        activeFSEventReplay?.cancel()
+        guard !indexStats.isIndexing, activeFSEventReplay == nil, activeFSEventReconciliationID == nil else {
+            pendingFSEventCatchUpRoots = roots
+            DiagnosticLogger.shared.log(
+                category: "fsevents",
+                event: "fsevents.reconciliationDeferred",
+                fields: [
+                    "rootCount": .publicInt(roots.count),
+                    "roots": .pathArray(rootPaths(roots)),
+                    "indexing": .publicBool(indexStats.isIndexing),
+                    "replayActive": .publicBool(activeFSEventReplay != nil || activeFSEventReconciliationID != nil)
+                ]
+            )
+            return
+        }
+
         let reconciliationID = UUID()
         activeFSEventReconciliationID = reconciliationID
         fseventCatchUpStartedAt = Date()
@@ -2771,7 +2918,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             self.fseventCatchUpStartedAt = nil
 
             switch action {
-            case let .reconcile(paths):
+            case let .reconcile(paths, baselineEventID):
                 let paths = self.pathsIncludingReadableZeroRowRecoveryCandidates(paths)
                 DiagnosticLogger.shared.log(
                     category: "fsevents",
@@ -2781,8 +2928,14 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                         "paths": .pathArray(paths)
                     ]
                 )
-                self.index.reconcileIndexedRootsInBackground(
-                    rootURLs: paths.map { URL(fileURLWithPath: $0, isDirectory: true) }
+                let result = self.index.reconcileIndexedRootsInBackground(
+                    rootURLs: paths.map { URL(fileURLWithPath: $0, isDirectory: true) },
+                    activityPresentation: .backgroundCatchUp
+                )
+                self.handleScopedFSEventCatchUpRequestResult(
+                    result,
+                    roots: roots,
+                    baselineEventID: baselineEventID
                 )
             case let .upToDate(baselineEventID):
                 DiagnosticLogger.shared.log(
@@ -2797,6 +2950,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                 self.updateStatus()
                 self.scheduleZeroRowRootRecoveryIfNeeded()
             case let .fullReconcile(paths):
+                self.activeFSEventScopedCatchUpBaseline = nil
+                self.queuedFSEventScopedCatchUpBaseline = nil
                 DiagnosticLogger.shared.log(
                     level: .warning,
                     category: "fsevents",
@@ -2809,9 +2964,68 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                 self.index.recordRecursiveRescan()
                 let rootURLs = paths.map(self.pathsIncludingReadableZeroRowRecoveryCandidates)?
                     .map { URL(fileURLWithPath: $0, isDirectory: true) }
-                self.index.reconcileIndexedRootsInBackground(rootURLs: rootURLs)
+                self.index.reconcileIndexedRootsInBackground(
+                    rootURLs: rootURLs,
+                    activityPresentation: .foreground
+                )
             }
         }
+    }
+
+    private func handleScopedFSEventCatchUpRequestResult(
+        _ result: ReconciliationRequestResult,
+        roots: [URL],
+        baselineEventID: UInt64
+    ) {
+        switch result {
+        case .started:
+            let rootPaths = rootPaths(roots)
+            activeFSEventScopedCatchUpBaseline = mergedFSEventScopedCatchUpBaseline(
+                activeFSEventScopedCatchUpBaseline,
+                rootPaths: rootPaths,
+                eventID: baselineEventID
+            )
+        case .queued:
+            let rootPaths = rootPaths(roots)
+            queuedFSEventScopedCatchUpBaseline = mergedFSEventScopedCatchUpBaseline(
+                queuedFSEventScopedCatchUpBaseline,
+                rootPaths: rootPaths,
+                eventID: baselineEventID
+            )
+        case .coveredByActive:
+            let rootPaths = rootPaths(roots)
+            if activeFSEventScopedCatchUpBaseline?.rootPaths == rootPaths {
+                activeFSEventScopedCatchUpBaseline = mergedFSEventScopedCatchUpBaseline(
+                    activeFSEventScopedCatchUpBaseline,
+                    rootPaths: rootPaths,
+                    eventID: baselineEventID
+                )
+            } else {
+                pendingFSEventCatchUpRoots = roots
+            }
+            DiagnosticLogger.shared.log(
+                category: "fsevents",
+                event: "fsevents.reconciliationSuppressedDuplicate",
+                fields: [
+                    "rootCount": .publicInt(roots.count),
+                    "roots": .pathArray(rootPaths),
+                    "baselineEventID": .publicUInt64(baselineEventID)
+                ]
+            )
+        case .ignored:
+            break
+        }
+    }
+
+    private func mergedFSEventScopedCatchUpBaseline(
+        _ existing: (rootPaths: [String], eventID: UInt64)?,
+        rootPaths: [String],
+        eventID: UInt64
+    ) -> (rootPaths: [String], eventID: UInt64) {
+        guard let existing, existing.rootPaths == rootPaths else {
+            return (rootPaths, eventID)
+        }
+        return (rootPaths, max(existing.eventID, eventID))
     }
 
     private func cancelFSEventCatchUp() {
@@ -2819,6 +3033,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         activeFSEventReplay = nil
         activeFSEventReconciliationID = nil
         fseventCatchUpStartedAt = nil
+        pendingFSEventCatchUpRoots = nil
+        activeFSEventScopedCatchUpBaseline = nil
+        queuedFSEventScopedCatchUpBaseline = nil
     }
 
     private func coalesceFSEvents(_ events: [FileSystemEvent]) {
@@ -2942,44 +3159,11 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func indexStatusText() -> String {
-        if indexedRoots.isEmpty {
-            return "No folders"
-        }
-
-        if let fseventCatchUpStartedAt {
-            let elapsed = max(Date().timeIntervalSince(fseventCatchUpStartedAt), 0)
-            return AppRuntimeStatusFormatter.catchUpStatus(elapsed: elapsed)
-        }
-
-        switch indexStats.phase {
-        case .idle:
-            return indexStats.status
-        case .loading:
-            return "Loading • \(indexStats.status)"
-        case .scanning:
-            if indexStats.isUpdating {
-                return "\(indexStats.status) • \(indexStats.searchableCount.formatted()) searchable\(operationElapsedSuffix())"
-            }
-            if indexStats.status == "Reconciling changed folders" {
-                return "\(indexStats.status) • \(indexStats.searchableCount.formatted()) searchable\(operationElapsedSuffix())"
-            }
-            let verb = indexStats.isReconciling ? "Reconciling" : "Indexing"
-            return "\(verb) \(indexStats.discoveredCount.formatted()) discovered • \(indexStats.searchableCount.formatted()) searchable\(operationElapsedSuffix())"
-        case .optimizing:
-            return "\(indexStats.status) • \(indexStats.searchableCount.formatted()) searchable\(operationElapsedSuffix())"
-        case .saving:
-            return "Saving index • \(indexStats.searchableCount.formatted()) searchable\(operationElapsedSuffix())"
-        case .ready:
-            return AppRuntimeStatusFormatter.readyStatus(status: indexStats.status, lastUpdated: indexStats.lastUpdated)
-        case .failed:
-            return indexStats.status
-        }
-    }
-
-    private func operationElapsedSuffix() -> String {
-        guard let startedAt = indexStats.activeOperationStartedAt else { return "" }
-        let elapsed = max(Date().timeIntervalSince(startedAt), 0)
-        return " • \(AppRuntimeStatusFormatter.operationElapsed(elapsed))"
+        SearchWindowPresentation.indexStatusText(
+            indexedRootsIsEmpty: indexedRoots.isEmpty,
+            fseventCatchUpStartedAt: fseventCatchUpStartedAt,
+            stats: indexStats
+        )
     }
 
     private func updateActionButtons() {
