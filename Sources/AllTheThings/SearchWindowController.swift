@@ -2959,7 +2959,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         )
         updateStatus()
 
-        activeFSEventReplay = fseventReconciler.reconcile(roots: roots) { @MainActor @Sendable [weak self] action in
+        let exclusionRules = FileExclusionRules(patterns: index.allExclusionPatterns())
+        activeFSEventReplay = fseventReconciler.reconcile(roots: roots, exclusions: exclusionRules) { @MainActor @Sendable [weak self] action in
             guard let self, self.activeFSEventReconciliationID == reconciliationID else { return }
             self.activeFSEventReplay = nil
             self.activeFSEventReconciliationID = nil

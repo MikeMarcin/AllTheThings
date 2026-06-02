@@ -45,7 +45,7 @@ enum AppSettings {
     static let indexedRootsDidChangeNotification = Notification.Name("com.allthethings.settings.indexedRootsDidChange")
     static let exclusionPatternsDidChangeNotification = Notification.Name("com.allthethings.settings.exclusionPatternsDidChange")
 
-    private static let currentExclusionDefaultsVersion = 8
+    private static let currentExclusionDefaultsVersion = 10
     private static let versionOneDefaultExclusionPatterns = [
         "node_modules/",
         "DerivedData/",
@@ -70,6 +70,14 @@ enum AppSettings {
         ".nuxt/",
         ".venv/",
         "venv/"
+    ]
+    private static let retiredSearchableUnrealDefaultExclusionPatterns = [
+        "Engine/Content/",
+        "Engine/Source/ThirdParty/",
+        "Engine/Source/Runtime/Engine/Private/",
+        "thirdparty/",
+        "third_party/",
+        "vendor/"
     ]
 
     static func registerDefaults(_ defaults: UserDefaults = .standard) {
@@ -347,6 +355,14 @@ enum AppSettings {
                 didChangePatterns = true
             }
         }
+        if currentVersion < 10 {
+            let retiredPatterns = Set(retiredSearchableUnrealDefaultExclusionPatterns)
+            let filteredPatterns = patterns.filter { !retiredPatterns.contains($0) }
+            if filteredPatterns.count != patterns.count {
+                patterns = filteredPatterns
+                didChangePatterns = true
+            }
+        }
 
         let additions = defaultExclusionPatternsAdded(after: currentVersion)
         if !additions.isEmpty {
@@ -379,12 +395,9 @@ enum AppSettings {
             additions.append(".build/**/index/store/")
         }
         if version < 6 {
-            additions.append("Engine/Content/")
             additions.append("Engine/DerivedDataCache/")
             additions.append("Engine/Intermediate/")
             additions.append("Engine/Saved/")
-            additions.append("Engine/Source/ThirdParty/")
-            additions.append("Engine/Source/Runtime/Engine/Private/")
             additions.append("build/.cmake/api/")
             additions.append("build/_deps/")
             additions.append(".venv/")
@@ -396,10 +409,13 @@ enum AppSettings {
             additions.append("Xcode.app/Contents/Developer/Platforms/")
             additions.append("Xcode.app/Contents/Developer/Toolchains/")
         }
-        if version < 8 {
-            additions.append("thirdparty/")
-            additions.append("third_party/")
-            additions.append("vendor/")
+        if version < 9 {
+            additions.append(".git/*")
+            additions.append("!.git/config")
+            additions.append("!.git/HEAD")
+            additions.append("!.git/description")
+            additions.append("!.git/hooks/**")
+            additions.append("!.git/info/**")
         }
         return additions
     }
