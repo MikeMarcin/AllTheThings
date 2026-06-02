@@ -2,9 +2,12 @@ import Foundation
 
 public struct FileExclusionRules: @unchecked Sendable {
     public static let defaultPatterns = [
-        ".git/objects/",
-        ".git/modules/**/objects/",
-        ".git/lfs/objects/",
+        ".git/*",
+        "!.git/config",
+        "!.git/HEAD",
+        "!.git/description",
+        "!.git/hooks/**",
+        "!.git/info/**",
         ".hg/store/",
         ".svn/pristine/",
         "node_modules/",
@@ -19,18 +22,12 @@ public struct FileExclusionRules: @unchecked Sendable {
         "Xcode.app/Contents/Developer/Toolchains/",
         "Engine/Binaries/ThirdParty/DotNet/",
         "Engine/Binaries/ThirdParty/Python3/",
-        "Engine/Content/",
         "Engine/DerivedDataCache/",
         "Engine/Intermediate/",
         "Engine/Saved/",
-        "Engine/Source/ThirdParty/",
-        "Engine/Source/Runtime/Engine/Private/",
         ".build/**/index/store/",
         "build/.cmake/api/",
         "build/_deps/",
-        "thirdparty/",
-        "third_party/",
-        "vendor/",
         ".venv/",
         "venv/",
         ".tox/",
@@ -46,29 +43,68 @@ public struct FileExclusionRules: @unchecked Sendable {
     public let patterns: [String]
     private let rules: [Rule]
 
+    public enum Decision: Sendable, Equatable {
+        case index
+        case skipButDescend
+        case prune
+
+        public var shouldIndex: Bool {
+            self == .index
+        }
+
+        public var shouldDescend: Bool {
+            self != .prune
+        }
+    }
+
     public init(patterns: [String] = Self.defaultPatterns) {
         self.patterns = patterns
         self.rules = patterns.compactMap(Rule.init(rawPattern:))
     }
 
     public func excludes(url: URL, roots: [String], isDirectory: Bool? = nil) -> Bool {
+        decision(url: url, roots: roots, isDirectory: isDirectory) != .index
+    }
+
+    public func decision(url: URL, roots: [String], isDirectory: Bool? = nil) -> Decision {
         let standardized = url.standardizedFileURL
         let path = standardized.path
         let relativePaths = Self.relativePaths(for: path, roots: roots)
-        let pathComponents = path.split(separator: "/").map(String.init)
         let effectiveIsDirectory = isDirectory ?? standardized.hasDirectoryPath
         var excluded = false
+        var finalMatchingRuleIndex: Int?
+        var finalMatchingRule: Rule?
 
-        for rule in rules where rule.matches(
-            name: standardized.lastPathComponent,
-            pathComponents: pathComponents,
-            relativePaths: relativePaths,
-            isDirectory: effectiveIsDirectory
-        ) {
+        for (index, rule) in rules.enumerated() {
+            let matchesTarget = rule.matches(
+                relativePaths: relativePaths,
+                isDirectory: effectiveIsDirectory
+            )
+            let matchesIgnoredAncestor = !matchesTarget && rule.matchesIgnoredAncestor(of: relativePaths)
+            guard matchesTarget || matchesIgnoredAncestor else { continue }
+
             excluded = !rule.isNegated
+            finalMatchingRuleIndex = index
+            finalMatchingRule = rule
         }
 
-        return excluded
+        guard effectiveIsDirectory else {
+            return excluded ? .prune : .index
+        }
+
+        if finalMatchingRule?.isTraversalOnlyDirectoryReinclude == true {
+            return .skipButDescend
+        }
+
+        guard excluded else { return .index }
+        guard let finalMatchingRuleIndex else { return .prune }
+
+        for rule in rules.dropFirst(finalMatchingRuleIndex + 1)
+            where rule.mayReincludeDescendant(of: relativePaths) {
+            return .skipButDescend
+        }
+
+        return .prune
     }
 
     private static func relativePaths(for path: String, roots: [String]) -> [String] {
@@ -87,9 +123,11 @@ public struct FileExclusionRules: @unchecked Sendable {
 
     private final class Rule: @unchecked Sendable {
         let isNegated: Bool
+        let isTraversalOnlyDirectoryReinclude: Bool
         private let isDirectoryPattern: Bool
         private let isAnchored: Bool
         private let containsSlash: Bool
+        private let literalPrefix: String
         private let regex: NSRegularExpression
 
         init?(rawPattern: String) {
@@ -136,6 +174,8 @@ public struct FileExclusionRules: @unchecked Sendable {
 
             isAnchored = anchored
             containsSlash = pattern.contains("/")
+            isTraversalOnlyDirectoryReinclude = isNegated && isDirectoryPattern && !containsSlash && pattern == "*"
+            literalPrefix = Self.literalPrefix(for: pattern)
 
             do {
                 regex = try NSRegularExpression(pattern: Self.regexPattern(for: pattern), options: [.caseInsensitive])
@@ -145,28 +185,81 @@ public struct FileExclusionRules: @unchecked Sendable {
         }
 
         func matches(
-            name: String,
-            pathComponents: [String],
             relativePaths: [String],
             isDirectory: Bool
         ) -> Bool {
-            if !containsSlash {
-                if isDirectoryPattern {
-                    return pathComponents.contains { matchesWholeString($0) }
-                }
-
-                return matchesWholeString(name) || pathComponents.contains { matchesWholeString($0) }
-            }
-
-            for relativePath in relativePaths where matchesPath(relativePath, isDirectory: isDirectory) {
+            for relativePath in relativePaths where matches(relativePath: relativePath, isDirectory: isDirectory) {
                 return true
             }
 
             return false
         }
 
+        func mayReincludeDescendant(of relativePaths: [String]) -> Bool {
+            guard isNegated, !isTraversalOnlyDirectoryReinclude, containsSlash, !literalPrefix.isEmpty else {
+                return false
+            }
+
+            let prefix = literalPrefix.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            guard !prefix.isEmpty else { return false }
+
+            return relativePaths.contains { relativePath in
+                Self.pathsMayOverlapForDescendant(rulePrefix: prefix, directoryPath: relativePath)
+            }
+        }
+
+        func matchesIgnoredAncestor(of relativePaths: [String]) -> Bool {
+            guard !isNegated else { return false }
+
+            return relativePaths.contains { relativePath in
+                let components = Self.components(for: relativePath)
+                guard components.count > 1 else { return false }
+
+                for count in 1..<components.count {
+                    let ancestor = components.prefix(count).joined(separator: "/")
+                    if matches(relativePath: ancestor, isDirectory: true) {
+                        return true
+                    }
+                }
+
+                return false
+            }
+        }
+
+        private func matches(relativePath: String, isDirectory: Bool) -> Bool {
+            if !containsSlash {
+                if isAnchored {
+                    return matchesPath(relativePath, isDirectory: isDirectory)
+                }
+
+                return matchesComponentPattern(relativePath: relativePath, isDirectory: isDirectory)
+            }
+
+            return matchesPath(relativePath, isDirectory: isDirectory)
+        }
+
+        private func matchesComponentPattern(relativePath: String, isDirectory: Bool) -> Bool {
+            let components = Self.components(for: relativePath)
+            guard !components.isEmpty else { return false }
+
+            if isDirectoryPattern {
+                if isNegated, !isDirectory {
+                    return false
+                }
+
+                let directoryComponents = isDirectory ? components : components.dropLast()
+                return directoryComponents.contains { matchesWholeString($0) }
+            }
+
+            return components.contains { matchesWholeString($0) }
+        }
+
         private func matchesPath(_ relativePath: String, isDirectory: Bool) -> Bool {
             guard !relativePath.isEmpty else { return false }
+
+            if isNegated, isDirectoryPattern, !isDirectory {
+                return false
+            }
 
             if isDirectoryPattern {
                 let prefixes = directoryPrefixes(for: relativePath, isDirectory: isDirectory)
@@ -177,7 +270,7 @@ public struct FileExclusionRules: @unchecked Sendable {
         }
 
         private func directoryPrefixes(for relativePath: String, isDirectory: Bool) -> [String] {
-            let components = relativePath.split(separator: "/").map(String.init)
+            let components = Self.components(for: relativePath)
             guard !components.isEmpty else { return [] }
 
             let prefixCount = isDirectory ? components.count : max(components.count - 1, 0)
@@ -193,7 +286,7 @@ public struct FileExclusionRules: @unchecked Sendable {
 
             guard !isAnchored else { return false }
 
-            let components = candidate.split(separator: "/").map(String.init)
+            let components = Self.components(for: candidate)
             guard components.count > 1 else { return false }
 
             for index in 1..<components.count where matchesWholeString(components[index...].joined(separator: "/")) {
@@ -227,6 +320,9 @@ public struct FileExclusionRules: @unchecked Sendable {
                 } else if character == "?" {
                     output += "[^/]"
                     index = nextIndex
+                } else if character == "[", let characterClass = regexCharacterClass(in: pattern, from: index) {
+                    output += characterClass.pattern
+                    index = characterClass.endIndex
                 } else {
                     output += NSRegularExpression.escapedPattern(for: String(character))
                     index = nextIndex
@@ -235,6 +331,76 @@ public struct FileExclusionRules: @unchecked Sendable {
 
             output += "$"
             return output
+        }
+
+        private static func literalPrefix(for pattern: String) -> String {
+            var output = ""
+            var index = pattern.startIndex
+
+            while index < pattern.endIndex {
+                let character = pattern[index]
+                if character == "*" || character == "?" || character == "[" {
+                    break
+                }
+                output.append(character)
+                index = pattern.index(after: index)
+            }
+
+            return output
+        }
+
+        private static func regexCharacterClass(
+            in pattern: String,
+            from startIndex: String.Index
+        ) -> (pattern: String, endIndex: String.Index)? {
+            var index = pattern.index(after: startIndex)
+            guard index < pattern.endIndex else { return nil }
+
+            var output = "["
+            var hasContent = false
+            if pattern[index] == "!" || pattern[index] == "^" {
+                output += "^"
+                index = pattern.index(after: index)
+            }
+
+            while index < pattern.endIndex {
+                let character = pattern[index]
+                let nextIndex = pattern.index(after: index)
+
+                if character == "]", hasContent {
+                    output += "]"
+                    return (output, nextIndex)
+                }
+
+                guard character != "/" else { return nil }
+                output += escapedCharacterClassLiteral(character)
+                hasContent = true
+                index = nextIndex
+            }
+
+            return nil
+        }
+
+        private static func escapedCharacterClassLiteral(_ character: Character) -> String {
+            switch character {
+            case "\\":
+                return "\\\\"
+            case "]":
+                return "\\]"
+            default:
+                return String(character)
+            }
+        }
+
+        private static func pathsMayOverlapForDescendant(rulePrefix: String, directoryPath: String) -> Bool {
+            guard !directoryPath.isEmpty else { return true }
+            return rulePrefix == directoryPath
+                || rulePrefix.hasPrefix(directoryPath + "/")
+                || directoryPath.hasPrefix(rulePrefix + "/")
+        }
+
+        private static func components(for path: String) -> [String] {
+            path.split(separator: "/").map(String.init)
         }
     }
 }

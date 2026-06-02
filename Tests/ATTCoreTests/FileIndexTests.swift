@@ -102,6 +102,133 @@ struct FileIndexTests {
         #expect(abs(updatedModifiedTime - newestDate.timeIntervalSinceReferenceDate) < 0.001)
     }
 
+    @Test("scans traversal-only directories without indexing pruned siblings")
+    func scansTraversalOnlyDirectoriesWithoutIndexingPrunedSiblings() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        let sourceDirectory = root.appendingPathComponent("Sources", isDirectory: true)
+        let vendorDirectory = root.appendingPathComponent("Vendor", isDirectory: true)
+        try fileManager.createDirectory(at: sourceDirectory, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: vendorDirectory, withIntermediateDirectories: true)
+        let included = sourceDirectory.appendingPathComponent("App.swift")
+        let prunedFile = sourceDirectory.appendingPathComponent("README.md")
+        let prunedDirectoryFile = vendorDirectory.appendingPathComponent("Library.swift")
+        try "included".write(to: included, atomically: true, encoding: .utf8)
+        try "pruned".write(to: prunedFile, atomically: true, encoding: .utf8)
+        try "vendor".write(to: prunedDirectoryFile, atomically: true, encoding: .utf8)
+
+        let index = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            exclusionPatterns: [
+                "*",
+                "!*/",
+                "!*.swift",
+                "Vendor/"
+            ]
+        )
+        index.replaceRootsAndRebuild([root])
+
+        try await waitUntil {
+            !index.currentStats().isIndexing
+        }
+
+        #expect(searchPaths(in: index, query: "App.swift").contains(included.path))
+        #expect(!searchPaths(in: index, query: "README.md").contains(prunedFile.path))
+        #expect(!searchPaths(in: index, query: "Library.swift").contains(prunedDirectoryFile.path))
+        #expect(!searchPaths(in: index, query: "Sources").contains(sourceDirectory.path))
+    }
+
+    @Test("scoped update traverses excluded parents with explicit re-includes")
+    func scopedUpdateTraversesExcludedParentsWithExplicitReIncludes() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        let index = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            exclusionPatterns: [
+                "*",
+                "!*/",
+                "Generated/",
+                "!Generated/Keep.swift"
+            ]
+        )
+        index.replaceRootsAndRebuild([root])
+        try await waitUntil {
+            !index.currentStats().isIndexing
+        }
+
+        let generatedDirectory = root.appendingPathComponent("Generated", isDirectory: true)
+        try fileManager.createDirectory(at: generatedDirectory, withIntermediateDirectories: true)
+        let kept = generatedDirectory.appendingPathComponent("Keep.swift")
+        let dropped = generatedDirectory.appendingPathComponent("Drop.swift")
+        try "kept".write(to: kept, atomically: true, encoding: .utf8)
+        try "dropped".write(to: dropped, atomically: true, encoding: .utf8)
+        index.update(paths: [generatedDirectory.path])
+
+        try await waitUntil {
+            searchPaths(in: index, query: "Keep.swift").contains(kept.path)
+        }
+        #expect(!searchPaths(in: index, query: "Drop.swift").contains(dropped.path))
+        #expect(!searchPaths(in: index, query: "Generated").contains(generatedDirectory.path))
+    }
+
+    @Test("default git rules index useful git files only")
+    func defaultGitRulesIndexUsefulGitFilesOnly() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        let gitDirectory = root.appendingPathComponent(".git", isDirectory: true)
+        let hooksDirectory = gitDirectory.appendingPathComponent("hooks", isDirectory: true)
+        let infoDirectory = gitDirectory.appendingPathComponent("info", isDirectory: true)
+        let refsDirectory = gitDirectory.appendingPathComponent("refs/heads", isDirectory: true)
+        let objectsDirectory = gitDirectory.appendingPathComponent("objects/ab", isDirectory: true)
+        try fileManager.createDirectory(at: hooksDirectory, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: infoDirectory, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: refsDirectory, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: objectsDirectory, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        let config = gitDirectory.appendingPathComponent("config")
+        let hook = hooksDirectory.appendingPathComponent("pre-commit")
+        let infoExclude = infoDirectory.appendingPathComponent("exclude")
+        let fetchHead = gitDirectory.appendingPathComponent("FETCH_HEAD")
+        let ref = refsDirectory.appendingPathComponent("main")
+        let object = objectsDirectory.appendingPathComponent("cdef")
+        try "config".write(to: config, atomically: true, encoding: .utf8)
+        try "hook".write(to: hook, atomically: true, encoding: .utf8)
+        try "exclude".write(to: infoExclude, atomically: true, encoding: .utf8)
+        try "fetch".write(to: fetchHead, atomically: true, encoding: .utf8)
+        try "ref".write(to: ref, atomically: true, encoding: .utf8)
+        try "object".write(to: object, atomically: true, encoding: .utf8)
+
+        let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)")
+        index.replaceRootsAndRebuild([root])
+
+        try await waitUntil {
+            !index.currentStats().isIndexing
+        }
+
+        #expect(searchPaths(in: index, query: "config", includeHidden: true).contains(config.path))
+        #expect(searchPaths(in: index, query: "pre-commit", includeHidden: true).contains(hook.path))
+        #expect(searchPaths(in: index, query: "exclude", includeHidden: true).contains(infoExclude.path))
+        #expect(!searchPaths(in: index, query: "FETCH_HEAD", includeHidden: true).contains(fetchHead.path))
+        #expect(!searchPaths(in: index, query: "main", includeHidden: true).contains(ref.path))
+        #expect(!searchPaths(in: index, query: "cdef", includeHidden: true).contains(object.path))
+    }
+
     @Test("same-path update preserves optimized search structures")
     func samePathUpdatePreservesOptimizedSearchStructures() async throws {
         let fileManager = FileManager.default
@@ -1394,6 +1521,14 @@ struct FileIndexTests {
         }
 
         Issue.record("Timed out waiting for condition")
+    }
+
+    private func searchPaths(in index: FileIndex, query: String, includeHidden: Bool = false) -> [String] {
+        index.search(SearchRequest(
+            query: query,
+            sort: SortSpec(column: .name, ascending: true),
+            includeHidden: includeHidden
+        ), maxResults: 50).results.map(\.record.path)
     }
 
     private func supportDirectory(applicationName: String) -> URL {

@@ -5072,14 +5072,22 @@ public final class FileIndex: @unchecked Sendable {
                     logSkippedRoot(root, reason: "unreadable")
                     continue
                 }
-                guard !shouldExclude(root, exclusions: exclusions, rootPaths: ruleRootPaths, isDirectory: true) else {
+                let rootDecision = exclusionDecision(
+                    for: root,
+                    exclusions: exclusions,
+                    rootPaths: ruleRootPaths,
+                    isDirectory: true
+                )
+                guard rootDecision != .prune else {
                     logSkippedRoot(root, reason: "excluded")
                     continue
                 }
-                if let rootRecord = FileRecord(url: root) {
+                if rootDecision.shouldIndex, let rootRecord = FileRecord(url: root) {
                     state.addInitialRecord(rootRecord)
                 }
-                state.enqueue(root)
+                if rootDecision.shouldDescend {
+                    state.enqueue(root)
+                }
             }
         }
 
@@ -5114,20 +5122,23 @@ public final class FileIndex: @unchecked Sendable {
 
                         autoreleasepool {
                             let values = try? child.resourceValues(forKeys: FileRecord.resourceKeys)
-                            guard !self.shouldExclude(child, exclusions: exclusions, rootPaths: ruleRootPaths, isDirectory: values?.isDirectory) else {
-                                return
-                            }
-
                             let isDirectory = values?.isDirectory == true
+                            let decision = self.exclusionDecision(
+                                for: child,
+                                exclusions: exclusions,
+                                rootPaths: ruleRootPaths,
+                                isDirectory: isDirectory
+                            )
+                            guard decision != .prune else { return }
                             guard !(isDirectory && self.isLikelyLoop(child)) else {
                                 return
                             }
 
-                            if let record = FileRecord(url: child, resourceValues: values) {
+                            if decision.shouldIndex, let record = FileRecord(url: child, resourceValues: values) {
                                 batch.append(record)
                             }
 
-                            if isDirectory {
+                            if isDirectory, decision.shouldDescend {
                                 state.enqueue(child)
                             }
                         }
@@ -5783,17 +5794,21 @@ public final class FileIndex: @unchecked Sendable {
         for path in paths {
             autoreleasepool {
                 let url = URL(fileURLWithPath: path).standardizedFileURL
-                guard !shouldExclude(url, exclusions: indexState.exclusions, rootPaths: indexState.rootPaths) else { return }
-
                 var isDirectory: ObjCBool = false
                 if fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory) {
-                    guard !shouldExclude(url, exclusions: indexState.exclusions, rootPaths: indexState.rootPaths, isDirectory: isDirectory.boolValue) else { return }
+                    let decision = exclusionDecision(
+                        for: url,
+                        exclusions: indexState.exclusions,
+                        rootPaths: indexState.rootPaths,
+                        isDirectory: isDirectory.boolValue
+                    )
+                    guard decision != .prune else { return }
 
-                    if let record = FileRecord(url: url) {
+                    if decision.shouldIndex, let record = FileRecord(url: url) {
                         upserts[record.path] = record
                     }
 
-                    if isDirectory.boolValue {
+                    if isDirectory.boolValue, decision.shouldDescend {
                         requiresDirectoryReconciliation = true
                         if let scannedRecords = scanDirectoryForUpdate(
                             root: url,
@@ -5808,6 +5823,19 @@ public final class FileIndex: @unchecked Sendable {
                         }
                     }
                 } else {
+                    let fileDecision = exclusionDecision(
+                        for: url,
+                        exclusions: indexState.exclusions,
+                        rootPaths: indexState.rootPaths,
+                        isDirectory: false
+                    )
+                    let directoryDecision = exclusionDecision(
+                        for: url,
+                        exclusions: indexState.exclusions,
+                        rootPaths: indexState.rootPaths,
+                        isDirectory: true
+                    )
+                    guard fileDecision != .prune || directoryDecision != .prune else { return }
                     deletedPrefixes.append(url.path)
                 }
             }
@@ -6016,30 +6044,40 @@ public final class FileIndex: @unchecked Sendable {
             guard isCurrentGeneration(currentGeneration) else { return false }
 
             let values = try? directory.resourceValues(forKeys: FileRecord.resourceKeys)
-            guard !shouldExclude(directory, exclusions: exclusions, rootPaths: rootPaths, isDirectory: values?.isDirectory) else {
-                return true
-            }
+            let isDirectory = values?.isDirectory == true
+            let decision = exclusionDecision(
+                for: directory,
+                exclusions: exclusions,
+                rootPaths: rootPaths,
+                isDirectory: isDirectory
+            )
+            guard decision != .prune else { return true }
 
-            if let record = FileRecord(url: directory, resourceValues: values) {
+            if decision.shouldIndex, let record = FileRecord(url: directory, resourceValues: values) {
                 records[record.path] = record
             }
 
-            guard values?.isDirectory == true else { return true }
+            guard isDirectory, decision.shouldDescend else { return true }
             guard !isLikelyLoop(directory) else { return true }
 
             return enumerateShallowChildURLs(in: directory) { child in
                 guard isCurrentGeneration(currentGeneration) else { return false }
 
                 let childValues = try? child.resourceValues(forKeys: FileRecord.resourceKeys)
-                guard !shouldExclude(child, exclusions: exclusions, rootPaths: rootPaths, isDirectory: childValues?.isDirectory) else {
-                    return true
-                }
+                let childIsDirectory = childValues?.isDirectory == true
+                let childDecision = exclusionDecision(
+                    for: child,
+                    exclusions: exclusions,
+                    rootPaths: rootPaths,
+                    isDirectory: childIsDirectory
+                )
+                guard childDecision != .prune else { return true }
 
-                if childValues?.isDirectory == true {
+                if childIsDirectory, childDecision.shouldDescend {
                     return visit(child)
                 }
 
-                if let record = FileRecord(url: child, resourceValues: childValues) {
+                if childDecision.shouldIndex, let record = FileRecord(url: child, resourceValues: childValues) {
                     records[record.path] = record
                 }
                 return true
@@ -7464,13 +7502,13 @@ public final class FileIndex: @unchecked Sendable {
         rootPaths.contains { path == $0 || path.hasPrefix($0 + "/") }
     }
 
-    private func shouldExclude(
-        _ url: URL,
+    private func exclusionDecision(
+        for url: URL,
         exclusions: FileExclusionRules,
         rootPaths: [String],
         isDirectory: Bool? = nil
-    ) -> Bool {
-        exclusions.excludes(url: url, roots: rootPaths, isDirectory: isDirectory)
+    ) -> FileExclusionRules.Decision {
+        exclusions.decision(url: url, roots: rootPaths, isDirectory: isDirectory)
     }
 
     private func canScanDirectory(_ url: URL) -> Bool {

@@ -183,6 +183,72 @@ struct FileSystemWatcherTests {
         #expect(action == .reconcile(paths: [root.path], baselineEventID: 6_000))
     }
 
+    @Test("FSEvent reconciliation drops excluded git churn before collapse")
+    func fseventReconciliationDropsExcludedGitChurnBeforeCollapse() async {
+        let root = URL(fileURLWithPath: "/tmp/allthethings/root-a", isDirectory: true)
+        let store = memoryCursorStore()
+        store.markBaseline(for: [root.path], eventID: 40)
+        let source = FakeHistoryReplaySource(
+            events: [
+                FileSystemEvent(
+                    path: root.appendingPathComponent(".git/objects/ab/cdef").path,
+                    flags: 0,
+                    eventID: 41
+                ),
+                FileSystemEvent(
+                    path: root.appendingPathComponent(".git/FETCH_HEAD").path,
+                    flags: 0,
+                    eventID: 42
+                ),
+                FileSystemEvent(
+                    path: root.path,
+                    flags: FSEventStreamEventFlags(kFSEventStreamEventFlagHistoryDone),
+                    eventID: 43
+                )
+            ],
+            completion: .completed
+        )
+        let coordinator = FSEventReconciliationCoordinator(
+            cursorStore: store,
+            replaySource: source,
+            currentEventID: { 43 }
+        )
+
+        let action = await actionFromCoordinator(coordinator, roots: [root])
+        #expect(action == .upToDate(baselineEventID: 43))
+    }
+
+    @Test("FSEvent reconciliation keeps allowed git paths after filtering")
+    func fseventReconciliationKeepsAllowedGitPathsAfterFiltering() async {
+        let root = URL(fileURLWithPath: "/tmp/allthethings/root-a", isDirectory: true)
+        let gitDirectory = root.appendingPathComponent(".git", isDirectory: true)
+        let store = memoryCursorStore()
+        store.markBaseline(for: [root.path], eventID: 40)
+        let source = FakeHistoryReplaySource(
+            events: [
+                FileSystemEvent(
+                    path: gitDirectory.appendingPathComponent("config").path,
+                    flags: 0,
+                    eventID: 41
+                ),
+                FileSystemEvent(
+                    path: root.path,
+                    flags: FSEventStreamEventFlags(kFSEventStreamEventFlagHistoryDone),
+                    eventID: 42
+                )
+            ],
+            completion: .completed
+        )
+        let coordinator = FSEventReconciliationCoordinator(
+            cursorStore: store,
+            replaySource: source,
+            currentEventID: { 42 }
+        )
+
+        let action = await actionFromCoordinator(coordinator, roots: [root])
+        #expect(action == .reconcile(paths: [gitDirectory.path], baselineEventID: 42))
+    }
+
     @Test("FSEvent reconciliation falls back when a cursor is missing")
     func fseventReconciliationFallsBackForMissingCursor() async {
         let root = URL(fileURLWithPath: "/tmp/allthethings/root-a", isDirectory: true)

@@ -1,4 +1,5 @@
 import CoreServices
+import ATTCore
 import Foundation
 
 struct FileSystemEvent {
@@ -217,6 +218,7 @@ final class FSEventReconciliationCoordinator: @unchecked Sendable {
     @discardableResult
     func reconcile(
         roots: [URL],
+        exclusions: FileExclusionRules = FileExclusionRules(),
         completion: @escaping @MainActor @Sendable (FSEventReconciliationAction) -> Void
     ) -> FSEventHistoryReplayCancellable? {
         let rootPaths = roots.map { $0.standardizedFileURL.path }
@@ -231,7 +233,7 @@ final class FSEventReconciliationCoordinator: @unchecked Sendable {
             return nil
         }
 
-        let collector = FSEventHistoryReplayCollector(rootPaths: rootPaths)
+        let collector = FSEventHistoryReplayCollector(rootPaths: rootPaths, exclusions: exclusions)
         guard let session = replaySource.replay(
             roots: roots,
             sinceEventID: FSEventStreamEventId(sinceEventID),
@@ -258,19 +260,25 @@ private final class FSEventHistoryReplayCollector: @unchecked Sendable {
     private static let maximumHistoricalReconciliationPaths = 5_000
 
     private let rootPaths: [String]
+    private let exclusions: FileExclusionRules
     private let lock = NSLock()
     private var reconciliationPaths = Set<String>()
     private var fallbackRootPaths = Set<String>()
     private var requiresGlobalFallback = false
     private var sawHistoryDone = false
+    private var rawEventCount = 0
+    private var droppedExcludedEventCount = 0
 
-    init(rootPaths: [String]) {
+    init(rootPaths: [String], exclusions: FileExclusionRules) {
         self.rootPaths = rootPaths.sorted { $0.count > $1.count }
+        self.exclusions = exclusions
     }
 
     func ingest(_ events: [FileSystemEvent]) {
         lock.lock()
         defer { lock.unlock() }
+
+        rawEventCount += events.count
 
         for event in events {
             if event.historyReplayCompleted {
@@ -283,7 +291,13 @@ private final class FSEventHistoryReplayCollector: @unchecked Sendable {
                 continue
             }
 
-            reconciliationPaths.insert(reconciliationScope(for: event, rootPath: rootPath))
+            let decision = exclusionDecision(for: event)
+            guard decision != .prune else {
+                droppedExcludedEventCount += 1
+                continue
+            }
+
+            reconciliationPaths.insert(reconciliationScope(for: event, rootPath: rootPath, decision: decision))
 
             if requiresGlobalFallback {
                 continue
@@ -303,36 +317,70 @@ private final class FSEventHistoryReplayCollector: @unchecked Sendable {
 
     func action(completion: FSEventHistoryReplayCompletion, currentEventID: UInt64) -> FSEventReconciliationAction {
         lock.lock()
-        defer { lock.unlock() }
+        let action: FSEventReconciliationAction
+        let collapsedScopeCount: Int
+        let keptScopeCount = reconciliationPaths.count + fallbackRootPaths.count
+        let loggedRawEventCount = rawEventCount
+        let loggedDroppedExcludedEventCount = droppedExcludedEventCount
+        let loggedRequiresGlobalFallback = requiresGlobalFallback
 
-        guard completion == .completed, sawHistoryDone else {
-            return .fullReconcile(paths: nil)
+        if completion != .completed || !sawHistoryDone {
+            action = .fullReconcile(paths: nil)
+            collapsedScopeCount = 0
+        } else if requiresGlobalFallback {
+            action = .fullReconcile(paths: nil)
+            collapsedScopeCount = 0
+        } else if !fallbackRootPaths.isEmpty {
+            let paths = Self.collapsedPaths(fallbackRootPaths.union(reconciliationPaths))
+            action = .fullReconcile(paths: paths)
+            collapsedScopeCount = paths.count
+        } else if reconciliationPaths.isEmpty {
+            action = .upToDate(baselineEventID: currentEventID)
+            collapsedScopeCount = 0
+        } else {
+            let paths = Self.collapsedPaths(reconciliationPaths)
+            action = .reconcile(paths: paths, baselineEventID: currentEventID)
+            collapsedScopeCount = paths.count
         }
+        lock.unlock()
 
-        if requiresGlobalFallback {
-            return .fullReconcile(paths: nil)
-        }
+        DiagnosticLogger.shared.log(
+            category: "fsevents",
+            event: "fsevents.reconciliationFiltered",
+            fields: [
+                "rawEventCount": .publicInt(loggedRawEventCount),
+                "droppedExcludedEventCount": .publicInt(loggedDroppedExcludedEventCount),
+                "keptScopeCount": .publicInt(keptScopeCount),
+                "collapsedScopeCount": .publicInt(collapsedScopeCount),
+                "requiresGlobalFallback": .publicBool(loggedRequiresGlobalFallback)
+            ]
+        )
 
-        if !fallbackRootPaths.isEmpty {
-            return .fullReconcile(paths: Self.collapsedPaths(fallbackRootPaths.union(reconciliationPaths)))
-        }
-
-        if reconciliationPaths.isEmpty {
-            return .upToDate(baselineEventID: currentEventID)
-        }
-
-        return .reconcile(paths: Self.collapsedPaths(reconciliationPaths), baselineEventID: currentEventID)
+        return action
     }
 
     private func matchingRoot(for path: String) -> String? {
         rootPaths.first { path == $0 || path.hasPrefix($0 + "/") }
     }
 
-    private func reconciliationScope(for event: FileSystemEvent, rootPath: String) -> String {
+    private func exclusionDecision(for event: FileSystemEvent) -> FileExclusionRules.Decision {
+        let url = URL(fileURLWithPath: event.path).standardizedFileURL
+        let decision = exclusions.decision(url: url, roots: rootPaths, isDirectory: event.itemIsDirectory)
+        guard decision == .prune, !event.itemIsDirectory else { return decision }
+
+        let directoryDecision = exclusions.decision(url: url, roots: rootPaths, isDirectory: true)
+        return directoryDecision == .index ? directoryDecision : decision
+    }
+
+    private func reconciliationScope(
+        for event: FileSystemEvent,
+        rootPath: String,
+        decision: FileExclusionRules.Decision
+    ) -> String {
         let path = URL(fileURLWithPath: event.path).standardizedFileURL.path
         guard path != rootPath else { return rootPath }
 
-        if event.itemIsDirectory {
+        if event.itemIsDirectory || decision == .skipButDescend {
             return path
         }
 
