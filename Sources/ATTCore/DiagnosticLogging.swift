@@ -270,6 +270,11 @@ public final class DiagnosticLogger: @unchecked Sendable {
 
     public static let shared = DiagnosticLogger()
 
+    struct RecentDiagnosticContext: Sendable {
+        let persistedFields: [String: DiagnosticLogFieldValue]?
+        let event: DiagnosticLogEvent
+    }
+
     private struct Configuration: @unchecked Sendable {
         let directoryURL: URL
         let maxTotalBytes: UInt64
@@ -290,6 +295,8 @@ public final class DiagnosticLogger: @unchecked Sendable {
     private static let maxLineBytes = 64 * 1024
     private static let logFilePrefix = "diagnostic-log-"
     private static let logFileExtension = "jsonl"
+    private static let recentDiagnosticMaxAge: TimeInterval = 180
+    private static let recentDiagnosticMaxEvents = 512
 
     private let queue = DispatchQueue(label: "att.diagnostic-log", qos: .utility)
     private let stateLock = NSLock()
@@ -302,6 +309,7 @@ public final class DiagnosticLogger: @unchecked Sendable {
     private var currentLogFileBytes: UInt64 = 0
     private var flushTimer: DispatchSourceTimer?
     private var lastFlushDate = Date.distantPast
+    private var recentDiagnosticContext: [RecentDiagnosticContext] = []
     private var minimumLevel: DiagnosticLogLevel = .info
 
     public init() {}
@@ -347,6 +355,7 @@ public final class DiagnosticLogger: @unchecked Sendable {
             flushTimer?.cancel()
             flushTimer = nil
             buffer.removeAll(keepingCapacity: false)
+            recentDiagnosticContext.removeAll(keepingCapacity: false)
             currentLogFileURL = nil
             currentLogFileBytes = 0
             lastFlushDate = configuration.clock()
@@ -370,12 +379,16 @@ public final class DiagnosticLogger: @unchecked Sendable {
         diagnosticFields: [String: DiagnosticLogFieldValue] = [:]
     ) {
         let configuredMinimumLevel = stateLock.withLock { minimumLevel }
-        guard level.isRecorded(withMinimumLevel: configuredMinimumLevel) else {
+        let recordsEvent = level.isRecorded(withMinimumLevel: configuredMinimumLevel)
+        let capturesRecentDiagnosticContext = configuredMinimumLevel == .info
+            && (level == .diagnostic || (recordsEvent && !diagnosticFields.isEmpty))
+        guard recordsEvent || capturesRecentDiagnosticContext else {
             return
         }
+        let enrichedFields = fields.merging(diagnosticFields) { _, diagnosticField in diagnosticField }
         let fieldsToRecord: [String: DiagnosticLogFieldValue]
         if configuredMinimumLevel.includesDiagnosticFields() {
-            fieldsToRecord = fields.merging(diagnosticFields) { _, diagnosticField in diagnosticField }
+            fieldsToRecord = enrichedFields
         } else {
             fieldsToRecord = fields
         }
@@ -402,14 +415,35 @@ public final class DiagnosticLogger: @unchecked Sendable {
                 append(droppedSummary, configuration: configuration)
             }
 
+            let timestamp = configuration.clock()
             let logEvent = DiagnosticLogEvent(
-                timestamp: configuration.clock(),
+                timestamp: timestamp,
                 level: level,
                 category: category,
                 event: event,
                 fields: fieldsToRecord
             )
-            append(logEvent, configuration: configuration)
+            if capturesRecentDiagnosticContext {
+                let persistedFields = recordsEvent
+                    ? logEvent.capped(maxStringLength: Self.maxStringLength, maxArrayValues: Self.maxArrayValues).fields
+                    : nil
+                appendRecentDiagnosticContext(
+                    RecentDiagnosticContext(
+                        persistedFields: persistedFields,
+                        event: DiagnosticLogEvent(
+                            timestamp: timestamp,
+                            level: level,
+                            category: category,
+                            event: event,
+                            fields: enrichedFields
+                        )
+                    ),
+                    configuration: configuration
+                )
+            }
+            if recordsEvent {
+                append(logEvent, configuration: configuration)
+            }
         }
     }
 
@@ -436,6 +470,7 @@ public final class DiagnosticLogger: @unchecked Sendable {
         try queue.sync {
             guard let configuration = stateLock.withLock({ self.configuration }) else { return }
             buffer.removeAll(keepingCapacity: false)
+            recentDiagnosticContext.removeAll(keepingCapacity: false)
             currentLogFileURL = nil
             currentLogFileBytes = 0
             for url in logFileURLs(configuration: configuration) {
@@ -449,6 +484,15 @@ public final class DiagnosticLogger: @unchecked Sendable {
         return queue.sync {
             guard let configuration = stateLock.withLock({ self.configuration }) else { return [] }
             return logFileURLs(configuration: configuration)
+        }
+    }
+
+    func currentRecentDiagnosticContext() -> [RecentDiagnosticContext] {
+        flush()
+        return queue.sync {
+            guard let configuration = stateLock.withLock({ self.configuration }) else { return [] }
+            pruneRecentDiagnosticContext(now: configuration.clock())
+            return recentDiagnosticContext
         }
     }
 
@@ -489,6 +533,29 @@ public final class DiagnosticLogger: @unchecked Sendable {
             flushBuffer(configuration)
         } else {
             scheduleFlushTimerIfNeeded(configuration)
+        }
+    }
+
+    private func appendRecentDiagnosticContext(_ context: RecentDiagnosticContext, configuration: Configuration) {
+        recentDiagnosticContext.append(
+            RecentDiagnosticContext(
+                persistedFields: context.persistedFields,
+                event: context.event.capped(
+                    maxStringLength: Self.maxStringLength,
+                    maxArrayValues: Self.maxArrayValues
+                )
+            )
+        )
+        pruneRecentDiagnosticContext(now: configuration.clock())
+    }
+
+    private func pruneRecentDiagnosticContext(now: Date) {
+        let cutoff = now.addingTimeInterval(-Self.recentDiagnosticMaxAge)
+        recentDiagnosticContext.removeAll { context in
+            context.event.timestamp < cutoff
+        }
+        if recentDiagnosticContext.count > Self.recentDiagnosticMaxEvents {
+            recentDiagnosticContext.removeFirst(recentDiagnosticContext.count - Self.recentDiagnosticMaxEvents)
         }
     }
 
@@ -881,6 +948,7 @@ public final class DiagnosticLogExporter: @unchecked Sendable {
     private func export(kind: ExportKind, to destinationURL: URL) throws {
         logger.flush()
         let files = logger.currentLogFileURLs()
+        var recentDiagnosticContext = logger.currentRecentDiagnosticContext()
         let configuration = logger.currentConfigurationSummary()
         let anonymizer = kind == .anonymized ? DiagnosticLogAnonymizer(salt: UUID().uuidString) : nil
         let output = try OutputWriter(url: destinationURL, fileManager: fileManager)
@@ -888,6 +956,7 @@ public final class DiagnosticLogExporter: @unchecked Sendable {
         try writeMetadata(
             kind: kind,
             files: files,
+            recentDiagnosticContextCount: recentDiagnosticContext.count,
             configuration: configuration,
             output: output,
             anonymizer: anonymizer
@@ -897,11 +966,21 @@ public final class DiagnosticLogExporter: @unchecked Sendable {
         for file in files {
             switch kind {
             case .raw:
-                try output.writeFileContents(file)
+                try writeRawLogFile(file, output: output, recentDiagnosticContext: &recentDiagnosticContext)
             case .anonymized:
-                malformedLines += try writeAnonymizedLogFile(file, output: output, anonymizer: anonymizer)
+                malformedLines += try writeAnonymizedLogFile(
+                    file,
+                    output: output,
+                    anonymizer: anonymizer,
+                    recentDiagnosticContext: &recentDiagnosticContext
+                )
             }
         }
+        try writeRemainingRecentDiagnosticContext(
+            recentDiagnosticContext,
+            output: output,
+            anonymizer: anonymizer
+        )
 
         if malformedLines > 0 {
             let event = DiagnosticLogEvent(
@@ -920,6 +999,7 @@ public final class DiagnosticLogExporter: @unchecked Sendable {
     private func writeMetadata(
         kind: ExportKind,
         files: [URL],
+        recentDiagnosticContextCount: Int,
         configuration: (directoryURL: URL, maxTotalBytes: UInt64, maxAge: TimeInterval)?,
         output: OutputWriter,
         anonymizer: DiagnosticLogAnonymizer?
@@ -927,6 +1007,7 @@ public final class DiagnosticLogExporter: @unchecked Sendable {
         var fields: [String: DiagnosticLogFieldValue] = [
             "exportKind": .publicString(kind.rawValue),
             "logFileCount": .publicInt(files.count),
+            "recentDiagnosticContextCount": .publicInt(recentDiagnosticContextCount),
             "schemaVersion": .publicInt(DiagnosticLogEvent.currentSchemaVersion)
         ]
         if let configuration {
@@ -964,7 +1045,8 @@ public final class DiagnosticLogExporter: @unchecked Sendable {
     private func writeAnonymizedLogFile(
         _ file: URL,
         output: OutputWriter,
-        anonymizer: DiagnosticLogAnonymizer?
+        anonymizer: DiagnosticLogAnonymizer?,
+        recentDiagnosticContext: inout [DiagnosticLogger.RecentDiagnosticContext]
     ) throws -> Int {
         guard let anonymizer else { return 0 }
         let data = try Data(contentsOf: file)
@@ -978,7 +1060,11 @@ public final class DiagnosticLogExporter: @unchecked Sendable {
             }
 
             do {
-                let event = try DiagnosticLogger.makeDecoder().decode(DiagnosticLogEvent.self, from: lineData)
+                let decodedEvent = try DiagnosticLogger.makeDecoder().decode(DiagnosticLogEvent.self, from: lineData)
+                let event = takeRecentDiagnosticContext(
+                    matching: decodedEvent,
+                    from: &recentDiagnosticContext
+                ) ?? decodedEvent
                 try output.writeLine(DiagnosticLogger.encodeLine(anonymizer.anonymized(event)))
             } catch {
                 malformed += 1
@@ -986,6 +1072,60 @@ public final class DiagnosticLogExporter: @unchecked Sendable {
         }
 
         return malformed
+    }
+
+    private func writeRawLogFile(
+        _ file: URL,
+        output: OutputWriter,
+        recentDiagnosticContext: inout [DiagnosticLogger.RecentDiagnosticContext]
+    ) throws {
+        let data = try Data(contentsOf: file)
+        let text = String(decoding: data, as: UTF8.self)
+        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            guard !line.isEmpty else { continue }
+            guard let lineData = String(line).data(using: .utf8) else { continue }
+            if
+                let decodedEvent = try? DiagnosticLogger.makeDecoder().decode(DiagnosticLogEvent.self, from: lineData),
+                let replacement = takeRecentDiagnosticContext(
+                    matching: decodedEvent,
+                    from: &recentDiagnosticContext
+                )
+            {
+                try output.writeLine(DiagnosticLogger.encodeLine(replacement))
+            } else {
+                var rawLine = Data(lineData)
+                rawLine.append(0x0A)
+                try output.writeLine(rawLine)
+            }
+        }
+    }
+
+    private func writeRemainingRecentDiagnosticContext(
+        _ recentDiagnosticContext: [DiagnosticLogger.RecentDiagnosticContext],
+        output: OutputWriter,
+        anonymizer: DiagnosticLogAnonymizer?
+    ) throws {
+        for context in recentDiagnosticContext.sorted(by: { $0.event.timestamp < $1.event.timestamp }) {
+            try writeEvent(context.event, output: output, anonymizer: anonymizer)
+        }
+    }
+
+    private func takeRecentDiagnosticContext(
+        matching event: DiagnosticLogEvent,
+        from recentDiagnosticContext: inout [DiagnosticLogger.RecentDiagnosticContext]
+    ) -> DiagnosticLogEvent? {
+        guard let index = recentDiagnosticContext.firstIndex(where: { context in
+            guard let persistedFields = context.persistedFields else { return false }
+            return context.event.level == event.level
+                && context.event.category == event.category
+                && context.event.event == event.event
+                && persistedFields == event.fields
+                && abs(context.event.timestamp.timeIntervalSince(event.timestamp)) < 1.1
+        }) else {
+            return nil
+        }
+
+        return recentDiagnosticContext.remove(at: index).event
     }
 
     private func snapshotEvent(_ snapshot: IndexInsightsSnapshot) -> DiagnosticLogEvent {
