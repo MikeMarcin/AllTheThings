@@ -88,6 +88,16 @@ enum SettingsSection {
     }
 }
 
+private extension DiagnosticLogLevel {
+    var settingsTitle: String {
+        switch self {
+        case .info: "Standard"
+        case .diagnostic: "Verbose"
+        case .debug, .warning, .error: rawValue.capitalized
+        }
+    }
+}
+
 @MainActor
 private final class SettingsViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate {
     private let defaults: UserDefaults
@@ -119,6 +129,12 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     private let showHiddenFilesSwitch = NSSwitch()
     private let allowMultipleInstancesSwitch = NSSwitch()
     private let automaticallyCheckForUpdatesSwitch = NSSwitch()
+    private let diagnosticLogLevelSegmentedControl = NSSegmentedControl(
+        labels: [DiagnosticLogLevel.info, .diagnostic].map(\.settingsTitle),
+        trackingMode: .selectOne,
+        target: nil,
+        action: nil
+    )
     private let fullDiskAccessStatusIconView = NSImageView()
     private let fullDiskAccessStatusLabel = NSTextField(labelWithString: "")
     private let fullDiskAccessExplanationLabel = NSTextField(labelWithString: "")
@@ -151,6 +167,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     private static let settingsTableRowHeight: CGFloat = 42
     private static let indexedRootsMaximumVisibleRows = 8
     private static let exclusionPatternsMaximumVisibleRows = 10
+    private static let diagnosticDetailLevels: [DiagnosticLogLevel] = [.info, .diagnostic]
 
     init(
         defaults: UserDefaults,
@@ -424,7 +441,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         let (scrollView, contentView) = makePageScrollView()
 
         let sectionLabel = makeSectionLabel("Application")
-        let privacyLabel = makeSectionLabel("Privacy & Access")
+        let diagnosticsLabel = makeSectionLabel("Diagnostics")
 
         configureSwitch(globalHotKeySwitch, action: #selector(toggleGlobalHotKey(_:)))
         configureGlobalHotKeyButton()
@@ -434,7 +451,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         configureSwitch(showHiddenFilesSwitch, action: #selector(toggleShowHiddenFiles(_:)))
         configureSwitch(allowMultipleInstancesSwitch, action: #selector(toggleAllowMultipleInstances(_:)))
         configureSwitch(automaticallyCheckForUpdatesSwitch, action: #selector(toggleAutomaticallyCheckForUpdates(_:)))
-        configureFullDiskAccessButtons()
+        configureDiagnosticLogLevelControl()
 
         let settingsCard = makeSettingsCard(rows: [
             makeControlRow(
@@ -473,12 +490,18 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
                 control: automaticallyCheckForUpdatesSwitch
             )
         ])
-        let fullDiskAccessCard = makeFullDiskAccessCard()
+        let diagnosticsCard = makeSettingsCard(rows: [
+            makeControlRow(
+                title: "Diagnostic detail",
+                detail: "Choose how much path-heavy diagnostic context is saved locally.",
+                control: diagnosticLogLevelSegmentedControl
+            )
+        ])
 
         contentView.addSubview(sectionLabel)
         contentView.addSubview(settingsCard)
-        contentView.addSubview(privacyLabel)
-        contentView.addSubview(fullDiskAccessCard)
+        contentView.addSubview(diagnosticsLabel)
+        contentView.addSubview(diagnosticsCard)
 
         NSLayoutConstraint.activate([
             sectionLabel.topAnchor.constraint(equalTo: contentView.safeAreaLayoutGuide.topAnchor, constant: 26),
@@ -489,17 +512,16 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
             settingsCard.leadingAnchor.constraint(equalTo: sectionLabel.leadingAnchor),
             settingsCard.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -36),
 
-            privacyLabel.topAnchor.constraint(equalTo: settingsCard.bottomAnchor, constant: 28),
-            privacyLabel.leadingAnchor.constraint(equalTo: settingsCard.leadingAnchor),
-            privacyLabel.trailingAnchor.constraint(lessThanOrEqualTo: settingsCard.trailingAnchor),
+            diagnosticsLabel.topAnchor.constraint(equalTo: settingsCard.bottomAnchor, constant: 28),
+            diagnosticsLabel.leadingAnchor.constraint(equalTo: settingsCard.leadingAnchor),
+            diagnosticsLabel.trailingAnchor.constraint(lessThanOrEqualTo: settingsCard.trailingAnchor),
 
-            fullDiskAccessCard.topAnchor.constraint(equalTo: privacyLabel.bottomAnchor, constant: 12),
-            fullDiskAccessCard.leadingAnchor.constraint(equalTo: settingsCard.leadingAnchor),
-            fullDiskAccessCard.trailingAnchor.constraint(equalTo: settingsCard.trailingAnchor),
-            fullDiskAccessCard.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -24)
+            diagnosticsCard.topAnchor.constraint(equalTo: diagnosticsLabel.bottomAnchor, constant: 12),
+            diagnosticsCard.leadingAnchor.constraint(equalTo: settingsCard.leadingAnchor),
+            diagnosticsCard.trailingAnchor.constraint(equalTo: settingsCard.trailingAnchor),
+            diagnosticsCard.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -24)
         ])
 
-        updateFullDiskAccessStatus()
         return scrollView
     }
 
@@ -509,6 +531,9 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         let indexLabel = makeSectionLabel("Index")
         configureIndexSummaryControls()
         let indexCard = makeIndexSummaryCard()
+        let accessLabel = makeSectionLabel("Folder Access")
+        configureFullDiskAccessButtons()
+        let fullDiskAccessCard = makeFullDiskAccessCard()
 
         let rootsHeader = NSStackView()
         rootsHeader.translatesAutoresizingMaskIntoConstraints = false
@@ -587,6 +612,8 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
 
         contentView.addSubview(indexLabel)
         contentView.addSubview(indexCard)
+        contentView.addSubview(accessLabel)
+        contentView.addSubview(fullDiskAccessCard)
         contentView.addSubview(rootsHeader)
         contentView.addSubview(accessWarning)
         contentView.addSubview(rootsCard)
@@ -602,7 +629,15 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
             indexCard.leadingAnchor.constraint(equalTo: indexLabel.leadingAnchor),
             indexCard.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -36),
 
-            rootsHeader.topAnchor.constraint(equalTo: indexCard.bottomAnchor, constant: 28),
+            accessLabel.topAnchor.constraint(equalTo: indexCard.bottomAnchor, constant: 28),
+            accessLabel.leadingAnchor.constraint(equalTo: indexCard.leadingAnchor),
+            accessLabel.trailingAnchor.constraint(lessThanOrEqualTo: indexCard.trailingAnchor),
+
+            fullDiskAccessCard.topAnchor.constraint(equalTo: accessLabel.bottomAnchor, constant: 12),
+            fullDiskAccessCard.leadingAnchor.constraint(equalTo: indexCard.leadingAnchor),
+            fullDiskAccessCard.trailingAnchor.constraint(equalTo: indexCard.trailingAnchor),
+
+            rootsHeader.topAnchor.constraint(equalTo: fullDiskAccessCard.bottomAnchor, constant: 28),
             rootsHeader.leadingAnchor.constraint(equalTo: indexCard.leadingAnchor),
             rootsHeader.trailingAnchor.constraint(equalTo: indexCard.trailingAnchor),
             resetRootsButton.widthAnchor.constraint(equalToConstant: 28),
@@ -637,6 +672,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         ])
 
         updateIndexSummary()
+        updateFullDiskAccessStatus()
         updateIndexedFoldersAccessWarning()
         return scrollView
     }
@@ -847,6 +883,14 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
             symbol: "arrow.clockwise",
             action: #selector(recheckFullDiskAccess(_:))
         )
+    }
+
+    private func configureDiagnosticLogLevelControl() {
+        diagnosticLogLevelSegmentedControl.translatesAutoresizingMaskIntoConstraints = false
+        diagnosticLogLevelSegmentedControl.target = self
+        diagnosticLogLevelSegmentedControl.action = #selector(changeDiagnosticLogLevel(_:))
+        diagnosticLogLevelSegmentedControl.setContentHuggingPriority(.required, for: .horizontal)
+        diagnosticLogLevelSegmentedControl.setContentCompressionResistancePriority(.required, for: .horizontal)
     }
 
     private func configureIconButton(_ button: NSButton, symbol: String, tooltip: String, action: Selector) {
@@ -1230,7 +1274,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         let folderNames = protectedFolders
             .map(\.lastPathComponent)
             .joined(separator: ", ")
-        indexedFoldersAccessWarningLabel.stringValue = "\(folderNames) are indexed, but Full Disk Access is not confirmed. Grant Full Disk Access or remove protected folders from indexing to avoid macOS prompts during indexing and refreshes."
+        indexedFoldersAccessWarningLabel.stringValue = "\(folderNames) are indexed, but Full Disk Access is not confirmed. Use the Folder Access card above or remove protected folders from indexing."
     }
 
     private static func tableCardHeight(itemCount: Int, maximumVisibleRows: Int) -> CGFloat {
@@ -1418,6 +1462,9 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         showHiddenFilesSwitch.state = defaults.bool(forKey: AppSettings.showHiddenFilesKey) ? .on : .off
         allowMultipleInstancesSwitch.state = defaults.bool(forKey: AppSettings.allowMultipleInstancesKey) ? .on : .off
         automaticallyCheckForUpdatesSwitch.state = ReleaseUpdater.shared.automaticallyChecksForUpdates ? .on : .off
+        diagnosticLogLevelSegmentedControl.selectedSegment = Self.diagnosticDetailLevels.firstIndex(
+            of: AppSettings.diagnosticLogLevel(defaults: defaults)
+        ) ?? 0
         updateFullDiskAccessStatus()
         updateIndexedFoldersAccessWarning()
     }
@@ -1463,6 +1510,12 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     @objc private func recheckFullDiskAccess(_ sender: NSButton) {
         updateFullDiskAccessStatus()
         updateIndexedFoldersAccessWarning()
+    }
+
+    @objc private func changeDiagnosticLogLevel(_ sender: NSSegmentedControl) {
+        guard sender.selectedSegment >= 0, sender.selectedSegment < Self.diagnosticDetailLevels.count else { return }
+
+        AppSettings.saveDiagnosticLogLevel(Self.diagnosticDetailLevels[sender.selectedSegment], defaults: defaults)
     }
 
     @objc private func changeThemePreference(_ sender: NSSegmentedControl) {

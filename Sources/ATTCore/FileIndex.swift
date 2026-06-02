@@ -2266,7 +2266,9 @@ public final class FileIndex: @unchecked Sendable {
             event: "index.rebuildRequested",
             fields: [
                 "mode": .publicString(Self.diagnosticRebuildModeString(mode)),
-                "rootCount": .publicInt(canonicalRoots.count),
+                "rootCount": .publicInt(canonicalRoots.count)
+            ],
+            diagnosticFields: [
                 "roots": .pathArray(canonicalRoots.map(\.path))
             ]
         )
@@ -2358,7 +2360,9 @@ public final class FileIndex: @unchecked Sendable {
             fields: [
                 "reconcilesAllRoots": .publicBool(reconcilesAllRoots),
                 "activityPresentation": .publicString(requestedPresentation.rawValue),
-                "scopeCount": .publicInt(rootURLs.count),
+                "scopeCount": .publicInt(rootURLs.count)
+            ],
+            diagnosticFields: [
                 "scopes": .pathArray(scopePaths)
             ]
         )
@@ -2409,7 +2413,9 @@ public final class FileIndex: @unchecked Sendable {
                 fields: [
                     "reconcilesAllRoots": .publicBool(reconcilesAllRoots),
                     "activityPresentation": .publicString(requestedPresentation.rawValue),
-                    "scopeCount": .publicInt(scopePaths.count),
+                    "scopeCount": .publicInt(scopePaths.count)
+                ],
+                diagnosticFields: [
                     "scopes": .pathArray(scopePaths)
                 ]
             )
@@ -2437,7 +2443,9 @@ public final class FileIndex: @unchecked Sendable {
             category: "index",
             event: "index.updateQueued",
             fields: [
-                "pathCount": .publicInt(paths.count),
+                "pathCount": .publicInt(paths.count)
+            ],
+            diagnosticFields: [
                 "paths": .pathArray(Array(paths))
             ]
         )
@@ -4781,9 +4789,11 @@ public final class FileIndex: @unchecked Sendable {
                 fields: [
                     "recordCount": .publicInt(snapshot.resultCount),
                     "rootCount": .publicInt(persisted.manifest.roots.count),
-                    "roots": .pathArray(persisted.manifest.roots),
                     "optimizedForSearch": .publicBool(loadedOptimized),
                     "durationSeconds": .publicDouble(Date().timeIntervalSince(started))
+                ],
+                diagnosticFields: [
+                    "roots": .pathArray(persisted.manifest.roots)
                 ]
             )
             MemoryTelemetry.log(
@@ -4834,9 +4844,11 @@ public final class FileIndex: @unchecked Sendable {
             fields: [
                 "mode": .publicString(Self.diagnosticRebuildModeString(mode)),
                 "rootCount": .publicInt(rootPaths.count),
-                "roots": .pathArray(rootPaths),
                 "resumedFromCheckpoint": .publicBool(checkpoint != nil),
                 "workerCount": .publicInt(Self.scanWorkerCount())
+            ],
+            diagnosticFields: [
+                "roots": .pathArray(rootPaths)
             ]
         )
 
@@ -4910,8 +4922,10 @@ public final class FileIndex: @unchecked Sendable {
                 "reconcilesAllRoots": .publicBool(reconcilesAllRoots),
                 "activityPresentation": .publicString(activityPresentation.rawValue),
                 "scopeCount": .publicInt(rootURLs.count),
-                "scopes": .pathArray(scannedRootPaths),
                 "workerCount": .publicInt(Self.refreshScanWorkerCount())
+            ],
+            diagnosticFields: [
+                "scopes": .pathArray(scannedRootPaths)
             ]
         )
         guard let scanResult = scanConcurrently(
@@ -5748,7 +5762,9 @@ public final class FileIndex: @unchecked Sendable {
             category: "index",
             event: "index.updateBegin",
             fields: [
-                "pathCount": .publicInt(paths.count),
+                "pathCount": .publicInt(paths.count)
+            ],
+            diagnosticFields: [
                 "paths": .pathArray(paths)
             ]
         )

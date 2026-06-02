@@ -111,6 +111,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             maxTotalBytes: Self.diagnosticLogMaxTotalBytes,
             maxAge: Self.diagnosticLogMaxAge
         )
+        DiagnosticLogger.shared.setMinimumLevel(AppSettings.diagnosticLogLevel(defaults: defaults))
     }
 
     @discardableResult
@@ -427,7 +428,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             category: "diagnosticLog",
             event: "diagnosticLog.exportRequested",
             fields: [
-                "exportKind": .publicString(kind),
+                "exportKind": .publicString(kind)
+            ],
+            diagnosticFields: [
                 "destination": .path(url.path)
             ]
         )
@@ -451,7 +454,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     category: "diagnosticLog",
                     event: "diagnosticLog.exportFinished",
                     fields: [
-                        "exportKind": .publicString(kind),
+                        "exportKind": .publicString(kind)
+                    ],
+                    diagnosticFields: [
                         "destination": .path(url.path)
                     ]
                 )

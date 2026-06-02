@@ -2098,7 +2098,6 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                 category: "search",
                 event: "search.displayed",
                 fields: [
-                    "query": .query(signature.query),
                     "sortColumn": .publicString(signature.sort.column.rawValue),
                     "sortAscending": .publicBool(signature.sort.ascending),
                     "includeHidden": .publicBool(signature.includeHidden),
@@ -2106,7 +2105,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                     "totalMatches": .publicInt(response.totalMatches),
                     "uiLatencySeconds": .publicDouble(elapsed),
                     "indexLatencySeconds": .publicDouble(response.elapsed),
-                    "usesIndexedCandidates": .publicBool(response.usesIndexedCandidates),
+                    "usesIndexedCandidates": .publicBool(response.usesIndexedCandidates)
+                ],
+                diagnosticFields: [
+                    "query": .query(signature.query),
                     "executionPath": .publicString(profile.executionPath.rawValue),
                     "indexesUsed": .publicStringArray(profile.indexesUsed.map(\.rawValue).sorted()),
                     "candidateCount": .publicInt(profile.candidateCount),
@@ -2759,7 +2761,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             category: "index",
             event: "index.zeroRowRootRecoveryRequested",
             fields: [
-                "rootCount": .publicInt(unattemptedPaths.count),
+                "rootCount": .publicInt(unattemptedPaths.count)
+            ],
+            diagnosticFields: [
                 "roots": .pathArray(unattemptedPaths)
             ]
         )
@@ -2890,9 +2894,11 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                 event: "fsevents.reconciliationDeferred",
                 fields: [
                     "rootCount": .publicInt(roots.count),
-                    "roots": .pathArray(rootPaths(roots)),
                     "indexing": .publicBool(indexStats.isIndexing),
                     "replayActive": .publicBool(activeFSEventReplay != nil || activeFSEventReconciliationID != nil)
+                ],
+                diagnosticFields: [
+                    "roots": .pathArray(rootPaths(roots))
                 ]
             )
             return
@@ -2905,7 +2911,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             category: "fsevents",
             event: "fsevents.reconciliationStarted",
             fields: [
-                "rootCount": .publicInt(roots.count),
+                "rootCount": .publicInt(roots.count)
+            ],
+            diagnosticFields: [
                 "roots": .pathArray(rootPaths(roots))
             ]
         )
@@ -2924,7 +2932,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                     category: "fsevents",
                     event: "fsevents.reconciliationReconcile",
                     fields: [
-                        "pathCount": .publicInt(paths.count),
+                        "pathCount": .publicInt(paths.count)
+                    ],
+                    diagnosticFields: [
                         "paths": .pathArray(paths)
                     ]
                 )
@@ -3008,8 +3018,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                 event: "fsevents.reconciliationSuppressedDuplicate",
                 fields: [
                     "rootCount": .publicInt(roots.count),
-                    "roots": .pathArray(rootPaths),
                     "baselineEventID": .publicUInt64(baselineEventID)
+                ],
+                diagnosticFields: [
+                    "roots": .pathArray(rootPaths)
                 ]
             )
         case .ignored:
@@ -3046,7 +3058,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             event: "fsevents.eventsReceived",
             fields: [
                 "eventCount": .publicInt(events.count),
-                "recursiveEventCount": .publicInt(events.filter(\.requiresRecursiveRescan).count),
+                "recursiveEventCount": .publicInt(events.filter(\.requiresRecursiveRescan).count)
+            ],
+            diagnosticFields: [
                 "paths": .pathArray(events.map(\.path))
             ]
         )
@@ -3404,16 +3418,37 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         level: DiagnosticLogLevel = .info,
         extraFields: [String: DiagnosticLogFieldValue] = [:]
     ) {
-        var fields = extraFields
+        var fields = extraFields.filter { _, value in
+            level == .warning || level == .error || !isDiagnosticOnlyField(value)
+        }
         fields["action"] = .publicString(action)
         fields["selectionCount"] = .publicInt(records.count)
-        fields["paths"] = .pathArray(records.map(\.path))
+        if level == .warning || level == .error {
+            fields["paths"] = .pathArray(records.map(\.path))
+        }
+
+        var diagnosticFields = extraFields.filter { _, value in
+            isDiagnosticOnlyField(value)
+        }
+        if level != .warning, level != .error {
+            diagnosticFields["paths"] = .pathArray(records.map(\.path))
+        }
         DiagnosticLogger.shared.log(
             level: level,
             category: "fileAction",
             event: "fileAction.\(action)",
-            fields: fields
+            fields: fields,
+            diagnosticFields: diagnosticFields
         )
+    }
+
+    private func isDiagnosticOnlyField(_ field: DiagnosticLogFieldValue) -> Bool {
+        switch field.privacy {
+        case .path, .pathArray, .query, .privateString:
+            return true
+        case .publicValue, .errorText:
+            return false
+        }
     }
 
     @objc private func openSelected(_ sender: Any?) {
@@ -3536,7 +3571,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                 event: "fileAction.moveToTrash",
                 fields: [
                     "action": .publicString("moveToTrash"),
-                    "selectionCount": .publicInt(changedPaths.count),
+                    "selectionCount": .publicInt(changedPaths.count)
+                ],
+                diagnosticFields: [
                     "paths": .pathArray(changedPaths)
                 ]
             )

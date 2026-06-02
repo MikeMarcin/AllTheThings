@@ -188,6 +188,24 @@ struct AppSettingsTests {
         #expect(AppSettings.appFontSize(defaults: defaults) == AppSettings.defaultAppFontSize)
     }
 
+    @Test("diagnostic log level defaults to standard info and saves diagnostic")
+    func diagnosticLogLevelDefaultsToStandardInfoAndSavesDiagnostic() throws {
+        let (defaults, suiteName) = try makeDefaults()
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+            DiagnosticLogger.shared.setMinimumLevel(.info)
+        }
+
+        AppSettings.registerDefaults(defaults)
+        #expect(AppSettings.diagnosticLogLevel(defaults: defaults) == .info)
+
+        AppSettings.saveDiagnosticLogLevel(.diagnostic, defaults: defaults)
+
+        #expect(AppSettings.diagnosticLogLevel(defaults: defaults) == .diagnostic)
+        #expect(defaults.string(forKey: AppSettings.diagnosticLogLevelKey) == DiagnosticLogLevel.diagnostic.rawValue)
+        #expect(DiagnosticLogger.shared.currentMinimumLevel() == .diagnostic)
+    }
+
     private func makeDefaults() throws -> (UserDefaults, String) {
         let suiteName = "AllTheThingsTests-\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suiteName))
