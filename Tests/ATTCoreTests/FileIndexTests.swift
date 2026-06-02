@@ -244,6 +244,100 @@ struct FileIndexTests {
         #expect(index.currentDiagnostics().completedSnapshotRebuilds == rebuildsBeforeReady + 2)
     }
 
+    @Test("background catch up reconciliation keeps background presentation and covers duplicates")
+    func backgroundCatchUpReconciliationKeepsBackgroundPresentationAndCoversDuplicates() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        let folder = root.appendingPathComponent("Changed", isDirectory: true)
+        try fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        let changedFile = folder.appendingPathComponent("WakeChanged.txt")
+        try "changed".write(to: changedFile, atomically: true, encoding: .utf8)
+
+        let rootRecord = try #require(FileRecord(url: root))
+        let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)", loadsSnapshotImmediately: false)
+        index.replaceRecordsForTesting([rootRecord], roots: [root])
+
+        let firstResult = index.reconcileIndexedRootsInBackground(
+            rootURLs: [folder],
+            activityPresentation: .backgroundCatchUp
+        )
+        let duplicateResult = index.reconcileIndexedRootsInBackground(
+            rootURLs: [folder],
+            activityPresentation: .backgroundCatchUp
+        )
+
+        #expect(firstResult == .started)
+        #expect(duplicateResult == .coveredByActive)
+        #expect(index.currentStats().activityPresentation == .backgroundCatchUp)
+        #expect(index.currentStats().status == "Catching up changes")
+
+        try await waitUntil(timeout: .seconds(10)) {
+            let stats = index.currentStats()
+            let response = index.search(SearchRequest(
+                query: "WakeChanged",
+                sort: SortSpec(column: .relevance, ascending: false)
+            ), maxResults: 10)
+            return !stats.isIndexing
+                && stats.activityPresentation == .backgroundCatchUp
+                && stats.status.hasPrefix("Caught up")
+                && response.results.contains { $0.record.path == changedFile.path }
+        }
+    }
+
+    @Test("partially overlapping reconciliation queues only uncovered catch up scopes")
+    func partiallyOverlappingReconciliationQueuesOnlyUncoveredCatchUpScopes() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        let firstFolder = root.appendingPathComponent("First", isDirectory: true)
+        let secondFolder = root.appendingPathComponent("Second", isDirectory: true)
+        try fileManager.createDirectory(at: firstFolder, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: secondFolder, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        let firstFile = firstFolder.appendingPathComponent("FirstWakeChanged.txt")
+        let secondFile = secondFolder.appendingPathComponent("SecondWakeChanged.txt")
+        try "first".write(to: firstFile, atomically: true, encoding: .utf8)
+        try "second".write(to: secondFile, atomically: true, encoding: .utf8)
+
+        let rootRecord = try #require(FileRecord(url: root))
+        let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)", loadsSnapshotImmediately: false)
+        index.replaceRecordsForTesting([rootRecord], roots: [root])
+
+        let firstResult = index.reconcileIndexedRootsInBackground(
+            rootURLs: [firstFolder],
+            activityPresentation: .backgroundCatchUp
+        )
+        let overlappingResult = index.reconcileIndexedRootsInBackground(
+            rootURLs: [firstFolder, secondFolder],
+            activityPresentation: .backgroundCatchUp
+        )
+
+        #expect(firstResult == .started)
+        #expect(overlappingResult == .queued)
+
+        try await waitUntil(timeout: .seconds(10)) {
+            let first = index.search(SearchRequest(
+                query: "FirstWakeChanged",
+                sort: SortSpec(column: .relevance, ascending: false)
+            ), maxResults: 10)
+            let second = index.search(SearchRequest(
+                query: "SecondWakeChanged",
+                sort: SortSpec(column: .relevance, ascending: false)
+            ), maxResults: 10)
+            return !index.currentStats().isIndexing
+                && first.results.contains { $0.record.path == firstFile.path }
+                && second.results.contains { $0.record.path == secondFile.path }
+        }
+    }
+
     @Test("large overlay updates schedule mapped snapshot compaction")
     func largeOverlayUpdatesScheduleMappedSnapshotCompaction() async throws {
         let fileManager = FileManager.default

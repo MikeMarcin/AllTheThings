@@ -191,7 +191,7 @@ final class FSEventStreamHistoryReplaySource: FSEventHistoryReplaySource {
 }
 
 enum FSEventReconciliationAction: Equatable, Sendable {
-    case reconcile(paths: [String])
+    case reconcile(paths: [String], baselineEventID: UInt64)
     case upToDate(baselineEventID: UInt64)
     case fullReconcile(paths: [String]?)
 }
@@ -321,7 +321,7 @@ private final class FSEventHistoryReplayCollector: @unchecked Sendable {
             return .upToDate(baselineEventID: currentEventID)
         }
 
-        return .reconcile(paths: Self.collapsedPaths(reconciliationPaths))
+        return .reconcile(paths: Self.collapsedPaths(reconciliationPaths), baselineEventID: currentEventID)
     }
 
     private func matchingRoot(for path: String) -> String? {

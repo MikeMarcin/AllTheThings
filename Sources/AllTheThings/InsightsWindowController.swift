@@ -1105,6 +1105,9 @@ enum InsightsRootDisplay {
             return "Loading"
         }
         guard stats.isIndexing else { return nil }
+        if stats.activityPresentation == .backgroundCatchUp {
+            return "Catching up"
+        }
 
         switch stats.phase {
         case .scanning:
