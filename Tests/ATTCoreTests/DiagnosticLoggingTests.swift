@@ -188,6 +188,117 @@ struct DiagnosticLoggingTests {
         #expect(infoEvent.fields["path"] == .path("/Users/alice/Secret.txt"))
     }
 
+    @Test("standard export includes recent diagnostic context without duplicating standard events")
+    func standardExportIncludesRecentDiagnosticContextWithoutDuplicatingStandardEvents() throws {
+        let fileManager = FileManager.default
+        let directory = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsDiagnosticRecentContext-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? fileManager.removeItem(at: directory)
+        }
+
+        let clock = MutableClock(Date(timeIntervalSince1970: 1_800_000_000))
+        let logger = DiagnosticLogger()
+        logger.configure(
+            directoryURL: directory,
+            maxTotalBytes: 50_000,
+            maxAge: 60 * 60 * 24 * 365,
+            clock: { clock.now },
+            fileManager: fileManager
+        )
+        logger.setMinimumLevel(.info)
+        logger.log(
+            category: "test",
+            event: "test.standard",
+            fields: [
+                "count": .publicInt(1)
+            ],
+            diagnosticFields: [
+                "path": .path("/Users/alice/SecretStandard.txt")
+            ]
+        )
+        logger.flush()
+        clock.now = clock.now.addingTimeInterval(1)
+        logger.log(
+            level: .diagnostic,
+            category: "test",
+            event: "test.diagnostic",
+            fields: [
+                "path": .path("/Users/alice/SecretDiagnostic.txt")
+            ]
+        )
+
+        let diskEvents = try loggedEvents(from: logger)
+        let diskStandardEvent = try #require(diskEvents.first { $0.event == "test.standard" })
+        #expect(diskStandardEvent.fields["count"] != nil)
+        #expect(diskStandardEvent.fields["path"] == nil)
+        #expect(!diskEvents.contains { $0.event == "test.diagnostic" })
+
+        let exporter = DiagnosticLogExporter(logger: logger, clock: { clock.now }, fileManager: fileManager)
+        let rawURL = directory.appendingPathComponent("raw-export.jsonl")
+        try exporter.exportRaw(to: rawURL)
+        let exportedEvents = try decodedEvents(in: rawURL)
+        let exportedStandardEvents = exportedEvents.filter { $0.event == "test.standard" }
+        #expect(exportedStandardEvents.count == 1)
+        let exportedStandardEvent = try #require(exportedStandardEvents.first)
+        #expect(exportedStandardEvent.fields["path"] == .path("/Users/alice/SecretStandard.txt"))
+        #expect(exportedEvents.contains { $0.event == "test.diagnostic" })
+        let metadataEvent = try #require(exportedEvents.first { $0.event == "diagnosticLog.exportMetadata" })
+        #expect(metadataEvent.fields["recentDiagnosticContextCount"] == .publicInt(2))
+
+        let anonymizedURL = directory.appendingPathComponent("anonymized-export.jsonl")
+        try exporter.exportAnonymized(to: anonymizedURL)
+        let anonymized = try String(contentsOf: anonymizedURL, encoding: .utf8)
+        #expect(anonymized.contains("test.standard"))
+        #expect(anonymized.contains("test.diagnostic"))
+        #expect(!anonymized.contains("SecretStandard"))
+        #expect(!anonymized.contains("SecretDiagnostic"))
+    }
+
+    @Test("standard recent diagnostic context is age bounded")
+    func standardRecentDiagnosticContextIsAgeBounded() throws {
+        let fileManager = FileManager.default
+        let directory = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsDiagnosticRecentContextAge-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? fileManager.removeItem(at: directory)
+        }
+
+        let clock = MutableClock(Date(timeIntervalSince1970: 1_800_000_000))
+        let logger = DiagnosticLogger()
+        logger.configure(
+            directoryURL: directory,
+            maxTotalBytes: 50_000,
+            maxAge: 60 * 60 * 24 * 365,
+            clock: { clock.now },
+            fileManager: fileManager
+        )
+        logger.setMinimumLevel(.info)
+        logger.log(
+            level: .diagnostic,
+            category: "test",
+            event: "test.oldDiagnostic",
+            fields: ["path": .path("/Users/alice/OldSecret.txt")]
+        )
+        logger.flush()
+        clock.now = clock.now.addingTimeInterval(181)
+        logger.log(
+            level: .diagnostic,
+            category: "test",
+            event: "test.recentDiagnostic",
+            fields: ["path": .path("/Users/alice/RecentSecret.txt")]
+        )
+
+        let exporter = DiagnosticLogExporter(logger: logger, clock: { clock.now }, fileManager: fileManager)
+        let rawURL = directory.appendingPathComponent("raw-export.jsonl")
+        try exporter.exportRaw(to: rawURL)
+        let exportedEvents = try decodedEvents(in: rawURL)
+        #expect(!exportedEvents.contains { $0.event == "test.oldDiagnostic" })
+        #expect(exportedEvents.contains { $0.event == "test.recentDiagnostic" })
+        let metadataEvent = try #require(exportedEvents.first { $0.event == "diagnosticLog.exportMetadata" })
+        #expect(metadataEvent.fields["recentDiagnosticContextCount"] == .publicInt(1))
+    }
+
     @Test("anonymizer removes sensitive strings while preserving shape")
     func anonymizerRemovesSensitiveStringsWhilePreservingShape() throws {
         let path = "/Users/alice/Documents/SecretProject/File.swift"
@@ -301,11 +412,26 @@ struct DiagnosticLoggingTests {
         logger.flush()
         let decoder = DiagnosticLogger.makeDecoder()
         return try logger.currentLogFileURLs().flatMap { fileURL -> [DiagnosticLogEvent] in
-            let lines = try String(contentsOf: fileURL, encoding: .utf8)
-                .split(separator: "\n")
-            return try lines.map { line in
-                try decoder.decode(DiagnosticLogEvent.self, from: Data(line.utf8))
-            }
+            try decodedEvents(in: fileURL, decoder: decoder)
         }
+    }
+
+    private func decodedEvents(
+        in fileURL: URL,
+        decoder: JSONDecoder = DiagnosticLogger.makeDecoder()
+    ) throws -> [DiagnosticLogEvent] {
+        let lines = try String(contentsOf: fileURL, encoding: .utf8)
+            .split(separator: "\n")
+        return lines.compactMap { line in
+            try? decoder.decode(DiagnosticLogEvent.self, from: Data(line.utf8))
+        }
+    }
+}
+
+private final class MutableClock: @unchecked Sendable {
+    var now: Date
+
+    init(_ now: Date) {
+        self.now = now
     }
 }
