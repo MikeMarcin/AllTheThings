@@ -150,6 +150,65 @@ enum SearchWindowPresentation {
     }
 }
 
+@MainActor
+enum ExpandedMascotLayout {
+    struct Target: Equatable {
+        let anchorX: CGFloat
+        let bottomConstraintConstant: CGFloat
+        let displaySize: CGFloat
+    }
+
+    static let visibleLeadingInset: CGFloat = 0
+    static let operationVisibleContentLeadingInset: CGFloat = 12
+    static let expandedFooterLift: CGFloat = OperationMascotCoordinator.footerSlotHeight
+    static let autoExpandDelay: TimeInterval = 0.75
+
+    static func anchorX(for displaySize: CGFloat) -> CGFloat {
+        visibleLeadingInset + (displaySize / 2) - contentLeadingInset(for: displaySize)
+    }
+
+    static func contentLeadingInset(for displaySize: CGFloat) -> CGFloat {
+        operationVisibleContentLeadingInset * displaySize / OperationMascotCoordinator.expandedDisplaySize
+    }
+
+    static func collapsedTarget(footerFrame: NSRect) -> Target {
+        Target(
+            anchorX: footerFrame.midX,
+            bottomConstraintConstant: 0,
+            displaySize: OperationMascotCoordinator.statusDisplaySize
+        )
+    }
+
+    static func expandedTarget(displaySize: CGFloat = OperationMascotCoordinator.expandedDisplaySize) -> Target {
+        Target(
+            anchorX: anchorX(for: displaySize),
+            bottomConstraintConstant: -expandedFooterLift,
+            displaySize: displaySize
+        )
+    }
+
+    static func expandedFrame(
+        footerFrame: NSRect,
+        displaySize: CGFloat = OperationMascotCoordinator.expandedDisplaySize
+    ) -> NSRect {
+        let target = expandedTarget(displaySize: displaySize)
+        return NSRect(
+            x: target.anchorX - (displaySize / 2),
+            y: footerFrame.minY - target.bottomConstraintConstant,
+            width: displaySize,
+            height: OperationMascotCoordinator.displayHeight(for: displaySize)
+        )
+    }
+
+    static func visibleContentLeadingX(
+        footerFrame: NSRect,
+        displaySize: CGFloat = OperationMascotCoordinator.expandedDisplaySize
+    ) -> CGFloat {
+        expandedFrame(footerFrame: footerFrame, displaySize: displaySize).minX
+            + contentLeadingInset(for: displaySize)
+    }
+}
+
 final class SearchWindowController: NSWindowController {
     private enum WindowLayout {
         static let preferredContentSize = NSSize(width: 1_180, height: 720)
@@ -551,18 +610,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
 
         func expandedTargetFrame() -> NSRect {
-            rootView.layoutSubtreeIfNeeded()
-            let targetCenterX = currentFooterAnchorX()
-            let targetWidth = OperationMascotCoordinator.expandedDisplaySize
-            let targetHeight = OperationMascotCoordinator.displayHeight(for: targetWidth)
-            let footerFrame = footerImageView.convert(footerImageView.bounds, to: rootView)
-            let targetBottom = footerFrame.minY
-            return NSRect(
-                x: targetCenterX - (targetWidth / 2),
-                y: targetBottom,
-                width: targetWidth,
-                height: targetHeight
-            )
+            ExpandedMascotLayout.expandedFrame(footerFrame: currentFooterFrame())
         }
 
         func setExpanded(_ visible: Bool, animated: Bool, context: MascotPresentationContext) {
@@ -576,25 +624,23 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             let currentTransitionID = transitionID
             updateTooltips(expanded: visible)
 
-            let collapsedSize = OperationMascotCoordinator.statusDisplaySize
-            let targetSize = visible ? OperationMascotCoordinator.expandedDisplaySize : collapsedSize
-            let footerAnchorX = currentFooterAnchorX()
-            let targetAnchorX = footerAnchorX
+            let footerFrame = currentFooterFrame()
+            let collapsedTarget = ExpandedMascotLayout.collapsedTarget(footerFrame: footerFrame)
+            let expandedTarget = ExpandedMascotLayout.expandedTarget()
+            let target = visible ? expandedTarget : collapsedTarget
             let shouldTween = shouldTweenTransition(requested: animated)
 
             if visible && context.loadingOverlayVisible {
                 isTransitionInProgress = false
-                centerXConstraint.constant = targetAnchorX
-                imageBottomConstraint.constant = 0
-                animationCoordinator.setDisplaySize(targetSize)
+                apply(target)
+                animationCoordinator.setDisplaySize(target.displaySize)
                 updatePlacement(context: context)
                 return
             }
 
             if visible {
-                centerXConstraint.constant = footerAnchorX
-                imageBottomConstraint.constant = 0
-                animationCoordinator.setDisplaySize(collapsedSize)
+                apply(collapsedTarget)
+                animationCoordinator.setDisplaySize(collapsedTarget.displaySize)
                 expandedView.isHidden = false
                 footerImageView.isHidden = true
                 rootView.layoutSubtreeIfNeeded()
@@ -602,9 +648,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
             guard shouldTween else {
                 isTransitionInProgress = false
-                centerXConstraint.constant = targetAnchorX
-                imageBottomConstraint.constant = 0
-                animationCoordinator.setDisplaySize(targetSize)
+                apply(target)
+                animationCoordinator.setDisplaySize(target.displaySize)
                 updatePlacement(context: context)
                 return
             }
@@ -619,19 +664,18 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             NSAnimationContext.runAnimationGroup { animationContext in
                 animationContext.duration = 0.22
                 animationContext.allowsImplicitAnimation = true
-                self.centerXConstraint.constant = targetAnchorX
-                self.imageBottomConstraint.constant = 0
-                self.animationCoordinator.setDisplaySize(targetSize)
+                self.apply(target)
+                self.animationCoordinator.setDisplaySize(target.displaySize)
                 self.rootView.animator().layoutSubtreeIfNeeded()
             } completionHandler: {
                 guard self.transitionID == currentTransitionID else { return }
                 self.isTransitionInProgress = false
                 self.finishScaleTransition()
                 if !visible {
+                    let resetTarget = ExpandedMascotLayout.collapsedTarget(footerFrame: self.currentFooterFrame())
                     self.updateHostPlacement()
-                    self.animationCoordinator.setDisplaySize(collapsedSize)
-                    self.imageBottomConstraint.constant = 0
-                    self.centerXConstraint.constant = self.currentFooterAnchorX()
+                    self.apply(resetTarget)
+                    self.animationCoordinator.setDisplaySize(resetTarget.displaySize)
                     return
                 }
                 self.updateHostPlacement()
@@ -651,9 +695,14 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             footerImageView.toolTip = tooltip
         }
 
-        private func currentFooterAnchorX() -> CGFloat {
+        private func currentFooterFrame() -> NSRect {
             rootView.layoutSubtreeIfNeeded()
-            return footerImageView.convert(footerImageView.bounds, to: rootView).midX
+            return footerImageView.convert(footerImageView.bounds, to: rootView)
+        }
+
+        private func apply(_ target: ExpandedMascotLayout.Target) {
+            centerXConstraint.constant = target.anchorX
+            imageBottomConstraint.constant = target.bottomConstraintConstant
         }
 
         private func shouldTweenTransition(requested animated: Bool) -> Bool {
@@ -808,15 +857,6 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         var suspendsMascotPlayback: Bool {
             self == .background
-        }
-    }
-
-    private enum ExpandedMascotLayout {
-        static let visibleLeadingInset: CGFloat = 14
-        static let autoExpandDelay: TimeInterval = 0.75
-
-        static func anchorX(for displaySize: CGFloat) -> CGFloat {
-            visibleLeadingInset + (OperationMascotCoordinator.displayHeight(for: displaySize) / 2)
         }
     }
 

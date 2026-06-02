@@ -30,6 +30,43 @@ struct SearchToolbarTests {
         #expect(!tooltips.contains("Reindex scopes"))
     }
 
+    @Test("expanded mascot layout keeps visible pixels onscreen")
+    @MainActor
+    func expandedMascotLayoutKeepsVisiblePixelsOnscreen() {
+        let footerFrame = mascotFooterFrame()
+        let expandedFrame = ExpandedMascotLayout.expandedFrame(footerFrame: footerFrame)
+
+        #expect(expandedFrame.minX == -ExpandedMascotLayout.operationVisibleContentLeadingInset)
+        #expect(ExpandedMascotLayout.visibleContentLeadingX(footerFrame: footerFrame) == ExpandedMascotLayout.visibleLeadingInset)
+        #expect(expandedFrame.width == OperationMascotCoordinator.expandedDisplaySize)
+        #expect(expandedFrame.height == OperationMascotCoordinator.displayHeight(for: expandedFrame.width))
+    }
+
+    @Test("expanded mascot target scales and translates from collapsed target")
+    @MainActor
+    func expandedMascotTargetScalesAndTranslatesFromCollapsedTarget() {
+        let footerFrame = mascotFooterFrame()
+        let collapsedTarget = ExpandedMascotLayout.collapsedTarget(footerFrame: footerFrame)
+        let expandedTarget = ExpandedMascotLayout.expandedTarget()
+
+        #expect(collapsedTarget.displaySize == OperationMascotCoordinator.statusDisplaySize)
+        #expect(expandedTarget.displaySize == OperationMascotCoordinator.expandedDisplaySize)
+        #expect(expandedTarget.anchorX != collapsedTarget.anchorX)
+        #expect(expandedTarget.bottomConstraintConstant != collapsedTarget.bottomConstraintConstant)
+    }
+
+    @Test("expanded mascot is lifted above the footer row")
+    @MainActor
+    func expandedMascotIsLiftedAboveTheFooterRow() {
+        let footerFrame = mascotFooterFrame()
+        let expandedTarget = ExpandedMascotLayout.expandedTarget()
+        let expandedFrame = ExpandedMascotLayout.expandedFrame(footerFrame: footerFrame)
+
+        #expect(expandedTarget.bottomConstraintConstant == -ExpandedMascotLayout.expandedFooterLift)
+        #expect(ExpandedMascotLayout.expandedFooterLift == OperationMascotCoordinator.footerSlotHeight)
+        #expect(expandedFrame.minY == footerFrame.minY + OperationMascotCoordinator.footerSlotHeight)
+    }
+
     @Test("zero-row root recovery only retries readable empty roots")
     func zeroRowRootRecoveryOnlyRetriesReadableEmptyRoots() {
         let roots = [
@@ -139,6 +176,16 @@ struct SearchToolbarTests {
         return view.subviews.reduce(current) { partial, subview in
             partial + buttons(in: subview)
         }
+    }
+
+    @MainActor
+    private func mascotFooterFrame() -> NSRect {
+        NSRect(
+            x: ExpandedMascotLayout.visibleLeadingInset,
+            y: 8,
+            width: OperationMascotCoordinator.statusDisplaySize,
+            height: OperationMascotCoordinator.displayHeight(for: OperationMascotCoordinator.statusDisplaySize)
+        )
     }
 
     private func makeRoot(path: String, trackedFileCount: Int) -> IndexRootInsight {
