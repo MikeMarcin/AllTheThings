@@ -28,6 +28,7 @@ enum AppSettings {
     static let themePreferenceKey = "ATTThemePreference"
     static let appFontFamilyNameKey = "ATTAppFontFamilyName"
     static let appFontSizeKey = "ATTAppFontSize"
+    static let diagnosticLogLevelKey = "ATTDiagnosticLogLevel"
     static let lightMatchColorsKey = "ATTLightMatchColors"
     static let darkMatchColorsKey = "ATTDarkMatchColors"
     static let indexedRootsKey = "ATTIndexedRoots"
@@ -39,6 +40,7 @@ enum AppSettings {
     static let menuBarIconDidChangeNotification = Notification.Name("com.allthethings.settings.menuBarIconDidChange")
     static let themePreferenceDidChangeNotification = Notification.Name("com.allthethings.settings.themePreferenceDidChange")
     static let appFontDidChangeNotification = Notification.Name("com.allthethings.settings.appFontDidChange")
+    static let diagnosticLogLevelDidChangeNotification = Notification.Name("com.allthethings.settings.diagnosticLogLevelDidChange")
     static let matchColorsDidChangeNotification = Notification.Name("com.allthethings.settings.matchColorsDidChange")
     static let indexedRootsDidChangeNotification = Notification.Name("com.allthethings.settings.indexedRootsDidChange")
     static let exclusionPatternsDidChangeNotification = Notification.Name("com.allthethings.settings.exclusionPatternsDidChange")
@@ -84,6 +86,7 @@ enum AppSettings {
             themePreferenceKey: AppThemePreference.system.rawValue,
             appFontFamilyNameKey: "",
             appFontSizeKey: Double(defaultAppFontSize),
+            diagnosticLogLevelKey: DiagnosticLogLevel.info.rawValue,
             lightMatchColorsKey: defaultMatchColorHexes(isDark: false),
             darkMatchColorsKey: defaultMatchColorHexes(isDark: true),
             exclusionPatternsKey: FileExclusionRules.defaultPatterns
@@ -175,6 +178,36 @@ enum AppSettings {
         NotificationCenter.default.post(name: menuBarIconDidChangeNotification, object: defaults)
     }
 
+    static func diagnosticLogLevel(defaults: UserDefaults = .standard) -> DiagnosticLogLevel {
+        guard
+            let rawValue = defaults.string(forKey: diagnosticLogLevelKey),
+            let level = DiagnosticLogLevel(rawValue: rawValue)
+        else {
+            return .info
+        }
+
+        return level
+    }
+
+    static func saveDiagnosticLogLevel(
+        _ level: DiagnosticLogLevel,
+        defaults: UserDefaults = .standard
+    ) {
+        guard diagnosticLogLevel(defaults: defaults) != level else { return }
+
+        defaults.set(level.rawValue, forKey: diagnosticLogLevelKey)
+        defaults.synchronize()
+        DiagnosticLogger.shared.setMinimumLevel(level)
+        DiagnosticLogger.shared.log(
+            category: "settings",
+            event: "settings.diagnosticLogLevelChanged",
+            fields: [
+                "level": .publicString(level.rawValue)
+            ]
+        )
+        NotificationCenter.default.post(name: diagnosticLogLevelDidChangeNotification, object: defaults)
+    }
+
     static func indexedRoots(defaults: UserDefaults = .standard) -> [URL] {
         guard indexedRootsConfigured(defaults: defaults) else {
             return []
@@ -205,7 +238,9 @@ enum AppSettings {
             category: "settings",
             event: "settings.indexedRootsChanged",
             fields: [
-                "rootCount": .publicInt(paths.count),
+                "rootCount": .publicInt(paths.count)
+            ],
+            diagnosticFields: [
                 "roots": .pathArray(paths)
             ]
         )
@@ -239,7 +274,9 @@ enum AppSettings {
             category: "settings",
             event: "settings.exclusionPatternsChanged",
             fields: [
-                "patternCount": .publicInt(patterns.count),
+                "patternCount": .publicInt(patterns.count)
+            ],
+            diagnosticFields: [
                 "patterns": .privateString(patterns.joined(separator: "\n"))
             ]
         )

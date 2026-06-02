@@ -115,6 +115,79 @@ struct DiagnosticLoggingTests {
         }
     }
 
+    @Test("standard minimum suppresses diagnostic level but keeps info warning and error")
+    func standardMinimumSuppressesDiagnosticLevelButKeepsInfoWarningAndError() throws {
+        let fileManager = FileManager.default
+        let directory = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsDiagnosticLevel-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? fileManager.removeItem(at: directory)
+        }
+
+        let logger = DiagnosticLogger()
+        logger.configure(
+            directoryURL: directory,
+            maxTotalBytes: 20_000,
+            maxAge: 60,
+            fileManager: fileManager
+        )
+        logger.setMinimumLevel(.info)
+        logger.log(level: .diagnostic, category: "test", event: "test.diagnostic")
+        logger.log(
+            category: "test",
+            event: "test.info",
+            fields: ["count": .publicInt(1)],
+            diagnosticFields: ["path": .path("/Users/alice/Secret.txt")]
+        )
+        logger.log(level: .warning, category: "test", event: "test.warning")
+        logger.log(level: .error, category: "test", event: "test.error")
+
+        let events = try loggedEvents(from: logger)
+        #expect(!events.contains { $0.event == "test.diagnostic" })
+        let infoEvent = try #require(events.first { $0.event == "test.info" })
+        #expect(infoEvent.fields["count"] != nil)
+        #expect(infoEvent.fields["path"] == nil)
+        #expect(events.contains { $0.event == "test.warning" })
+        #expect(events.contains { $0.event == "test.error" })
+    }
+
+    @Test("diagnostic minimum records diagnostic level events and diagnostic fields")
+    func diagnosticMinimumRecordsDiagnosticLevelEventsAndDiagnosticFields() throws {
+        let fileManager = FileManager.default
+        let directory = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsDiagnosticLevel-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? fileManager.removeItem(at: directory)
+        }
+
+        let logger = DiagnosticLogger()
+        logger.configure(
+            directoryURL: directory,
+            maxTotalBytes: 20_000,
+            maxAge: 60,
+            fileManager: fileManager
+        )
+        logger.setMinimumLevel(.diagnostic)
+        logger.log(level: .diagnostic, category: "test", event: "test.diagnostic")
+        logger.log(
+            category: "test",
+            event: "test.info",
+            fields: [
+                "path": .publicString("summary"),
+                "count": .publicInt(1)
+            ],
+            diagnosticFields: [
+                "path": .path("/Users/alice/Secret.txt")
+            ]
+        )
+
+        let events = try loggedEvents(from: logger)
+        #expect(events.contains { $0.event == "test.diagnostic" })
+        let infoEvent = try #require(events.first { $0.event == "test.info" })
+        #expect(infoEvent.fields["count"] != nil)
+        #expect(infoEvent.fields["path"] == .path("/Users/alice/Secret.txt"))
+    }
+
     @Test("anonymizer removes sensitive strings while preserving shape")
     func anonymizerRemovesSensitiveStringsWhilePreservingShape() throws {
         let path = "/Users/alice/Documents/SecretProject/File.swift"
@@ -222,5 +295,17 @@ struct DiagnosticLoggingTests {
             return ""
         }
         return value
+    }
+
+    private func loggedEvents(from logger: DiagnosticLogger) throws -> [DiagnosticLogEvent] {
+        logger.flush()
+        let decoder = DiagnosticLogger.makeDecoder()
+        return try logger.currentLogFileURLs().flatMap { fileURL -> [DiagnosticLogEvent] in
+            let lines = try String(contentsOf: fileURL, encoding: .utf8)
+                .split(separator: "\n")
+            return try lines.map { line in
+                try decoder.decode(DiagnosticLogEvent.self, from: Data(line.utf8))
+            }
+        }
     }
 }

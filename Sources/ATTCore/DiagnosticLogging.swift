@@ -2,12 +2,34 @@ import Foundation
 
 public enum DiagnosticLogLevel: String, Codable, CaseIterable, Sendable {
     case debug
+    case diagnostic
     case info
     case warning
     case error
 
     var canDropUnderBackpressure: Bool {
-        self == .debug || self == .info
+        self == .debug || self == .diagnostic || self == .info
+    }
+
+    private var priority: Int {
+        switch self {
+        case .debug: 0
+        case .diagnostic: 1
+        case .info: 2
+        case .warning: 3
+        case .error: 4
+        }
+    }
+
+    func isRecorded(withMinimumLevel minimumLevel: DiagnosticLogLevel) -> Bool {
+        if self == .warning || self == .error {
+            return true
+        }
+        return priority >= minimumLevel.priority
+    }
+
+    func includesDiagnosticFields() -> Bool {
+        priority <= DiagnosticLogLevel.diagnostic.priority
     }
 }
 
@@ -280,6 +302,7 @@ public final class DiagnosticLogger: @unchecked Sendable {
     private var currentLogFileBytes: UInt64 = 0
     private var flushTimer: DispatchSourceTimer?
     private var lastFlushDate = Date.distantPast
+    private var minimumLevel: DiagnosticLogLevel = .info
 
     public init() {}
 
@@ -343,8 +366,19 @@ public final class DiagnosticLogger: @unchecked Sendable {
         level: DiagnosticLogLevel = .info,
         category: String,
         event: String,
-        fields: [String: DiagnosticLogFieldValue] = [:]
+        fields: [String: DiagnosticLogFieldValue] = [:],
+        diagnosticFields: [String: DiagnosticLogFieldValue] = [:]
     ) {
+        let configuredMinimumLevel = stateLock.withLock { minimumLevel }
+        guard level.isRecorded(withMinimumLevel: configuredMinimumLevel) else {
+            return
+        }
+        let fieldsToRecord: [String: DiagnosticLogFieldValue]
+        if configuredMinimumLevel.includesDiagnosticFields() {
+            fieldsToRecord = fields.merging(diagnosticFields) { _, diagnosticField in diagnosticField }
+        } else {
+            fieldsToRecord = fields
+        }
         let shouldEnqueue = stateLock.withLock { () -> Bool in
             guard configuration != nil else { return false }
             if pendingEventCount >= Self.maxPendingEvents, level.canDropUnderBackpressure {
@@ -373,10 +407,20 @@ public final class DiagnosticLogger: @unchecked Sendable {
                 level: level,
                 category: category,
                 event: event,
-                fields: fields
+                fields: fieldsToRecord
             )
             append(logEvent, configuration: configuration)
         }
+    }
+
+    public func setMinimumLevel(_ minimumLevel: DiagnosticLogLevel) {
+        stateLock.withLock {
+            self.minimumLevel = minimumLevel
+        }
+    }
+
+    public func currentMinimumLevel() -> DiagnosticLogLevel {
+        stateLock.withLock { minimumLevel }
     }
 
     public func flush() {
