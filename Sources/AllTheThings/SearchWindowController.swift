@@ -3556,8 +3556,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             withApplicationAt: applicationURL,
             configuration: NSWorkspace.OpenConfiguration()
         ) { [weak self] _, error in
-            if let error {
-                self?.logFileAction(
+            guard let error else { return }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.logFileAction(
                     "openWithApplicationFailed",
                     records: records,
                     level: .error,
@@ -3566,7 +3568,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                         "error": .errorText(error.localizedDescription)
                     ]
                 )
-                self?.presentError("Could not open item.", informativeText: error.localizedDescription)
+                self.presentError("Could not open item.", informativeText: error.localizedDescription)
             }
         }
     }
