@@ -511,6 +511,44 @@ struct FileIndexTests {
         }
     }
 
+    @Test("queued refreshes continue draining after the maximum batch")
+    func queuedRefreshesContinueDrainingAfterMaximumBatch() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)", loadsSnapshotImmediately: false)
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil {
+            let stats = index.currentStats()
+            return !stats.isIndexing && stats.indexedCount >= 1
+        }
+
+        let beforeDiagnostics = index.currentDiagnostics()
+        let fileCount = 650
+        let files = try (0..<fileCount).map { offset in
+            let file = root.appendingPathComponent("QueuedRefresh\(offset).swift")
+            try "queued \(offset)".write(to: file, atomically: true, encoding: .utf8)
+            return file
+        }
+
+        index.update(paths: files.map(\.path))
+
+        try await waitUntil(timeout: .seconds(10)) {
+            let diagnostics = index.currentDiagnostics()
+            let response = index.search(SearchRequest(
+                query: "QueuedRefresh",
+                sort: SortSpec(column: .name, ascending: true)
+            ), maxResults: fileCount + 10)
+            return diagnostics.completedRefreshBatches >= beforeDiagnostics.completedRefreshBatches + 2
+                && response.totalMatches == fileCount
+        }
+    }
+
     @Test("update applies optimized overlay so log and log.rb searches stay indexed")
     func updateAppliesOptimizedOverlaySoLogAndLogRBSearchesStayIndexed() async throws {
         let applicationName = "AllTheThingsTests-\(UUID().uuidString)"

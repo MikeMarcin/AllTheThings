@@ -5659,6 +5659,23 @@ public final class FileIndex: @unchecked Sendable {
         return min(2, max(1, ProcessInfo.processInfo.activeProcessorCount / 4))
     }
 
+    private static func seconds(for interval: DispatchTimeInterval) -> TimeInterval {
+        switch interval {
+        case let .seconds(value):
+            TimeInterval(value)
+        case let .milliseconds(value):
+            TimeInterval(value) / 1_000
+        case let .microseconds(value):
+            TimeInterval(value) / 1_000_000
+        case let .nanoseconds(value):
+            TimeInterval(value) / 1_000_000_000
+        case .never:
+            0
+        @unknown default:
+            0
+        }
+    }
+
     private static func configuredLargeOverlayPersistRecordLimit() -> Int {
         guard
             let rawValue = ProcessInfo.processInfo.environment["ATT_INDEX_LARGE_OVERLAY_PERSIST_RECORD_LIMIT"],
@@ -5692,15 +5709,27 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     private func scheduleUpdateDrainIfNeeded(delay: DispatchTimeInterval) {
-        let shouldSchedule = lock.withLock { () -> Bool in
+        let scheduled = lock.withLock { () -> (shouldSchedule: Bool, pendingPathCount: Int) in
             guard !pendingRefreshPaths.isEmpty, !isRefreshDrainScheduled else {
-                return false
+                return (false, pendingRefreshPaths.count)
             }
             isRefreshDrainScheduled = true
-            return true
+            return (true, pendingRefreshPaths.count)
         }
 
-        guard shouldSchedule else { return }
+        guard scheduled.shouldSchedule else { return }
+
+        if scheduled.pendingPathCount > Self.maximumRefreshBatchPaths {
+            DiagnosticLogger.shared.log(
+                category: "index",
+                event: "index.updateDrainScheduled",
+                fields: [
+                    "pendingPathCount": .publicInt(scheduled.pendingPathCount),
+                    "maximumBatchPathCount": .publicInt(Self.maximumRefreshBatchPaths),
+                    "delaySeconds": .publicDouble(Self.seconds(for: delay))
+                ]
+            )
+        }
 
         indexQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
             self?.drainUpdateQueue()
@@ -5708,25 +5737,59 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     private func drainUpdateQueue() {
-        let paths = lock.withLock { () -> [String] in
+        let drain = lock.withLock { () -> (
+            paths: [String],
+            pendingPathCountAfterBatch: Int,
+            deferredByIndexing: Bool,
+            reconciling: Bool,
+            updating: Bool,
+            phase: IndexPhase
+        ) in
             guard !indexing else {
                 isRefreshDrainScheduled = false
-                return []
+                return ([], pendingRefreshPaths.count, true, reconciling, updating, phase)
             }
 
             let batch = Array(pendingRefreshPaths.prefix(Self.maximumRefreshBatchPaths))
             for path in batch {
                 pendingRefreshPaths.remove(path)
             }
+            let pendingPathCountAfterBatch = pendingRefreshPaths.count
             if pendingRefreshPaths.isEmpty {
                 pendingRefreshPaths.removeAll(keepingCapacity: false)
-                isRefreshDrainScheduled = false
             }
-            return batch
+            isRefreshDrainScheduled = false
+            return (batch, pendingPathCountAfterBatch, false, reconciling, updating, phase)
         }
 
-        if !paths.isEmpty {
-            updateNow(paths: paths)
+        if drain.deferredByIndexing {
+            DiagnosticLogger.shared.log(
+                category: "index",
+                event: "index.updateDrainDeferred",
+                fields: [
+                    "reason": .publicString("indexing"),
+                    "pendingPathCount": .publicInt(drain.pendingPathCountAfterBatch),
+                    "reconciling": .publicBool(drain.reconciling),
+                    "updating": .publicBool(drain.updating),
+                    "phase": .publicString(drain.phase.rawValue)
+                ]
+            )
+            return
+        }
+
+        if !drain.paths.isEmpty {
+            if drain.pendingPathCountAfterBatch > 0 {
+                DiagnosticLogger.shared.log(
+                    category: "index",
+                    event: "index.updateDrainContinuing",
+                    fields: [
+                        "batchPathCount": .publicInt(drain.paths.count),
+                        "remainingPathCount": .publicInt(drain.pendingPathCountAfterBatch),
+                        "maximumBatchPathCount": .publicInt(Self.maximumRefreshBatchPaths)
+                    ]
+                )
+            }
+            updateNow(paths: drain.paths)
         }
 
         let shouldContinue = lock.withLock { !pendingRefreshPaths.isEmpty }
@@ -6261,7 +6324,8 @@ public final class FileIndex: @unchecked Sendable {
                 event: "index.snapshotPersistFinished",
                 fields: [
                     "recordCount": .publicInt(metrics.recordCount),
-                    "durationSeconds": .publicDouble(Date().timeIntervalSince(started))
+                    "durationSeconds": .publicDouble(Date().timeIntervalSince(started)),
+                    "pendingRefreshPathCount": .publicInt(lock.withLock { pendingRefreshPaths.count })
                 ]
             )
             if snapshotData.snapshot.store.kind == .overlay || snapshotData.snapshot.store.kind == .heapPaged {
