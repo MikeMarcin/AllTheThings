@@ -3552,26 +3552,15 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                 "applicationPath": .path(applicationURL.path)
             ]
         )
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.promptsUserIfNeeded = true
+        // LaunchServices calls this completion on a concurrent queue; omit it to avoid a main-actor callback trap.
         NSWorkspace.shared.open(
             urls,
             withApplicationAt: applicationURL,
-            configuration: NSWorkspace.OpenConfiguration()
-        ) { [weak self] _, error in
-            guard let error else { return }
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.logFileAction(
-                    "openWithApplicationFailed",
-                    records: records,
-                    level: .error,
-                    extraFields: [
-                        "applicationPath": .path(applicationURL.path),
-                        "error": .errorText(error.localizedDescription)
-                    ]
-                )
-                self.presentError("Could not open item.", informativeText: error.localizedDescription)
-            }
-        }
+            configuration: configuration,
+            completionHandler: nil
+        )
     }
 
     @objc private func revealSelected(_ sender: Any?) {
