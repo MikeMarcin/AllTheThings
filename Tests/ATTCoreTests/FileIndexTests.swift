@@ -2,7 +2,7 @@
 import Foundation
 import Testing
 
-@Suite("File index")
+@Suite("File index", .serialized)
 struct FileIndexTests {
     @Test("search combines fuzzy text with wildcard and structured path clauses")
     func searchCombinesFuzzyWildcardAndStructuredPathClauses() async throws {
