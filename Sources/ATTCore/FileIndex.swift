@@ -1761,10 +1761,31 @@ public final class FileIndex: @unchecked Sendable {
                 }
 
                 var candidates: [Int32] = []
-                for (fileExtension, values) in extensionIndex where FileIndex.wildcardMatches(fileExtension, pattern: token) {
+                for (fileExtension, values) in extensionIndex where FuzzyMatcher.wildcardMatches(fileExtension, pattern: token) {
                     candidates = FileIndex.unionPostingLists(candidates, values)
                 }
                 return candidates
+            }
+        }
+
+        func exactExtensionCandidatesForFastPath(token: String, mode: FuzzyMatcher.MatchMode) -> [Int32]? {
+            guard !extensionIndex.isEmpty, !token.isEmpty else { return nil }
+
+            switch mode {
+            case .exact:
+                return extensionIndex[token] ?? []
+            case .wildcard:
+                guard let alternatives = FuzzyMatcher.exactWildcardLiteralAlternatives(token) else { return nil }
+                var candidates: [Int32] = []
+                for alternative in alternatives {
+                    candidates = FileIndex.unionPostingLists(candidates, extensionIndex[alternative] ?? [])
+                }
+                return candidates
+            case .fuzzy:
+                for fileExtension in extensionIndex.keys where fileExtension != token && fileExtension.hasPrefix(token) {
+                    return nil
+                }
+                return extensionIndex[token] ?? []
             }
         }
 
@@ -2721,6 +2742,18 @@ public final class FileIndex: @unchecked Sendable {
                 return finish(fastResponse)
             }
 
+            if let fastResponse = Self.fastExactExtensionSearch(
+                snapshot: snapshot,
+                request: request,
+                parsedQuery: parsedQuery,
+                maxResults: boundedMaxResults,
+                started: started,
+                snapshotRevision: snapshotRevision,
+                shouldCancel: shouldCancel
+            ) {
+                return finish(fastResponse)
+            }
+
             if let indexedResponse = Self.indexedCandidateSearch(
                 snapshot: snapshot,
                 request: request,
@@ -3437,9 +3470,154 @@ public final class FileIndex: @unchecked Sendable {
         )
     }
 
+    private static func fastExactExtensionSearch(
+        snapshot: SearchSnapshot,
+        request: SearchRequest,
+        parsedQuery: FuzzyMatcher.ParsedQuery,
+        maxResults: Int,
+        started: Date,
+        snapshotRevision: UInt64,
+        shouldCancel: @Sendable () -> Bool
+    ) -> SearchResponse? {
+        guard let candidates = exactExtensionFastPathCandidates(snapshot: snapshot, parsedQuery: parsedQuery) else {
+            return nil
+        }
+
+        guard let selected = nameSortedExactExtensionMatches(
+            snapshot: snapshot,
+            candidates: candidates,
+            parsedQuery: parsedQuery,
+            request: request,
+            maxResults: maxResults,
+            shouldCancel: shouldCancel
+        ) else {
+            return nil
+        }
+
+        let elapsed = Date().timeIntervalSince(started)
+        var indexesUsed: Set<SearchIndexUse> = [.extensionPostings]
+        if !request.includeHidden {
+            indexesUsed.insert(.visibleBitset)
+        }
+        return SearchResponse(
+            results: materialize(selected.matches, from: snapshot),
+            totalMatches: selected.total,
+            elapsed: elapsed,
+            snapshotRevision: snapshotRevision,
+            usesIndexedCandidates: true,
+            executionProfile: SearchExecutionProfile(
+                executionPath: .extensionCandidateIntersection,
+                indexesUsed: indexesUsed,
+                candidateCount: candidates.count,
+                elapsed: elapsed
+            )
+        )
+    }
+
+    private static func exactExtensionFastPathCandidates(
+        snapshot: SearchSnapshot,
+        parsedQuery: FuzzyMatcher.ParsedQuery
+    ) -> [Int32]? {
+        guard
+            parsedQuery.negative.isEmpty,
+            parsedQuery.positive.count == 1,
+            let clause = parsedQuery.positive.first,
+            !clause.alternatives.isEmpty
+        else {
+            return nil
+        }
+
+        var candidates: [Int32] = []
+        var sharedQuality: MatchQuality?
+        for alternative in clause.alternatives {
+            guard case .fileExtension(let pattern, let mode) = alternative else {
+                return nil
+            }
+            guard
+                let extensionCandidates = snapshot.exactExtensionCandidatesForFastPath(token: pattern.token, mode: mode),
+                let representativeExtension = FuzzyMatcher.exactWildcardLiteralAlternatives(pattern.token)?.first,
+                let explanation = FuzzyMatcher.extensionExplanation(representativeExtension, pattern: pattern, mode: mode)
+            else {
+                return nil
+            }
+
+            if let quality = sharedQuality {
+                guard quality == explanation.quality else {
+                    return nil
+                }
+            } else {
+                sharedQuality = explanation.quality
+            }
+            candidates = unionPostingLists(candidates, extensionCandidates)
+        }
+
+        return sharedQuality == nil ? nil : candidates
+    }
+
     private struct NameSortedSelection {
         let matches: [SearchMatch]
         let total: Int
+    }
+
+    private static func nameSortedExactExtensionMatches(
+        snapshot: SearchSnapshot,
+        candidates: [Int32],
+        parsedQuery: FuzzyMatcher.ParsedQuery,
+        request: SearchRequest,
+        maxResults: Int,
+        shouldCancel: @Sendable () -> Bool
+    ) -> NameSortedSelection? {
+        guard snapshot.hasSortedOrder, !snapshot.nameAscending.isEmpty || candidates.isEmpty else {
+            return nil
+        }
+
+        let order: [Int]
+        switch request.sort.column {
+        case .relevance, .fileExtension:
+            order = snapshot.nameAscending
+        case .name:
+            order = request.sort.ascending ? snapshot.nameAscending : snapshot.nameDescending
+        case .path, .modified, .created, .size, .kind, .volume, .root:
+            return nil
+        }
+
+        var included = Array(repeating: UInt8(0), count: snapshot.count)
+        var total = 0
+        for (offset, candidate) in candidates.enumerated() {
+            if offset.isMultiple(of: 512), shouldCancel() {
+                return nil
+            }
+
+            let rowID = Int(candidate)
+            guard rowID >= 0, rowID < snapshot.count else { continue }
+            guard snapshot.store.isResultRow(at: rowID) else { continue }
+            guard request.includeHidden || snapshot.isVisible(at: rowID) else { continue }
+            guard included[rowID] == 0 else { continue }
+            included[rowID] = 1
+            total += 1
+        }
+
+        guard maxResults > 0, total > 0 else {
+            return NameSortedSelection(matches: [], total: total)
+        }
+
+        var matches: [SearchMatch] = []
+        matches.reserveCapacity(min(maxResults, total))
+        for (offset, rowID) in order.enumerated() {
+            if offset.isMultiple(of: 512), shouldCancel() {
+                return nil
+            }
+            guard included[rowID] != 0 else { continue }
+            guard let explanation = FuzzyMatcher.explain(record: snapshot.view(at: rowID), parsedQuery: parsedQuery) else {
+                continue
+            }
+            matches.append(SearchMatch(rowID: rowID, score: explanation.score, match: explanation))
+            if matches.count == maxResults {
+                break
+            }
+        }
+
+        return NameSortedSelection(matches: matches, total: total)
     }
 
     private struct NameSortCandidate {
@@ -4040,25 +4218,59 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     private static func wildcardRequiredFragments(from pattern: String) -> [[UInt8]] {
+        let characters = Array(pattern)
         var fragments: [[UInt8]] = []
-        var current: [UInt8] = []
+        var current = ""
+        var index = 0
 
-        for byte in pattern.utf8 {
-            if byte == 42 || byte == 47 || byte == 63 || byte == 92 {
-                if !current.isEmpty {
-                    fragments.append(current)
-                    current.removeAll(keepingCapacity: true)
+        func flushCurrent() {
+            guard !current.isEmpty else { return }
+            fragments.append(Array(current.utf8))
+            current.removeAll(keepingCapacity: true)
+        }
+
+        while index < characters.count {
+            let character = characters[index]
+            if character == "*" || character == "?" || character == "/" || character == "\\" {
+                flushCurrent()
+                index += 1
+            } else if character == "[" {
+                flushCurrent()
+                if let nextIndex = wildcardCharacterClassEnd(in: characters, startIndex: index) {
+                    index = nextIndex
+                } else {
+                    current.append(character)
+                    index += 1
                 }
             } else {
-                current.append(byte)
+                current.append(character)
+                index += 1
             }
         }
 
-        if !current.isEmpty {
-            fragments.append(current)
-        }
+        flushCurrent()
 
         return fragments
+    }
+
+    private static func wildcardCharacterClassEnd(in characters: [Character], startIndex: Int) -> Int? {
+        var index = startIndex + 1
+        guard index < characters.count else { return nil }
+
+        if characters[index] == "!" || characters[index] == "^" {
+            index += 1
+        }
+
+        var hasMember = false
+        while index < characters.count {
+            if characters[index] == "]", hasMember {
+                return index + 1
+            }
+            hasMember = true
+            index += 1
+        }
+
+        return nil
     }
 
     private static func pathLiteralFragments(from token: String) -> [[UInt8]] {
@@ -4537,36 +4749,6 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         return result
-    }
-
-    private static func wildcardMatches(_ text: String, pattern: String) -> Bool {
-        let textBytes = Array(text.utf8)
-        let patternBytes = Array(pattern.utf8)
-        guard !patternBytes.isEmpty else { return false }
-
-        var previous = Array(repeating: false, count: textBytes.count + 1)
-        previous[0] = true
-
-        for patternByte in patternBytes {
-            var current = Array(repeating: false, count: textBytes.count + 1)
-
-            if patternByte == 42 {
-                current[0] = previous[0]
-                if !textBytes.isEmpty {
-                    for index in 1...textBytes.count {
-                        current[index] = previous[index] || current[index - 1]
-                    }
-                }
-            } else if !textBytes.isEmpty {
-                for index in 1...textBytes.count {
-                    current[index] = previous[index - 1] && (patternByte == 63 || patternByte == textBytes[index - 1])
-                }
-            }
-
-            previous = current
-        }
-
-        return previous[textBytes.count]
     }
 
     private static func pathDepthPenalty(_ path: String) -> Int {

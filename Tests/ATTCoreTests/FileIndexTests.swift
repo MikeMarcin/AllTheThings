@@ -1449,6 +1449,78 @@ struct FileIndexTests {
         #expect(!fullScanResponse.usesIndexedCandidates)
     }
 
+    @Test("exact extension searches use extension postings without row scans")
+    func exactExtensionSearchesUseExtensionPostingsWithoutRowScans() {
+        let root = "/tmp/allthethings-extension-fast-path"
+        let cppCount = 750
+        var records: [FileRecord] = []
+        records.reserveCapacity(cppCount + 253)
+
+        for offset in 0..<cppCount {
+            records.append(makeRecord(path: "\(root)/cpp/File\(String(format: "%05d", offset)).cpp"))
+        }
+        for offset in 0..<250 {
+            records.append(makeRecord(path: "\(root)/swift/File\(String(format: "%05d", offset)).swift"))
+        }
+        records.append(makeRecord(path: "\(root)/modules/Module.cppm"))
+        records.append(makeRecord(path: "\(root)/headers/Bridge.hpp"))
+        records.append(makeRecord(path: "\(root)/headers/Bridge.ipp"))
+
+        let index = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        index.replaceRecordsForTesting(records)
+
+        for query in [".cpp", "*.cpp", "ext:cpp"] {
+            let response = index.search(SearchRequest(
+                query: query,
+                sort: SortSpec(column: .name, ascending: true)
+            ), maxResults: 25)
+
+            #expect(response.usesIndexedCandidates)
+            #expect(response.executionProfile.executionPath == .extensionCandidateIntersection)
+            #expect(response.executionProfile.indexesUsed == [.extensionPostings])
+            #expect(response.executionProfile.candidateCount == cppCount)
+            #expect(response.executionProfile.scannedRowCount == 0)
+            #expect(response.totalMatches == cppCount)
+            #expect(response.results.count == 25)
+            #expect(response.results.allSatisfy { $0.record.fileExtension == "cpp" })
+        }
+
+        for query in ["ext:cpp,cppm", "*.cpp|*.cppm"] {
+            let response = index.search(SearchRequest(
+                query: query,
+                sort: SortSpec(column: .name, ascending: true)
+            ), maxResults: 25)
+
+            #expect(response.usesIndexedCandidates)
+            #expect(response.executionProfile.executionPath == .extensionCandidateIntersection)
+            #expect(response.executionProfile.indexesUsed == [.extensionPostings])
+            #expect(response.executionProfile.candidateCount == cppCount + 1)
+            #expect(response.executionProfile.scannedRowCount == 0)
+            #expect(response.totalMatches == cppCount + 1)
+            #expect(response.results.count == 25)
+            #expect(response.results.allSatisfy { ["cpp", "cppm"].contains($0.record.fileExtension) })
+        }
+
+        for query in ["*.[hic]pp", "ext:[hic]pp"] {
+            let response = index.search(SearchRequest(
+                query: query,
+                sort: SortSpec(column: .name, ascending: true)
+            ), maxResults: 25)
+
+            #expect(response.usesIndexedCandidates)
+            #expect(response.executionProfile.executionPath == .extensionCandidateIntersection)
+            #expect(response.executionProfile.indexesUsed == [.extensionPostings])
+            #expect(response.executionProfile.candidateCount == cppCount + 2)
+            #expect(response.executionProfile.scannedRowCount == 0)
+            #expect(response.totalMatches == cppCount + 2)
+            #expect(response.results.count == 25)
+            #expect(response.results.allSatisfy { ["cpp", "hpp", "ipp"].contains($0.record.fileExtension) })
+        }
+    }
+
     @Test("log search ranks match quality before selected column sort")
     func logSearchRanksMatchQualityBeforeSelectedColumnSort() throws {
         let root = "/tmp/allthethings-ranking"
