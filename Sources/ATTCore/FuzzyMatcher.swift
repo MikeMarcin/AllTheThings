@@ -316,7 +316,7 @@ public enum FuzzyMatcher {
         extensionExplanation(extensionValue, pattern: pattern, mode: mode)?.score
     }
 
-    private static func extensionExplanation(_ extensionValue: String, pattern: SearchPattern, mode: MatchMode) -> MatchExplanation? {
+    static func extensionExplanation(_ extensionValue: String, pattern: SearchPattern, mode: MatchMode) -> MatchExplanation? {
         let token = pattern.token
         guard !token.isEmpty else { return nil }
 
@@ -520,7 +520,8 @@ public enum FuzzyMatcher {
         case .any where parsed.pattern.token.hasPrefix("*.") && parsed.pattern.token.count > 2:
             return .fileExtension(makeSearchPattern(normalizedExtensionToken(parsed.pattern.token), mode: parsed.mode), mode: parsed.mode)
         case .any where parsed.pattern.token.hasPrefix(".") && parsed.pattern.token.count > 1:
-            return .fileExtension(makeSearchPattern(String(parsed.pattern.token.dropFirst()), mode: parsed.mode), mode: parsed.mode)
+            let extensionToken = String(parsed.pattern.token.dropFirst())
+            return .fileExtension(makeSearchPattern(extensionToken, mode: .exact), mode: .exact)
         case .name, .path, .any:
             return .text(field: field, pattern: parsed.pattern, mode: parsed.mode)
         }
@@ -538,7 +539,8 @@ public enum FuzzyMatcher {
         case .fileExtension:
             let extensionToken = normalizedExtensionToken(parsed.pattern.token)
             guard !extensionToken.isEmpty else { return nil }
-            return .fileExtension(makeSearchPattern(extensionToken, mode: parsed.mode), mode: parsed.mode)
+            let mode: MatchMode = parsed.mode == .fuzzy ? .exact : parsed.mode
+            return .fileExtension(makeSearchPattern(extensionToken, mode: mode), mode: mode)
         case .kind:
             return .kind(parsed.pattern.token)
         }
@@ -608,7 +610,7 @@ public enum FuzzyMatcher {
         } else if value.hasSuffix("\"") {
             value.removeLast()
             mode = .exact
-        } else if value.contains("*") || value.contains("?") {
+        } else if containsWildcardSyntax(value) {
             mode = .wildcard
         }
 
@@ -1182,18 +1184,81 @@ public enum FuzzyMatcher {
         return (previousIsLowerOrDigit && currentIsUpper) || (previousIsUpper && currentIsUpper && nextIsLower)
     }
 
-    private static func wildcardMatches(_ text: String, pattern: String) -> Bool {
+    private enum WildcardToken {
+        case star
+        case single
+        case literal(Character)
+        case characterClass(Set<Character>, inverted: Bool)
+
+        func matches(_ character: Character) -> Bool {
+            switch self {
+            case .star:
+                return true
+            case .single:
+                return true
+            case .literal(let expected):
+                return character == expected
+            case .characterClass(let members, let inverted):
+                let contains = members.contains(character)
+                return inverted ? !contains : contains
+            }
+        }
+    }
+
+    private static func containsWildcardSyntax(_ value: String) -> Bool {
+        value.contains("*") || value.contains("?") || wildcardTokens(from: value).contains {
+            if case .characterClass = $0 {
+                return true
+            }
+            return false
+        }
+    }
+
+    static func exactWildcardLiteralAlternatives(_ pattern: String, maxAlternatives: Int = 128) -> [String]? {
+        var alternatives = [""]
+
+        for token in wildcardTokens(from: pattern) {
+            switch token {
+            case .star, .single:
+                return nil
+            case .literal(let character):
+                for index in alternatives.indices {
+                    alternatives[index].append(character)
+                }
+            case .characterClass(let members, let inverted):
+                guard !inverted else { return nil }
+                let sortedMembers = members.sorted { String($0) < String($1) }
+                guard !sortedMembers.isEmpty, alternatives.count * sortedMembers.count <= maxAlternatives else {
+                    return nil
+                }
+
+                var expanded: [String] = []
+                expanded.reserveCapacity(alternatives.count * sortedMembers.count)
+                for alternative in alternatives {
+                    for member in sortedMembers {
+                        expanded.append(alternative + String(member))
+                    }
+                }
+                alternatives = expanded
+            }
+        }
+
+        var seen = Set<String>()
+        return alternatives.filter { seen.insert($0).inserted }
+    }
+
+    static func wildcardMatches(_ text: String, pattern: String) -> Bool {
         let textChars = Array(text)
-        let patternChars = Array(pattern)
-        guard !patternChars.isEmpty else { return false }
+        let patternTokens = wildcardTokens(from: pattern)
+        guard !patternTokens.isEmpty else { return false }
 
         var previous = Array(repeating: false, count: textChars.count + 1)
         previous[0] = true
 
-        for patternChar in patternChars {
+        for patternToken in patternTokens {
             var current = Array(repeating: false, count: textChars.count + 1)
 
-            if patternChar == "*" {
+            if case .star = patternToken {
                 current[0] = previous[0]
                 if !textChars.isEmpty {
                     for index in 1...textChars.count {
@@ -1203,7 +1268,7 @@ public enum FuzzyMatcher {
             } else {
                 if !textChars.isEmpty {
                     for index in 1...textChars.count {
-                        current[index] = previous[index - 1] && (patternChar == "?" || patternChar == textChars[index - 1])
+                        current[index] = previous[index - 1] && patternToken.matches(textChars[index - 1])
                     }
                 }
             }
@@ -1212,6 +1277,102 @@ public enum FuzzyMatcher {
         }
 
         return previous[textChars.count]
+    }
+
+    private static func wildcardTokens(from pattern: String) -> [WildcardToken] {
+        let characters = Array(pattern)
+        var tokens: [WildcardToken] = []
+        var index = 0
+
+        while index < characters.count {
+            let character = characters[index]
+            switch character {
+            case "*":
+                tokens.append(.star)
+                index += 1
+            case "?":
+                tokens.append(.single)
+                index += 1
+            case "[":
+                if let parsed = wildcardCharacterClass(in: characters, startIndex: index) {
+                    tokens.append(parsed.token)
+                    index = parsed.nextIndex
+                } else {
+                    tokens.append(.literal(character))
+                    index += 1
+                }
+            default:
+                tokens.append(.literal(character))
+                index += 1
+            }
+        }
+
+        return tokens
+    }
+
+    private static func wildcardCharacterClass(
+        in characters: [Character],
+        startIndex: Int
+    ) -> (token: WildcardToken, nextIndex: Int)? {
+        var index = startIndex + 1
+        guard index < characters.count else { return nil }
+
+        var inverted = false
+        if characters[index] == "!" || characters[index] == "^" {
+            inverted = true
+            index += 1
+        }
+
+        var members = Set<Character>()
+        var previous: Character?
+        var hasMember = false
+
+        while index < characters.count {
+            let character = characters[index]
+            if character == "]", hasMember {
+                return (.characterClass(members, inverted: inverted), index + 1)
+            }
+
+            if
+                character == "-",
+                let previousMember = previous,
+                index + 1 < characters.count,
+                characters[index + 1] != "]",
+                addWildcardRange(from: previousMember, through: characters[index + 1], into: &members)
+            {
+                previous = characters[index + 1]
+                hasMember = true
+                index += 2
+                continue
+            }
+
+            members.insert(character)
+            previous = character
+            hasMember = true
+            index += 1
+        }
+
+        return nil
+    }
+
+    private static func addWildcardRange(from start: Character, through end: Character, into members: inout Set<Character>) -> Bool {
+        let startScalars = Array(start.unicodeScalars)
+        let endScalars = Array(end.unicodeScalars)
+        guard startScalars.count == 1, endScalars.count == 1 else {
+            return false
+        }
+
+        let startScalar = startScalars[0]
+        let endScalar = endScalars[0]
+        guard startScalar.value <= endScalar.value else {
+            return false
+        }
+
+        for value in startScalar.value...endScalar.value {
+            guard let scalar = UnicodeScalar(value) else { return false }
+            members.insert(Character(scalar))
+        }
+        return true
     }
 
     private struct StructuredPathMatch {
@@ -1322,7 +1483,7 @@ public enum FuzzyMatcher {
     }
 
     private static func structuredSegmentMatches(_ segment: String, pattern: String) -> Bool {
-        if pattern.contains("*") || pattern.contains("?") {
+        if containsWildcardSyntax(pattern) {
             return wildcardMatches(segment, pattern: pattern)
         }
         return segment.hasPrefix(pattern)
@@ -1440,6 +1601,6 @@ public enum FuzzyMatcher {
 
 private extension String {
     var removingWildcardSyntax: String {
-        filter { $0 != "*" && $0 != "?" }
+        filter { $0 != "*" && $0 != "?" && $0 != "[" && $0 != "]" && $0 != "!" && $0 != "^" }
     }
 }

@@ -14,12 +14,25 @@ struct FuzzyMatcherTests {
     @Test("matches extension-leading queries")
     func extensionMatch() throws {
         let cpp = try #require(makeRecord(name: "SearchIndex.cpp"))
+        let cppModule = try #require(makeRecord(name: "Module.cppm"))
+        let hpp = try #require(makeRecord(name: "SearchIndex.hpp"))
+        let ipp = try #require(makeRecord(name: "SearchIndex.ipp"))
         let swift = try #require(makeRecord(name: "SearchWindow.swift"))
 
         #expect(FuzzyMatcher.score(record: cpp, query: ".cpp") != nil)
+        #expect(FuzzyMatcher.score(record: cppModule, query: ".cpp") == nil)
         #expect(FuzzyMatcher.score(record: swift, query: ".cpp") == nil)
         #expect(FuzzyMatcher.score(record: cpp, query: "*.cpp") != nil)
         #expect(FuzzyMatcher.score(record: swift, query: "*.cpp") == nil)
+        #expect(FuzzyMatcher.score(record: cpp, query: "ext:cpp") != nil)
+        #expect(FuzzyMatcher.score(record: cppModule, query: "ext:cpp") == nil)
+        #expect(FuzzyMatcher.score(record: cppModule, query: "ext:cpp*") != nil)
+        #expect(FuzzyMatcher.score(record: cpp, query: "*.[hic]pp") != nil)
+        #expect(FuzzyMatcher.score(record: hpp, query: "*.[hic]pp") != nil)
+        #expect(FuzzyMatcher.score(record: ipp, query: "*.[hic]pp") != nil)
+        #expect(FuzzyMatcher.score(record: cppModule, query: "*.[hic]pp") == nil)
+        #expect(FuzzyMatcher.score(record: hpp, query: "ext:[h-i]pp") != nil)
+        #expect(FuzzyMatcher.score(record: ipp, query: "ext:[h-i]pp") != nil)
     }
 
     @Test("matches small typos")
