@@ -21,6 +21,10 @@ enum AppSettings {
     static let globalSearchHotKeyConfirmationResolvedKey = "ATTGlobalSearchHotKeyConfirmationResolved"
     static let globalSearchHotKeyKeyCodeKey = "ATTGlobalSearchHotKeyKeyCode"
     static let globalSearchHotKeyModifierFlagsKey = "ATTGlobalSearchHotKeyModifierFlags"
+    static let globalAppSearchHotKeyEnabledKey = "ATTGlobalAppSearchHotKeyEnabled"
+    static let globalAppSearchHotKeyConfirmationResolvedKey = "ATTGlobalAppSearchHotKeyConfirmationResolved"
+    static let globalAppSearchHotKeyKeyCodeKey = "ATTGlobalAppSearchHotKeyKeyCode"
+    static let globalAppSearchHotKeyModifierFlagsKey = "ATTGlobalAppSearchHotKeyModifierFlags"
     static let fullDiskAccessOnboardingShownKey = "ATTFullDiskAccessOnboardingShown"
     static let highlightSearchTextKey = "ATTHighlightSearchText"
     static let menuBarIconEnabledKey = "ATTMenuBarIconEnabled"
@@ -33,16 +37,20 @@ enum AppSettings {
     static let darkMatchColorsKey = "ATTDarkMatchColors"
     static let indexedRootsKey = "ATTIndexedRoots"
     static let indexedRootsInitializedKey = "ATTIndexedRootsInitialized"
+    static let appSearchRootsKey = "ATTAppSearchRoots"
+    static let appSearchRootsInitializedKey = "ATTAppSearchRootsInitialized"
     static let indexingSetupCompletedKey = "ATTIndexingSetupCompleted"
     static let exclusionPatternsKey = "ATTExclusionPatterns"
     static let exclusionDefaultsVersionKey = "ATTExclusionDefaultsVersion"
     static let globalSearchHotKeyDidChangeNotification = Notification.Name("com.allthethings.settings.globalSearchHotKeyDidChange")
+    static let globalAppSearchHotKeyDidChangeNotification = Notification.Name("com.allthethings.settings.globalAppSearchHotKeyDidChange")
     static let menuBarIconDidChangeNotification = Notification.Name("com.allthethings.settings.menuBarIconDidChange")
     static let themePreferenceDidChangeNotification = Notification.Name("com.allthethings.settings.themePreferenceDidChange")
     static let appFontDidChangeNotification = Notification.Name("com.allthethings.settings.appFontDidChange")
     static let diagnosticLogLevelDidChangeNotification = Notification.Name("com.allthethings.settings.diagnosticLogLevelDidChange")
     static let matchColorsDidChangeNotification = Notification.Name("com.allthethings.settings.matchColorsDidChange")
     static let indexedRootsDidChangeNotification = Notification.Name("com.allthethings.settings.indexedRootsDidChange")
+    static let appSearchRootsDidChangeNotification = Notification.Name("com.allthethings.settings.appSearchRootsDidChange")
     static let exclusionPatternsDidChangeNotification = Notification.Name("com.allthethings.settings.exclusionPatternsDidChange")
 
     private static let currentExclusionDefaultsVersion = 10
@@ -87,6 +95,10 @@ enum AppSettings {
             globalSearchHotKeyConfirmationResolvedKey: false,
             globalSearchHotKeyKeyCodeKey: Int(GlobalHotKey.defaultSearch.keyCode),
             globalSearchHotKeyModifierFlagsKey: Int(GlobalHotKey.defaultSearch.modifiers),
+            globalAppSearchHotKeyEnabledKey: true,
+            globalAppSearchHotKeyConfirmationResolvedKey: false,
+            globalAppSearchHotKeyKeyCodeKey: Int(GlobalHotKey.defaultAppSearch.keyCode),
+            globalAppSearchHotKeyModifierFlagsKey: Int(GlobalHotKey.defaultAppSearch.modifiers),
             fullDiskAccessOnboardingShownKey: false,
             highlightSearchTextKey: true,
             menuBarIconEnabledKey: true,
@@ -165,6 +177,45 @@ enum AppSettings {
             ]
         )
         NotificationCenter.default.post(name: globalSearchHotKeyDidChangeNotification, object: defaults)
+    }
+
+    static func globalAppSearchHotKeyEnabled(defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: globalAppSearchHotKeyEnabledKey)
+    }
+
+    static func globalAppSearchHotKeyNeedsConfirmation(defaults: UserDefaults = .standard) -> Bool {
+        globalAppSearchHotKeyEnabled(defaults: defaults)
+            && !defaults.bool(forKey: globalAppSearchHotKeyConfirmationResolvedKey)
+    }
+
+    static func globalAppSearchHotKey(defaults: UserDefaults = .standard) -> GlobalHotKey {
+        let keyCode = defaults.integer(forKey: globalAppSearchHotKeyKeyCodeKey)
+        let modifiers = defaults.integer(forKey: globalAppSearchHotKeyModifierFlagsKey)
+        let hotKey = GlobalHotKey(keyCode: UInt32(max(0, keyCode)), modifiers: UInt32(max(0, modifiers)))
+
+        return hotKey.isValid ? hotKey : .defaultAppSearch
+    }
+
+    static func saveGlobalAppSearchHotKey(
+        enabled: Bool,
+        hotKey: GlobalHotKey,
+        defaults: UserDefaults = .standard
+    ) {
+        defaults.set(enabled, forKey: globalAppSearchHotKeyEnabledKey)
+        defaults.set(true, forKey: globalAppSearchHotKeyConfirmationResolvedKey)
+        defaults.set(Int(hotKey.keyCode), forKey: globalAppSearchHotKeyKeyCodeKey)
+        defaults.set(Int(hotKey.modifiers), forKey: globalAppSearchHotKeyModifierFlagsKey)
+        defaults.synchronize()
+        DiagnosticLogger.shared.log(
+            category: "settings",
+            event: "settings.globalAppSearchHotKeyChanged",
+            fields: [
+                "enabled": .publicBool(enabled),
+                "keyCode": .publicInt(Int(hotKey.keyCode)),
+                "modifiers": .publicInt(Int(hotKey.modifiers))
+            ]
+        )
+        NotificationCenter.default.post(name: globalAppSearchHotKeyDidChangeNotification, object: defaults)
     }
 
     static func menuBarIconEnabled(defaults: UserDefaults = .standard) -> Bool {
@@ -271,6 +322,41 @@ enum AppSettings {
         defaults.synchronize()
     }
 
+    static func appSearchRoots(defaults: UserDefaults = .standard) -> [URL] {
+        guard appSearchRootsConfigured(defaults: defaults) else {
+            return suggestedDefaultAppSearchRoots()
+        }
+
+        return uniqueRoots(savedAppSearchRootURLs(defaults: defaults))
+    }
+
+    static func appSearchRootsConfigured(defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: appSearchRootsInitializedKey)
+            || !(defaults.array(forKey: appSearchRootsKey) as? [String] ?? []).isEmpty
+    }
+
+    static func saveAppSearchRoots(_ roots: [URL], defaults: UserDefaults = .standard) {
+        let paths = uniqueRoots(roots).map(\.path)
+        defaults.set(paths, forKey: appSearchRootsKey)
+        defaults.set(true, forKey: appSearchRootsInitializedKey)
+        defaults.synchronize()
+        DiagnosticLogger.shared.log(
+            category: "settings",
+            event: "settings.appSearchRootsChanged",
+            fields: [
+                "rootCount": .publicInt(paths.count)
+            ],
+            diagnosticFields: [
+                "roots": .pathArray(paths)
+            ]
+        )
+        NotificationCenter.default.post(name: appSearchRootsDidChangeNotification, object: defaults)
+    }
+
+    static func resetAppSearchRoots(defaults: UserDefaults = .standard) {
+        saveAppSearchRoots(suggestedDefaultAppSearchRoots(), defaults: defaults)
+    }
+
     static func exclusionPatterns(defaults: UserDefaults = .standard) -> [String] {
         defaults.array(forKey: exclusionPatternsKey) as? [String] ?? FileExclusionRules.defaultPatterns
     }
@@ -307,6 +393,10 @@ enum AppSettings {
         suggestedDefaultIndexedRoots()
     }
 
+    static func defaultAppSearchRoots() -> [URL] {
+        suggestedDefaultAppSearchRoots()
+    }
+
     static func suggestedDefaultIndexedRoots() -> [URL] {
         let fileManager = FileManager.default
         let home = fileManager.homeDirectoryForCurrentUser
@@ -314,15 +404,31 @@ enum AppSettings {
             home.appendingPathComponent("Desktop", isDirectory: true),
             home.appendingPathComponent("Documents", isDirectory: true),
             home.appendingPathComponent("Downloads", isDirectory: true),
-            home.appendingPathComponent("Developer", isDirectory: true),
-            URL(fileURLWithPath: "/Applications", isDirectory: true)
+            home.appendingPathComponent("Developer", isDirectory: true)
         ]
 
         return candidates.filter { fileManager.fileExists(atPath: $0.path) }
     }
 
+    static func suggestedDefaultAppSearchRoots() -> [URL] {
+        let fileManager = FileManager.default
+        let home = fileManager.homeDirectoryForCurrentUser
+        let candidates = [
+            URL(fileURLWithPath: "/Applications", isDirectory: true),
+            URL(fileURLWithPath: "/System/Applications", isDirectory: true),
+            home.appendingPathComponent("Applications", isDirectory: true)
+        ]
+
+        return uniqueRoots(candidates.filter { fileManager.fileExists(atPath: $0.path) })
+    }
+
     private static func savedIndexedRootURLs(defaults: UserDefaults) -> [URL] {
         (defaults.array(forKey: indexedRootsKey) as? [String] ?? [])
+            .map { URL(fileURLWithPath: $0, isDirectory: true) }
+    }
+
+    private static func savedAppSearchRootURLs(defaults: UserDefaults) -> [URL] {
+        (defaults.array(forKey: appSearchRootsKey) as? [String] ?? [])
             .map { URL(fileURLWithPath: $0, isDirectory: true) }
     }
 

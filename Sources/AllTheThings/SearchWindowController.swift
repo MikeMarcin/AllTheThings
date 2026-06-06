@@ -252,6 +252,12 @@ final class SearchWindowController: NSWindowController {
     }
 
     @MainActor
+    func focusSearchField(prefill text: String) {
+        guard let viewController = window?.contentViewController as? SearchViewController else { return }
+        viewController.focusSearchField(prefill: text)
+    }
+
+    @MainActor
     func reindexConfiguredRootsFromSettings() {
         guard let viewController = window?.contentViewController as? SearchViewController else { return }
         viewController.reindexConfiguredRootsFromSettings()
@@ -734,6 +740,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private lazy var fseventReconciler = FSEventReconciliationCoordinator(cursorStore: fseventCursorStore)
     private let searchQueue = DispatchQueue(label: "att.search", qos: .userInitiated)
     private let explanationQueue = DispatchQueue(label: "att.search.explain", qos: .utility)
+    private let applicationSearchCatalog = ApplicationSearchCatalog()
     private let defaults = UserDefaults.standard
 
     private let searchField = NSSearchField()
@@ -952,6 +959,12 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         )
         NotificationCenter.default.addObserver(
             self,
+            selector: #selector(appSearchRootsDidChange(_:)),
+            name: AppSettings.appSearchRootsDidChangeNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
             selector: #selector(exclusionPatternsDidChange(_:)),
             name: AppSettings.exclusionPatternsDidChangeNotification,
             object: nil
@@ -995,6 +1008,17 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         if selectText {
             searchField.selectText(nil)
         }
+    }
+
+    func focusSearchField(prefill text: String) {
+        view.window?.makeFirstResponder(searchField)
+        searchField.stringValue = text
+        if let editor = searchField.currentEditor() {
+            editor.selectedRange = NSRange(location: (text as NSString).length, length: 0)
+        }
+        markSearchInputStarted()
+        scheduleSearch(force: true)
+        updateSetupSuggestions()
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int {
@@ -1049,7 +1073,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             textField?.stringValue = dateFormatter.string(from: record.modifiedDate)
             textField?.textColor = .labelColor
         case .size:
-            textField?.stringValue = record.isDirectory ? "Folder" : byteFormatter.string(fromByteCount: Int64(record.sizeBytes))
+            textField?.stringValue = record.isDirectory
+                ? (Self.isApplicationBundle(record) ? "App" : "Folder")
+                : byteFormatter.string(fromByteCount: Int64(record.sizeBytes))
             textField?.textColor = .labelColor
             textField?.alignment = .right
         case .created:
@@ -1059,7 +1085,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             textField?.stringValue = record.fileExtension
             textField?.textColor = .secondaryLabelColor
         case .kind:
-            textField?.stringValue = record.isDirectory ? "Folder" : "File"
+            textField?.stringValue = Self.kindName(for: record)
             textField?.textColor = .labelColor
         case .volume:
             textField?.stringValue = record.volumeName
@@ -1098,6 +1124,29 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     func controlTextDidChange(_ obj: Notification) {
         markSearchInputStarted()
         scheduleSearch()
+        updateSetupSuggestions()
+    }
+
+    func control(
+        _ control: NSControl,
+        textView: NSTextView,
+        doCommandBy commandSelector: Selector
+    ) -> Bool {
+        guard control === searchField else { return false }
+
+        switch commandSelector {
+        case #selector(NSResponder.moveDown(_:)):
+            moveResultSelection(delta: 1)
+            return true
+        case #selector(NSResponder.moveUp(_:)):
+            moveResultSelection(delta: -1)
+            return true
+        case #selector(NSResponder.insertNewline(_:)), NSSelectorFromString("insertNewlineIgnoringFieldEditor:"):
+            openSelectedOrFirstResult()
+            return true
+        default:
+            return false
+        }
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
@@ -1186,6 +1235,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         tableView.allowsColumnResizing = true
         tableView.doubleAction = #selector(openSelected(_:))
         tableView.target = self
+        tableView.openAction = { [weak self] in
+            self?.openSelected(nil)
+        }
         tableView.copyAction = { [weak self] in
             self?.copySelectedFiles()
         }
@@ -1359,6 +1411,12 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         setupSuggestionPanel.chooseGlobalHotKeyButton.action = #selector(chooseSuggestedGlobalHotKey(_:))
         setupSuggestionPanel.dismissGlobalHotKeyButton.target = self
         setupSuggestionPanel.dismissGlobalHotKeyButton.action = #selector(dismissSuggestedGlobalHotKey(_:))
+        setupSuggestionPanel.enableGlobalAppSearchHotKeyButton.target = self
+        setupSuggestionPanel.enableGlobalAppSearchHotKeyButton.action = #selector(enableSuggestedGlobalAppSearchHotKey(_:))
+        setupSuggestionPanel.chooseGlobalAppSearchHotKeyButton.target = self
+        setupSuggestionPanel.chooseGlobalAppSearchHotKeyButton.action = #selector(chooseSuggestedGlobalAppSearchHotKey(_:))
+        setupSuggestionPanel.dismissGlobalAppSearchHotKeyButton.target = self
+        setupSuggestionPanel.dismissGlobalAppSearchHotKeyButton.action = #selector(dismissSuggestedGlobalAppSearchHotKey(_:))
         setupSuggestionPanel.dismissFullDiskAccessButton.target = self
         setupSuggestionPanel.dismissFullDiskAccessButton.action = #selector(dismissSuggestedFullDiskAccess(_:))
     }
@@ -1395,17 +1453,21 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     private func updateSetupSuggestions() {
         let needsIndexingSetup = !AppSettings.indexingSetupCompleted(defaults: defaults)
+        let appSearchActive = ApplicationSearchQuery.parse(currentSearchText()) != nil
         let needsGlobalHotKey = AppSettings.globalSearchHotKeyNeedsConfirmation(defaults: defaults)
+        let needsGlobalAppSearchHotKey = AppSettings.globalAppSearchHotKeyNeedsConfirmation(defaults: defaults)
         let needsFullDiskAccess = !defaults.bool(forKey: AppSettings.fullDiskAccessOnboardingShownKey)
             && (needsIndexingSetup || !FullDiskAccessController.protectedDefaultFoldersCovered(by: indexedRoots).isEmpty)
 
-        let setupOverlayVisible = needsIndexingSetup || isSetupMascotTuckInProgress
+        let setupOverlayVisible = (needsIndexingSetup && !appSearchActive) || isSetupMascotTuckInProgress
         indexingSetupOverlay.isHidden = !setupOverlayVisible
         indexingSetupOverlay.setMascotVisible(setupOverlayVisible && !isSetupMascotTuckInProgress)
         setupMascotCoordinator?.setActive(setupOverlayVisible && !isSetupMascotTuckInProgress)
         setupSuggestionPanel.update(
             hotKey: AppSettings.globalSearchHotKey(defaults: defaults),
+            appHotKey: AppSettings.globalAppSearchHotKey(defaults: defaults),
             needsGlobalHotKey: needsGlobalHotKey,
+            needsGlobalAppSearchHotKey: needsGlobalAppSearchHotKey,
             needsFullDiskAccess: needsFullDiskAccess
         )
         updateMascotPlacementVisibility()
@@ -1437,6 +1499,32 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         updateSetupSuggestions()
     }
 
+    @objc private func enableSuggestedGlobalAppSearchHotKey(_ sender: NSButton) {
+        let hotKey = AppSettings.globalAppSearchHotKey(defaults: defaults)
+
+        do {
+            if let appDelegate = NSApp.delegate as? AppDelegate {
+                try appDelegate.saveGlobalAppSearchHotKey(enabled: true, hotKey: hotKey)
+            } else {
+                AppSettings.saveGlobalAppSearchHotKey(enabled: true, hotKey: hotKey, defaults: defaults)
+            }
+        } catch {
+            presentError("Could not register global app search hotkey.", informativeText: error.localizedDescription)
+        }
+
+        updateSetupSuggestions()
+    }
+
+    @objc private func chooseSuggestedGlobalAppSearchHotKey(_ sender: NSButton) {
+        AppSettings.saveGlobalAppSearchHotKey(
+            enabled: false,
+            hotKey: AppSettings.globalAppSearchHotKey(defaults: defaults),
+            defaults: defaults
+        )
+        (NSApp.delegate as? AppDelegate)?.showSettings(section: .general)
+        updateSetupSuggestions()
+    }
+
     @objc private func openSuggestedFullDiskAccessSettings(_ sender: NSButton) {
         DiagnosticLogger.shared.log(category: "privacy", event: "fullDiskAccess.openSettingsFromSuggestion")
         markFullDiskAccessOnboardingShown()
@@ -1448,6 +1536,15 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         AppSettings.saveGlobalSearchHotKey(
             enabled: false,
             hotKey: AppSettings.globalSearchHotKey(defaults: defaults),
+            defaults: defaults
+        )
+        updateSetupSuggestions()
+    }
+
+    @objc private func dismissSuggestedGlobalAppSearchHotKey(_ sender: NSButton) {
+        AppSettings.saveGlobalAppSearchHotKey(
+            enabled: false,
+            hotKey: AppSettings.globalAppSearchHotKey(defaults: defaults),
             defaults: defaults
         )
         updateSetupSuggestions()
@@ -1859,6 +1956,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         schedulesAsyncExplanation: Bool
     ) -> MatchExplanation? {
         let query = currentSearchText().trimmingCharacters(in: .whitespacesAndNewlines)
+        if ApplicationSearchQuery.parse(query) != nil {
+            return result.match
+        }
+
         guard !query.isEmpty else {
             return result.match
         }
@@ -1877,6 +1978,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     private func scheduleVisibleExplanations() {
         let query = currentSearchText().trimmingCharacters(in: .whitespacesAndNewlines)
+        guard ApplicationSearchQuery.parse(query) == nil else { return }
         guard !query.isEmpty else { return }
 
         let visibleRows = tableView.rows(in: tableView.visibleRect)
@@ -1950,16 +2052,20 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func scheduleSearch(force: Bool = false) {
-        guard !indexStats.isLoadingSnapshot else { return }
+        let queryText = currentSearchText()
+        let appSearchQuery = ApplicationSearchQuery.parse(queryText)
+        guard appSearchQuery != nil || !indexStats.isLoadingSnapshot else { return }
 
-        let request = SearchRequest(query: currentSearchText(), sort: sortSpec, includeHidden: showsHiddenFiles)
-        updateScanSnapshotPublishingPreference(for: request)
+        let request = SearchRequest(query: queryText, sort: sortSpec, includeHidden: showsHiddenFiles)
+        if appSearchQuery == nil {
+            updateScanSnapshotPublishingPreference(for: request)
+        }
         let signature = SearchSignature(
             query: request.query,
             sort: request.sort,
             includeHidden: request.includeHidden
         )
-        if shouldSuppressEmptySearchDuringIndexing(request: request) {
+        if appSearchQuery == nil, shouldSuppressEmptySearchDuringIndexing(request: request) {
             suppressEmptySearchDuringIndexing(signature: signature)
             return
         }
@@ -2015,7 +2121,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let index = self.index
         let budgetTimeout = SearchBudgetTimeout()
         let trimmedQuery = request.query.trimmingCharacters(in: .whitespacesAndNewlines)
-        let shouldRunPreviewSearch = !trimmedQuery.isEmpty
+        let shouldRunPreviewSearch = appSearchQuery == nil
+            && !trimmedQuery.isEmpty
             && request.sort.column == .name
             && signature != displayedSearchSignature
         let previewRequest = SearchRequest(
@@ -2024,6 +2131,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             includeHidden: request.includeHidden,
             mode: .interactivePreview
         )
+        let appSearchRoots = appSearchQuery == nil ? [] : AppSettings.appSearchRoots(defaults: defaults)
+        let applicationSearchCatalog = self.applicationSearchCatalog
 
         searchQueue.async {
             guard !token.isCancelled else {
@@ -2055,11 +2164,12 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             }
 
             let fullSearchStartedAt = Date()
-            guard let response = index.search(request, shouldCancel: {
+            let shouldCancelSearch: @Sendable () -> Bool = {
                 if token.isCancelled {
                     return true
                 }
                 if
+                    appSearchQuery == nil,
                     Self.shouldBudgetSearchDuringIndexing(request: request, stats: index.currentStats()),
                     Date().timeIntervalSince(fullSearchStartedAt) >= SearchScheduling.unoptimizedIndexingSearchBudget
                 {
@@ -2067,7 +2177,17 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                     return true
                 }
                 return false
-            }) else {
+            }
+            let response = appSearchQuery.map { appQuery in
+                applicationSearchCatalog.search(
+                    queryText: appQuery.searchText,
+                    roots: appSearchRoots,
+                    sort: request.sort,
+                    shouldCancel: shouldCancelSearch
+                )
+            } ?? index.search(request, shouldCancel: shouldCancelSearch)
+
+            guard let response else {
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
                     self.clearSearchTokenIfCurrent(token)
@@ -2626,6 +2746,13 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         updateActionButtons()
     }
 
+    @objc private func appSearchRootsDidChange(_ notification: Notification) {
+        applicationSearchCatalog.invalidate()
+        guard ApplicationSearchQuery.parse(currentSearchText()) != nil else { return }
+        scheduledSearchSignature = nil
+        scheduleSearch(force: true)
+    }
+
     @objc private func exclusionPatternsDidChange(_ notification: Notification) {
         let patterns = AppSettings.exclusionPatterns(defaults: defaults)
         guard patterns != index.allExclusionPatterns() else { return }
@@ -3174,7 +3301,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             refreshMemoryStatus()
         }
 
-        guard AppSettings.indexingSetupCompleted(defaults: defaults) else {
+        let appSearchActive = ApplicationSearchQuery.parse(currentSearchText()) != nil
+        guard AppSettings.indexingSetupCompleted(defaults: defaults) || appSearchActive else {
             countLabel.stringValue = "0 shown / 0 matches • 0 indexed"
             statusLabel.stringValue = "Setup needed • Choose what AllTheThings can search • \(memoryStatusText)"
             return
@@ -3185,14 +3313,14 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let total = totalMatches.formatted()
         var countSegments = [
             "\(shownCount.formatted()) shown / \(total) matches",
-            "\(indexed) indexed"
+            appSearchActive ? "\(AppSettings.appSearchRoots(defaults: defaults).count.formatted()) app folders" : "\(indexed) indexed"
         ]
         if !currentSearchText().isEmpty {
             countSegments.append(searchElapsedText())
         }
         countLabel.stringValue = countSegments.joined(separator: " • ")
 
-        statusLabel.stringValue = "\(indexStatusText()) • \(memoryStatusText)"
+        statusLabel.stringValue = "\(appSearchActive ? "Application search" : indexStatusText()) • \(memoryStatusText)"
     }
 
     private func searchElapsedText() -> String {
@@ -3226,6 +3354,38 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         openButton.isEnabled = enabled
         revealButton.isEnabled = enabled
         copyButton.isEnabled = enabled
+    }
+
+    private func moveResultSelection(delta: Int) {
+        guard !results.isEmpty else { return }
+
+        let row: Int
+        if tableView.selectedRow >= 0 {
+            row = min(max(tableView.selectedRow + delta, 0), results.count - 1)
+        } else if delta < 0 {
+            row = results.count - 1
+        } else {
+            row = 0
+        }
+
+        selectResultRow(row)
+    }
+
+    private func openSelectedOrFirstResult() {
+        guard !results.isEmpty else { return }
+
+        if tableView.selectedRow < 0 {
+            selectResultRow(0)
+        }
+        openSelected(nil)
+    }
+
+    private func selectResultRow(_ row: Int) {
+        guard row >= 0, row < results.count else { return }
+
+        tableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        tableView.scrollRowToVisible(row)
+        updateActionButtons()
     }
 
     private func selectedRecord() -> FileRecord? {
@@ -3430,6 +3590,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     @objc private func searchFieldDidChange(_ sender: NSSearchField) {
         markSearchInputStarted()
         scheduleSearch()
+        updateSetupSuggestions()
     }
 
     @objc private func toggleColumnVisibility(_ sender: NSMenuItem) {
@@ -3946,6 +4107,17 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         guard !path.isEmpty else { return "" }
         let url = URL(fileURLWithPath: path, isDirectory: true)
         return url.lastPathComponent.isEmpty ? path : url.lastPathComponent
+    }
+
+    private static func kindName(for record: FileRecord) -> String {
+        if isApplicationBundle(record) {
+            return "Application"
+        }
+        return record.isDirectory ? "Folder" : "File"
+    }
+
+    private static func isApplicationBundle(_ record: FileRecord) -> Bool {
+        record.isDirectory && record.fileExtension == "app"
     }
 
     private static func normalizedSortSpec(_ spec: SortSpec, visibleColumns: Set<Column>) -> SortSpec {

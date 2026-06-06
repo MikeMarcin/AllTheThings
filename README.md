@@ -14,9 +14,9 @@ AllTheThings is a native macOS file-search app built for one fast loop: type a f
 
 ## Getting Started
 
-On first launch, AllTheThings indexes the default folders that exist on your Mac: `~/Desktop`, `~/Documents`, `~/Downloads`, `~/Developer`, and `/Applications`. If setup suggestions are available, they appear at the top of the search window instead of blocking the app.
+On first launch, AllTheThings indexes the default folders that exist on your Mac: `~/Desktop`, `~/Documents`, `~/Downloads`, and `~/Developer`. Applications are searched separately with `app:` so bundle internals are not part of normal filename/path search. If setup suggestions are available, they appear at the top of the search window instead of blocking the app.
 
-Use the folder-plus toolbar button to add folders. Use the refresh toolbar button to rebuild indexed scopes. The footer shows indexing state, match count, and query time. The default global search shortcut is `Command-Shift-Space`; enable it from the setup suggestion, or disable/remap it in Settings. Enable launch at login to keep the shortcut available after signing in. The optional menu bar loupe can focus search, open Settings, toggle launch at login, or quit the app.
+Use the folder-plus toolbar button to add folders. Use the refresh toolbar button to rebuild indexed scopes. The footer shows indexing state, match count, and query time. The default global search shortcut is `Command-Shift-Space`; enable it from the setup suggestion, or disable/remap it in Settings. The default global app search shortcut is `Shift-Option-Space`; enable it from the setup suggestion or Settings to open search with `app:` prefilled. Enable launch at login to keep shortcuts available after signing in. The optional menu bar loupe can focus search, open Settings, toggle launch at login, or quit the app.
 
 High-noise folders such as `node_modules`, `DerivedData`, `.git/objects`, `Library/Caches`, and `.Trash` are skipped.
 
@@ -34,8 +34,9 @@ Type in the search field and results update immediately. Queries are case-insens
 | `path:Sources ext:swift` | Match a path token and require Swift files. |
 | `package !path:node_modules` | Match `package` but exclude `node_modules` paths. |
 | `source/**/*.hpp` | Match structured path segments with `**` spanning folders. |
+| `app:terminal` | Search launchable `.app` bundles from configured application search folders. |
 
-Useful prefixes include `name:`, `path:`, `ext:`, and `kind:`. The aliases `file:`, `filename:`, `basename:`, `folder:`, `dir:`, `directory:`, `extension:`, `suffix:`, and `type:` are also supported.
+Useful prefixes include `app:`, `name:`, `path:`, `ext:`, and `kind:`. The aliases `apps:`, `application:`, `applications:`, `file:`, `filename:`, `basename:`, `folder:`, `dir:`, `directory:`, `extension:`, `suffix:`, and `type:` are also supported.
 
 Use `!` or `-` to exclude a term, `|` for alternatives, and double quotes for an exact substring. Wildcards use `*` for any run of characters and `?` for one character.
 
@@ -72,7 +73,7 @@ Be careful when sharing screenshots or recordings. A file-search window can expo
 
 ## Troubleshooting
 
-If expected files are missing, confirm the parent folder is indexed in **Settings > Indexed Folders**, click the refresh toolbar button, check whether the file is under a skipped folder, and make sure macOS privacy protections are not hiding the location. Grant Full Disk Access or remove protected folders from indexing if macOS keeps asking for folder access.
+If expected files are missing, confirm the parent folder is indexed in **Settings > Indexed Folders**, click the refresh toolbar button, check whether the file is under a skipped folder, and make sure macOS privacy protections are not hiding the location. For application results, confirm the app bundle is under one of the configured **Application Search** folders in **Settings > Indexed Folders**. Grant Full Disk Access or remove protected folders from indexing if macOS keeps asking for folder access.
 
 If the app opens an existing running instance instead of starting a second copy, use **AllTheThings > Allow Multiple Instances**.
 

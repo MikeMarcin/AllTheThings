@@ -103,10 +103,14 @@ struct FuzzyMatcherTests {
     @Test("supports kind filters")
     func kindFilters() throws {
         let directory = try #require(makeRecord(name: "Sources", isDirectory: true))
+        let application = try #require(makeRecord(name: "Safari.app", isDirectory: true))
         let file = try #require(makeRecord(name: "Sources.swift"))
 
         #expect(FuzzyMatcher.score(record: directory, query: "kind:folder") != nil)
         #expect(FuzzyMatcher.score(record: file, query: "kind:folder") == nil)
+        #expect(FuzzyMatcher.score(record: application, query: "kind:app") != nil)
+        #expect(FuzzyMatcher.score(record: application, query: "type:application") != nil)
+        #expect(FuzzyMatcher.score(record: directory, query: "kind:app") == nil)
         #expect(FuzzyMatcher.score(record: file, query: "type:file") != nil)
     }
 

@@ -366,7 +366,12 @@ public enum FuzzyMatcher {
     }
 
     private static func kindExplanation<Record: SearchRecordReadable>(record: Record, token: String) -> MatchExplanation? {
-        let values = record.isDirectory ? ["folder", "directory", "dir"] : ["file"]
+        let values: [String]
+        if record.isDirectory && record.fileExtension == "app" {
+            values = ["app", "application", "folder", "directory", "dir"]
+        } else {
+            values = record.isDirectory ? ["folder", "directory", "dir"] : ["file"]
+        }
         guard values.contains(where: { $0.hasPrefix(token) }) else { return nil }
         return MatchExplanation(
             matchClass: .metadata,

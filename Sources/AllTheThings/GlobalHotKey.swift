@@ -7,6 +7,10 @@ struct GlobalHotKey: Equatable {
         keyCode: UInt32(kVK_Space),
         modifiers: UInt32(cmdKey | shiftKey)
     )
+    static let defaultAppSearch = GlobalHotKey(
+        keyCode: UInt32(kVK_Space),
+        modifiers: UInt32(shiftKey | optionKey)
+    )
 
     let keyCode: UInt32
     let modifiers: UInt32
@@ -198,7 +202,6 @@ final class GlobalHotKeyController {
     }
 
     private static let signature = OSType(0x41545448)
-    private static let hotKeyIDValue = UInt32(1)
     private static let hotKeyExistsStatus = OSStatus(-9878)
     private static let hotKeyInvalidStatus = OSStatus(-9879)
 
@@ -217,23 +220,25 @@ final class GlobalHotKeyController {
         )
         guard
             status == noErr,
-            hotKeyID.signature == GlobalHotKeyController.signature,
-            hotKeyID.id == GlobalHotKeyController.hotKeyIDValue
+            hotKeyID.signature == GlobalHotKeyController.signature
         else {
             return noErr
         }
 
         let controller = Unmanaged<GlobalHotKeyController>.fromOpaque(userData).takeUnretainedValue()
+        guard hotKeyID.id == controller.hotKeyIDValue else { return noErr }
         controller.action()
         return noErr
     }
 
+    private let hotKeyIDValue: UInt32
     private let action: () -> Void
     private var eventHandlerRef: EventHandlerRef?
     private var hotKeyRef: EventHotKeyRef?
     private var registeredHotKey: GlobalHotKey?
 
-    init(action: @escaping () -> Void) {
+    init(hotKeyIDValue: UInt32 = 1, action: @escaping () -> Void) {
+        self.hotKeyIDValue = hotKeyIDValue
         self.action = action
         installEventHandler()
     }
@@ -286,7 +291,7 @@ final class GlobalHotKeyController {
     }
 
     private func register(_ hotKey: GlobalHotKey) throws {
-        let hotKeyID = EventHotKeyID(signature: Self.signature, id: Self.hotKeyIDValue)
+        let hotKeyID = EventHotKeyID(signature: Self.signature, id: hotKeyIDValue)
         var nextHotKeyRef: EventHotKeyRef?
         let status = RegisterEventHotKey(
             hotKey.keyCode,

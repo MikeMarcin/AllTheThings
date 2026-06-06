@@ -8,6 +8,7 @@ public enum SearchExecutionPath: String, Codable, CaseIterable, Sendable {
     case optimizedSortedFastPath
     case fullFallbackScan
     case indexedCandidateIntersection
+    case applicationCatalog
     case unprofiledIndexed
     case unprofiled
 }
@@ -19,6 +20,7 @@ public enum SearchIndexUse: String, Codable, CaseIterable, Hashable, Sendable {
     case extensionPostings
     case modifiedOrder
     case visibleBitset
+    case applicationCatalog
 }
 
 public struct SearchExecutionProfile: Codable, Equatable, Sendable {

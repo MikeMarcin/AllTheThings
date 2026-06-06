@@ -343,19 +343,26 @@ final class IndexingSetupOverlayView: NSView {
 final class SetupSuggestionPanelView: NSView {
     let enableGlobalHotKeyButton = NSButton()
     let chooseGlobalHotKeyButton = NSButton()
+    let enableGlobalAppSearchHotKeyButton = NSButton()
+    let chooseGlobalAppSearchHotKeyButton = NSButton()
     let openFullDiskAccessButton = NSButton()
     let dismissGlobalHotKeyButton = NSButton()
+    let dismissGlobalAppSearchHotKeyButton = NSButton()
     let dismissFullDiskAccessButton = NSButton()
 
     private let globalHotKeyRow = NSView()
+    private let globalAppSearchHotKeyRow = NSView()
     private let fullDiskAccessRow = NSView()
     private let globalHotKeySeparator = SetupSuggestionSeparatorView()
+    private let globalAppSearchHotKeySeparator = SetupSuggestionSeparatorView()
     private let globalHotKeyDetailLabel = NSTextField(labelWithString: "")
+    private let globalAppSearchHotKeyDetailLabel = NSTextField(labelWithString: "")
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
 
         let globalHotKeyTitleLabel = Self.makeTitleLabel("Global search hotkey")
+        let globalAppSearchHotKeyTitleLabel = Self.makeTitleLabel("Global app search hotkey")
         let fullDiskAccessTitleLabel = Self.makeTitleLabel("Full Disk Access")
         let fullDiskAccessDetailLabel = Self.makeDetailLabel(
             "Grant access before indexing protected folders to avoid macOS prompts."
@@ -369,6 +376,17 @@ final class SetupSuggestionPanelView: NSView {
                 Self.configureActionButton(enableGlobalHotKeyButton, title: "Enable", symbolName: "checkmark.circle"),
                 Self.configureActionButton(chooseGlobalHotKeyButton, title: "Customize", symbolName: "slider.horizontal.3"),
                 Self.configureActionButton(dismissGlobalHotKeyButton, title: "Not Now", symbolName: "xmark")
+            ]
+        )
+        Self.configureSuggestionRow(
+            globalAppSearchHotKeyRow,
+            symbolName: "macwindow.badge.plus",
+            titleLabel: globalAppSearchHotKeyTitleLabel,
+            detailLabel: globalAppSearchHotKeyDetailLabel,
+            buttons: [
+                Self.configureActionButton(enableGlobalAppSearchHotKeyButton, title: "Enable", symbolName: "checkmark.circle"),
+                Self.configureActionButton(chooseGlobalAppSearchHotKeyButton, title: "Customize", symbolName: "slider.horizontal.3"),
+                Self.configureActionButton(dismissGlobalAppSearchHotKeyButton, title: "Not Now", symbolName: "xmark")
             ]
         )
         Self.configureSuggestionRow(
@@ -391,6 +409,8 @@ final class SetupSuggestionPanelView: NSView {
         let rowsStack = NSStackView(views: [
             globalHotKeyRow,
             globalHotKeySeparator,
+            globalAppSearchHotKeyRow,
+            globalAppSearchHotKeySeparator,
             fullDiskAccessRow
         ])
         rowsStack.translatesAutoresizingMaskIntoConstraints = false
@@ -405,7 +425,8 @@ final class SetupSuggestionPanelView: NSView {
             rowsStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
             rowsStack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
             rowsStack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
-            globalHotKeySeparator.heightAnchor.constraint(equalToConstant: 2)
+            globalHotKeySeparator.heightAnchor.constraint(equalToConstant: 2),
+            globalAppSearchHotKeySeparator.heightAnchor.constraint(equalToConstant: 2)
         ])
     }
 
@@ -421,14 +442,19 @@ final class SetupSuggestionPanelView: NSView {
 
     func update(
         hotKey: GlobalHotKey,
+        appHotKey: GlobalHotKey,
         needsGlobalHotKey: Bool,
+        needsGlobalAppSearchHotKey: Bool,
         needsFullDiskAccess: Bool
     ) {
         globalHotKeyDetailLabel.stringValue = "Use \(hotKey.displayString) to open search from anywhere."
+        globalAppSearchHotKeyDetailLabel.stringValue = "Use \(appHotKey.displayString) to open app search from anywhere."
         globalHotKeyRow.isHidden = !needsGlobalHotKey
+        globalAppSearchHotKeyRow.isHidden = !needsGlobalAppSearchHotKey
         fullDiskAccessRow.isHidden = !needsFullDiskAccess
-        globalHotKeySeparator.isHidden = !needsGlobalHotKey || !needsFullDiskAccess
-        isHidden = !needsGlobalHotKey && !needsFullDiskAccess
+        globalHotKeySeparator.isHidden = !needsGlobalHotKey || (!needsGlobalAppSearchHotKey && !needsFullDiskAccess)
+        globalAppSearchHotKeySeparator.isHidden = !needsGlobalAppSearchHotKey || !needsFullDiskAccess
+        isHidden = !needsGlobalHotKey && !needsGlobalAppSearchHotKey && !needsFullDiskAccess
     }
 
     private func updateThemeColors() {
@@ -560,6 +586,7 @@ final class SearchCancellationToken: @unchecked Sendable {
 }
 
 final class FileTableView: NSTableView {
+    var openAction: (() -> Void)?
     var copyAction: (() -> Void)?
     var copyPathAction: (() -> Void)?
 
@@ -578,6 +605,11 @@ final class FileTableView: NSTableView {
     }
 
     override func keyDown(with event: NSEvent) {
+        if Self.isPlainReturn(event) {
+            openAction?()
+            return
+        }
+
         guard
             event.modifierFlags.contains(.command),
             event.charactersIgnoringModifiers?.lowercased() == "c"
@@ -591,6 +623,14 @@ final class FileTableView: NSTableView {
         } else {
             copyAction?()
         }
+    }
+
+    private static func isPlainReturn(_ event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard modifiers.isEmpty || modifiers == .numericPad else { return false }
+
+        return event.charactersIgnoringModifiers == "\r"
+            || event.charactersIgnoringModifiers == "\u{3}"
     }
 }
 
