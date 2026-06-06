@@ -1,6 +1,7 @@
 @testable import AllTheThings
 import AppKit
 import ATTCore
+import Carbon.HIToolbox
 import Foundation
 import Testing
 
@@ -65,6 +66,72 @@ struct AppSettingsTests {
         #expect(AppSettings.indexedRootsConfigured(defaults: defaults))
         #expect(!AppSettings.indexingSetupCompleted(defaults: defaults))
         #expect(AppSettings.indexedRoots(defaults: defaults) == AppSettings.suggestedDefaultIndexedRoots())
+    }
+
+    @Test("default indexed roots exclude Applications")
+    func defaultIndexedRootsExcludeApplications() {
+        let paths = AppSettings.suggestedDefaultIndexedRoots().map(\.standardizedFileURL.path)
+
+        #expect(!paths.contains("/Applications"))
+    }
+
+    @Test("app search roots default save and reset separately from indexed roots")
+    func appSearchRootsDefaultSaveAndResetSeparatelyFromIndexedRoots() throws {
+        let (defaults, suiteName) = try makeDefaults()
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        AppSettings.registerDefaults(defaults)
+        #expect(!AppSettings.appSearchRootsConfigured(defaults: defaults))
+        #expect(AppSettings.appSearchRoots(defaults: defaults) == AppSettings.suggestedDefaultAppSearchRoots())
+        #expect(!AppSettings.appSearchRootsConfigured(defaults: defaults))
+        #expect(defaults.object(forKey: AppSettings.appSearchRootsKey) == nil)
+
+        let root = URL(fileURLWithPath: "/tmp/AllTheThingsApps", isDirectory: true)
+        AppSettings.saveAppSearchRoots([root], defaults: defaults)
+
+        #expect(AppSettings.appSearchRootsConfigured(defaults: defaults))
+        #expect(AppSettings.appSearchRoots(defaults: defaults) == [root.standardizedFileURL])
+        #expect(!AppSettings.indexedRootsConfigured(defaults: defaults))
+
+        AppSettings.resetAppSearchRoots(defaults: defaults)
+        #expect(AppSettings.appSearchRootsConfigured(defaults: defaults))
+        #expect(AppSettings.appSearchRoots(defaults: defaults) == AppSettings.suggestedDefaultAppSearchRoots())
+    }
+
+    @Test("global app search hotkey defaults to shift option space and requires confirmation")
+    func globalAppSearchHotKeyDefaultsToShiftOptionSpaceAndRequiresConfirmation() throws {
+        let (defaults, suiteName) = try makeDefaults()
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        AppSettings.registerDefaults(defaults)
+
+        #expect(AppSettings.globalAppSearchHotKeyEnabled(defaults: defaults))
+        #expect(AppSettings.globalAppSearchHotKeyNeedsConfirmation(defaults: defaults))
+        #expect(AppSettings.globalAppSearchHotKey(defaults: defaults) == GlobalHotKey.defaultAppSearch)
+        #expect(GlobalHotKey.defaultAppSearch.keyCode == UInt32(kVK_Space))
+        #expect(GlobalHotKey.defaultAppSearch.modifiers == UInt32(shiftKey | optionKey))
+        #expect(GlobalHotKey.defaultAppSearch.displayString == "⇧⌥Space")
+    }
+
+    @Test("saving global app search hotkey resolves confirmation")
+    func savingGlobalAppSearchHotKeyResolvesConfirmation() throws {
+        let (defaults, suiteName) = try makeDefaults()
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        AppSettings.registerDefaults(defaults)
+        let hotKey = GlobalHotKey(keyCode: UInt32(kVK_ANSI_A), modifiers: UInt32(cmdKey | optionKey))
+
+        AppSettings.saveGlobalAppSearchHotKey(enabled: false, hotKey: hotKey, defaults: defaults)
+
+        #expect(!AppSettings.globalAppSearchHotKeyEnabled(defaults: defaults))
+        #expect(!AppSettings.globalAppSearchHotKeyNeedsConfirmation(defaults: defaults))
+        #expect(AppSettings.globalAppSearchHotKey(defaults: defaults) == hotKey)
     }
 
     @Test("setup folder edits stay pending until indexing starts")

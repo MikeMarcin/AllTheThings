@@ -123,6 +123,8 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     private let resetDarkMatchColorsButton = NSButton()
     private let globalHotKeySwitch = NSSwitch()
     private let changeGlobalHotKeyButton = NSButton()
+    private let globalAppSearchHotKeySwitch = NSSwitch()
+    private let changeGlobalAppSearchHotKeyButton = NSButton()
     private let launchAtLoginSwitch = NSSwitch()
     private let menuBarIconSwitch = NSSwitch()
     private let highlightSearchTextSwitch = NSSwitch()
@@ -145,6 +147,9 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     private let rootsTableView = NSTableView()
     private let addRootButton = NSButton()
     private let resetRootsButton = NSButton()
+    private let appSearchRootsTableView = NSTableView()
+    private let addAppSearchRootButton = NSButton()
+    private let resetAppSearchRootsButton = NSButton()
     private let indexSizeValueLabel = NSTextField(labelWithString: "")
     private let indexCreatedValueLabel = NSTextField(labelWithString: "")
     private let reindexButton = NSButton()
@@ -155,17 +160,21 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     private var pageViews: [SettingsSection: NSView] = [:]
     private var selectedSection = SettingsSection.general
     private var indexedRoots: [URL] = []
+    private var appSearchRoots: [URL] = []
     private var exclusionPatterns: [String] = []
     private var indexedRootsCardHeightConstraint: NSLayoutConstraint?
+    private var appSearchRootsCardHeightConstraint: NSLayoutConstraint?
     private var indexedRootsCardTopConstraint: NSLayoutConstraint?
     private var exclusionPatternsCardHeightConstraint: NSLayoutConstraint?
     private var indexedFoldersAccessWarningCollapsedHeightConstraint: NSLayoutConstraint?
 
     private static let exclusionPatternFieldIdentifier = NSUserInterfaceItemIdentifier("exclusionPatternField")
     private static let indexedRootPasteboardType = NSPasteboard.PasteboardType("com.allthethings.settings.indexed-root-row")
+    private static let appSearchRootPasteboardType = NSPasteboard.PasteboardType("com.allthethings.settings.app-search-root-row")
     private static let exclusionPatternPasteboardType = NSPasteboard.PasteboardType("com.allthethings.settings.exclusion-pattern-row")
     private static let settingsTableRowHeight: CGFloat = 42
     private static let indexedRootsMaximumVisibleRows = 8
+    private static let appSearchRootsMaximumVisibleRows = 5
     private static let exclusionPatternsMaximumVisibleRows = 10
     private static let diagnosticDetailLevels: [DiagnosticLogLevel] = [.info, .diagnostic]
 
@@ -204,6 +213,12 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
             self,
             selector: #selector(indexedRootsDidChange(_:)),
             name: AppSettings.indexedRootsDidChangeNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appSearchRootsDidChange(_:)),
+            name: AppSettings.appSearchRootsDidChangeNotification,
             object: nil
         )
         NotificationCenter.default.addObserver(
@@ -305,6 +320,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
 
         if selectedSection == .indexedFolders {
             renderIndexedRoots()
+            renderAppSearchRoots()
             renderExclusionPatterns()
         }
     }
@@ -445,6 +461,8 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
 
         configureSwitch(globalHotKeySwitch, action: #selector(toggleGlobalHotKey(_:)))
         configureGlobalHotKeyButton()
+        configureSwitch(globalAppSearchHotKeySwitch, action: #selector(toggleGlobalAppSearchHotKey(_:)))
+        configureGlobalAppSearchHotKeyButton()
         configureSwitch(launchAtLoginSwitch, action: #selector(toggleLaunchAtLogin(_:)))
         configureSwitch(menuBarIconSwitch, action: #selector(toggleMenuBarIcon(_:)))
         configureSwitch(highlightSearchTextSwitch, action: #selector(toggleHighlightSearchText(_:)))
@@ -458,6 +476,11 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
                 title: "Global search hotkey",
                 detail: "Focus the search window from any app.",
                 control: makeGlobalHotKeyControl()
+            ),
+            makeControlRow(
+                title: "Global app search hotkey",
+                detail: "Open search with app: ready to launch applications.",
+                control: makeGlobalAppSearchHotKeyControl()
             ),
             makeControlRow(
                 title: "Launch at login",
@@ -565,6 +588,35 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         let accessWarning = makeIndexedFoldersAccessWarningView()
         let rootsCard = makeIndexedRootsCard()
 
+        let appSearchHeader = NSStackView()
+        appSearchHeader.translatesAutoresizingMaskIntoConstraints = false
+        appSearchHeader.orientation = .horizontal
+        appSearchHeader.alignment = .centerY
+        appSearchHeader.spacing = 8
+
+        let appSearchLabel = makeSectionLabel("Application Search")
+
+        configureIconButton(
+            resetAppSearchRootsButton,
+            symbol: "arrow.counterclockwise",
+            tooltip: "Reset app search folders to defaults",
+            action: #selector(resetAppSearchRoots(_:))
+        )
+        configureAddButton(
+            addAppSearchRootButton,
+            tooltip: "Add app search folder",
+            action: #selector(addAppSearchRoot(_:))
+        )
+
+        let appSearchHeaderSpacer = NSView()
+        appSearchHeaderSpacer.translatesAutoresizingMaskIntoConstraints = false
+        appSearchHeader.addArrangedSubview(appSearchLabel)
+        appSearchHeader.addArrangedSubview(appSearchHeaderSpacer)
+        appSearchHeader.addArrangedSubview(resetAppSearchRootsButton)
+        appSearchHeader.addArrangedSubview(addAppSearchRootButton)
+
+        let appSearchCard = makeAppSearchRootsCard()
+
         let exclusionsHeader = NSStackView()
         exclusionsHeader.translatesAutoresizingMaskIntoConstraints = false
         exclusionsHeader.orientation = .horizontal
@@ -617,6 +669,8 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         contentView.addSubview(rootsHeader)
         contentView.addSubview(accessWarning)
         contentView.addSubview(rootsCard)
+        contentView.addSubview(appSearchHeader)
+        contentView.addSubview(appSearchCard)
         contentView.addSubview(exclusionsHeader)
         contentView.addSubview(exclusionsCard)
 
@@ -654,9 +708,21 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
             rootsCard.leadingAnchor.constraint(equalTo: rootsHeader.leadingAnchor),
             rootsCard.trailingAnchor.constraint(equalTo: rootsHeader.trailingAnchor),
 
-            exclusionsHeader.topAnchor.constraint(equalTo: rootsCard.bottomAnchor, constant: 28),
-            exclusionsHeader.leadingAnchor.constraint(equalTo: rootsCard.leadingAnchor),
-            exclusionsHeader.trailingAnchor.constraint(equalTo: rootsCard.trailingAnchor),
+            appSearchHeader.topAnchor.constraint(equalTo: rootsCard.bottomAnchor, constant: 28),
+            appSearchHeader.leadingAnchor.constraint(equalTo: rootsCard.leadingAnchor),
+            appSearchHeader.trailingAnchor.constraint(equalTo: rootsCard.trailingAnchor),
+            resetAppSearchRootsButton.widthAnchor.constraint(equalToConstant: 28),
+            resetAppSearchRootsButton.heightAnchor.constraint(equalToConstant: 24),
+            addAppSearchRootButton.widthAnchor.constraint(equalToConstant: 74),
+            addAppSearchRootButton.heightAnchor.constraint(equalToConstant: 30),
+
+            appSearchCard.topAnchor.constraint(equalTo: appSearchHeader.bottomAnchor, constant: 10),
+            appSearchCard.leadingAnchor.constraint(equalTo: appSearchHeader.leadingAnchor),
+            appSearchCard.trailingAnchor.constraint(equalTo: appSearchHeader.trailingAnchor),
+
+            exclusionsHeader.topAnchor.constraint(equalTo: appSearchCard.bottomAnchor, constant: 28),
+            exclusionsHeader.leadingAnchor.constraint(equalTo: appSearchCard.leadingAnchor),
+            exclusionsHeader.trailingAnchor.constraint(equalTo: appSearchCard.trailingAnchor),
             exclusionHelpButton.widthAnchor.constraint(equalToConstant: 20),
             exclusionHelpButton.heightAnchor.constraint(equalToConstant: 20),
             resetExclusionsButton.widthAnchor.constraint(equalToConstant: 28),
@@ -665,8 +731,8 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
             addExclusionButton.heightAnchor.constraint(equalToConstant: 30),
 
             exclusionsCard.topAnchor.constraint(equalTo: exclusionsHeader.bottomAnchor, constant: 10),
-            exclusionsCard.leadingAnchor.constraint(equalTo: rootsCard.leadingAnchor),
-            exclusionsCard.trailingAnchor.constraint(equalTo: rootsCard.trailingAnchor),
+            exclusionsCard.leadingAnchor.constraint(equalTo: appSearchCard.leadingAnchor),
+            exclusionsCard.trailingAnchor.constraint(equalTo: appSearchCard.trailingAnchor),
             exclusionsCard.bottomAnchor.constraint(lessThanOrEqualTo: contentView.bottomAnchor, constant: -24),
             contentBottomConstraint
         ])
@@ -847,27 +913,52 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     }
 
     private func configureGlobalHotKeyButton() {
-        changeGlobalHotKeyButton.translatesAutoresizingMaskIntoConstraints = false
-        changeGlobalHotKeyButton.bezelStyle = .rounded
-        changeGlobalHotKeyButton.target = self
-        changeGlobalHotKeyButton.action = #selector(changeGlobalHotKey(_:))
-        changeGlobalHotKeyButton.toolTip = "Change global search hotkey"
-        changeGlobalHotKeyButton.setContentHuggingPriority(.required, for: .horizontal)
-        changeGlobalHotKeyButton.setContentCompressionResistancePriority(.required, for: .horizontal)
+        configureHotKeyButton(
+            changeGlobalHotKeyButton,
+            action: #selector(changeGlobalHotKey(_:)),
+            tooltip: "Change global search hotkey"
+        )
+    }
+
+    private func configureGlobalAppSearchHotKeyButton() {
+        configureHotKeyButton(
+            changeGlobalAppSearchHotKeyButton,
+            action: #selector(changeGlobalAppSearchHotKey(_:)),
+            tooltip: "Change global app search hotkey"
+        )
+    }
+
+    private func configureHotKeyButton(_ button: NSButton, action: Selector, tooltip: String) {
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.bezelStyle = .rounded
+        button.target = self
+        button.action = action
+        button.toolTip = tooltip
+        button.setContentHuggingPriority(.required, for: .horizontal)
+        button.setContentCompressionResistancePriority(.required, for: .horizontal)
     }
 
     private func makeGlobalHotKeyControl() -> NSView {
         let stack = NSStackView(views: [globalHotKeySwitch, changeGlobalHotKeyButton])
+        configureHotKeyControlStack(stack, button: changeGlobalHotKeyButton)
+        return stack
+    }
+
+    private func makeGlobalAppSearchHotKeyControl() -> NSView {
+        let stack = NSStackView(views: [globalAppSearchHotKeySwitch, changeGlobalAppSearchHotKeyButton])
+        configureHotKeyControlStack(stack, button: changeGlobalAppSearchHotKeyButton)
+        return stack
+    }
+
+    private func configureHotKeyControlStack(_ stack: NSStackView, button: NSButton) {
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.orientation = .horizontal
         stack.alignment = .centerY
         stack.spacing = 10
 
         NSLayoutConstraint.activate([
-            changeGlobalHotKeyButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 116)
+            button.widthAnchor.constraint(greaterThanOrEqualToConstant: 116)
         ])
-
-        return stack
     }
 
     private func configureFullDiskAccessButtons() {
@@ -1114,6 +1205,42 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         return card
     }
 
+    private func makeAppSearchRootsCard() -> NSView {
+        let card = makeCard()
+
+        let scrollView = NSScrollView()
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.borderType = .noBorder
+        scrollView.drawsBackground = false
+
+        configureSettingsTable(
+            appSearchRootsTableView,
+            pasteboardType: Self.appSearchRootPasteboardType,
+            columnIdentifier: IndexedRootCellView.identifier
+        )
+
+        scrollView.documentView = appSearchRootsTableView
+        let heightConstraint = card.heightAnchor.constraint(equalToConstant: Self.tableCardHeight(
+            itemCount: appSearchRoots.count,
+            maximumVisibleRows: Self.appSearchRootsMaximumVisibleRows
+        ))
+        appSearchRootsCardHeightConstraint = heightConstraint
+
+        card.addSubview(scrollView)
+        NSLayoutConstraint.activate([
+            scrollView.topAnchor.constraint(equalTo: card.topAnchor),
+            scrollView.leadingAnchor.constraint(equalTo: card.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: card.trailingAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: card.bottomAnchor),
+            heightConstraint
+        ])
+
+        return card
+    }
+
     private func makeExclusionPatternsCard() -> NSView {
         let card = makeCard()
 
@@ -1237,6 +1364,12 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         updateIndexSummary()
     }
 
+    private func renderAppSearchRoots() {
+        appSearchRoots = AppSettings.appSearchRoots(defaults: defaults)
+        appSearchRootsTableView.reloadData()
+        updateIndexedFolderCardHeights()
+    }
+
     private func renderExclusionPatterns() {
         exclusionPatterns = AppSettings.exclusionPatterns(defaults: defaults)
         exclusionsTableView.reloadData()
@@ -1247,6 +1380,10 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         indexedRootsCardHeightConstraint?.constant = Self.tableCardHeight(
             itemCount: indexedRoots.count,
             maximumVisibleRows: Self.indexedRootsMaximumVisibleRows
+        )
+        appSearchRootsCardHeightConstraint?.constant = Self.tableCardHeight(
+            itemCount: appSearchRoots.count,
+            maximumVisibleRows: Self.appSearchRootsMaximumVisibleRows
         )
         exclusionPatternsCardHeightConstraint?.constant = Self.tableCardHeight(
             itemCount: exclusionPatterns.count,
@@ -1302,6 +1439,10 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
             return indexedRoots.isEmpty ? 1 : indexedRoots.count
         }
 
+        if tableView === appSearchRootsTableView {
+            return appSearchRoots.isEmpty ? 1 : appSearchRoots.count
+        }
+
         if tableView === exclusionsTableView {
             return exclusionPatterns.isEmpty ? 1 : exclusionPatterns.count
         }
@@ -1329,6 +1470,25 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
                 index: row,
                 target: self,
                 removeAction: #selector(removeIndexedRoot(_:))
+            )
+            return cell
+        }
+
+        if tableView === appSearchRootsTableView {
+            guard !appSearchRoots.isEmpty else {
+                let view = EmptyListCellView()
+                view.messageLabel.stringValue = "No app search folders"
+                return view
+            }
+
+            guard row >= 0, row < appSearchRoots.count else { return nil }
+
+            let cell = IndexedRootCellView()
+            cell.configure(
+                root: appSearchRoots[row],
+                index: row,
+                target: self,
+                removeAction: #selector(removeAppSearchRoot(_:))
             )
             return cell
         }
@@ -1361,7 +1521,14 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         _ tableView: NSTableView,
         pasteboardWriterForRow row: Int
     ) -> NSPasteboardWriting? {
-        let count = tableView === rootsTableView ? indexedRoots.count : exclusionPatterns.count
+        let count: Int
+        if tableView === rootsTableView {
+            count = indexedRoots.count
+        } else if tableView === appSearchRootsTableView {
+            count = appSearchRoots.count
+        } else {
+            count = exclusionPatterns.count
+        }
         guard row >= 0, row < count else { return nil }
 
         let item = NSPasteboardItem()
@@ -1400,6 +1567,10 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
             return moveIndexedRoot(from: sourceIndex, to: proposedRow)
         }
 
+        if tableView === appSearchRootsTableView {
+            return moveAppSearchRoot(from: sourceIndex, to: proposedRow)
+        }
+
         if tableView === exclusionsTableView {
             return moveExclusionPattern(from: sourceIndex, to: proposedRow)
         }
@@ -1408,7 +1579,13 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     }
 
     private func pasteboardType(for tableView: NSTableView) -> NSPasteboard.PasteboardType {
-        tableView === rootsTableView ? Self.indexedRootPasteboardType : Self.exclusionPatternPasteboardType
+        if tableView === rootsTableView {
+            return Self.indexedRootPasteboardType
+        }
+        if tableView === appSearchRootsTableView {
+            return Self.appSearchRootPasteboardType
+        }
+        return Self.exclusionPatternPasteboardType
     }
 
     private func moveIndexedRoot(from sourceIndex: Int, to proposedRow: Int) -> Bool {
@@ -1426,6 +1603,24 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         indexedRoots.insert(root, at: destinationIndex)
         AppSettings.saveIndexedRoots(indexedRoots, defaults: defaults)
         renderIndexedRoots()
+        return true
+    }
+
+    private func moveAppSearchRoot(from sourceIndex: Int, to proposedRow: Int) -> Bool {
+        guard sourceIndex >= 0, sourceIndex < appSearchRoots.count else { return false }
+
+        var destinationIndex = min(max(proposedRow, 0), appSearchRoots.count)
+        guard destinationIndex != sourceIndex && destinationIndex != sourceIndex + 1 else {
+            return false
+        }
+
+        let root = appSearchRoots.remove(at: sourceIndex)
+        if destinationIndex > sourceIndex {
+            destinationIndex -= 1
+        }
+        appSearchRoots.insert(root, at: destinationIndex)
+        AppSettings.saveAppSearchRoots(appSearchRoots, defaults: defaults)
+        renderAppSearchRoots()
         return true
     }
 
@@ -1456,6 +1651,10 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         globalHotKeySwitch.state = globalHotKeyEnabled ? .on : .off
         changeGlobalHotKeyButton.title = AppSettings.globalSearchHotKey(defaults: defaults).displayString
         changeGlobalHotKeyButton.isEnabled = true
+        let globalAppSearchHotKeyEnabled = AppSettings.globalAppSearchHotKeyEnabled(defaults: defaults)
+        globalAppSearchHotKeySwitch.state = globalAppSearchHotKeyEnabled ? .on : .off
+        changeGlobalAppSearchHotKeyButton.title = AppSettings.globalAppSearchHotKey(defaults: defaults).displayString
+        changeGlobalAppSearchHotKeyButton.isEnabled = true
         launchAtLoginSwitch.state = LaunchAtLoginController.isEnabled ? .on : .off
         menuBarIconSwitch.state = AppSettings.menuBarIconEnabled(defaults: defaults) ? .on : .off
         highlightSearchTextSwitch.state = defaults.bool(forKey: AppSettings.highlightSearchTextKey) ? .on : .off
@@ -1698,6 +1897,121 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         updateControls()
     }
 
+    @objc private func toggleGlobalAppSearchHotKey(_ sender: NSSwitch) {
+        let hotKey = AppSettings.globalAppSearchHotKey(defaults: defaults)
+        guard sender.state == .on else {
+            saveGlobalAppSearchHotKey(enabled: false, hotKey: hotKey)
+            return
+        }
+
+        confirmGlobalAppSearchHotKeyChange(hotKey) { [weak self] didConfirm in
+            guard let self else { return }
+            if didConfirm {
+                self.saveGlobalAppSearchHotKey(enabled: true, hotKey: hotKey)
+            } else {
+                self.updateControls()
+            }
+        }
+    }
+
+    @objc private func changeGlobalAppSearchHotKey(_ sender: NSButton) {
+        let recorder = HotKeyRecorderView()
+        let alert = NSAlert()
+        alert.messageText = "Change global app search hotkey"
+        alert.informativeText = "Press a shortcut with a non-modifier key and at least one modifier."
+        alert.accessoryView = recorder
+        let saveButton = alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        saveButton.isEnabled = false
+        alert.window.initialFirstResponder = recorder
+
+        recorder.onChange = { hotKey in
+            saveButton.isEnabled = hotKey != nil
+        }
+        recorder.onCancel = { [weak alert] in
+            guard let window = alert?.window else { return }
+            if let sheetParent = window.sheetParent {
+                sheetParent.endSheet(window, returnCode: .cancel)
+            } else {
+                NSApp.stopModal(withCode: .cancel)
+                window.orderOut(nil)
+            }
+        }
+
+        let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard
+                response == .alertFirstButtonReturn,
+                let self,
+                let hotKey = recorder.recordedHotKey
+            else {
+                self?.updateControls()
+                return
+            }
+
+            guard
+                !AppSettings.globalAppSearchHotKeyEnabled(defaults: self.defaults)
+                    || hotKey != AppSettings.globalAppSearchHotKey(defaults: self.defaults)
+            else {
+                self.updateControls()
+                return
+            }
+
+            self.confirmGlobalAppSearchHotKeyChange(hotKey) { [weak self] didConfirm in
+                guard let self else { return }
+                if didConfirm {
+                    self.saveGlobalAppSearchHotKey(enabled: true, hotKey: hotKey)
+                } else {
+                    self.updateControls()
+                }
+            }
+        }
+
+        if let window = view.window {
+            alert.beginSheetModal(for: window, completionHandler: completion)
+            DispatchQueue.main.async {
+                alert.window.makeFirstResponder(recorder)
+            }
+        } else {
+            DispatchQueue.main.async {
+                alert.window.makeFirstResponder(recorder)
+            }
+            completion(alert.runModal())
+        }
+    }
+
+    private func confirmGlobalAppSearchHotKeyChange(_ hotKey: GlobalHotKey, completion: @escaping (Bool) -> Void) {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "Use \(hotKey.displayString) as the global app search hotkey?"
+        alert.informativeText = "AllTheThings will claim this shortcut system-wide while it is running and use it to open search with app: ready. If another app or macOS feature already uses this shortcut, choose a different one instead."
+        alert.addButton(withTitle: "Use Shortcut")
+        alert.addButton(withTitle: "Cancel")
+
+        let handler: (NSApplication.ModalResponse) -> Void = { response in
+            completion(response == .alertFirstButtonReturn)
+        }
+
+        if let window = view.window {
+            alert.beginSheetModal(for: window, completionHandler: handler)
+        } else {
+            handler(alert.runModal())
+        }
+    }
+
+    private func saveGlobalAppSearchHotKey(enabled: Bool, hotKey: GlobalHotKey) {
+        do {
+            if let appDelegate = NSApp.delegate as? AppDelegate {
+                try appDelegate.saveGlobalAppSearchHotKey(enabled: enabled, hotKey: hotKey)
+            } else {
+                AppSettings.saveGlobalAppSearchHotKey(enabled: enabled, hotKey: hotKey, defaults: defaults)
+            }
+        } catch {
+            presentError("Could not register global app search hotkey.", informativeText: error.localizedDescription)
+        }
+
+        updateControls()
+    }
+
     private func presentError(_ message: String, informativeText: String) {
         let alert = NSAlert()
         alert.alertStyle = .warning
@@ -1788,6 +2102,51 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
 
     @objc private func indexedRootsDidChange(_ notification: Notification) {
         renderIndexedRoots()
+    }
+
+    @objc private func addAppSearchRoot(_ sender: NSButton) {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = true
+        panel.prompt = "Add"
+
+        let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard response == .OK, let self else { return }
+
+            var roots = AppSettings.appSearchRoots(defaults: self.defaults)
+            var existing = Set(roots.map { $0.standardizedFileURL.path })
+
+            for url in panel.urls.map(\.standardizedFileURL) where existing.insert(url.path).inserted {
+                roots.append(url)
+            }
+
+            AppSettings.saveAppSearchRoots(roots, defaults: self.defaults)
+            self.renderAppSearchRoots()
+        }
+
+        if let window = view.window {
+            panel.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            completion(panel.runModal())
+        }
+    }
+
+    @objc private func removeAppSearchRoot(_ sender: NSButton) {
+        guard sender.tag >= 0, sender.tag < appSearchRoots.count else { return }
+
+        appSearchRoots.remove(at: sender.tag)
+        AppSettings.saveAppSearchRoots(appSearchRoots, defaults: defaults)
+        renderAppSearchRoots()
+    }
+
+    @objc private func resetAppSearchRoots(_ sender: NSButton) {
+        AppSettings.resetAppSearchRoots(defaults: defaults)
+        renderAppSearchRoots()
+    }
+
+    @objc private func appSearchRootsDidChange(_ notification: Notification) {
+        renderAppSearchRoots()
     }
 
     @objc private func addExclusionPattern(_ sender: NSButton) {

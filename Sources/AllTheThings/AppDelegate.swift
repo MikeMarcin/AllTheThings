@@ -20,9 +20,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var aboutWindowController: NSWindowController?
     private var noticesWindowController: NSWindowController?
     private var globalHotKeyController: GlobalHotKeyController?
+    private var globalAppSearchHotKeyController: GlobalHotKeyController?
     private var statusItem: NSStatusItem?
     private var statusMenu: NSMenu?
     private var didPresentGlobalHotKeyRegistrationError = false
+    private var didPresentGlobalAppSearchHotKeyRegistrationError = false
 
     override init() {
         AppSettings.registerDefaults(defaults)
@@ -44,6 +46,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self,
             selector: #selector(globalSearchHotKeyDidChange(_:)),
             name: AppSettings.globalSearchHotKeyDidChangeNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(globalAppSearchHotKeyDidChange(_:)),
+            name: AppSettings.globalAppSearchHotKeyDidChangeNotification,
             object: nil
         )
         NotificationCenter.default.addObserver(
@@ -97,7 +105,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
         fileIndex.recordAppLaunch(appVersion: Self.appVersionString)
         let window = launchedAsLoginItem ? nil : showPrimaryWindow(activate: true)
-        configureGlobalHotKey(presentsErrors: !launchedAsLoginItem)
+        configureGlobalHotKeys(presentsErrors: !launchedAsLoginItem)
         if !launchedAsLoginItem {
             ReleaseUpdater.shared.checkAutomaticallyIfNeeded(presentingWindow: window)
         }
@@ -214,14 +222,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @MainActor
-    private func configureGlobalHotKey(presentsErrors: Bool = false) {
-        let controller = GlobalHotKeyController { [weak self] in
+    func saveGlobalAppSearchHotKey(enabled: Bool, hotKey: GlobalHotKey) throws {
+        try globalAppSearchHotKeyController?.configure(isEnabled: enabled, hotKey: hotKey)
+        AppSettings.saveGlobalAppSearchHotKey(enabled: enabled, hotKey: hotKey, defaults: defaults)
+    }
+
+    @MainActor
+    private func configureGlobalHotKeys(presentsErrors: Bool = false) {
+        globalHotKeyController = GlobalHotKeyController(hotKeyIDValue: 1) { [weak self] in
             Task { @MainActor in
                 self?.focusSearchFromHotKey()
             }
         }
-        globalHotKeyController = controller
+        globalAppSearchHotKeyController = GlobalHotKeyController(hotKeyIDValue: 2) { [weak self] in
+            Task { @MainActor in
+                self?.focusAppSearchFromHotKey()
+            }
+        }
+
         applyGlobalHotKeySettings(presentsErrors: presentsErrors)
+        applyGlobalAppSearchHotKeySettings(presentsErrors: presentsErrors)
     }
 
     @MainActor
@@ -240,6 +260,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 presentGlobalHotKeyRegistrationError(error)
             } else {
                 NSLog("AllTheThings could not register global search hotkey: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    @MainActor
+    private func applyGlobalAppSearchHotKeySettings(presentsErrors: Bool = false) {
+        if AppSettings.globalAppSearchHotKeyNeedsConfirmation(defaults: defaults) {
+            return
+        }
+
+        do {
+            try globalAppSearchHotKeyController?.configure(
+                isEnabled: AppSettings.globalAppSearchHotKeyEnabled(defaults: defaults),
+                hotKey: AppSettings.globalAppSearchHotKey(defaults: defaults)
+            )
+        } catch {
+            if presentsErrors {
+                presentGlobalAppSearchHotKeyRegistrationError(error)
+            } else {
+                NSLog("AllTheThings could not register global app search hotkey: \(error.localizedDescription)")
             }
         }
     }
@@ -264,9 +304,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @MainActor
+    private func presentGlobalAppSearchHotKeyRegistrationError(_ error: Error) {
+        guard !didPresentGlobalAppSearchHotKeyRegistrationError else { return }
+        didPresentGlobalAppSearchHotKeyRegistrationError = true
+
+        let hotKey = AppSettings.globalAppSearchHotKey(defaults: defaults)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Global app search hotkey conflict"
+        alert.informativeText = "\(error.localizedDescription)\n\nAllTheThings did not claim \(hotKey.displayString). Open Settings to choose a different shortcut or disable the global app search hotkey."
+        alert.addButton(withTitle: "OK")
+
+        if let window = windowController?.window {
+            alert.beginSheetModal(for: window)
+        } else {
+            alert.runModal()
+        }
+    }
+
+    @MainActor
     private func focusSearchFromHotKey() {
         _ = showPrimaryWindow(activate: true)
         windowController?.focusSearchField(selectText: true)
+    }
+
+    @MainActor
+    private func focusAppSearchFromHotKey() {
+        _ = showPrimaryWindow(activate: true)
+        windowController?.focusSearchField(prefill: "app:")
     }
 
     @objc @MainActor private func toggleLaunchAtLoginFromStatusItem(_ sender: Any?) {
@@ -313,6 +378,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc @MainActor private func applyGlobalHotKeySettingsFromNotification() {
         applyGlobalHotKeySettings()
+    }
+
+    @objc private func globalAppSearchHotKeyDidChange(_ notification: Notification) {
+        performSelector(onMainThread: #selector(applyGlobalAppSearchHotKeySettingsFromNotification), with: nil, waitUntilDone: false)
+    }
+
+    @objc @MainActor private func applyGlobalAppSearchHotKeySettingsFromNotification() {
+        applyGlobalAppSearchHotKeySettings()
     }
 
     @objc private func menuBarIconDidChange(_ notification: Notification) {

@@ -7872,7 +7872,7 @@ public final class FileIndex: @unchecked Sendable {
         case .fileExtension:
             primary = ordered(lhs.fileExtension, rhs.fileExtension)
         case .kind:
-            primary = ordered(lhs.isDirectory ? "Folder" : "File", rhs.isDirectory ? "Folder" : "File")
+            primary = ordered(kindName(for: lhs), kindName(for: rhs))
         case .volume:
             primary = ordered(lhs.volumeName, rhs.volumeName)
         case .root:
@@ -7888,6 +7888,10 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         return lhs.path < rhs.path
+    }
+
+    private static func kindName<Record: SearchRecordReadable>(for record: Record) -> String {
+        record.isDirectory && record.fileExtension == "app" ? "Application" : (record.isDirectory ? "Folder" : "File")
     }
 
     private static func diagnosticRebuildModeString(_ mode: RebuildMode) -> String {
