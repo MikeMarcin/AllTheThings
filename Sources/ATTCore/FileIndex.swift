@@ -6352,9 +6352,10 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     private static func directoryEntryName(_ entry: UnsafeMutablePointer<dirent>) -> String {
-        withUnsafePointer(to: entry.pointee.d_name) { pointer in
-            pointer.withMemoryRebound(to: CChar.self, capacity: Int(entry.pointee.d_namlen) + 1) { namePointer in
-                String(cString: namePointer)
+        let byteCount = Int(entry.pointee.d_namlen)
+        return withUnsafePointer(to: entry.pointee.d_name) { pointer in
+            pointer.withMemoryRebound(to: UInt8.self, capacity: max(byteCount, 1)) { bytes in
+                String(decoding: UnsafeBufferPointer(start: bytes, count: byteCount), as: UTF8.self)
             }
         }
     }

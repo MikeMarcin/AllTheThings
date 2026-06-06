@@ -1,4 +1,5 @@
 import ATTCore
+import Dispatch
 import Foundation
 import Testing
 
@@ -203,5 +204,62 @@ struct FileExclusionRulesTests {
                 isDirectory: false
             ) == .prune)
         }
+    }
+
+    @Test("rule decisions are safe under concurrent scanner workers")
+    func ruleDecisionsAreSafeUnderConcurrentScannerWorkers() {
+        let root = "/tmp/project"
+        let rules = FileExclusionRules(patterns: FileExclusionRules.defaultPatterns + [
+            "*",
+            "!*/",
+            "!*.swift",
+            "!Package.swift",
+            "Generated/",
+            "!Generated/Keep.swift",
+            "Vendor/**/Build/"
+        ])
+        let samples: [(path: String, isDirectory: Bool, expected: FileExclusionRules.Decision)] = [
+            ("/tmp/project/Sources/App.swift", false, .index),
+            ("/tmp/project/Sources/Feature/Subfeature/ViewModel.swift", false, .index),
+            ("/tmp/project/Sources/Feature/Subfeature/README.md", false, .prune),
+            ("/tmp/project/Package.swift", false, .index),
+            ("/tmp/project/Generated", true, .skipButDescend),
+            ("/tmp/project/Generated/Keep.swift", false, .index),
+            ("/tmp/project/Generated/Drop.swift", false, .prune),
+            ("/tmp/project/Vendor/Library/Build", true, .prune),
+            ("/tmp/project/node_modules/react/index.js", false, .prune)
+        ]
+        let recorder = ConcurrentMismatchRecorder()
+
+        DispatchQueue.concurrentPerform(iterations: 2_000) { iteration in
+            let sample = samples[iteration % samples.count]
+            let decision = rules.decision(
+                url: URL(fileURLWithPath: sample.path),
+                roots: [root],
+                isDirectory: sample.isDirectory
+            )
+            if decision != sample.expected {
+                recorder.append("\(sample.path): expected \(sample.expected), got \(decision)")
+            }
+        }
+
+        #expect(recorder.messages.isEmpty)
+    }
+}
+
+private final class ConcurrentMismatchRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedMessages: [String] = []
+
+    var messages: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedMessages
+    }
+
+    func append(_ message: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        storedMessages.append(message)
     }
 }
