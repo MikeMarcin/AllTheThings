@@ -42,6 +42,9 @@ public struct FileExclusionRules: @unchecked Sendable {
 
     public let patterns: [String]
     private let rules: [Rule]
+    // FileIndex copies this value into concurrent scan workers; the reference lock keeps
+    // those copies coordinated while they share Rule instances and regex matchers.
+    private let decisionLock = NSLock()
 
     public enum Decision: Sendable, Equatable {
         case index
@@ -71,6 +74,10 @@ public struct FileExclusionRules: @unchecked Sendable {
         let path = standardized.path
         let relativePaths = Self.relativePaths(for: path, roots: roots)
         let effectiveIsDirectory = isDirectory ?? standardized.hasDirectoryPath
+
+        decisionLock.lock()
+        defer { decisionLock.unlock() }
+
         var excluded = false
         var finalMatchingRuleIndex: Int?
         var finalMatchingRule: Rule?
