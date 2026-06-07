@@ -58,6 +58,91 @@ struct ApplicationSearchCatalogTests {
         #expect(response.results.first?.match != nil)
     }
 
+    @Test("metadata aliases rank vscode before xcode")
+    func metadataAliasesRankVSCodeBeforeXcode() throws {
+        let fixture = try AppCatalogFixture()
+        defer { fixture.remove() }
+
+        _ = try fixture.makeApp("Xcode.app", infoPlist: [
+            "CFBundleIdentifier": "com.apple.dt.Xcode",
+            "CFBundleName": "Xcode",
+            "CFBundleExecutable": "Xcode"
+        ])
+        _ = try fixture.makeApp("Visual Studio Code.app", infoPlist: [
+            "CFBundleIdentifier": "com.microsoft.VSCode",
+            "CFBundleURLTypes": [[
+                "CFBundleURLName": "Visual Studio Code",
+                "CFBundleURLSchemes": ["vscode"]
+            ]],
+            "CFBundleDisplayName": "Code",
+            "CFBundleName": "Code",
+            "CFBundleExecutable": "Code"
+        ])
+
+        let vscodeResponse = try #require(ApplicationSearchCatalog().search(
+            queryText: "vscode",
+            roots: [fixture.root],
+            sort: SortSpec(column: .name, ascending: true),
+            maxResults: 100
+        ))
+        #expect(vscodeResponse.results.first?.record.name == "Visual Studio Code.app")
+        #expect(vscodeResponse.results.first?.match?.matchClass == .alias)
+
+        let compactAliasResponse = try #require(ApplicationSearchCatalog().search(
+            queryText: "vsc",
+            roots: [fixture.root],
+            sort: SortSpec(column: .name, ascending: true),
+            maxResults: 100
+        ))
+        #expect(compactAliasResponse.results.first?.record.name == "Visual Studio Code.app")
+        #expect(compactAliasResponse.results.first?.match?.matchClass == .alias)
+
+        let xcodeResponse = try #require(ApplicationSearchCatalog().search(
+            queryText: "xcode",
+            roots: [fixture.root],
+            sort: SortSpec(column: .name, ascending: true),
+            maxResults: 100
+        ))
+        #expect(xcodeResponse.results.first?.record.name == "Xcode.app")
+        #expect(xcodeResponse.results.first?.match?.matchClass == .exact)
+    }
+
+    @Test("app basename exact match beats metadata alias")
+    func appBasenameExactMatchBeatsMetadataAlias() throws {
+        let fixture = try AppCatalogFixture()
+        defer { fixture.remove() }
+
+        _ = try fixture.makeApp("VLC.app", infoPlist: [
+            "CFBundleIdentifier": "org.videolan.vlc",
+            "CFBundleName": "VLC",
+            "CFBundleExecutable": "VLC",
+            "CFBundleURLTypes": [[
+                "CFBundleURLName": "VLC",
+                "CFBundleURLSchemes": ["vlc"]
+            ]]
+        ])
+
+        let response = try #require(ApplicationSearchCatalog().search(
+            queryText: "VLC",
+            roots: [fixture.root],
+            sort: SortSpec(column: .name, ascending: true),
+            maxResults: 100
+        ))
+
+        #expect(response.results.first?.record.name == "VLC.app")
+        #expect(response.results.first?.match?.matchClass == .exact)
+
+        let prefixResponse = try #require(ApplicationSearchCatalog().search(
+            queryText: "v",
+            roots: [fixture.root],
+            sort: SortSpec(column: .name, ascending: true),
+            maxResults: 100
+        ))
+
+        #expect(prefixResponse.results.first?.record.name == "VLC.app")
+        #expect(prefixResponse.results.first?.match?.matchClass == .prefix)
+    }
+
     @Test("configured app bundle root is searchable")
     func configuredAppBundleRootIsSearchable() throws {
         let fixture = try AppCatalogFixture()
@@ -86,13 +171,21 @@ private struct AppCatalogFixture {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     }
 
-    func makeApp(_ relativePath: String) throws -> URL {
+    func makeApp(_ relativePath: String, infoPlist: [String: Any]? = nil) throws -> URL {
         let app = root.appendingPathComponent(relativePath, isDirectory: true)
         try makeDirectory(relativePath)
-        try fileManager.createDirectory(
-            at: app.appendingPathComponent("Contents", isDirectory: true),
-            withIntermediateDirectories: true
-        )
+        let contents = app.appendingPathComponent("Contents", isDirectory: true)
+        try fileManager.createDirectory(at: contents, withIntermediateDirectories: true)
+
+        if let infoPlist {
+            let data = try PropertyListSerialization.data(
+                fromPropertyList: infoPlist,
+                format: .xml,
+                options: 0
+            )
+            try data.write(to: contents.appendingPathComponent("Info.plist", isDirectory: false))
+        }
+
         return app
     }
 

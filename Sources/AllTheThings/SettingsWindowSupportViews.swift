@@ -10,7 +10,7 @@ final class MatchColorPaletteControl: NSView {
     private var colorWells: [MatchClass: NSColorWell] = [:]
     private var isDark = false
 
-    private static let matchClasses: [MatchClass] = [.exact, .prefix, .substring, .near, .weakPath, .metadata]
+    private static let matchClasses: [MatchClass] = [.alias, .exact, .prefix, .substring, .near, .weakPath, .metadata]
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -75,6 +75,7 @@ final class MatchColorPaletteControl: NSView {
 
     private static func label(for matchClass: MatchClass) -> String {
         switch matchClass {
+        case .alias: "Alias"
         case .exact: "Exact"
         case .prefix: "Prefix"
         case .substring: "Text"
