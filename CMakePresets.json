@@ -39,6 +39,14 @@
             ]
         },
         {
+            "name": "safety-check",
+            "displayName": "Run Native Safety Checks",
+            "configurePreset": "default",
+            "targets": [
+                "safety-check"
+            ]
+        },
+        {
             "name": "run",
             "displayName": "Run Release App",
             "configurePreset": "default",

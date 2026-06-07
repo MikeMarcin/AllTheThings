@@ -1,4 +1,5 @@
 @testable import ATTCore
+import Darwin
 import Foundation
 import Testing
 
@@ -1232,6 +1233,52 @@ struct FileIndexTests {
                 && added.results.contains { $0.record.path == addedFile.path }
                 && retained.results.contains { $0.record.path == retainedFile.path }
         }
+    }
+
+    @Test("directory entry decoding reads only record name bytes")
+    func directoryEntryDecodingReadsOnlyRecordNameBytes() throws {
+        let pageSize = Int(sysconf(Int32(_SC_PAGESIZE)))
+        let mappingSize = pageSize * 2
+        let mappingPointer = mmap(nil, mappingSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0)
+        guard let mappingPointer, mappingPointer != MAP_FAILED else {
+            Issue.record("mmap failed with errno \(errno)")
+            return
+        }
+        defer {
+            munmap(mappingPointer, mappingSize)
+        }
+
+        guard mprotect(mappingPointer.advanced(by: pageSize), pageSize, PROT_NONE) == 0 else {
+            Issue.record("mprotect failed with errno \(errno)")
+            return
+        }
+
+        let recordLengthOffset = try #require(MemoryLayout<dirent>.offset(of: \.d_reclen))
+        let nameLengthOffset = try #require(MemoryLayout<dirent>.offset(of: \.d_namlen))
+        let typeOffset = try #require(MemoryLayout<dirent>.offset(of: \.d_type))
+        let nameOffset = try #require(MemoryLayout<dirent>.offset(of: \.d_name))
+        let nameBytes = Array("BoundaryName.swiftx".utf8)
+        let entryStartOffset = pageSize - nameOffset - nameBytes.count
+        let entryPointer = mappingPointer.advanced(by: entryStartOffset)
+        entryPointer.storeBytes(
+            of: UInt16(nameOffset + nameBytes.count),
+            toByteOffset: recordLengthOffset,
+            as: UInt16.self
+        )
+        entryPointer.storeBytes(
+            of: UInt16(nameBytes.count),
+            toByteOffset: nameLengthOffset,
+            as: UInt16.self
+        )
+        entryPointer.storeBytes(of: UInt8(DT_DIR), toByteOffset: typeOffset, as: UInt8.self)
+        UnsafeMutableRawBufferPointer(
+            start: entryPointer.advanced(by: nameOffset),
+            count: nameBytes.count
+        ).copyBytes(from: nameBytes)
+
+        let decoded = try #require(FileIndex.directoryEntryInfo(entryPointer.assumingMemoryBound(to: dirent.self)))
+        #expect(decoded.name == "BoundaryName.swiftx")
+        #expect(decoded.isDirectory)
     }
 
     @Test("visible bitset hides descendants of hidden parent rows")

@@ -114,6 +114,28 @@
             "problemMatcher": "$gcc"
         },
         {
+            "label": "CMake: Run Native Safety Checks",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--build",
+                "--preset",
+                "safety-check"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "dependsOn": "CMake: Configure",
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "clear": true,
+                "showReuseMessage": false
+            },
+            "group": "test",
+            "problemMatcher": "$gcc"
+        },
+        {
             "label": "CMake: Clean App Bundles",
             "type": "shell",
             "command": "cmake",
