@@ -1936,16 +1936,17 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             return
         }
 
-        let label = matchLabel(for: explanation.matchClass)
+        let presentation = matchPresentation(for: explanation)
         let color = matchColor(for: explanation.quality)
         let placard = MatchPlacard(
-            title: "\(label) match",
-            scoreText: "Score \(explanation.score.formatted())",
+            title: presentation.title,
+            scoreText: presentation.scoreText,
+            detail: presentation.detail,
             reason: explanation.reason,
             color: color
         )
         cell.configure(
-            icon: matchIcon(for: explanation.matchClass, accessibilityDescription: label),
+            icon: matchIcon(for: presentation.iconClass, accessibilityDescription: presentation.label),
             color: color,
             placard: placard
         )
@@ -3495,6 +3496,36 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         case .weakPath: "Path"
         case .metadata: "Meta"
         }
+    }
+
+    private struct MatchPresentation {
+        let label: String
+        let title: String
+        let scoreText: String
+        let detail: String?
+        let iconClass: MatchClass
+    }
+
+    private func matchPresentation(for explanation: MatchExplanation) -> MatchPresentation {
+        let label = matchLabel(for: explanation.matchClass)
+        if explanation.isAliasDerived {
+            let sourceLabel = "Alias \(label.lowercased())"
+            return MatchPresentation(
+                label: sourceLabel,
+                title: "\(sourceLabel) match",
+                scoreText: "Ranks as \(label) - Score \(explanation.score.formatted())",
+                detail: "Matched app metadata, not the visible bundle name.",
+                iconClass: .alias
+            )
+        }
+
+        return MatchPresentation(
+            label: label,
+            title: "\(label) match",
+            scoreText: "Score \(explanation.score.formatted())",
+            detail: nil,
+            iconClass: explanation.matchClass
+        )
     }
 
     private func matchIcon(for matchClass: MatchClass, accessibilityDescription: String) -> NSImage? {

@@ -58,8 +58,8 @@ struct ApplicationSearchCatalogTests {
         #expect(response.results.first?.match != nil)
     }
 
-    @Test("metadata aliases rank vscode before xcode")
-    func metadataAliasesRankVSCodeBeforeXcode() throws {
+    @Test("metadata aliases classify by matched shape and rank vscode before xcode")
+    func metadataAliasesClassifyByMatchedShapeAndRankVSCodeBeforeXcode() throws {
         let fixture = try AppCatalogFixture()
         defer { fixture.remove() }
 
@@ -78,6 +78,7 @@ struct ApplicationSearchCatalogTests {
             "CFBundleName": "Code",
             "CFBundleExecutable": "Code"
         ])
+        _ = try fixture.makeApp("My VSCode Helper.app")
 
         let vscodeResponse = try #require(ApplicationSearchCatalog().search(
             queryText: "vscode",
@@ -86,7 +87,11 @@ struct ApplicationSearchCatalogTests {
             maxResults: 100
         ))
         #expect(vscodeResponse.results.first?.record.name == "Visual Studio Code.app")
-        #expect(vscodeResponse.results.first?.match?.matchClass == .alias)
+        #expect(vscodeResponse.results.first?.match?.matchClass == .exact)
+        #expect(vscodeResponse.results.first?.match?.isAliasDerived == true)
+        let helperResult = try #require(vscodeResponse.results.first { $0.record.name == "My VSCode Helper.app" })
+        #expect(helperResult.match?.matchClass == .substring)
+        #expect(helperResult.match?.isAliasDerived == false)
 
         let compactAliasResponse = try #require(ApplicationSearchCatalog().search(
             queryText: "vsc",
@@ -95,7 +100,8 @@ struct ApplicationSearchCatalogTests {
             maxResults: 100
         ))
         #expect(compactAliasResponse.results.first?.record.name == "Visual Studio Code.app")
-        #expect(compactAliasResponse.results.first?.match?.matchClass == .alias)
+        #expect(compactAliasResponse.results.first?.match?.matchClass == .exact)
+        #expect(compactAliasResponse.results.first?.match?.isAliasDerived == true)
 
         let xcodeResponse = try #require(ApplicationSearchCatalog().search(
             queryText: "xcode",
@@ -105,10 +111,11 @@ struct ApplicationSearchCatalogTests {
         ))
         #expect(xcodeResponse.results.first?.record.name == "Xcode.app")
         #expect(xcodeResponse.results.first?.match?.matchClass == .exact)
+        #expect(xcodeResponse.results.first?.match?.isAliasDerived == false)
     }
 
-    @Test("app basename exact match beats metadata alias")
-    func appBasenameExactMatchBeatsMetadataAlias() throws {
+    @Test("app basename exact and prefix matches beat metadata alias prefixes")
+    func appBasenameExactAndPrefixMatchesBeatMetadataAliasPrefixes() throws {
         let fixture = try AppCatalogFixture()
         defer { fixture.remove() }
 
@@ -121,6 +128,16 @@ struct ApplicationSearchCatalogTests {
                 "CFBundleURLSchemes": ["vlc"]
             ]]
         ])
+        _ = try fixture.makeApp("Steam.app", infoPlist: [
+            "CFBundleIdentifier": "com.valvesoftware.Steam",
+            "CFBundleName": "Steam",
+            "CFBundleExecutable": "Steam",
+            "CFBundleURLTypes": [[
+                "CFBundleURLName": "Valve",
+                "CFBundleURLSchemes": ["valve"]
+            ]]
+        ])
+        _ = try fixture.makeApp("Preview.app")
 
         let response = try #require(ApplicationSearchCatalog().search(
             queryText: "VLC",
@@ -131,6 +148,7 @@ struct ApplicationSearchCatalogTests {
 
         #expect(response.results.first?.record.name == "VLC.app")
         #expect(response.results.first?.match?.matchClass == .exact)
+        #expect(response.results.first?.match?.isAliasDerived == false)
 
         let prefixResponse = try #require(ApplicationSearchCatalog().search(
             queryText: "v",
@@ -141,6 +159,16 @@ struct ApplicationSearchCatalogTests {
 
         #expect(prefixResponse.results.first?.record.name == "VLC.app")
         #expect(prefixResponse.results.first?.match?.matchClass == .prefix)
+        #expect(prefixResponse.results.first?.match?.isAliasDerived == false)
+        let steamIndex = try #require(prefixResponse.results.firstIndex { $0.record.name == "Steam.app" })
+        let previewIndex = try #require(prefixResponse.results.firstIndex { $0.record.name == "Preview.app" })
+        let steamResult = prefixResponse.results[steamIndex]
+        let previewResult = prefixResponse.results[previewIndex]
+        #expect(steamResult.match?.matchClass == .prefix)
+        #expect(steamResult.match?.isAliasDerived == true)
+        #expect(previewResult.match?.matchClass == .substring)
+        #expect(steamIndex > 0)
+        #expect(steamIndex < previewIndex)
     }
 
     @Test("configured app bundle root is searchable")
