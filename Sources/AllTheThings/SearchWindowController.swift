@@ -2706,9 +2706,11 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
     }
 
-    @objc private func userDefaultsDidChange(_ notification: Notification) {
-        settingsDidChange()
-        updateSetupSuggestions()
+    @objc private nonisolated func userDefaultsDidChange(_ notification: Notification) {
+        Task { @MainActor [weak self] in
+            self?.settingsDidChange()
+            self?.updateSetupSuggestions()
+        }
     }
 
     @objc private func appFontDidChange(_ notification: Notification) {
@@ -3485,6 +3487,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     private func matchLabel(for matchClass: MatchClass) -> String {
         switch matchClass {
+        case .alias: "Alias"
         case .exact: "Exact"
         case .prefix: "Prefix"
         case .substring: "Text"
@@ -3496,6 +3499,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     private func matchIcon(for matchClass: MatchClass, accessibilityDescription: String) -> NSImage? {
         let candidates: [String] = switch matchClass {
+        case .alias:
+            ["tag.circle.fill", "tag.circle", "tag.fill", "tag"]
         case .exact:
             ["checkmark.circle.fill", "checkmark.circle"]
         case .prefix:

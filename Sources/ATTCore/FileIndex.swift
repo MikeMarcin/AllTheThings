@@ -56,6 +56,7 @@ public enum MatchClass: Int, Codable, CaseIterable, Sendable {
     case substring = 3
     case prefix = 4
     case exact = 5
+    case alias = 6
 }
 
 public struct MatchQuality: Codable, Equatable, Comparable, Sendable {

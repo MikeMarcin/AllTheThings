@@ -1,5 +1,5 @@
-import AppKit
 import ATTCore
+import AppKit
 import Foundation
 
 extension AppSettings {
@@ -112,14 +112,20 @@ extension AppSettings {
     }
 
     static func defaultMatchColorHexes(isDark: Bool) -> [String: String] {
-        Dictionary(uniqueKeysWithValues: MatchClass.allCases.map { matchClass in
-            (matchColorKey(for: matchClass), hexString(for: defaultMatchColor(for: matchClass, isDark: isDark)) ?? "#666666")
-        })
+        Dictionary(
+            uniqueKeysWithValues: MatchClass.allCases.map { matchClass in
+                (
+                    matchColorKey(for: matchClass),
+                    hexString(for: defaultMatchColor(for: matchClass, isDark: isDark)) ?? "#666666"
+                )
+            })
     }
 
     private static func matchColorHexes(defaults: UserDefaults, isDark: Bool) -> [String: String] {
         let defaultsHexes = defaultMatchColorHexes(isDark: isDark)
-        let savedHexes = defaults.dictionary(forKey: matchColorStorageKey(isDark: isDark)) as? [String: String] ?? [:]
+        let savedHexes =
+            defaults.dictionary(forKey: matchColorStorageKey(isDark: isDark)) as? [String: String]
+            ?? [:]
         return defaultsHexes.merging(savedHexes) { _, saved in saved }
     }
 
@@ -149,6 +155,8 @@ extension AppSettings {
     private static func defaultMatchColor(for matchClass: MatchClass, isDark: Bool) -> NSColor {
         if isDark {
             switch matchClass {
+            case .alias:
+                return NSColor(calibratedRed: 0.30, green: 0.84, blue: 0.72, alpha: 1)
             case .exact:
                 return NSColor(calibratedRed: 0.78, green: 0.48, blue: 1.0, alpha: 1)
             case .prefix:
@@ -165,6 +173,8 @@ extension AppSettings {
         }
 
         switch matchClass {
+        case .alias:
+            return NSColor(calibratedRed: 0.00, green: 0.50, blue: 0.42, alpha: 1)
         case .exact:
             return NSColor(calibratedRed: 0.57, green: 0.24, blue: 0.78, alpha: 1)
         case .prefix:
@@ -182,6 +192,7 @@ extension AppSettings {
 
     private static func matchColorKey(for matchClass: MatchClass) -> String {
         switch matchClass {
+        case .alias: "alias"
         case .exact: "exact"
         case .prefix: "prefix"
         case .substring: "substring"

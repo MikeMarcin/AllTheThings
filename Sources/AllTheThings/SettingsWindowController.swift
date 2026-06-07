@@ -2319,7 +2319,9 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         renderExclusionPatterns()
     }
 
-    @objc private func userDefaultsDidChange(_ notification: Notification) {
-        updateControls()
+    @objc private nonisolated func userDefaultsDidChange(_ notification: Notification) {
+        Task { @MainActor [weak self] in
+            self?.updateControls()
+        }
     }
 }

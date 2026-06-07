@@ -18,6 +18,8 @@ add_test(
         "CLANG_MODULE_CACHE_PATH=${SWIFT_BUILD_ROOT}/debug/ModuleCache"
         "${SWIFT_EXECUTABLE}" test
         --disable-sandbox
+        --parallel
+        --num-workers 1
         --package-path "${CMAKE_SOURCE_DIR}"
         --build-path "${SWIFT_BUILD_ROOT}/debug"
 )
@@ -27,6 +29,8 @@ add_custom_target(check
         "CLANG_MODULE_CACHE_PATH=${SWIFT_BUILD_ROOT}/debug/ModuleCache"
         "${SWIFT_EXECUTABLE}" test
         --disable-sandbox
+        --parallel
+        --num-workers 1
         --package-path "${CMAKE_SOURCE_DIR}"
         --build-path "${SWIFT_BUILD_ROOT}/debug"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
