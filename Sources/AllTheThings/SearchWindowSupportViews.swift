@@ -3,6 +3,7 @@ import AppKit
 struct MatchPlacard {
     let title: String
     let scoreText: String
+    let detail: String?
     let reason: String
     let color: NSColor
 }
@@ -99,7 +100,7 @@ final class MatchIconCellView: NSTableCellView {
         }
         self.placardView = placardView
 
-        let size = NSSize(width: 284, height: 112)
+        let size = NSSize(width: 316, height: 136)
         let anchor = convert(bounds, to: contentView)
         let maxX = contentView.bounds.maxX - size.width - 10
         let preferredX = anchor.maxX + 8
@@ -129,6 +130,7 @@ final class MatchPlacardView: NSView {
     private let swatchView = MatchSwatchView()
     private let titleLabel = NSTextField(labelWithString: "")
     private let scoreLabel = NSTextField(labelWithString: "")
+    private let detailLabel = NSTextField(wrappingLabelWithString: "")
     private let reasonLabel = NSTextField(wrappingLabelWithString: "")
 
     override init(frame frameRect: NSRect) {
@@ -150,6 +152,8 @@ final class MatchPlacardView: NSView {
         swatchView.color = placard.color
         titleLabel.stringValue = placard.title
         scoreLabel.stringValue = placard.scoreText
+        detailLabel.stringValue = placard.detail ?? ""
+        detailLabel.isHidden = placard.detail == nil
         reasonLabel.stringValue = placard.reason
         updateLayerColors()
     }
@@ -165,11 +169,16 @@ final class MatchPlacardView: NSView {
         swatchView.translatesAutoresizingMaskIntoConstraints = false
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
         scoreLabel.translatesAutoresizingMaskIntoConstraints = false
+        detailLabel.translatesAutoresizingMaskIntoConstraints = false
         reasonLabel.translatesAutoresizingMaskIntoConstraints = false
 
         titleLabel.font = AppSettings.appFont(sizeDelta: 0, weight: .semibold)
         scoreLabel.font = AppSettings.appFont(sizeDelta: -1, weight: .medium)
         scoreLabel.textColor = .secondaryLabelColor
+        detailLabel.font = AppSettings.appFont(sizeDelta: -1, weight: .medium)
+        detailLabel.textColor = .labelColor
+        detailLabel.maximumNumberOfLines = 2
+        detailLabel.lineBreakMode = .byTruncatingTail
         reasonLabel.font = AppSettings.appFont(sizeDelta: -1)
         reasonLabel.textColor = .secondaryLabelColor
         reasonLabel.maximumNumberOfLines = 3
@@ -178,6 +187,7 @@ final class MatchPlacardView: NSView {
         addSubview(swatchView)
         addSubview(titleLabel)
         addSubview(scoreLabel)
+        addSubview(detailLabel)
         addSubview(reasonLabel)
 
         NSLayoutConstraint.activate([
@@ -194,8 +204,12 @@ final class MatchPlacardView: NSView {
             scoreLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 3),
             scoreLabel.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
 
+            detailLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            detailLabel.topAnchor.constraint(equalTo: scoreLabel.bottomAnchor, constant: 7),
+            detailLabel.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
+
             reasonLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
-            reasonLabel.topAnchor.constraint(equalTo: scoreLabel.bottomAnchor, constant: 10),
+            reasonLabel.topAnchor.constraint(equalTo: detailLabel.bottomAnchor, constant: 6),
             reasonLabel.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
             reasonLabel.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -12)
         ])

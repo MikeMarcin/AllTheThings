@@ -63,6 +63,26 @@ public struct MatchQuality: Codable, Equatable, Comparable, Sendable {
     public let matchClass: MatchClass
     public let scoreBin: Int
 
+    var sortRank: Int {
+        // Raw values are persisted and used by settings UI tags; ranking is independent.
+        switch matchClass {
+        case .metadata:
+            return 0
+        case .weakPath:
+            return 1
+        case .near:
+            return 2
+        case .substring:
+            return 3
+        case .alias:
+            return 4
+        case .prefix:
+            return 5
+        case .exact:
+            return 6
+        }
+    }
+
     public init(matchClass: MatchClass, scoreBin: Int) {
         self.matchClass = matchClass
         self.scoreBin = max(0, min(scoreBin, 4))
@@ -73,8 +93,8 @@ public struct MatchQuality: Codable, Equatable, Comparable, Sendable {
     }
 
     public static func < (lhs: MatchQuality, rhs: MatchQuality) -> Bool {
-        if lhs.matchClass.rawValue != rhs.matchClass.rawValue {
-            return lhs.matchClass.rawValue < rhs.matchClass.rawValue
+        if lhs.sortRank != rhs.sortRank {
+            return lhs.sortRank < rhs.sortRank
         }
         return lhs.scoreBin < rhs.scoreBin
     }
@@ -114,9 +134,19 @@ public struct MatchExplanation: Codable, Equatable, Sendable {
     public let field: MatchField
     public let reason: String
     public let spans: [MatchSpan]
+    public let isAliasDerived: Bool
 
     public var matchClass: MatchClass {
         quality.matchClass
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case quality
+        case score
+        case field
+        case reason
+        case spans
+        case isAliasDerived
     }
 
     public init(
@@ -124,13 +154,15 @@ public struct MatchExplanation: Codable, Equatable, Sendable {
         score: Int,
         field: MatchField,
         reason: String,
-        spans: [MatchSpan] = []
+        spans: [MatchSpan] = [],
+        isAliasDerived: Bool = false
     ) {
         self.quality = MatchQuality(matchClass: matchClass, score: score)
         self.score = score
         self.field = field
         self.reason = reason
         self.spans = spans
+        self.isAliasDerived = isAliasDerived
     }
 
     public init(
@@ -138,13 +170,35 @@ public struct MatchExplanation: Codable, Equatable, Sendable {
         score: Int,
         field: MatchField,
         reason: String,
-        spans: [MatchSpan] = []
+        spans: [MatchSpan] = [],
+        isAliasDerived: Bool = false
     ) {
         self.quality = quality
         self.score = score
         self.field = field
         self.reason = reason
         self.spans = spans
+        self.isAliasDerived = isAliasDerived
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        quality = try container.decode(MatchQuality.self, forKey: .quality)
+        score = try container.decode(Int.self, forKey: .score)
+        field = try container.decode(MatchField.self, forKey: .field)
+        reason = try container.decode(String.self, forKey: .reason)
+        spans = try container.decode([MatchSpan].self, forKey: .spans)
+        isAliasDerived = try container.decodeIfPresent(Bool.self, forKey: .isAliasDerived) ?? false
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(quality, forKey: .quality)
+        try container.encode(score, forKey: .score)
+        try container.encode(field, forKey: .field)
+        try container.encode(reason, forKey: .reason)
+        try container.encode(spans, forKey: .spans)
+        try container.encode(isAliasDerived, forKey: .isAliasDerived)
     }
 }
 
@@ -2991,7 +3045,7 @@ public final class FileIndex: @unchecked Sendable {
         guard !shouldCancel() else { return nil }
         if let includedQuality {
             let order = request.sort.ascending ? snapshot.nameAscending : snapshot.nameDescending
-            var qualityBuckets = (0..<32).map { _ in [Int]() }
+            var qualityBuckets = (0..<(MatchClass.allCases.count * 5)).map { _ in [Int]() }
 
             for (offset, rowID) in order.enumerated() {
                 if offset & 511 == 0, shouldCancel() {
@@ -3132,7 +3186,7 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     private static func indexedQualityCode(_ quality: MatchQuality) -> UInt8 {
-        UInt8(quality.matchClass.rawValue * 5 + quality.scoreBin)
+        UInt8(quality.sortRank * 5 + quality.scoreBin)
     }
 
     private static func fastLargeShortFuzzyComponentSearch(

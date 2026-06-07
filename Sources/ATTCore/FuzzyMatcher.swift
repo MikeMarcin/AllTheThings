@@ -702,7 +702,8 @@ public enum FuzzyMatcher {
             reason: reason,
             spans: explanation.spans.map { span in
                 MatchSpan(field: field, location: span.location, length: span.length, style: span.style)
-            }
+            },
+            isAliasDerived: explanation.isAliasDerived
         )
     }
 

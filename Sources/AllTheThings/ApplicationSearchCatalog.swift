@@ -269,10 +269,6 @@ final class ApplicationSearchCatalog: @unchecked Sendable {
         recordMatch: MatchExplanation?,
         aliasMatch: MatchExplanation?
     ) -> MatchExplanation? {
-        if appNameMatch?.matchClass == .exact || appNameMatch?.matchClass == .prefix {
-            return appNameMatch
-        }
-
         return bestExplanation(bestExplanation(appNameMatch, recordMatch), aliasMatch)
     }
 
@@ -328,17 +324,19 @@ final class ApplicationSearchCatalog: @unchecked Sendable {
             let explanation: MatchExplanation?
             if alias.value == normalizedQuery {
                 explanation = MatchExplanation(
-                    matchClass: .alias,
-                    score: 12_000,
+                    matchClass: .exact,
+                    score: 9_600,
                     field: .name,
-                    reason: "App alias from \(alias.source) exactly matched \"\(query)\""
+                    reason: "App alias from \(alias.source) exactly matched \"\(query)\"",
+                    isAliasDerived: true
                 )
             } else if alias.value.hasPrefix(normalizedQuery) {
                 explanation = MatchExplanation(
-                    matchClass: .alias,
-                    score: 9_900 - min(alias.value.count, 300),
+                    matchClass: .prefix,
+                    score: 7_600 - min(alias.value.count, 300),
                     field: .name,
-                    reason: "App alias from \(alias.source) starts with \"\(query)\""
+                    reason: "App alias from \(alias.source) starts with \"\(query)\"",
+                    isAliasDerived: true
                 )
             } else {
                 explanation = nil
