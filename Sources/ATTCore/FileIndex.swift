@@ -6397,23 +6397,49 @@ public final class FileIndex: @unchecked Sendable {
         defer { closedir(stream) }
 
         while let entry = readdir(stream) {
-            let name = Self.directoryEntryName(entry)
+            guard let entryInfo = Self.directoryEntryInfo(entry) else { continue }
+            let name = entryInfo.name
             guard name != "." && name != ".." else { continue }
 
-            let child = directory.appendingPathComponent(name, isDirectory: entry.pointee.d_type == DT_DIR)
+            let child = directory.appendingPathComponent(name, isDirectory: entryInfo.isDirectory)
             guard body(child) else { return false }
         }
 
         return true
     }
 
-    private static func directoryEntryName(_ entry: UnsafeMutablePointer<dirent>) -> String {
-        let byteCount = Int(entry.pointee.d_namlen)
-        return withUnsafePointer(to: entry.pointee.d_name) { pointer in
-            pointer.withMemoryRebound(to: UInt8.self, capacity: max(byteCount, 1)) { bytes in
-                String(decoding: UnsafeBufferPointer(start: bytes, count: byteCount), as: UTF8.self)
-            }
+    private static let direntRecordLengthOffset = MemoryLayout<dirent>.offset(of: \.d_reclen)!
+    private static let direntNameLengthOffset = MemoryLayout<dirent>.offset(of: \.d_namlen)!
+    private static let direntTypeOffset = MemoryLayout<dirent>.offset(of: \.d_type)!
+    private static let direntNameOffset = MemoryLayout<dirent>.offset(of: \.d_name)!
+
+    static func directoryEntryInfo(_ entry: UnsafeMutablePointer<dirent>) -> (name: String, isDirectory: Bool)? {
+        let rawEntry = UnsafeRawPointer(entry)
+        let recordByteCount = Int(rawEntry.load(
+            fromByteOffset: Self.direntRecordLengthOffset,
+            as: UInt16.self
+        ))
+        let nameByteCount = Int(rawEntry.load(
+            fromByteOffset: Self.direntNameLengthOffset,
+            as: UInt16.self
+        ))
+        let entryType = rawEntry.load(fromByteOffset: Self.direntTypeOffset, as: UInt8.self)
+        let maximumNameByteCount = recordByteCount - Self.direntNameOffset
+        guard recordByteCount >= Self.direntNameOffset,
+              recordByteCount <= MemoryLayout<dirent>.size,
+              nameByteCount > 0,
+              nameByteCount <= maximumNameByteCount else {
+            return nil
         }
+
+        let nameBytes = UnsafeRawBufferPointer(
+            start: rawEntry.advanced(by: Self.direntNameOffset),
+            count: nameByteCount
+        )
+        return (
+            name: String(decoding: nameBytes, as: UTF8.self),
+            isDirectory: Int32(entryType) == DT_DIR
+        )
     }
 
     private func updateIndexingProgress(status: String, indexedCount: Int) {

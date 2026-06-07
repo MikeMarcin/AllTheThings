@@ -35,6 +35,12 @@ add_custom_target(check
     USES_TERMINAL
 )
 
+add_custom_target(safety-check
+    COMMAND "${CMAKE_SOURCE_DIR}/tools/safety-check.sh"
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    USES_TERMINAL
+)
+
 add_custom_target(app
     COMMAND "${CMAKE_COMMAND}"
         "-DSWIFT_EXECUTABLE=${SWIFT_EXECUTABLE}"

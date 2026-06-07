@@ -18,6 +18,7 @@ NOTARY_PROFILE="${APPLE_NOTARY_PROFILE:-${DEFAULT_NOTARY_PROFILE}}"
 ALLOW_DIRTY=0
 SKIP_NOTARIZE=0
 SKIP_SIGN=0
+SKIP_SAFETY_CHECKS=0
 SKIP_TESTS=0
 OUTPUT_DIR=""
 REQUESTED_VERSION=""
@@ -35,6 +36,7 @@ Options:
   --notary-profile NAME    notarytool keychain profile. Defaults to APPLE_NOTARY_PROFILE or ${DEFAULT_NOTARY_PROFILE}.
   --output-dir DIR         Release output directory. Defaults to build/releases/VERSION.
   --skip-tests             Do not run the CMake check preset.
+  --skip-safety-checks     Do not run sanitizer-backed native safety checks.
   --skip-sign              Leave the CMake-built app's existing signature in place.
   --skip-notarize          Do not submit to Apple's notary service or staple a ticket.
   --allow-dirty            Allow packaging with uncommitted git changes.
@@ -120,6 +122,10 @@ while [[ $# -gt 0 ]]; do
             SKIP_TESTS=1
             shift
             ;;
+        --skip-safety-checks)
+            SKIP_SAFETY_CHECKS=1
+            shift
+            ;;
         --skip-sign)
             SKIP_SIGN=1
             shift
@@ -200,8 +206,14 @@ cmake --preset "${CONFIGURE_PRESET}"
 if [[ "${SKIP_TESTS}" == "0" ]]; then
     log "Running tests"
     cmake --build --preset check
+    if [[ "${SKIP_SAFETY_CHECKS}" == "0" ]]; then
+        log "Running native safety checks"
+        "${ROOT_DIR}/tools/safety-check.sh"
+    else
+        log "Skipping native safety checks"
+    fi
 else
-    log "Skipping tests"
+    log "Skipping tests and native safety checks"
 fi
 
 log "Building app bundle"
