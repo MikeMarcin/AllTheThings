@@ -1937,7 +1937,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
 
         let presentation = matchPresentation(for: explanation)
-        let color = matchColor(for: explanation.quality)
+        let color = matchColor(for: explanation)
         let placard = MatchPlacard(
             title: presentation.title,
             scoreText: presentation.scoreText,
@@ -3555,11 +3555,60 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         return nil
     }
 
+    private func matchColor(for explanation: MatchExplanation) -> NSColor {
+        let baseColor = matchColor(for: explanation.quality)
+        guard explanation.isAliasDerived else { return baseColor }
+
+        let aliasColor = AppSettings.matchColor(
+            for: .alias,
+            isDark: AppTheme.isDarkAppearance(for: view),
+            defaults: defaults
+        )
+        return saturatedColor(
+            blendedColor(baseColor, with: aliasColor, fraction: 0.42),
+            multiplier: 1.12
+        )
+    }
+
     private func matchColor(for quality: MatchQuality) -> NSColor {
         AppSettings.matchColor(
             for: quality.matchClass,
             isDark: AppTheme.isDarkAppearance(for: view),
             defaults: defaults
+        )
+    }
+
+    private func blendedColor(_ baseColor: NSColor, with overlayColor: NSColor, fraction: CGFloat) -> NSColor {
+        let amount = max(0, min(fraction, 1))
+        guard
+            let base = baseColor.usingColorSpace(.sRGB),
+            let overlay = overlayColor.usingColorSpace(.sRGB)
+        else {
+            return baseColor
+        }
+
+        return NSColor(
+            srgbRed: base.redComponent * (1 - amount) + overlay.redComponent * amount,
+            green: base.greenComponent * (1 - amount) + overlay.greenComponent * amount,
+            blue: base.blueComponent * (1 - amount) + overlay.blueComponent * amount,
+            alpha: base.alphaComponent
+        )
+    }
+
+    private func saturatedColor(_ color: NSColor, multiplier: CGFloat) -> NSColor {
+        guard let rgb = color.usingColorSpace(.sRGB) else { return color }
+
+        var hue: CGFloat = 0
+        var saturation: CGFloat = 0
+        var brightness: CGFloat = 0
+        var alpha: CGFloat = 0
+        rgb.getHue(&hue, saturation: &saturation, brightness: &brightness, alpha: &alpha)
+
+        return NSColor(
+            calibratedHue: hue,
+            saturation: min(saturation * multiplier, 1),
+            brightness: min(brightness * 1.03, 1),
+            alpha: alpha
         )
     }
 

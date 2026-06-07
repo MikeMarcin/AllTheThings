@@ -96,17 +96,44 @@ final class MatchIconCellView: NSTableCellView {
             visiblePlacardView.removeFromSuperview()
         }
         if placardView.superview == nil {
-            contentView.addSubview(placardView)
+            contentView.addSubview(placardView, positioned: .above, relativeTo: nil)
         }
         self.placardView = placardView
 
         let size = NSSize(width: 316, height: 136)
         let anchor = convert(bounds, to: contentView)
-        let maxX = contentView.bounds.maxX - size.width - 10
+        let placementBounds = placardPlacementBounds(in: contentView)
+        let maxX = placementBounds.maxX - size.width - 10
         let preferredX = anchor.maxX + 8
-        let x = max(10, min(preferredX, maxX))
-        let y = max(10, min(anchor.midY - size.height / 2, contentView.bounds.maxY - size.height - 10))
+        let x = max(placementBounds.minX + 10, min(preferredX, maxX))
+        let y = max(
+            placementBounds.minY + 10,
+            min(anchor.midY - size.height / 2, placementBounds.maxY - size.height - 10)
+        )
         placardView.frame = NSRect(origin: NSPoint(x: x, y: y), size: size)
+    }
+
+    private func placardPlacementBounds(in contentView: NSView) -> NSRect {
+        guard let tableView = enclosingTableView() else {
+            return contentView.bounds
+        }
+
+        let visibleTableBounds = tableView.convert(tableView.visibleRect, to: contentView)
+        guard visibleTableBounds.height >= 40, visibleTableBounds.width >= 120 else {
+            return contentView.bounds
+        }
+        return visibleTableBounds.intersection(contentView.bounds)
+    }
+
+    private func enclosingTableView() -> NSTableView? {
+        var view = superview
+        while let current = view {
+            if let tableView = current as? NSTableView {
+                return tableView
+            }
+            view = current.superview
+        }
+        return nil
     }
 
     private static func tintedImage(_ image: NSImage?, color: NSColor) -> NSImage? {
@@ -162,6 +189,7 @@ final class MatchPlacardView: NSView {
         wantsLayer = true
         layer?.cornerRadius = 8
         layer?.borderWidth = 1
+        layer?.zPosition = 1_000
         layer?.shadowOpacity = 0.28
         layer?.shadowRadius = 14
         layer?.shadowOffset = NSSize(width: 0, height: -4)
@@ -178,11 +206,11 @@ final class MatchPlacardView: NSView {
         detailLabel.font = AppSettings.appFont(sizeDelta: -1, weight: .medium)
         detailLabel.textColor = .labelColor
         detailLabel.maximumNumberOfLines = 2
-        detailLabel.lineBreakMode = .byTruncatingTail
+        detailLabel.lineBreakMode = .byWordWrapping
         reasonLabel.font = AppSettings.appFont(sizeDelta: -1)
         reasonLabel.textColor = .secondaryLabelColor
         reasonLabel.maximumNumberOfLines = 3
-        reasonLabel.lineBreakMode = .byTruncatingTail
+        reasonLabel.lineBreakMode = .byWordWrapping
 
         addSubview(swatchView)
         addSubview(titleLabel)
@@ -220,9 +248,10 @@ final class MatchPlacardView: NSView {
     private func updateLayerColors() {
         let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         layer?.backgroundColor = (isDark
-            ? NSColor(calibratedWhite: 0.12, alpha: 0.98)
-            : NSColor(calibratedWhite: 0.97, alpha: 0.98)
+            ? NSColor(calibratedWhite: 0.12, alpha: 1.0)
+            : NSColor(calibratedWhite: 0.97, alpha: 1.0)
         ).cgColor
+        layer?.isOpaque = true
         layer?.borderColor = (isDark
             ? NSColor(calibratedWhite: 1.0, alpha: 0.16)
             : NSColor(calibratedWhite: 0.0, alpha: 0.12)

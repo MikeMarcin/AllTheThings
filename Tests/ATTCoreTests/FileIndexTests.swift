@@ -1616,6 +1616,36 @@ struct FileIndexTests {
         #expect(completeResponse.totalMatches > previewResponse.totalMatches)
     }
 
+    @Test("overlay allRecords uses base bulk materialization")
+    func overlayAllRecordsUsesBaseBulkMaterialization() throws {
+        let alpha = makeRecord(path: "/tmp/allthethings-store/Alpha.txt")
+        let beta = makeRecord(path: "/tmp/allthethings-store/Beta.txt")
+        let gamma = makeRecord(path: "/tmp/allthethings-store/Gamma.txt")
+        let base = CountingRecordStore(records: [alpha, beta])
+        let overlay = OverlayRecordStore(base: base, upserts: [gamma], deletedRows: [1])
+
+        let records = overlay.allRecords()
+
+        #expect(records.map(\.path) == [alpha.path, gamma.path])
+        #expect(base.allRecordsCallCount == 1)
+        #expect(base.recordCallCount == 0)
+    }
+
+    @Test("replacing allRecords uses base bulk materialization")
+    func replacingAllRecordsUsesBaseBulkMaterialization() throws {
+        let alpha = makeRecord(path: "/tmp/allthethings-store/Alpha.txt")
+        let beta = makeRecord(path: "/tmp/allthethings-store/Beta.txt")
+        let replacement = makeRecord(path: "/tmp/allthethings-store/Alpha Renamed.txt")
+        let base = CountingRecordStore(records: [alpha, beta])
+        let replacing = ReplacingRecordStore(base: base, replacements: [0: replacement])
+
+        let records = replacing.allRecords()
+
+        #expect(records.map(\.path) == [replacement.path, beta.path])
+        #expect(base.allRecordsCallCount == 1)
+        #expect(base.recordCallCount == 0)
+    }
+
     private func waitUntil(
         timeout: Duration = .seconds(5),
         pollInterval: Duration = .milliseconds(25),
@@ -1671,6 +1701,37 @@ struct FileIndexTests {
             normalizedName: FuzzyMatcher.normalize(name),
             normalizedPath: FuzzyMatcher.normalize(path)
         )
+    }
+}
+
+private final class CountingRecordStore: RecordStore, @unchecked Sendable {
+    let kind = RecordStoreKind.heapPaged
+    private let records: [FileRecord]
+    private(set) var recordCallCount = 0
+    private(set) var allRecordsCallCount = 0
+
+    var count: Int { records.count }
+
+    init(records: [FileRecord]) {
+        self.records = records
+    }
+
+    func record(at index: Int) -> FileRecord {
+        recordCallCount += 1
+        return records[index]
+    }
+
+    func recordID(at index: Int) -> UInt64 {
+        records[index].id
+    }
+
+    func rowID(forPath path: String) -> Int? {
+        records.firstIndex { $0.path == path }
+    }
+
+    func allRecords() -> [FileRecord] {
+        allRecordsCallCount += 1
+        return records
     }
 }
 
