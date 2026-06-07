@@ -5149,7 +5149,8 @@ public final class FileIndex: @unchecked Sendable {
 
         let scannedRootPaths = rootURLs.map(\.path)
         let reconcilesAllRoots = Set(scannedRootPaths) == Set(allRootPaths)
-        let previousRecords = reconcilesAllRoots ? [] : lock.withLock { searchSnapshot.store.allRecords() }
+        let previousStore = reconcilesAllRoots ? nil : lock.withLock { searchSnapshot.store }
+        let previousRecords = previousStore?.allRecords() ?? []
 
         MemoryTelemetry.log("reconcile.scan.begin", activeIndexJobs: currentActiveIndexJobCount())
         DiagnosticLogger.shared.log(

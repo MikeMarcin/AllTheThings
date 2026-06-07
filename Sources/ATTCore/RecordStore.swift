@@ -584,6 +584,16 @@ final class OverlayRecordStore: RecordStore {
         return upserts[index - visibleBaseRows.count]
     }
 
+    func allRecords() -> [FileRecord] {
+        var records = base.allRecords()
+        if !deletedRows.isEmpty {
+            let deletedIDs = Set(deletedRows.map { base.recordID(at: $0) })
+            records.removeAll { deletedIDs.contains($0.id) }
+        }
+        records.append(contentsOf: upserts)
+        return records
+    }
+
     func recordID(at index: Int) -> UInt64 {
         withBaseRowOrUpsert(at: index, baseValue: { base.recordID(at: $0) }, upsertValue: \.id)
     }
@@ -801,6 +811,19 @@ final class ReplacingRecordStore: RecordStore {
 
     func record(at index: Int) -> FileRecord {
         replacements[index] ?? base.record(at: index)
+    }
+
+    func allRecords() -> [FileRecord] {
+        guard !replacements.isEmpty else { return base.allRecords() }
+
+        let replacementsByID = Dictionary(
+            uniqueKeysWithValues: replacements.map { rowID, record in
+                (base.recordID(at: rowID), record)
+            }
+        )
+        return base.allRecords().map { record in
+            replacementsByID[record.id] ?? record
+        }
     }
 
     func recordID(at index: Int) -> UInt64 {
