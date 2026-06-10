@@ -6,9 +6,9 @@ import Testing
 
 @Suite("Search toolbar")
 struct SearchToolbarTests {
-    @Test("toolbar opens settings and insights instead of indexing actions")
+    @Test("titlebar actions open settings and insights instead of indexing actions")
     @MainActor
-    func toolbarOpensSettingsAndInsightsInsteadOfIndexingActions() throws {
+    func titlebarActionsOpenSettingsAndInsightsInsteadOfIndexingActions() throws {
         let index = FileIndex(
             applicationName: "AllTheThingsToolbarTests-\(UUID().uuidString)",
             loadsSnapshotImmediately: false
@@ -18,16 +18,22 @@ struct SearchToolbarTests {
         }
 
         let controller = SearchWindowController(index: index)
+        let window = try #require(controller.window)
         let view = try #require(controller.window?.contentViewController?.view)
-        let tooltips = Set(buttons(in: view).compactMap(\.toolTip))
+        let contentTooltips = Set(buttons(in: view).compactMap(\.toolTip))
+        let titlebarTooltips = Set(window.titlebarAccessoryViewControllers.flatMap { accessory in
+            buttons(in: accessory.view).compactMap(\.toolTip)
+        })
 
-        #expect(tooltips.contains("Open Settings"))
-        #expect(tooltips.contains("Open Insights"))
-        #expect(tooltips.contains("Open selected file"))
-        #expect(tooltips.contains("Reveal selected file in Finder"))
-        #expect(tooltips.contains("Copy selected path"))
-        #expect(!tooltips.contains("Add indexed folder"))
-        #expect(!tooltips.contains("Reindex scopes"))
+        #expect(titlebarTooltips.contains("Open Settings"))
+        #expect(titlebarTooltips.contains("Open Insights"))
+        #expect(titlebarTooltips.contains("Open selected file"))
+        #expect(titlebarTooltips.contains("Reveal selected file in Finder"))
+        #expect(titlebarTooltips.contains("Copy selected path"))
+        #expect(!contentTooltips.contains("Open Settings"))
+        #expect(!contentTooltips.contains("Open Insights"))
+        #expect(!titlebarTooltips.contains("Add indexed folder"))
+        #expect(!titlebarTooltips.contains("Reindex scopes"))
     }
 
     @Test("expanded mascot layout keeps visible pixels onscreen")
