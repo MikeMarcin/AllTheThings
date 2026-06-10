@@ -39,6 +39,9 @@ struct SettingsWindowTests {
         #expect(hotkeyStrings.contains("Global search hotkey"))
         #expect(hotkeyStrings.contains("Global app search hotkey"))
         #expect(!hotkeyStrings.contains("Diagnostic detail"))
+        controller.window?.contentView?.layoutSubtreeIfNeeded()
+        let hotkeysCard = try #require(firstView(withIdentifier: "hotkeysSettingsCard", in: controller.window?.contentView))
+        #expect(abs(hotkeysCard.frame.height - 149) < 1)
 
         controller.selectSection(.indexedFolders)
         let indexedFolderStrings = visibleStrings(in: controller.window?.contentView)
@@ -63,5 +66,20 @@ struct SettingsWindowTests {
             strings.append(contentsOf: visibleStrings(in: subview))
         }
         return strings
+    }
+
+    @MainActor
+    private func firstView(withIdentifier identifier: String, in view: NSView?) -> NSView? {
+        guard let view, !view.isHidden else { return nil }
+        if view.identifier?.rawValue == identifier {
+            return view
+        }
+
+        for subview in view.subviews {
+            if let match = firstView(withIdentifier: identifier, in: subview) {
+                return match
+            }
+        }
+        return nil
     }
 }
