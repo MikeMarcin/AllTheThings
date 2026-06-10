@@ -23,6 +23,7 @@ final class SettingsWindowController: NSWindowController {
             defer: false
         )
         window.title = "Settings"
+        window.canHide = true
         window.isRestorable = false
         window.contentMinSize = NSSize(width: 700, height: 560)
         window.contentViewController = viewController
@@ -127,6 +128,12 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     private let changeGlobalAppSearchHotKeyButton = NSButton()
     private let launchAtLoginSwitch = NSSwitch()
     private let menuBarIconSwitch = NSSwitch()
+    private let statusFooterModeSegmentedControl = NSSegmentedControl(
+        labels: AppStatusFooterMode.allCases.map(\.title),
+        trackingMode: .selectOne,
+        target: nil,
+        action: nil
+    )
     private let highlightSearchTextSwitch = NSSwitch()
     private let showHiddenFilesSwitch = NSSwitch()
     private let allowMultipleInstancesSwitch = NSSwitch()
@@ -465,6 +472,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         configureGlobalAppSearchHotKeyButton()
         configureSwitch(launchAtLoginSwitch, action: #selector(toggleLaunchAtLogin(_:)))
         configureSwitch(menuBarIconSwitch, action: #selector(toggleMenuBarIcon(_:)))
+        configureStatusFooterModeControl()
         configureSwitch(highlightSearchTextSwitch, action: #selector(toggleHighlightSearchText(_:)))
         configureSwitch(showHiddenFilesSwitch, action: #selector(toggleShowHiddenFiles(_:)))
         configureSwitch(allowMultipleInstancesSwitch, action: #selector(toggleAllowMultipleInstances(_:)))
@@ -491,6 +499,11 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
                 title: "Menu bar icon",
                 detail: "Show the menu bar icon for quick search access.",
                 control: menuBarIconSwitch
+            ),
+            makeControlRow(
+                title: "Status footer",
+                detail: "Choose how much runtime detail appears below results.",
+                control: statusFooterModeSegmentedControl
             ),
             makeControlRow(
                 title: "Highlight search text",
@@ -982,6 +995,19 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         diagnosticLogLevelSegmentedControl.action = #selector(changeDiagnosticLogLevel(_:))
         diagnosticLogLevelSegmentedControl.setContentHuggingPriority(.required, for: .horizontal)
         diagnosticLogLevelSegmentedControl.setContentCompressionResistancePriority(.required, for: .horizontal)
+    }
+
+    private func configureStatusFooterModeControl() {
+        statusFooterModeSegmentedControl.translatesAutoresizingMaskIntoConstraints = false
+        statusFooterModeSegmentedControl.target = self
+        statusFooterModeSegmentedControl.action = #selector(changeStatusFooterMode(_:))
+        statusFooterModeSegmentedControl.toolTip = "Status footer"
+        statusFooterModeSegmentedControl.setContentHuggingPriority(.required, for: .horizontal)
+        statusFooterModeSegmentedControl.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        for segment in 0..<statusFooterModeSegmentedControl.segmentCount {
+            statusFooterModeSegmentedControl.setWidth(82, forSegment: segment)
+        }
     }
 
     private func configureIconButton(_ button: NSButton, symbol: String, tooltip: String, action: Selector) {
@@ -1657,6 +1683,9 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         changeGlobalAppSearchHotKeyButton.isEnabled = true
         launchAtLoginSwitch.state = LaunchAtLoginController.isEnabled ? .on : .off
         menuBarIconSwitch.state = AppSettings.menuBarIconEnabled(defaults: defaults) ? .on : .off
+        statusFooterModeSegmentedControl.selectedSegment = AppStatusFooterMode.allCases.firstIndex(
+            of: AppSettings.statusFooterMode(defaults: defaults)
+        ) ?? 0
         highlightSearchTextSwitch.state = defaults.bool(forKey: AppSettings.highlightSearchTextKey) ? .on : .off
         showHiddenFilesSwitch.state = defaults.bool(forKey: AppSettings.showHiddenFilesKey) ? .on : .off
         allowMultipleInstancesSwitch.state = defaults.bool(forKey: AppSettings.allowMultipleInstancesKey) ? .on : .off
@@ -1715,6 +1744,12 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         guard sender.selectedSegment >= 0, sender.selectedSegment < Self.diagnosticDetailLevels.count else { return }
 
         AppSettings.saveDiagnosticLogLevel(Self.diagnosticDetailLevels[sender.selectedSegment], defaults: defaults)
+    }
+
+    @objc private func changeStatusFooterMode(_ sender: NSSegmentedControl) {
+        guard sender.selectedSegment >= 0, sender.selectedSegment < AppStatusFooterMode.allCases.count else { return }
+
+        AppSettings.saveStatusFooterMode(AppStatusFooterMode.allCases[sender.selectedSegment], defaults: defaults)
     }
 
     @objc private func changeThemePreference(_ sender: NSSegmentedControl) {

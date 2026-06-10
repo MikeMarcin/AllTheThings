@@ -134,6 +134,23 @@ struct AppSettingsTests {
         #expect(AppSettings.globalAppSearchHotKey(defaults: defaults) == hotKey)
     }
 
+    @Test("status footer defaults to simple and can be detailed")
+    func statusFooterDefaultsToSimpleAndCanBeDetailed() throws {
+        let (defaults, suiteName) = try makeDefaults()
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        AppSettings.registerDefaults(defaults)
+
+        #expect(AppSettings.statusFooterMode(defaults: defaults) == .simple)
+
+        AppSettings.saveStatusFooterMode(.detailed, defaults: defaults)
+
+        #expect(AppSettings.statusFooterMode(defaults: defaults) == .detailed)
+        #expect(defaults.string(forKey: AppSettings.statusFooterModeKey) == AppStatusFooterMode.detailed.rawValue)
+    }
+
     @Test("hotkey controller ignores events registered to another controller")
     func hotKeyControllerIgnoresEventsRegisteredToAnotherController() {
         let searchHotKeyID = EventHotKeyID(signature: OSType(0x41545448), id: 1)
