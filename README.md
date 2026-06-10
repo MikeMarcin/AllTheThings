@@ -16,7 +16,7 @@ AllTheThings is a native macOS file-search app built for one fast loop: type a f
 
 On first launch, AllTheThings indexes the default folders that exist on your Mac: `~/Desktop`, `~/Documents`, `~/Downloads`, and `~/Developer`. Applications are searched separately with `app:` so bundle internals are not part of normal filename/path search. If setup suggestions are available, they appear at the top of the search window instead of blocking the app.
 
-Use the folder-plus toolbar button to add folders. Use the refresh toolbar button to rebuild indexed scopes. The footer defaults to a simple shown/matches count; Settings can switch it to detailed indexing state, match count, query time, memory, and version info. The default global search shortcut is `Command-Shift-Space`; enable it from the setup suggestion, or disable/remap it in Settings. The default global app search shortcut is `Shift-Option-Space`; enable it from the setup suggestion or Settings to open search with `app:` prefilled. Enable launch at login to keep shortcuts available after signing in. The optional menu bar icon can focus search, open Settings, toggle launch at login, or quit the app.
+Use the folder-plus toolbar button to add folders. Use the refresh toolbar button to rebuild indexed scopes. The footer defaults to a simple shown/matches count; Settings can switch it to detailed indexing state, match count, query time, memory, and version info. The default global search shortcut is `Command-Shift-Space`; enable it from the setup suggestion, or disable/remap it in **Settings > Hotkeys**. The default global app search shortcut is `Shift-Option-Space`; enable it from the setup suggestion or **Settings > Hotkeys** to open search with `app:` prefilled. Enable launch at login to keep shortcuts available after signing in. The optional menu bar icon can focus search, open Settings, toggle launch at login, or quit the app.
 
 High-noise folders such as `node_modules`, `DerivedData`, `.git/objects`, `Library/Caches`, and `.Trash` are skipped.
 
@@ -67,7 +67,7 @@ macOS protects locations such as Desktop, Documents, Downloads, some external or
 
 AllTheThings keeps structured diagnostic logs only on your Mac under its local Application Support folder. These raw logs may include search queries, file paths, file action context, and error messages so local diagnosis has enough detail to be useful. Logs are capped to about 50 MB and 30 days, are not sent over the network, and are not attached to update checks. Use **AllTheThings > Export Anonymized Diagnostic Log...** to create a shareable JSONL export that replaces sensitive strings such as paths and queries with deterministic same-length gibberish. **Export Raw Diagnostic Log...** preserves the local raw values and should be shared only when you intend to disclose that detail.
 
-Use **AllTheThings > Settings > General** to check Full Disk Access status or open the matching System Settings pane. Use **AllTheThings > Settings > Indexed Folders** to add or remove indexed folders.
+Use **AllTheThings > Settings > Indexed Folders** to check Full Disk Access status, open the matching System Settings pane, or add and remove indexed folders.
 
 Be careful when sharing screenshots or recordings. A file-search window can expose usernames, project names, client names, cloud folder names, and recently touched files.
 

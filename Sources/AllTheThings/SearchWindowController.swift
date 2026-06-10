@@ -1553,7 +1553,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             hotKey: AppSettings.globalSearchHotKey(defaults: defaults),
             defaults: defaults
         )
-        (NSApp.delegate as? AppDelegate)?.showSettings(section: .general)
+        (NSApp.delegate as? AppDelegate)?.showSettings(section: .hotkeys)
         updateSetupSuggestions()
     }
 
@@ -1579,7 +1579,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             hotKey: AppSettings.globalAppSearchHotKey(defaults: defaults),
             defaults: defaults
         )
-        (NSApp.delegate as? AppDelegate)?.showSettings(section: .general)
+        (NSApp.delegate as? AppDelegate)?.showSettings(section: .hotkeys)
         updateSetupSuggestions()
     }
 

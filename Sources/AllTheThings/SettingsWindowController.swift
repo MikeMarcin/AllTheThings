@@ -69,6 +69,7 @@ private final class SettingsWindow: NSWindow {
 
 enum SettingsSection {
     case general
+    case hotkeys
     case appearance
     case indexedFolders
 
@@ -76,6 +77,7 @@ enum SettingsSection {
         switch self {
         case .appearance: "Appearance"
         case .general: "General"
+        case .hotkeys: "Hotkeys"
         case .indexedFolders: "Indexed Folders"
         }
     }
@@ -84,6 +86,7 @@ enum SettingsSection {
         switch self {
         case .appearance: "paintpalette"
         case .general: "gearshape"
+        case .hotkeys: "keyboard"
         case .indexedFolders: "folder"
         }
     }
@@ -107,6 +110,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     private let contentContainer = NSView()
     private let appearanceSidebarRow = SidebarRow(section: .appearance)
     private let generalSidebarRow = SidebarRow(section: .general)
+    private let hotkeysSidebarRow = SidebarRow(section: .hotkeys)
     private let indexedFoldersSidebarRow = SidebarRow(section: .indexedFolders)
     private let themeSegmentedControl = NSSegmentedControl(
         labels: AppThemePreference.allCases.map(\.title),
@@ -273,13 +277,13 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         sidebar.blendingMode = .behindWindow
         sidebar.state = .active
 
-        let stack = NSStackView(views: [generalSidebarRow, appearanceSidebarRow, indexedFoldersSidebarRow])
+        let stack = NSStackView(views: [generalSidebarRow, hotkeysSidebarRow, appearanceSidebarRow, indexedFoldersSidebarRow])
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.orientation = .vertical
         stack.alignment = .width
         stack.spacing = 6
 
-        for row in [appearanceSidebarRow, generalSidebarRow, indexedFoldersSidebarRow] {
+        for row in [appearanceSidebarRow, generalSidebarRow, hotkeysSidebarRow, indexedFoldersSidebarRow] {
             row.target = self
             row.action = #selector(selectSidebarRow(_:))
         }
@@ -291,6 +295,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
             stack.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -12),
             appearanceSidebarRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
             generalSidebarRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            hotkeysSidebarRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
             indexedFoldersSidebarRow.widthAnchor.constraint(equalTo: stack.widthAnchor)
         ])
 
@@ -305,6 +310,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         selectedSection = section
         appearanceSidebarRow.isSelected = section == .appearance
         generalSidebarRow.isSelected = section == .general
+        hotkeysSidebarRow.isSelected = section == .hotkeys
         indexedFoldersSidebarRow.isSelected = section == .indexedFolders
         renderSelectedSection()
     }
@@ -343,6 +349,8 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
             page = makeAppearancePage()
         case .general:
             page = makeGeneralPage()
+        case .hotkeys:
+            page = makeHotkeysPage()
         case .indexedFolders:
             page = makeIndexedFoldersPage()
         }
@@ -466,10 +474,6 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         let sectionLabel = makeSectionLabel("Application")
         let diagnosticsLabel = makeSectionLabel("Diagnostics")
 
-        configureSwitch(globalHotKeySwitch, action: #selector(toggleGlobalHotKey(_:)))
-        configureGlobalHotKeyButton()
-        configureSwitch(globalAppSearchHotKeySwitch, action: #selector(toggleGlobalAppSearchHotKey(_:)))
-        configureGlobalAppSearchHotKeyButton()
         configureSwitch(launchAtLoginSwitch, action: #selector(toggleLaunchAtLogin(_:)))
         configureSwitch(menuBarIconSwitch, action: #selector(toggleMenuBarIcon(_:)))
         configureStatusFooterModeControl()
@@ -481,18 +485,8 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
 
         let settingsCard = makeSettingsCard(rows: [
             makeControlRow(
-                title: "Global search hotkey",
-                detail: "Focus the search window from any app.",
-                control: makeGlobalHotKeyControl()
-            ),
-            makeControlRow(
-                title: "Global app search hotkey",
-                detail: "Open search with app: ready to launch applications.",
-                control: makeGlobalAppSearchHotKeyControl()
-            ),
-            makeControlRow(
                 title: "Launch at login",
-                detail: "Start quietly when you sign in so the global hotkey is ready.",
+                detail: "Start quietly when you sign in so shortcuts and the menu bar icon are available.",
                 control: launchAtLoginSwitch
             ),
             makeControlRow(
@@ -556,6 +550,46 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
             diagnosticsCard.leadingAnchor.constraint(equalTo: settingsCard.leadingAnchor),
             diagnosticsCard.trailingAnchor.constraint(equalTo: settingsCard.trailingAnchor),
             diagnosticsCard.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -24)
+        ])
+
+        return scrollView
+    }
+
+    private func makeHotkeysPage() -> NSView {
+        let (scrollView, contentView) = makePageScrollView()
+
+        let sectionLabel = makeSectionLabel("Global Shortcuts")
+
+        configureSwitch(globalHotKeySwitch, action: #selector(toggleGlobalHotKey(_:)))
+        configureGlobalHotKeyButton()
+        configureSwitch(globalAppSearchHotKeySwitch, action: #selector(toggleGlobalAppSearchHotKey(_:)))
+        configureGlobalAppSearchHotKeyButton()
+
+        let hotkeysCard = makeSettingsCard(rows: [
+            makeControlRow(
+                title: "Global search hotkey",
+                detail: "Focus the search window from any app.",
+                control: makeGlobalHotKeyControl()
+            ),
+            makeControlRow(
+                title: "Global app search hotkey",
+                detail: "Open search with app: ready to launch applications.",
+                control: makeGlobalAppSearchHotKeyControl()
+            )
+        ])
+
+        contentView.addSubview(sectionLabel)
+        contentView.addSubview(hotkeysCard)
+
+        NSLayoutConstraint.activate([
+            sectionLabel.topAnchor.constraint(equalTo: contentView.safeAreaLayoutGuide.topAnchor, constant: 26),
+            sectionLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 36),
+            sectionLabel.trailingAnchor.constraint(lessThanOrEqualTo: contentView.trailingAnchor, constant: -36),
+
+            hotkeysCard.topAnchor.constraint(equalTo: sectionLabel.bottomAnchor, constant: 12),
+            hotkeysCard.leadingAnchor.constraint(equalTo: sectionLabel.leadingAnchor),
+            hotkeysCard.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -36),
+            hotkeysCard.bottomAnchor.constraint(lessThanOrEqualTo: contentView.bottomAnchor, constant: -24)
         ])
 
         return scrollView
