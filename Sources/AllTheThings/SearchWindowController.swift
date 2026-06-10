@@ -232,6 +232,7 @@ final class SearchWindowController: NSWindowController {
         window.contentViewController = viewController
         window.center()
         super.init(window: window)
+        viewController.installTitlebarActions(in: window)
     }
 
     private static func windowTitle() -> String {
@@ -759,6 +760,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private let copyButton = NSButton()
     private let settingsButton = NSButton()
     private let insightsButton = NSButton()
+    private var titlebarActionAccessory: NSTitlebarAccessoryViewController?
     private let loadingOverlay = ThemedBackgroundView(backgroundColor: NSColor.windowBackgroundColor.withAlphaComponent(0.92))
     private let loadingMascotImageView = NSImageView()
     private let loadingLabel = NSTextField(labelWithString: "Loading file list...")
@@ -899,6 +901,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         self.appFontFamilyName = AppSettings.appFontFamilyName(defaults: defaults)
         self.appFontSize = AppSettings.appFontSize(defaults: defaults)
         super.init(nibName: nil, bundle: nil)
+        configureTitlebarActionButtons()
     }
 
     deinit {
@@ -1180,6 +1183,30 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
     }
 
+    func installTitlebarActions(in window: NSWindow) {
+        guard titlebarActionAccessory == nil else { return }
+
+        let buttonStack = NSStackView(views: titlebarActionButtons)
+        buttonStack.orientation = .horizontal
+        buttonStack.alignment = .centerY
+        buttonStack.spacing = 6
+        buttonStack.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 12)
+        buttonStack.setContentHuggingPriority(.required, for: .horizontal)
+        buttonStack.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        let fittingSize = buttonStack.fittingSize
+        buttonStack.frame = NSRect(
+            origin: .zero,
+            size: NSSize(width: fittingSize.width, height: max(fittingSize.height, 32))
+        )
+
+        let accessory = NSTitlebarAccessoryViewController()
+        accessory.layoutAttribute = .right
+        accessory.view = buttonStack
+        window.addTitlebarAccessoryViewController(accessory)
+        titlebarActionAccessory = accessory
+    }
+
     private func buildInterface() {
         let rootStack = NSStackView()
         rootStack.orientation = .vertical
@@ -1192,7 +1219,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         topBar.orientation = .horizontal
         topBar.alignment = .centerY
         topBar.spacing = 8
-        topBar.edgeInsets = NSEdgeInsets(top: 12, left: 14, bottom: 8, right: 14)
+        topBar.edgeInsets = NSEdgeInsets(top: 10, left: 14, bottom: 10, right: 14)
         topBar.translatesAutoresizingMaskIntoConstraints = false
 
         searchField.placeholderString = "Search filenames and paths"
@@ -1204,16 +1231,6 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         searchField.sendsWholeSearchString = false
         searchField.translatesAutoresizingMaskIntoConstraints = false
         topBar.addArrangedSubview(searchField)
-
-        configureToolbarButton(settingsButton, symbol: "gearshape", tooltip: "Open Settings", action: #selector(openSettings(_:)))
-        configureToolbarButton(insightsButton, symbol: "chart.pie", tooltip: "Open Insights", action: #selector(openInsights(_:)))
-        configureToolbarButton(openButton, symbol: "arrow.up.forward.app", tooltip: "Open selected file", action: #selector(openSelected(_:)))
-        configureToolbarButton(revealButton, symbol: "folder", tooltip: "Reveal selected file in Finder", action: #selector(revealSelected(_:)))
-        configureToolbarButton(copyButton, symbol: "doc.on.doc", tooltip: "Copy selected path", action: #selector(copySelectedPath(_:)))
-
-        for button in [settingsButton, insightsButton, openButton, revealButton, copyButton] {
-            topBar.addArrangedSubview(button)
-        }
 
         configureSetupSuggestionPanel()
 
@@ -1279,6 +1296,11 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         footer.addArrangedSubview(statusLabel)
         updateMascotPersistentAnimation()
 
+        let titlebarSeparator = NSBox()
+        titlebarSeparator.boxType = .separator
+        titlebarSeparator.translatesAutoresizingMaskIntoConstraints = false
+
+        rootStack.addArrangedSubview(titlebarSeparator)
         rootStack.addArrangedSubview(topBar)
         rootStack.addArrangedSubview(setupSuggestionPanel)
         rootStack.addArrangedSubview(scrollView)
@@ -1296,6 +1318,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             rootStack.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             topBar.leadingAnchor.constraint(equalTo: rootStack.leadingAnchor),
             topBar.trailingAnchor.constraint(equalTo: rootStack.trailingAnchor),
+            titlebarSeparator.leadingAnchor.constraint(equalTo: rootStack.leadingAnchor),
+            titlebarSeparator.trailingAnchor.constraint(equalTo: rootStack.trailingAnchor),
+            titlebarSeparator.heightAnchor.constraint(equalToConstant: 1),
             setupSuggestionPanel.leadingAnchor.constraint(equalTo: rootStack.leadingAnchor),
             setupSuggestionPanel.trailingAnchor.constraint(equalTo: rootStack.trailingAnchor),
             scrollView.leadingAnchor.constraint(equalTo: rootStack.leadingAnchor),
@@ -1816,6 +1841,18 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             button.widthAnchor.constraint(equalToConstant: 32),
             button.heightAnchor.constraint(equalToConstant: 28)
         ])
+    }
+
+    private var titlebarActionButtons: [NSButton] {
+        [settingsButton, insightsButton, openButton, revealButton, copyButton]
+    }
+
+    private func configureTitlebarActionButtons() {
+        configureToolbarButton(settingsButton, symbol: "gearshape", tooltip: "Open Settings", action: #selector(openSettings(_:)))
+        configureToolbarButton(insightsButton, symbol: "chart.pie", tooltip: "Open Insights", action: #selector(openInsights(_:)))
+        configureToolbarButton(openButton, symbol: "arrow.up.forward.app", tooltip: "Open selected file", action: #selector(openSelected(_:)))
+        configureToolbarButton(revealButton, symbol: "folder", tooltip: "Reveal selected file in Finder", action: #selector(revealSelected(_:)))
+        configureToolbarButton(copyButton, symbol: "doc.on.doc", tooltip: "Copy selected path", action: #selector(copySelectedPath(_:)))
     }
 
     private func makeTableColumn(for column: Column) -> NSTableColumn {
