@@ -489,7 +489,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
             ),
             makeControlRow(
                 title: "Menu bar icon",
-                detail: "Show the menu bar loupe for quick search access.",
+                detail: "Show the menu bar icon for quick search access.",
                 control: menuBarIconSwitch
             ),
             makeControlRow(
