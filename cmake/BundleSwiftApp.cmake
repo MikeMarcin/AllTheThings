@@ -68,6 +68,7 @@ configure_file(
 set(APP_RESOURCE_FILES
     "AllTheThings.icns"
     "GameCoreTechLogo.png"
+    "NibMenuBarTemplate.png"
     "NibOperationIdleStrip.png"
     "NibOperationIndexingStrip.png"
     "NibOperationSearchingStrip.png"

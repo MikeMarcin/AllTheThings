@@ -914,6 +914,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSear
 
     private static func makeStatusIconImage() -> NSImage {
         let size = NSSize(width: 18, height: 18)
+        // Keep the status glyph tied to the real Nib sprite instead of a hand-drawn approximation.
+        if let url = Bundle.main.url(forResource: "NibMenuBarTemplate", withExtension: "png"),
+           let image = NSImage(contentsOf: url) {
+            image.size = size
+            image.isTemplate = true
+            return image
+        }
+
         let image = NSImage(size: size, flipped: false) { rect in
             guard let context = NSGraphicsContext.current?.cgContext else { return false }
             let scale = min(rect.width / size.width, rect.height / size.height)
@@ -922,87 +930,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSear
             func point(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
                 CGPoint(x: xOffset + x * scale, y: yOffset + y * scale)
             }
+            func fallbackRect(_ x: CGFloat, _ y: CGFloat, width: CGFloat, height: CGFloat) -> CGRect {
+                CGRect(
+                    x: point(x, y).x,
+                    y: point(x, y).y,
+                    width: width * scale,
+                    height: height * scale
+                )
+            }
 
             context.setFillColor(NSColor.black.cgColor)
             context.setStrokeColor(NSColor.black.cgColor)
             context.setLineCap(.round)
             context.setLineJoin(.round)
 
-            let leftFoot = CGRect(
-                x: point(5.65, 1.95).x,
-                y: point(5.65, 1.95).y,
-                width: 1.9 * scale,
-                height: 2.35 * scale
-            )
-            let rightFoot = CGRect(
-                x: point(10.45, 1.95).x,
-                y: point(10.45, 1.95).y,
-                width: 1.9 * scale,
-                height: 2.35 * scale
-            )
-            context.addPath(CGPath(
-                roundedRect: leftFoot,
-                cornerWidth: 0.55 * scale,
-                cornerHeight: 0.55 * scale,
-                transform: nil
-            ))
-            context.addPath(CGPath(
-                roundedRect: rightFoot,
-                cornerWidth: 0.55 * scale,
-                cornerHeight: 0.55 * scale,
-                transform: nil
-            ))
-            context.fillPath()
-
             context.setLineWidth(0.7 * scale)
-            context.move(to: point(7.3, 13.0))
-            context.addLine(to: point(6.55, 15.55))
-            context.move(to: point(10.7, 13.0))
-            context.addLine(to: point(11.45, 15.55))
+            context.move(to: point(7.0, 12.8))
+            context.addLine(to: point(6.3, 15.2))
+            context.move(to: point(11.0, 12.8))
+            context.addLine(to: point(11.7, 15.2))
             context.strokePath()
 
-            context.addEllipse(in: CGRect(
-                x: point(5.8, 15.35).x,
-                y: point(5.8, 15.35).y,
-                width: 1.5 * scale,
-                height: 1.5 * scale
-            ))
-            context.addEllipse(in: CGRect(
-                x: point(10.7, 15.35).x,
-                y: point(10.7, 15.35).y,
-                width: 1.5 * scale,
-                height: 1.5 * scale
-            ))
+            context.addEllipse(in: fallbackRect(5.6, 15.0, width: 1.4, height: 1.4))
+            context.addEllipse(in: fallbackRect(11.0, 15.0, width: 1.4, height: 1.4))
             context.fillPath()
 
-            let body = CGRect(
-                x: point(3.65, 3.25).x,
-                y: point(3.65, 3.25).y,
-                width: 10.7 * scale,
-                height: 10.5 * scale
-            )
             context.addPath(CGPath(
-                roundedRect: body,
-                cornerWidth: 2.15 * scale,
-                cornerHeight: 2.15 * scale,
+                roundedRect: fallbackRect(3.2, 3.3, width: 11.6, height: 9.9),
+                cornerWidth: 2.1 * scale,
+                cornerHeight: 2.1 * scale,
                 transform: nil
             ))
             context.fillPath()
 
             context.saveGState()
             context.setBlendMode(.clear)
-            context.addEllipse(in: CGRect(
-                x: point(6.9, 7.6).x,
-                y: point(6.9, 7.6).y,
-                width: 0.95 * scale,
-                height: 1.65 * scale
-            ))
-            context.addEllipse(in: CGRect(
-                x: point(10.15, 7.6).x,
-                y: point(10.15, 7.6).y,
-                width: 0.95 * scale,
-                height: 1.65 * scale
-            ))
+            context.addEllipse(in: fallbackRect(6.7, 7.5, width: 0.9, height: 1.6))
+            context.addEllipse(in: fallbackRect(10.4, 7.5, width: 0.9, height: 1.6))
             context.fillPath()
             context.restoreGState()
 
