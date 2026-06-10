@@ -51,6 +51,45 @@ struct SettingsWindowTests {
     }
 
     @MainActor
+    @Test("appearance page shows a synchronized theme preview selector")
+    func appearancePageShowsSynchronizedThemePreviewSelector() throws {
+        let suiteName = "AllTheThingsSettingsTests-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        AppSettings.registerDefaults(defaults)
+        AppSettings.saveThemePreference(.dark, defaults: defaults)
+        let index = FileIndex(applicationName: "AllTheThingsSettingsTests-\(UUID().uuidString)", loadsSnapshotImmediately: false)
+        let controller = SettingsWindowController(defaults: defaults, index: index, reindexHandler: {})
+        controller.loadWindow()
+        defer {
+            controller.close()
+        }
+
+        controller.selectSection(.appearance)
+        controller.window?.contentView?.layoutSubtreeIfNeeded()
+
+        let preview = try #require(
+            firstView(withIdentifier: "themePreviewSelector", in: controller.window?.contentView)
+                as? ThemePreviewSelectorControl
+        )
+        #expect(preview.selectedPreference == .dark)
+
+        let appearanceStrings = visibleStrings(in: controller.window?.contentView)
+        #expect(appearanceStrings.contains("System"))
+        #expect(appearanceStrings.contains("Light"))
+        #expect(appearanceStrings.contains("Dark"))
+        #expect(firstView(ofType: NSSegmentedControl.self, in: controller.window?.contentView) == nil)
+
+        preview.selectPreference(.light, sendsAction: true)
+        #expect(AppSettings.themePreference(defaults: defaults) == .light)
+        #expect(preview.selectedPreference == .light)
+    }
+
+    @MainActor
     private func visibleStrings(in view: NSView?) -> [String] {
         guard let view, !view.isHidden else { return [] }
 
@@ -77,6 +116,21 @@ struct SettingsWindowTests {
 
         for subview in view.subviews {
             if let match = firstView(withIdentifier: identifier, in: subview) {
+                return match
+            }
+        }
+        return nil
+    }
+
+    @MainActor
+    private func firstView<T: NSView>(ofType type: T.Type, in view: NSView?) -> T? {
+        guard let view, !view.isHidden else { return nil }
+        if let match = view as? T {
+            return match
+        }
+
+        for subview in view.subviews {
+            if let match = firstView(ofType: type, in: subview) {
                 return match
             }
         }

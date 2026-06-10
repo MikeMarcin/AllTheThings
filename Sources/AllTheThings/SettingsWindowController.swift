@@ -112,12 +112,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     private let generalSidebarRow = SidebarRow(section: .general)
     private let hotkeysSidebarRow = SidebarRow(section: .hotkeys)
     private let indexedFoldersSidebarRow = SidebarRow(section: .indexedFolders)
-    private let themeSegmentedControl = NSSegmentedControl(
-        labels: AppThemePreference.allCases.map(\.title),
-        trackingMode: .selectOne,
-        target: nil,
-        action: nil
-    )
+    private let themePreviewSelectorControl = ThemePreviewSelectorControl()
     private let fontFamilyPopUpButton = NSPopUpButton()
     private let fontSizeStepper = NSStepper()
     private let fontSizeValueLabel = NSTextField(labelWithString: "")
@@ -396,11 +391,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         configureMatchColorControls()
 
         let themeCard = makeSettingsCard(rows: [
-            makeControlRow(
-                title: "Theme",
-                detail: "Choose the app appearance.",
-                control: themeSegmentedControl
-            )
+            makeThemePreviewRow()
         ])
         let typographyCard = makeSettingsCard(rows: [
             makeControlRow(
@@ -833,17 +824,27 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         ])
     }
 
-    private func configureThemeControl() {
-        themeSegmentedControl.translatesAutoresizingMaskIntoConstraints = false
-        themeSegmentedControl.target = self
-        themeSegmentedControl.action = #selector(changeThemePreference(_:))
-        themeSegmentedControl.toolTip = "Theme"
-        themeSegmentedControl.setContentHuggingPriority(.required, for: .horizontal)
-        themeSegmentedControl.setContentCompressionResistancePriority(.required, for: .horizontal)
+    private func makeThemePreviewRow() -> NSView {
+        let row = NSView()
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.addSubview(themePreviewSelectorControl)
 
-        for segment in 0..<themeSegmentedControl.segmentCount {
-            themeSegmentedControl.setWidth(76, forSegment: segment)
-        }
+        NSLayoutConstraint.activate([
+            row.heightAnchor.constraint(greaterThanOrEqualToConstant: 132),
+
+            themePreviewSelectorControl.topAnchor.constraint(equalTo: row.topAnchor, constant: 18),
+            themePreviewSelectorControl.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 20),
+            themePreviewSelectorControl.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -20),
+            themePreviewSelectorControl.bottomAnchor.constraint(equalTo: row.bottomAnchor, constant: -16)
+        ])
+
+        return row
+    }
+
+    private func configureThemeControl() {
+        themePreviewSelectorControl.target = self
+        themePreviewSelectorControl.action = #selector(changeThemePreviewPreference(_:))
+        themePreviewSelectorControl.toolTip = "Theme preview"
     }
 
     private func configureFontControls() {
@@ -904,6 +905,17 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         return stack
     }
 
+    private func updateThemeControls() {
+        updateThemePreviewControl()
+    }
+
+    private func updateThemePreviewControl() {
+        themePreviewSelectorControl.configure(
+            defaults: defaults,
+            selectedPreference: AppSettings.themePreference(defaults: defaults)
+        )
+    }
+
     private func updateFontControls() {
         let familyName = AppSettings.appFontFamilyName(defaults: defaults) ?? ""
         let selectedItem = fontFamilyPopUpButton.itemArray.first { ($0.representedObject as? String ?? "") == familyName }
@@ -912,6 +924,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         let fontSize = AppSettings.appFontSize(defaults: defaults)
         fontSizeStepper.doubleValue = Double(fontSize)
         fontSizeValueLabel.stringValue = "\(Int(fontSize))"
+        updateThemePreviewControl()
     }
 
     private func configureMatchColorControls() {
@@ -962,6 +975,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     private func updateMatchColorControls() {
         lightMatchColorPaletteControl.configure(defaults: defaults, isDark: false)
         darkMatchColorPaletteControl.configure(defaults: defaults, isDark: true)
+        updateThemePreviewControl()
     }
 
     private func configureGlobalHotKeyButton() {
@@ -1713,8 +1727,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     }
 
     private func updateControls() {
-        let themePreference = AppSettings.themePreference(defaults: defaults)
-        themeSegmentedControl.selectedSegment = AppThemePreference.allCases.firstIndex(of: themePreference) ?? 0
+        updateThemeControls()
         updateFontControls()
         updateMatchColorControls()
         let globalHotKeyEnabled = AppSettings.globalSearchHotKeyEnabled(defaults: defaults)
@@ -1796,10 +1809,9 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         AppSettings.saveStatusFooterMode(AppStatusFooterMode.allCases[sender.selectedSegment], defaults: defaults)
     }
 
-    @objc private func changeThemePreference(_ sender: NSSegmentedControl) {
-        guard sender.selectedSegment >= 0, sender.selectedSegment < AppThemePreference.allCases.count else { return }
-
-        AppSettings.saveThemePreference(AppThemePreference.allCases[sender.selectedSegment], defaults: defaults)
+    @objc private func changeThemePreviewPreference(_ sender: ThemePreviewSelectorControl) {
+        AppSettings.saveThemePreference(sender.selectedPreference, defaults: defaults)
+        updateThemeControls()
     }
 
     @objc private func changeAppFontFamily(_ sender: NSPopUpButton) {
