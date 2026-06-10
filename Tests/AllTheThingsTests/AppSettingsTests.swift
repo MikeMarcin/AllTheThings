@@ -134,6 +134,17 @@ struct AppSettingsTests {
         #expect(AppSettings.globalAppSearchHotKey(defaults: defaults) == hotKey)
     }
 
+    @Test("hotkey controller ignores events registered to another controller")
+    func hotKeyControllerIgnoresEventsRegisteredToAnotherController() {
+        let searchHotKeyID = EventHotKeyID(signature: OSType(0x41545448), id: 1)
+        let appSearchHotKeyID = EventHotKeyID(signature: OSType(0x41545448), id: 2)
+        let foreignHotKeyID = EventHotKeyID(signature: OSType(0), id: 1)
+
+        #expect(GlobalHotKeyController.dispatchStatus(for: searchHotKeyID, controllerHotKeyIDValue: 1) == noErr)
+        #expect(GlobalHotKeyController.dispatchStatus(for: appSearchHotKeyID, controllerHotKeyIDValue: 1) == GlobalHotKeyController.eventNotHandledStatus)
+        #expect(GlobalHotKeyController.dispatchStatus(for: foreignHotKeyID, controllerHotKeyIDValue: 1) == GlobalHotKeyController.eventNotHandledStatus)
+    }
+
     @Test("setup folder edits stay pending until indexing starts")
     func setupFolderEditsStayPendingUntilIndexingStarts() throws {
         let (defaults, suiteName) = try makeDefaults()
