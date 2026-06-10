@@ -28,6 +28,7 @@ struct SettingsWindowTests {
         let generalStrings = visibleStrings(in: controller.window?.contentView)
         #expect(generalStrings.contains("Diagnostics"))
         #expect(generalStrings.contains("Diagnostic detail"))
+        #expect(generalStrings.contains("Status footer"))
         #expect(!generalStrings.contains { $0.contains("Full Disk Access") })
 
         controller.selectSection(.indexedFolders)

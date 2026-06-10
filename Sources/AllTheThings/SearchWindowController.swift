@@ -7,13 +7,17 @@ enum AppRuntimeStatusFormatter {
     static let transientReadyStatusDisplayDuration: TimeInterval = 5
 
     static func windowTitle(version: String?, build: String?) -> String {
+        "AllTheThings"
+    }
+
+    static func footerVersion(version: String?, build: String?) -> String {
         switch (version, build) {
         case let (version?, _) where !version.isEmpty:
-            return "AllTheThings \(version)"
+            return version
         case let (_, build?) where !build.isEmpty:
-            return "AllTheThings \(build)"
+            return build
         default:
-            return "AllTheThings"
+            return ""
         }
     }
 
@@ -226,6 +230,7 @@ final class SearchWindowController: NSWindowController {
         )
         window.title = Self.windowTitle()
         window.titlebarAppearsTransparent = true
+        window.canHide = true
         window.collectionBehavior.insert(.moveToActiveSpace)
         window.isRestorable = false
         window.contentMinSize = WindowLayout.minimumContentSize
@@ -755,6 +760,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private let expandedMascotImageView = NSImageView()
     private let statusLabel = NSTextField(labelWithString: "")
     private let countLabel = NSTextField(labelWithString: "")
+    private let versionLabel = NSTextField(labelWithString: "")
     private let openButton = NSButton()
     private let revealButton = NSButton()
     private let copyButton = NSButton()
@@ -823,6 +829,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private nonisolated(unsafe) var pendingZeroRowRootRecoveryWorkItem: DispatchWorkItem?
     private var highlightsSearchText: Bool
     private var showsHiddenFiles: Bool
+    private var statusFooterMode: AppStatusFooterMode
     private var appFontFamilyName: String?
     private var appFontSize: CGFloat
 
@@ -898,6 +905,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         self.rootDisplayNames = Self.rootDisplayNames(for: self.indexedRoots.map { $0.standardizedFileURL.path })
         self.highlightsSearchText = defaults.bool(forKey: AppSettings.highlightSearchTextKey)
         self.showsHiddenFiles = defaults.bool(forKey: AppSettings.showHiddenFilesKey)
+        self.statusFooterMode = AppSettings.statusFooterMode(defaults: defaults)
         self.appFontFamilyName = AppSettings.appFontFamilyName(defaults: defaults)
         self.appFontSize = AppSettings.appFontSize(defaults: defaults)
         super.init(nibName: nil, bundle: nil)
@@ -946,6 +954,12 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             self,
             selector: #selector(appFontDidChange(_:)),
             name: AppSettings.appFontDidChangeNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(statusFooterModeDidChange(_:)),
+            name: AppSettings.statusFooterModeDidChangeNotification,
             object: nil
         )
         NotificationCenter.default.addObserver(
@@ -1273,27 +1287,34 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
         tableView.sortDescriptors = [sortDescriptor(for: sortSpec)]
 
-        let footer = NSStackView()
-        footer.orientation = .horizontal
-        footer.alignment = .centerY
-        footer.spacing = 12
-        footer.edgeInsets = NSEdgeInsets(top: 2, left: 14, bottom: 2, right: 14)
+        let footer = NSView()
         footer.translatesAutoresizingMaskIntoConstraints = false
 
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+        countLabel.translatesAutoresizingMaskIntoConstraints = false
+        versionLabel.translatesAutoresizingMaskIntoConstraints = false
         countLabel.textColor = .secondaryLabelColor
+        countLabel.alignment = .center
         countLabel.lineBreakMode = .byTruncatingTail
         countLabel.setContentHuggingPriority(.required, for: .horizontal)
         countLabel.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
         statusLabel.textColor = .tertiaryLabelColor
+        statusLabel.alignment = .left
         statusLabel.lineBreakMode = .byTruncatingMiddle
         statusLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
         statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        versionLabel.textColor = .tertiaryLabelColor
+        versionLabel.alignment = .right
+        versionLabel.lineBreakMode = .byTruncatingHead
+        versionLabel.setContentHuggingPriority(.required, for: .horizontal)
+        versionLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
 
         configureMascotSlotView()
         mascotCoordinator = OperationMascotCoordinator(imageView: mascotImageView)
-        footer.addArrangedSubview(mascotSlotView)
-        footer.addArrangedSubview(countLabel)
-        footer.addArrangedSubview(statusLabel)
+        footer.addSubview(mascotSlotView)
+        footer.addSubview(statusLabel)
+        footer.addSubview(countLabel)
+        footer.addSubview(versionLabel)
         updateMascotPersistentAnimation()
 
         let titlebarSeparator = NSBox()
@@ -1327,11 +1348,22 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             scrollView.trailingAnchor.constraint(equalTo: rootStack.trailingAnchor),
             footer.leadingAnchor.constraint(equalTo: rootStack.leadingAnchor),
             footer.trailingAnchor.constraint(equalTo: rootStack.trailingAnchor),
+            footer.heightAnchor.constraint(greaterThanOrEqualToConstant: OperationMascotCoordinator.footerSlotHeight + 4),
             searchField.widthAnchor.constraint(greaterThanOrEqualToConstant: 360),
 
             scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 400),
 
+            mascotSlotView.leadingAnchor.constraint(equalTo: footer.leadingAnchor, constant: 14),
+            mascotSlotView.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
+            statusLabel.leadingAnchor.constraint(equalTo: mascotSlotView.trailingAnchor, constant: 12),
+            statusLabel.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
+            statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: countLabel.leadingAnchor, constant: -16),
+            countLabel.centerXAnchor.constraint(equalTo: footer.centerXAnchor),
+            countLabel.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
             countLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 260),
+            versionLabel.leadingAnchor.constraint(greaterThanOrEqualTo: countLabel.trailingAnchor, constant: 16),
+            versionLabel.trailingAnchor.constraint(equalTo: footer.trailingAnchor, constant: -14),
+            versionLabel.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
 
             loadingOverlay.topAnchor.constraint(equalTo: scrollView.topAnchor),
             loadingOverlay.leadingAnchor.constraint(equalTo: scrollView.leadingAnchor),
@@ -1352,6 +1384,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         tableView.rowHeight = max(20, baseSize + 8)
         countLabel.font = AppSettings.appFont(defaults: defaults)
         statusLabel.font = AppSettings.appFont(defaults: defaults)
+        versionLabel.font = AppSettings.appFont(defaults: defaults)
         loadingLabel.font = AppSettings.appFont(defaults: defaults, sizeDelta: 2, weight: .medium)
     }
 
@@ -2723,6 +2756,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private func settingsDidChange() {
         let updatedHighlightsSearchText = defaults.bool(forKey: AppSettings.highlightSearchTextKey)
         let updatedShowsHiddenFiles = defaults.bool(forKey: AppSettings.showHiddenFilesKey)
+        let updatedStatusFooterMode = AppSettings.statusFooterMode(defaults: defaults)
         let updatedAppFontFamilyName = AppSettings.appFontFamilyName(defaults: defaults)
         let updatedAppFontSize = AppSettings.appFontSize(defaults: defaults)
 
@@ -2742,6 +2776,11 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             showsHiddenFiles = updatedShowsHiddenFiles
             scheduleSearch(force: true)
         }
+
+        if updatedStatusFooterMode != statusFooterMode {
+            statusFooterMode = updatedStatusFooterMode
+            updateStatus()
+        }
     }
 
     @objc private nonisolated func userDefaultsDidChange(_ notification: Notification) {
@@ -2752,6 +2791,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     @objc private func appFontDidChange(_ notification: Notification) {
+        settingsDidChange()
+    }
+
+    @objc private func statusFooterModeDidChange(_ notification: Notification) {
         settingsDidChange()
     }
 
@@ -3342,25 +3385,57 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
 
         let appSearchActive = ApplicationSearchQuery.parse(currentSearchText()) != nil
+        let shownText = "\(results.count.formatted()) shown / \(totalMatches.formatted()) matches"
         guard AppSettings.indexingSetupCompleted(defaults: defaults) || appSearchActive else {
-            countLabel.stringValue = "0 shown / 0 matches • 0 indexed"
-            statusLabel.stringValue = "Setup needed • Choose what AllTheThings can search • \(memoryStatusText)"
+            applyFooterStatus(
+                shownText: shownText,
+                detailedCenterText: "\(shownText) • 0 indexed",
+                detailedLeftText: "\(memoryStatusText) • Setup needed • Choose what AllTheThings can search"
+            )
             return
         }
 
-        let shownCount = results.count
         let indexed = indexStats.indexedCount.formatted()
-        let total = totalMatches.formatted()
         var countSegments = [
-            "\(shownCount.formatted()) shown / \(total) matches",
+            shownText,
             appSearchActive ? "\(AppSettings.appSearchRoots(defaults: defaults).count.formatted()) app folders" : "\(indexed) indexed"
         ]
         if !currentSearchText().isEmpty {
             countSegments.append(searchElapsedText())
         }
-        countLabel.stringValue = countSegments.joined(separator: " • ")
 
-        statusLabel.stringValue = "\(appSearchActive ? "Application search" : indexStatusText()) • \(memoryStatusText)"
+        applyFooterStatus(
+            shownText: shownText,
+            detailedCenterText: countSegments.joined(separator: " • "),
+            detailedLeftText: "\(memoryStatusText) • \(appSearchActive ? "Application search" : indexStatusText())"
+        )
+    }
+
+    private func applyFooterStatus(
+        shownText: String,
+        detailedCenterText: String,
+        detailedLeftText: String
+    ) {
+        switch statusFooterMode {
+        case .simple:
+            statusLabel.stringValue = ""
+            statusLabel.isHidden = true
+            countLabel.stringValue = shownText
+            versionLabel.stringValue = ""
+            versionLabel.isHidden = true
+        case .detailed:
+            statusLabel.isHidden = false
+            statusLabel.stringValue = detailedLeftText
+            countLabel.stringValue = detailedCenterText
+            versionLabel.isHidden = false
+            versionLabel.stringValue = Self.footerVersionText()
+        }
+    }
+
+    private static func footerVersionText() -> String {
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+        return AppRuntimeStatusFormatter.footerVersion(version: version, build: build)
     }
 
     private func searchElapsedText() -> String {

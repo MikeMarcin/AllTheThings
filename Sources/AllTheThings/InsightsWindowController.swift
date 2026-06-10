@@ -33,6 +33,7 @@ final class InsightsWindowController: NSWindowController {
             defer: false
         )
         window.title = "Insights"
+        window.canHide = true
         window.isRestorable = false
         window.contentMinSize = Self.clampedContentSize(
             Self.minimumContentSize,

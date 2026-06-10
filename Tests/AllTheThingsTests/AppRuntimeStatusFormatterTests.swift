@@ -4,12 +4,20 @@ import Testing
 
 @Suite("App runtime status formatter")
 struct AppRuntimeStatusFormatterTests {
-    @Test("window title prefers version without build suffix")
-    func windowTitlePrefersVersionWithoutBuildSuffix() {
-        #expect(AppRuntimeStatusFormatter.windowTitle(version: "0.6.1", build: "42") == "AllTheThings 0.6.1")
-        #expect(AppRuntimeStatusFormatter.windowTitle(version: "0.6.1", build: nil) == "AllTheThings 0.6.1")
-        #expect(AppRuntimeStatusFormatter.windowTitle(version: nil, build: "42") == "AllTheThings 42")
+    @Test("window title omits version and build")
+    func windowTitleOmitsVersionAndBuild() {
+        #expect(AppRuntimeStatusFormatter.windowTitle(version: "0.6.1", build: "42") == "AllTheThings")
+        #expect(AppRuntimeStatusFormatter.windowTitle(version: "0.6.1", build: nil) == "AllTheThings")
+        #expect(AppRuntimeStatusFormatter.windowTitle(version: nil, build: "42") == "AllTheThings")
         #expect(AppRuntimeStatusFormatter.windowTitle(version: nil, build: nil) == "AllTheThings")
+    }
+
+    @Test("footer version prefers version without build suffix")
+    func footerVersionPrefersVersionWithoutBuildSuffix() {
+        #expect(AppRuntimeStatusFormatter.footerVersion(version: "0.6.1", build: "42") == "0.6.1")
+        #expect(AppRuntimeStatusFormatter.footerVersion(version: "0.6.1", build: nil) == "0.6.1")
+        #expect(AppRuntimeStatusFormatter.footerVersion(version: nil, build: "42") == "42")
+        #expect(AppRuntimeStatusFormatter.footerVersion(version: nil, build: nil) == "")
     }
 
     @Test("operation elapsed formats seconds minutes and hours")

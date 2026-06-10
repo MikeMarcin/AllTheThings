@@ -730,6 +730,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSear
         appMenu.addItem(checkUpdatesItem)
 
         appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "Hide AllTheThings", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Quit AllTheThings", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
         mainMenu.addItem(appItem)
@@ -1093,6 +1095,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSear
             defer: false
         )
         window.title = "About AllTheThings"
+        window.canHide = true
         window.isRestorable = false
 
         let logoView = NSImageView()
@@ -1216,6 +1219,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSear
             defer: false
         )
         window.title = "Third-Party Notices"
+        window.canHide = true
         window.isRestorable = false
         window.contentMinSize = NSSize(width: 520, height: 360)
 

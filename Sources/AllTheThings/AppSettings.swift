@@ -15,6 +15,18 @@ enum AppThemePreference: String, CaseIterable {
     }
 }
 
+enum AppStatusFooterMode: String, CaseIterable {
+    case simple
+    case detailed
+
+    var title: String {
+        switch self {
+        case .simple: "Simple"
+        case .detailed: "Detailed"
+        }
+    }
+}
+
 enum AppSettings {
     static let allowMultipleInstancesKey = "ATTAllowMultipleInstances"
     static let globalSearchHotKeyEnabledKey = "ATTGlobalSearchHotKeyEnabled"
@@ -29,6 +41,7 @@ enum AppSettings {
     static let highlightSearchTextKey = "ATTHighlightSearchText"
     static let menuBarIconEnabledKey = "ATTMenuBarIconEnabled"
     static let showHiddenFilesKey = "ATTShowHiddenFiles"
+    static let statusFooterModeKey = "ATTStatusFooterMode"
     static let themePreferenceKey = "ATTThemePreference"
     static let appFontFamilyNameKey = "ATTAppFontFamilyName"
     static let appFontSizeKey = "ATTAppFontSize"
@@ -45,6 +58,7 @@ enum AppSettings {
     static let globalSearchHotKeyDidChangeNotification = Notification.Name("com.allthethings.settings.globalSearchHotKeyDidChange")
     static let globalAppSearchHotKeyDidChangeNotification = Notification.Name("com.allthethings.settings.globalAppSearchHotKeyDidChange")
     static let menuBarIconDidChangeNotification = Notification.Name("com.allthethings.settings.menuBarIconDidChange")
+    static let statusFooterModeDidChangeNotification = Notification.Name("com.allthethings.settings.statusFooterModeDidChange")
     static let themePreferenceDidChangeNotification = Notification.Name("com.allthethings.settings.themePreferenceDidChange")
     static let appFontDidChangeNotification = Notification.Name("com.allthethings.settings.appFontDidChange")
     static let diagnosticLogLevelDidChangeNotification = Notification.Name("com.allthethings.settings.diagnosticLogLevelDidChange")
@@ -103,6 +117,7 @@ enum AppSettings {
             highlightSearchTextKey: true,
             menuBarIconEnabledKey: true,
             showHiddenFilesKey: false,
+            statusFooterModeKey: AppStatusFooterMode.simple.rawValue,
             themePreferenceKey: AppThemePreference.system.rawValue,
             appFontFamilyNameKey: "",
             appFontSizeKey: Double(defaultAppFontSize),
@@ -235,6 +250,32 @@ enum AppSettings {
             ]
         )
         NotificationCenter.default.post(name: menuBarIconDidChangeNotification, object: defaults)
+    }
+
+    static func statusFooterMode(defaults: UserDefaults = .standard) -> AppStatusFooterMode {
+        guard
+            let rawValue = defaults.string(forKey: statusFooterModeKey),
+            let mode = AppStatusFooterMode(rawValue: rawValue)
+        else {
+            return .simple
+        }
+
+        return mode
+    }
+
+    static func saveStatusFooterMode(_ mode: AppStatusFooterMode, defaults: UserDefaults = .standard) {
+        guard statusFooterMode(defaults: defaults) != mode else { return }
+
+        defaults.set(mode.rawValue, forKey: statusFooterModeKey)
+        defaults.synchronize()
+        DiagnosticLogger.shared.log(
+            category: "settings",
+            event: "settings.statusFooterModeChanged",
+            fields: [
+                "mode": .publicString(mode.rawValue)
+            ]
+        )
+        NotificationCenter.default.post(name: statusFooterModeDidChangeNotification, object: defaults)
     }
 
     static func diagnosticLogLevel(defaults: UserDefaults = .standard) -> DiagnosticLogLevel {
