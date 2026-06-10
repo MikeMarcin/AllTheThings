@@ -7,8 +7,8 @@ import Testing
 @Suite("Settings window")
 struct SettingsWindowTests {
     @MainActor
-    @Test("diagnostics stay on General and Full Disk Access lives in Indexed Folders")
-    func diagnosticsStayOnGeneralAndFullDiskAccessLivesInIndexedFolders() throws {
+    @Test("hotkeys have their own page and diagnostics stay on General")
+    func hotkeysHaveTheirOwnPageAndDiagnosticsStayOnGeneral() throws {
         let suiteName = "AllTheThingsSettingsTests-\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suiteName))
         defaults.removePersistentDomain(forName: suiteName)
@@ -29,7 +29,16 @@ struct SettingsWindowTests {
         #expect(generalStrings.contains("Diagnostics"))
         #expect(generalStrings.contains("Diagnostic detail"))
         #expect(generalStrings.contains("Status footer"))
+        #expect(!generalStrings.contains("Global search hotkey"))
+        #expect(!generalStrings.contains("Global app search hotkey"))
         #expect(!generalStrings.contains { $0.contains("Full Disk Access") })
+
+        controller.selectSection(.hotkeys)
+        let hotkeyStrings = visibleStrings(in: controller.window?.contentView)
+        #expect(hotkeyStrings.contains("Global Shortcuts"))
+        #expect(hotkeyStrings.contains("Global search hotkey"))
+        #expect(hotkeyStrings.contains("Global app search hotkey"))
+        #expect(!hotkeyStrings.contains("Diagnostic detail"))
 
         controller.selectSection(.indexedFolders)
         let indexedFolderStrings = visibleStrings(in: controller.window?.contentView)
