@@ -204,9 +204,10 @@ final class GlobalHotKeyController {
     private static let signature = OSType(0x41545448)
     private static let hotKeyExistsStatus = OSStatus(-9878)
     private static let hotKeyInvalidStatus = OSStatus(-9879)
+    static let eventNotHandledStatus = OSStatus(eventNotHandledErr)
 
     private static let eventHandler: EventHandlerUPP = { _, event, userData in
-        guard let event, let userData else { return noErr }
+        guard let event, let userData else { return GlobalHotKeyController.eventNotHandledStatus }
 
         var hotKeyID = EventHotKeyID()
         let status = GetEventParameter(
@@ -218,15 +219,13 @@ final class GlobalHotKeyController {
             nil,
             &hotKeyID
         )
-        guard
-            status == noErr,
-            hotKeyID.signature == GlobalHotKeyController.signature
-        else {
-            return noErr
-        }
+        guard status == noErr else { return GlobalHotKeyController.eventNotHandledStatus }
 
         let controller = Unmanaged<GlobalHotKeyController>.fromOpaque(userData).takeUnretainedValue()
-        guard hotKeyID.id == controller.hotKeyIDValue else { return noErr }
+        guard GlobalHotKeyController.dispatchStatus(for: hotKeyID, controllerHotKeyIDValue: controller.hotKeyIDValue) == noErr else {
+            return GlobalHotKeyController.eventNotHandledStatus
+        }
+
         controller.action()
         return noErr
     }
@@ -241,6 +240,17 @@ final class GlobalHotKeyController {
         self.hotKeyIDValue = hotKeyIDValue
         self.action = action
         installEventHandler()
+    }
+
+    static func dispatchStatus(for hotKeyID: EventHotKeyID, controllerHotKeyIDValue: UInt32) -> OSStatus {
+        guard
+            hotKeyID.signature == signature,
+            hotKeyID.id == controllerHotKeyIDValue
+        else {
+            return eventNotHandledStatus
+        }
+
+        return noErr
     }
 
     deinit {
