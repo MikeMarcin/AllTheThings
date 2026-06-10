@@ -923,52 +923,87 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSear
                 CGPoint(x: xOffset + x * scale, y: yOffset + y * scale)
             }
 
-            let nibPath = CGMutablePath()
-            nibPath.move(to: point(9.0, 1.45))
-            nibPath.addCurve(to: point(5.1, 6.2), control1: point(8.0, 3.2), control2: point(6.4, 4.8))
-            nibPath.addCurve(to: point(3.15, 13.75), control1: point(3.7, 8.1), control2: point(3.0, 10.9))
-            nibPath.addCurve(to: point(5.95, 16.35), control1: point(3.3, 15.35), control2: point(4.45, 16.35))
-            nibPath.addLine(to: point(12.05, 16.35))
-            nibPath.addCurve(to: point(14.85, 13.75), control1: point(13.55, 16.35), control2: point(14.7, 15.35))
-            nibPath.addCurve(to: point(12.9, 6.2), control1: point(15.0, 10.9), control2: point(14.3, 8.1))
-            nibPath.addCurve(to: point(9.0, 1.45), control1: point(11.6, 4.8), control2: point(10.0, 3.2))
-            nibPath.closeSubpath()
-
             context.setFillColor(NSColor.black.cgColor)
-            context.addPath(nibPath)
+            context.setStrokeColor(NSColor.black.cgColor)
+            context.setLineCap(.round)
+            context.setLineJoin(.round)
+
+            let leftFoot = CGRect(
+                x: point(5.65, 1.95).x,
+                y: point(5.65, 1.95).y,
+                width: 1.9 * scale,
+                height: 2.35 * scale
+            )
+            let rightFoot = CGRect(
+                x: point(10.45, 1.95).x,
+                y: point(10.45, 1.95).y,
+                width: 1.9 * scale,
+                height: 2.35 * scale
+            )
+            context.addPath(CGPath(
+                roundedRect: leftFoot,
+                cornerWidth: 0.55 * scale,
+                cornerHeight: 0.55 * scale,
+                transform: nil
+            ))
+            context.addPath(CGPath(
+                roundedRect: rightFoot,
+                cornerWidth: 0.55 * scale,
+                cornerHeight: 0.55 * scale,
+                transform: nil
+            ))
+            context.fillPath()
+
+            context.setLineWidth(0.7 * scale)
+            context.move(to: point(7.3, 13.0))
+            context.addLine(to: point(6.55, 15.55))
+            context.move(to: point(10.7, 13.0))
+            context.addLine(to: point(11.45, 15.55))
+            context.strokePath()
+
+            context.addEllipse(in: CGRect(
+                x: point(5.8, 15.35).x,
+                y: point(5.8, 15.35).y,
+                width: 1.5 * scale,
+                height: 1.5 * scale
+            ))
+            context.addEllipse(in: CGRect(
+                x: point(10.7, 15.35).x,
+                y: point(10.7, 15.35).y,
+                width: 1.5 * scale,
+                height: 1.5 * scale
+            ))
+            context.fillPath()
+
+            let body = CGRect(
+                x: point(3.65, 3.25).x,
+                y: point(3.65, 3.25).y,
+                width: 10.7 * scale,
+                height: 10.5 * scale
+            )
+            context.addPath(CGPath(
+                roundedRect: body,
+                cornerWidth: 2.15 * scale,
+                cornerHeight: 2.15 * scale,
+                transform: nil
+            ))
             context.fillPath()
 
             context.saveGState()
             context.setBlendMode(.clear)
-            context.setLineCap(.round)
-            context.setLineJoin(.round)
-
             context.addEllipse(in: CGRect(
-                x: point(7.85, 8.3).x,
-                y: point(7.85, 8.3).y,
-                width: 2.3 * scale,
-                height: 2.3 * scale
+                x: point(6.9, 7.6).x,
+                y: point(6.9, 7.6).y,
+                width: 0.95 * scale,
+                height: 1.65 * scale
+            ))
+            context.addEllipse(in: CGRect(
+                x: point(10.15, 7.6).x,
+                y: point(10.15, 7.6).y,
+                width: 0.95 * scale,
+                height: 1.65 * scale
             ))
             context.fillPath()
-
-            context.setLineWidth(0.95 * scale)
-            context.move(to: point(9.0, 2.55))
-            context.addLine(to: point(9.0, 8.0))
-            context.strokePath()
-
-            context.setLineWidth(0.75 * scale)
-            context.move(to: point(9.0, 10.9))
-            context.addLine(to: point(9.0, 14.7))
-            context.strokePath()
-
-            context.setLineWidth(0.8 * scale)
-            context.move(to: point(7.6, 10.0))
-            context.addLine(to: point(5.7, 12.2))
-            context.strokePath()
-
-            context.move(to: point(10.4, 10.0))
-            context.addLine(to: point(12.3, 12.2))
-            context.strokePath()
             context.restoreGState()
 
             return true
