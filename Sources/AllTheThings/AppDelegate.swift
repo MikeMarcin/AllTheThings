@@ -4,7 +4,7 @@ import CoreServices
 
 // AppKit invokes these Objective-C delegate hooks during startup; hop to the
 // main queue before touching Swift @MainActor AppKit APIs.
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSearchFieldDelegate {
     private static let activationRequestNotification = Notification.Name("com.allthethings.app.activateExistingInstance")
     private static let diagnosticLogMaxTotalBytes: UInt64 = 50 * 1024 * 1024
     private static let diagnosticLogMaxAge: TimeInterval = 30 * 24 * 60 * 60
@@ -23,6 +23,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var globalAppSearchHotKeyController: GlobalHotKeyController?
     private var statusItem: NSStatusItem?
     private var statusMenu: NSMenu?
+    private var statusSearchField: NSSearchField?
     private var didPresentGlobalHotKeyRegistrationError = false
     private var didPresentGlobalAppSearchHotKeyRegistrationError = false
 
@@ -361,15 +362,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc @MainActor private func activateStatusItem(_ sender: NSStatusBarButton) {
-        let event = NSApp.currentEvent
-        let shouldShowMenu = event?.type == .rightMouseUp
-            || event?.modifierFlags.contains(.control) == true
-
-        if shouldShowMenu {
-            showStatusMenu(relativeTo: sender)
-        } else {
-            focusSearchFromHotKey()
-        }
+        showStatusMenu(relativeTo: sender)
     }
 
     @objc private func globalSearchHotKeyDidChange(_ notification: Notification) {
@@ -836,7 +829,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let button = item.button {
             button.image = Self.makeStatusIconImage()
             button.imagePosition = .imageOnly
-            button.toolTip = "AllTheThings - Click to focus search. Control-click for menu."
+            button.toolTip = "AllTheThings - Click to search."
             button.target = self
             button.action = #selector(activateStatusItem(_:))
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
@@ -844,6 +837,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let menu = NSMenu(title: "AllTheThings")
         menu.delegate = self
+        menu.addItem(makeStatusSearchMenuItem())
+        menu.addItem(.separator())
 
         let settingsItem = NSMenuItem(
             title: "Settings...",
@@ -888,80 +883,95 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func removeStatusItem() {
         guard let item = statusItem else {
             statusMenu = nil
+            statusSearchField = nil
             return
         }
 
         NSStatusBar.system.removeStatusItem(item)
         statusItem = nil
         statusMenu = nil
+        statusSearchField = nil
+    }
+
+    @MainActor
+    private func makeStatusSearchMenuItem() -> NSMenuItem {
+        let item = NSMenuItem()
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 280, height: 44))
+        let searchField = NSSearchField(frame: NSRect(x: 12, y: 8, width: 256, height: 28))
+        searchField.placeholderString = "Search"
+        searchField.target = self
+        searchField.action = #selector(submitStatusSearch(_:))
+        searchField.delegate = self
+        searchField.focusRingType = .none
+        searchField.font = .systemFont(ofSize: 15)
+        container.addSubview(searchField)
+        item.view = container
+        statusSearchField = searchField
+        return item
     }
 
     private static func makeStatusIconImage() -> NSImage {
         let size = NSSize(width: 18, height: 18)
         let image = NSImage(size: size, flipped: false) { rect in
             guard let context = NSGraphicsContext.current?.cgContext else { return false }
-            let scale = rect.width / size.width
+            let scale = min(rect.width / size.width, rect.height / size.height)
+            let xOffset = rect.minX + (rect.width - size.width * scale) / 2
+            let yOffset = rect.minY + (rect.height - size.height * scale) / 2
             func point(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
-                CGPoint(x: rect.minX + x * scale, y: rect.minY + y * scale)
-            }
-            func radians(_ degrees: CGFloat) -> CGFloat {
-                degrees * .pi / 180
+                CGPoint(x: xOffset + x * scale, y: yOffset + y * scale)
             }
 
-            let contrastUnderlay = NSColor.labelColor.withAlphaComponent(0.24).cgColor
-            let cyan = CGColor(red: 0.08, green: 0.88, blue: 1.0, alpha: 1.0)
-            let blue = CGColor(red: 0.22, green: 0.40, blue: 1.0, alpha: 0.94)
-            let magenta = CGColor(red: 1.0, green: 0.14, blue: 0.84, alpha: 1.0)
-            let highlight = CGColor(red: 1.0, green: 1.0, blue: 1.0, alpha: 0.52)
-            let center = point(7.3, 10.4)
-            let radius = 4.35 * scale
-            let ringWidth = 2.55 * scale
-            let handleWidth = 3.15 * scale
+            let nibPath = CGMutablePath()
+            nibPath.move(to: point(9.0, 1.45))
+            nibPath.addCurve(to: point(5.1, 6.2), control1: point(8.0, 3.2), control2: point(6.4, 4.8))
+            nibPath.addCurve(to: point(3.15, 13.75), control1: point(3.7, 8.1), control2: point(3.0, 10.9))
+            nibPath.addCurve(to: point(5.95, 16.35), control1: point(3.3, 15.35), control2: point(4.45, 16.35))
+            nibPath.addLine(to: point(12.05, 16.35))
+            nibPath.addCurve(to: point(14.85, 13.75), control1: point(13.55, 16.35), control2: point(14.7, 15.35))
+            nibPath.addCurve(to: point(12.9, 6.2), control1: point(15.0, 10.9), control2: point(14.3, 8.1))
+            nibPath.addCurve(to: point(9.0, 1.45), control1: point(11.6, 4.8), control2: point(10.0, 3.2))
+            nibPath.closeSubpath()
 
+            context.setFillColor(NSColor.black.cgColor)
+            context.addPath(nibPath)
+            context.fillPath()
+
+            context.saveGState()
+            context.setBlendMode(.clear)
             context.setLineCap(.round)
             context.setLineJoin(.round)
 
-            context.setStrokeColor(contrastUnderlay)
-            context.setLineWidth(4.9 * scale)
-            context.move(to: point(10.8, 6.9))
-            context.addLine(to: point(15.1, 2.6))
+            context.addEllipse(in: CGRect(
+                x: point(7.85, 8.3).x,
+                y: point(7.85, 8.3).y,
+                width: 2.3 * scale,
+                height: 2.3 * scale
+            ))
+            context.fillPath()
+
+            context.setLineWidth(0.95 * scale)
+            context.move(to: point(9.0, 2.55))
+            context.addLine(to: point(9.0, 8.0))
             context.strokePath()
 
-            context.setStrokeColor(contrastUnderlay)
-            context.setLineWidth(4.3 * scale)
-            context.addArc(center: center, radius: radius, startAngle: 0, endAngle: .pi * 2, clockwise: false)
+            context.setLineWidth(0.75 * scale)
+            context.move(to: point(9.0, 10.9))
+            context.addLine(to: point(9.0, 14.7))
             context.strokePath()
 
-            context.setStrokeColor(magenta)
-            context.setLineWidth(handleWidth)
-            context.move(to: point(10.8, 6.9))
-            context.addLine(to: point(15.1, 2.6))
+            context.setLineWidth(0.8 * scale)
+            context.move(to: point(7.6, 10.0))
+            context.addLine(to: point(5.7, 12.2))
             context.strokePath()
 
-            context.setStrokeColor(cyan)
-            context.setLineWidth(ringWidth)
-            context.addArc(center: center, radius: radius, startAngle: radians(14), endAngle: radians(204), clockwise: false)
+            context.move(to: point(10.4, 10.0))
+            context.addLine(to: point(12.3, 12.2))
             context.strokePath()
-
-            context.setStrokeColor(blue)
-            context.setLineWidth(ringWidth)
-            context.addArc(center: center, radius: radius, startAngle: radians(204), endAngle: radians(298), clockwise: false)
-            context.strokePath()
-
-            context.setStrokeColor(magenta)
-            context.setLineWidth(ringWidth)
-            context.addArc(center: center, radius: radius, startAngle: radians(298), endAngle: radians(374), clockwise: false)
-            context.strokePath()
-
-            context.setStrokeColor(highlight)
-            context.setLineWidth(0.85 * scale)
-            context.addArc(center: center, radius: 3.25 * scale, startAngle: radians(112), endAngle: radians(158), clockwise: false)
-            context.strokePath()
+            context.restoreGState()
 
             return true
         }
-        image.isTemplate = false
-        image.cacheMode = .never
+        image.isTemplate = true
         return image
     }
 
@@ -972,6 +982,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height + 2), in: button)
     }
 
+    func menuWillOpen(_ menu: NSMenu) {
+        guard menu === statusMenu, let field = statusSearchField else { return }
+        field.stringValue = ""
+
+        NSObject.cancelPreviousPerformRequests(
+            withTarget: self,
+            selector: #selector(focusStatusSearchFieldFromMenu),
+            object: nil
+        )
+        perform(
+            #selector(focusStatusSearchFieldFromMenu),
+            with: nil,
+            afterDelay: 0,
+            inModes: [.eventTracking, .default]
+        )
+    }
+
+    @objc @MainActor private func focusStatusSearchFieldFromMenu() {
+        guard let field = statusSearchField, field.window != nil else { return }
+        field.window?.makeFirstResponder(field)
+        field.selectText(nil)
+    }
+
     func menuNeedsUpdate(_ menu: NSMenu) {
         for item in menu.items where item.action == #selector(toggleHiddenFiles(_:)) {
             item.state = defaults.bool(forKey: AppSettings.showHiddenFilesKey) ? .on : .off
@@ -980,6 +1013,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for item in menu.items where item.action == #selector(toggleLaunchAtLoginFromStatusItem(_:)) {
             item.state = LaunchAtLoginController.isEnabled ? .on : .off
         }
+    }
+
+    func controlTextDidChange(_ notification: Notification) {
+        guard
+            let field = notification.object as? NSSearchField,
+            field === statusSearchField,
+            !field.stringValue.isEmpty
+        else {
+            return
+        }
+
+        let query = field.stringValue
+        Task { @MainActor in
+            self.openSearchWindowFromStatusSearch(query)
+        }
+    }
+
+    @objc @MainActor private func submitStatusSearch(_ sender: NSSearchField) {
+        let query = sender.stringValue
+        if query.isEmpty {
+            focusSearchFromHotKey()
+        } else {
+            openSearchWindowFromStatusSearch(query)
+        }
+    }
+
+    @MainActor
+    private func openSearchWindowFromStatusSearch(_ query: String) {
+        statusMenu?.cancelTracking()
+        statusSearchField?.stringValue = ""
+        _ = showPrimaryWindow(activate: true)
+        windowController?.focusSearchField(prefill: query)
     }
 
     @MainActor
