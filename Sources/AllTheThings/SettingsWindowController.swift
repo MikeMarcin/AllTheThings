@@ -180,9 +180,11 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     private var indexedFoldersAccessWarningCollapsedHeightConstraint: NSLayoutConstraint?
 
     private static let exclusionPatternFieldIdentifier = NSUserInterfaceItemIdentifier("exclusionPatternField")
+    private static let hotkeysCardIdentifier = NSUserInterfaceItemIdentifier("hotkeysSettingsCard")
     private static let indexedRootPasteboardType = NSPasteboard.PasteboardType("com.allthethings.settings.indexed-root-row")
     private static let appSearchRootPasteboardType = NSPasteboard.PasteboardType("com.allthethings.settings.app-search-root-row")
     private static let exclusionPatternPasteboardType = NSPasteboard.PasteboardType("com.allthethings.settings.exclusion-pattern-row")
+    private static let settingsControlRowHeight: CGFloat = 74
     private static let settingsTableRowHeight: CGFloat = 42
     private static let indexedRootsMaximumVisibleRows = 8
     private static let appSearchRootsMaximumVisibleRows = 5
@@ -565,7 +567,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         configureSwitch(globalAppSearchHotKeySwitch, action: #selector(toggleGlobalAppSearchHotKey(_:)))
         configureGlobalAppSearchHotKeyButton()
 
-        let hotkeysCard = makeSettingsCard(rows: [
+        let hotkeyRows = [
             makeControlRow(
                 title: "Global search hotkey",
                 detail: "Focus the search window from any app.",
@@ -576,7 +578,9 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
                 detail: "Open search with app: ready to launch applications.",
                 control: makeGlobalAppSearchHotKeyControl()
             )
-        ])
+        ]
+        let hotkeysCard = makeSettingsCard(rows: hotkeyRows)
+        hotkeysCard.identifier = Self.hotkeysCardIdentifier
 
         contentView.addSubview(sectionLabel)
         contentView.addSubview(hotkeysCard)
@@ -589,6 +593,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
             hotkeysCard.topAnchor.constraint(equalTo: sectionLabel.bottomAnchor, constant: 12),
             hotkeysCard.leadingAnchor.constraint(equalTo: sectionLabel.leadingAnchor),
             hotkeysCard.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -36),
+            hotkeysCard.heightAnchor.constraint(equalToConstant: Self.settingsCardHeight(rowCount: hotkeyRows.count)),
             hotkeysCard.bottomAnchor.constraint(lessThanOrEqualTo: contentView.bottomAnchor, constant: -24)
         ])
 
@@ -1391,7 +1396,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         row.addSubview(control)
 
         NSLayoutConstraint.activate([
-            row.heightAnchor.constraint(greaterThanOrEqualToConstant: 74),
+            row.heightAnchor.constraint(greaterThanOrEqualToConstant: Self.settingsControlRowHeight),
 
             textStack.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 20),
             textStack.trailingAnchor.constraint(lessThanOrEqualTo: control.leadingAnchor, constant: -24),
@@ -1414,6 +1419,11 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
             separator.heightAnchor.constraint(equalToConstant: 1)
         ])
         return separator
+    }
+
+    private static func settingsCardHeight(rowCount: Int) -> CGFloat {
+        guard rowCount > 0 else { return 0 }
+        return CGFloat(rowCount) * settingsControlRowHeight + CGFloat(rowCount - 1)
     }
 
     private func renderIndexedRoots() {
