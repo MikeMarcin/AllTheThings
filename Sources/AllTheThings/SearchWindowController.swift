@@ -339,6 +339,16 @@ final class SearchWindowController: NSWindowController {
 }
 
 private final class SearchViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate, NSMenuDelegate {
+    private enum Palette {
+        static let searchBandBackground = NSColor(name: nil) { appearance in
+            if appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua {
+                return NSColor(calibratedRed: 30.0 / 255.0, green: 30.0 / 255.0, blue: 30.0 / 255.0, alpha: 1)
+            }
+
+            return .windowBackgroundColor
+        }
+    }
+
     private enum Column: String, CaseIterable {
         case match
         case name
@@ -1266,6 +1276,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         topBar.spacing = 8
         topBar.edgeInsets = NSEdgeInsets(top: 10, left: 14, bottom: 10, right: 14)
         topBar.translatesAutoresizingMaskIntoConstraints = false
+        let searchBand = ThemedBackgroundView(backgroundColor: Palette.searchBandBackground)
+        searchBand.addSubview(topBar)
 
         searchField.placeholderString = "Search filenames and paths"
         searchField.delegate = self
@@ -1353,7 +1365,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         titlebarSeparator.translatesAutoresizingMaskIntoConstraints = false
 
         rootStack.addArrangedSubview(titlebarSeparator)
-        rootStack.addArrangedSubview(topBar)
+        rootStack.addArrangedSubview(searchBand)
         rootStack.addArrangedSubview(setupSuggestionPanel)
         rootStack.addArrangedSubview(scrollView)
         rootStack.addArrangedSubview(footer)
@@ -1368,8 +1380,12 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             rootStack.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             rootStack.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             rootStack.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-            topBar.leadingAnchor.constraint(equalTo: rootStack.leadingAnchor),
-            topBar.trailingAnchor.constraint(equalTo: rootStack.trailingAnchor),
+            searchBand.leadingAnchor.constraint(equalTo: rootStack.leadingAnchor),
+            searchBand.trailingAnchor.constraint(equalTo: rootStack.trailingAnchor),
+            topBar.topAnchor.constraint(equalTo: searchBand.topAnchor),
+            topBar.leadingAnchor.constraint(equalTo: searchBand.leadingAnchor),
+            topBar.trailingAnchor.constraint(equalTo: searchBand.trailingAnchor),
+            topBar.bottomAnchor.constraint(equalTo: searchBand.bottomAnchor),
             titlebarSeparator.leadingAnchor.constraint(equalTo: rootStack.leadingAnchor),
             titlebarSeparator.trailingAnchor.constraint(equalTo: rootStack.trailingAnchor),
             titlebarSeparator.heightAnchor.constraint(equalToConstant: 1),
