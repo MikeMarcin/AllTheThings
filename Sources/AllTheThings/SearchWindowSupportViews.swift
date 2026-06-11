@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 
 struct MatchPlacard {
     let title: String
@@ -287,15 +288,69 @@ final class MatchSwatchView: NSView {
     }
 }
 
-final class ClickableMascotView: NSView {
+final class ClickableMascotView: NSControl {
     var onClick: (() -> Void)?
+    var accessibilityText = "Toggle large Nib" {
+        didSet {
+            toolTip = accessibilityText
+            setAccessibilityLabel(accessibilityText)
+        }
+    }
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        configure()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configure()
+    }
 
     override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
         onClick?()
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if Self.isActivationKey(event) {
+            onClick?()
+            return
+        }
+
+        super.keyDown(with: event)
     }
 
     override func resetCursorRects() {
         addCursorRect(bounds, cursor: .pointingHand)
+    }
+
+    override var focusRingMaskBounds: NSRect {
+        bounds
+    }
+
+    override func drawFocusRingMask() {
+        NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 5, yRadius: 5).fill()
+    }
+
+    private func configure() {
+        focusRingType = .default
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+        setAccessibilityLabel(accessibilityText)
+    }
+
+    private static func isActivationKey(_ event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        guard modifiers.isEmpty else { return false }
+
+        return event.keyCode == UInt16(kVK_Return)
+            || event.keyCode == UInt16(kVK_Space)
+            || event.charactersIgnoringModifiers == "\r"
+            || event.charactersIgnoringModifiers == "\u{3}"
+            || event.charactersIgnoringModifiers == " "
     }
 }
 
@@ -628,10 +683,41 @@ final class SearchCancellationToken: @unchecked Sendable {
     }
 }
 
+enum FileActionTargeting {
+    static func rowIndexes(
+        contextMenuTargetRow: Int?,
+        selectedRowIndexes: IndexSet,
+        rowCount: Int
+    ) -> IndexSet {
+        let validSelection = IndexSet(selectedRowIndexes.filter { row in
+            row >= 0 && row < rowCount
+        })
+
+        if let contextMenuTargetRow,
+           contextMenuTargetRow >= 0,
+           contextMenuTargetRow < rowCount,
+           !validSelection.contains(contextMenuTargetRow) {
+            return IndexSet(integer: contextMenuTargetRow)
+        }
+
+        return validSelection
+    }
+}
+
 final class FileTableView: NSTableView {
     var openAction: (() -> Void)?
     var copyAction: (() -> Void)?
     var copyPathAction: (() -> Void)?
+    var quickLookAction: (() -> Void)?
+    var getInfoAction: (() -> Void)?
+    var moveToTrashAction: (() -> Void)?
+    var contextMenuTargetRowDidChange: ((Int?) -> Void)?
+    var contextMenuTargetRow: Int? {
+        didSet {
+            invalidateContextMenuTargetRow(oldValue)
+            invalidateContextMenuTargetRow(contextMenuTargetRow)
+        }
+    }
 
     @objc func copy(_ sender: Any?) {
         copyAction?()
@@ -640,9 +726,7 @@ final class FileTableView: NSTableView {
     override func rightMouseDown(with event: NSEvent) {
         let location = convert(event.locationInWindow, from: nil)
         let clickedRow = row(at: location)
-        if clickedRow >= 0, !selectedRowIndexes.contains(clickedRow) {
-            selectRowIndexes(IndexSet(integer: clickedRow), byExtendingSelection: false)
-        }
+        setContextMenuTargetRow(clickedRow >= 0 ? clickedRow : nil)
 
         super.rightMouseDown(with: event)
     }
@@ -653,26 +737,101 @@ final class FileTableView: NSTableView {
             return
         }
 
-        guard
-            event.modifierFlags.contains(.command),
-            event.charactersIgnoringModifiers?.lowercased() == "c"
-        else {
-            super.keyDown(with: event)
+        if Self.isPlainSpace(event) {
+            quickLookAction?()
             return
         }
 
-        if event.modifierFlags.contains(.option) {
-            copyPathAction?()
-        } else {
-            copyAction?()
+        if Self.isCommandOnly(event, character: "o") {
+            openAction?()
+            return
         }
+
+        if Self.isCommandOnly(event, character: "i") {
+            getInfoAction?()
+            return
+        }
+
+        if Self.isCommandOnlyDelete(event) {
+            moveToTrashAction?()
+            return
+        }
+
+        if Self.isCommandOption(event, character: "c") {
+            copyPathAction?()
+            return
+        }
+
+        if Self.isCommandOnly(event, character: "c") {
+            copyAction?()
+            return
+        }
+
+        super.keyDown(with: event)
+    }
+
+    override func drawRow(_ row: Int, clipRect: NSRect) {
+        super.drawRow(row, clipRect: clipRect)
+
+        guard row == contextMenuTargetRow else { return }
+
+        let rowRect = rect(ofRow: row).insetBy(dx: 2, dy: 1.5)
+        guard rowRect.intersects(clipRect) else { return }
+
+        let path = NSBezierPath(roundedRect: rowRect, xRadius: 4, yRadius: 4)
+        path.lineWidth = 2
+        NSColor.keyboardFocusIndicatorColor
+            .withAlphaComponent(window?.isKeyWindow == true ? 0.95 : 0.45)
+            .setStroke()
+        path.stroke()
+    }
+
+    func setContextMenuTargetRow(_ row: Int?) {
+        contextMenuTargetRow = row
+        contextMenuTargetRowDidChange?(row)
+    }
+
+    func clearContextMenuTargetRow() {
+        setContextMenuTargetRow(nil)
+    }
+
+    private func invalidateContextMenuTargetRow(_ row: Int?) {
+        guard let row, row >= 0, row < numberOfRows else { return }
+        setNeedsDisplay(rect(ofRow: row))
+    }
+
+    private static func actionModifiers(_ event: NSEvent) -> NSEvent.ModifierFlags {
+        event.modifierFlags.intersection([.command, .option, .control, .shift])
+    }
+
+    private static func isPlainSpace(_ event: NSEvent) -> Bool {
+        actionModifiers(event).isEmpty
+            && (event.keyCode == UInt16(kVK_Space) || event.charactersIgnoringModifiers == " ")
+    }
+
+    private static func isCommandOnly(_ event: NSEvent, character: String) -> Bool {
+        actionModifiers(event) == .command
+            && event.charactersIgnoringModifiers?.lowercased() == character
+    }
+
+    private static func isCommandOption(_ event: NSEvent, character: String) -> Bool {
+        actionModifiers(event) == [.command, .option]
+            && event.charactersIgnoringModifiers?.lowercased() == character
+    }
+
+    private static func isCommandOnlyDelete(_ event: NSEvent) -> Bool {
+        actionModifiers(event) == .command
+            && (event.keyCode == UInt16(kVK_Delete) || event.charactersIgnoringModifiers == "\u{8}")
     }
 
     private static func isPlainReturn(_ event: NSEvent) -> Bool {
-        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        guard modifiers.isEmpty || modifiers == .numericPad else { return false }
+        let modifiers = actionModifiers(event)
+        guard modifiers.isEmpty else {
+            return false
+        }
 
-        return event.charactersIgnoringModifiers == "\r"
+        return event.keyCode == UInt16(kVK_Return)
+            || event.charactersIgnoringModifiers == "\r"
             || event.charactersIgnoringModifiers == "\u{3}"
     }
 }

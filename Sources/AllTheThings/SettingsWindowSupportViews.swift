@@ -230,6 +230,7 @@ private final class ThemePreviewOptionView: NSControl {
 
     private func configureView() {
         translatesAutoresizingMaskIntoConstraints = false
+        focusRingType = .default
         setContentHuggingPriority(.defaultLow, for: .horizontal)
         setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         identifier = NSUserInterfaceItemIdentifier("themePreview.\(preference.rawValue)")
@@ -270,6 +271,14 @@ private final class ThemePreviewOptionView: NSControl {
 
     private func updateAccessibilityValue() {
         setAccessibilityValue(isSelected ? "Selected" : nil)
+    }
+
+    override var focusRingMaskBounds: NSRect {
+        bounds
+    }
+
+    override func drawFocusRingMask() {
+        NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 7, yRadius: 7).fill()
     }
 }
 
@@ -769,8 +778,11 @@ final class SidebarRow: NSControl {
     var isSelected = false {
         didSet {
             updateSelectionBackground()
+            updateAccessibilityValue()
         }
     }
+
+    override var acceptsFirstResponder: Bool { true }
 
     init(section: SettingsSection) {
         self.section = section
@@ -778,7 +790,12 @@ final class SidebarRow: NSControl {
 
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
+        focusRingType = .default
         layer?.cornerRadius = 8
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+        setAccessibilityLabel(section.title)
+        updateAccessibilityValue()
         updateSelectionBackground()
 
         iconView.translatesAutoresizingMaskIntoConstraints = false
@@ -823,7 +840,40 @@ final class SidebarRow: NSControl {
             : AppTheme.resolvedCGColor(.clear, for: self)
     }
 
+    private func updateAccessibilityValue() {
+        setAccessibilityValue(isSelected ? "Selected" : nil)
+    }
+
     override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
         sendAction(action, to: target)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if Self.isActivationKey(event) {
+            sendAction(action, to: target)
+            return
+        }
+
+        super.keyDown(with: event)
+    }
+
+    override var focusRingMaskBounds: NSRect {
+        bounds
+    }
+
+    override func drawFocusRingMask() {
+        NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 8, yRadius: 8).fill()
+    }
+
+    private static func isActivationKey(_ event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        guard modifiers.isEmpty else { return false }
+
+        return event.keyCode == UInt16(kVK_Return)
+            || event.keyCode == UInt16(kVK_Space)
+            || event.charactersIgnoringModifiers == "\r"
+            || event.charactersIgnoringModifiers == "\u{3}"
+            || event.charactersIgnoringModifiers == " "
     }
 }
