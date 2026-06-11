@@ -338,7 +338,13 @@ final class SearchWindowController: NSWindowController {
     }
 }
 
-private final class SearchViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate, NSMenuDelegate {
+private final class PassthroughTitlebarLabel: NSTextField {
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
+}
+
+private final class SearchViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate, NSMenuDelegate, NSToolbarDelegate, NSToolbarItemValidation {
     private enum Palette {
         static let searchBandBackground = NSColor(name: nil) { appearance in
             if appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua {
@@ -783,12 +789,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private let statusLabel = NSTextField(labelWithString: "")
     private let countLabel = NSTextField(labelWithString: "")
     private let versionLabel = NSTextField(labelWithString: "")
-    private let openButton = NSButton()
-    private let revealButton = NSButton()
-    private let copyButton = NSButton()
-    private let settingsButton = NSButton()
-    private let insightsButton = NSButton()
-    private var titlebarActionAccessory: NSTitlebarAccessoryViewController?
+    private var titlebarToolbar: NSToolbar?
+    private weak var centeredTitleLabel: NSTextField?
     private let loadingOverlay = ThemedBackgroundView(backgroundColor: NSColor.windowBackgroundColor.withAlphaComponent(0.92))
     private let loadingMascotImageView = NSImageView()
     private let loadingLabel = NSTextField(labelWithString: "Loading file list...")
@@ -864,6 +866,41 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         static let visibleColumnsSchema = "ATTVisibleColumnsSchema"
     }
 
+    private enum SearchTitlebarToolbar {
+        static let identifier = NSToolbar.Identifier("ATTSearchTitlebarToolbar")
+        static let settings = NSToolbarItem.Identifier("ATTSearchTitlebarToolbar.settings")
+        static let insights = NSToolbarItem.Identifier("ATTSearchTitlebarToolbar.insights")
+        static let open = NSToolbarItem.Identifier("ATTSearchTitlebarToolbar.open")
+        static let reveal = NSToolbarItem.Identifier("ATTSearchTitlebarToolbar.reveal")
+        static let copy = NSToolbarItem.Identifier("ATTSearchTitlebarToolbar.copy")
+
+        static let defaultItems: [NSToolbarItem.Identifier] = [
+            .flexibleSpace,
+            settings,
+            insights,
+            .space,
+            open,
+            reveal,
+            copy
+        ]
+
+        static let allowedItems: [NSToolbarItem.Identifier] = [
+            settings,
+            insights,
+            open,
+            reveal,
+            copy,
+            .space,
+            .flexibleSpace
+        ]
+
+        static let selectionItems: Set<NSToolbarItem.Identifier> = [
+            open,
+            reveal,
+            copy
+        ]
+    }
+
     private enum EnergyMode {
         case interactive
         case background
@@ -933,7 +970,6 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         self.appFontFamilyName = AppSettings.appFontFamilyName(defaults: defaults)
         self.appFontSize = AppSettings.appFontSize(defaults: defaults)
         super.init(nibName: nil, bundle: nil)
-        configureTitlebarActionButtons()
     }
 
     deinit {
@@ -1239,27 +1275,113 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     func installTitlebarActions(in window: NSWindow) {
-        guard titlebarActionAccessory == nil else { return }
+        guard titlebarToolbar == nil else { return }
 
-        let buttonStack = NSStackView(views: titlebarActionButtons)
-        buttonStack.orientation = .horizontal
-        buttonStack.alignment = .centerY
-        buttonStack.spacing = 6
-        buttonStack.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 12)
-        buttonStack.setContentHuggingPriority(.required, for: .horizontal)
-        buttonStack.setContentCompressionResistancePriority(.required, for: .horizontal)
+        let toolbar = NSToolbar(identifier: SearchTitlebarToolbar.identifier)
+        toolbar.delegate = self
+        toolbar.displayMode = .iconOnly
+        toolbar.sizeMode = .regular
+        toolbar.allowsUserCustomization = false
+        toolbar.autosavesConfiguration = false
 
-        let fittingSize = buttonStack.fittingSize
-        buttonStack.frame = NSRect(
-            origin: .zero,
-            size: NSSize(width: fittingSize.width, height: max(fittingSize.height, 32))
+        window.titleVisibility = .hidden
+        window.toolbarStyle = .unified
+        window.toolbar = toolbar
+        titlebarToolbar = toolbar
+        installCenteredTitle(in: window)
+    }
+
+    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        SearchTitlebarToolbar.defaultItems
+    }
+
+    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        SearchTitlebarToolbar.allowedItems
+    }
+
+    func toolbar(
+        _ toolbar: NSToolbar,
+        itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
+        willBeInsertedIntoToolbar flag: Bool
+    ) -> NSToolbarItem? {
+        titlebarToolbarItem(for: itemIdentifier)
+    }
+
+    func validateToolbarItem(_ item: NSToolbarItem) -> Bool {
+        titlebarToolbarItemIsEnabled(item.itemIdentifier)
+    }
+
+    private func titlebarToolbarItem(for itemIdentifier: NSToolbarItem.Identifier) -> NSToolbarItem? {
+        let configuration: (label: String, symbol: String, tooltip: String, action: Selector)
+
+        switch itemIdentifier {
+        case SearchTitlebarToolbar.settings:
+            configuration = ("Settings", "gearshape", "Open Settings", #selector(openSettings(_:)))
+        case SearchTitlebarToolbar.insights:
+            configuration = ("Insights", "chart.pie", "Open Insights", #selector(openInsights(_:)))
+        case SearchTitlebarToolbar.open:
+            configuration = ("Open", "arrow.up.forward.app", "Open selected file", #selector(openSelected(_:)))
+        case SearchTitlebarToolbar.reveal:
+            configuration = ("Reveal", "folder", "Reveal selected file in Finder", #selector(revealSelected(_:)))
+        case SearchTitlebarToolbar.copy:
+            configuration = ("Copy Path", "doc.on.doc", "Copy selected path", #selector(copySelectedPath(_:)))
+        default:
+            return nil
+        }
+
+        let item = NSToolbarItem(itemIdentifier: itemIdentifier)
+        item.label = configuration.label
+        item.paletteLabel = configuration.label
+        item.toolTip = configuration.tooltip
+        item.image = NSImage(
+            systemSymbolName: configuration.symbol,
+            accessibilityDescription: configuration.tooltip
         )
+        item.target = self
+        item.action = configuration.action
+        item.visibilityPriority = .high
+        item.isEnabled = titlebarToolbarItemIsEnabled(itemIdentifier)
+        return item
+    }
 
-        let accessory = NSTitlebarAccessoryViewController()
-        accessory.layoutAttribute = .right
-        accessory.view = buttonStack
-        window.addTitlebarAccessoryViewController(accessory)
-        titlebarActionAccessory = accessory
+    private func titlebarToolbarItemIsEnabled(_ itemIdentifier: NSToolbarItem.Identifier) -> Bool {
+        if SearchTitlebarToolbar.selectionItems.contains(itemIdentifier) {
+            return !selectedRecords().isEmpty
+        }
+
+        return true
+    }
+
+    private func installCenteredTitle(in window: NSWindow) {
+        guard centeredTitleLabel == nil else {
+            centeredTitleLabel?.stringValue = window.title
+            return
+        }
+
+        let titlebarGuide = NSLayoutGuide()
+        view.addLayoutGuide(titlebarGuide)
+
+        let label = PassthroughTitlebarLabel(labelWithString: window.title)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.alignment = .center
+        label.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
+        label.textColor = .secondaryLabelColor
+        label.lineBreakMode = .byTruncatingMiddle
+        label.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        view.addSubview(label)
+
+        NSLayoutConstraint.activate([
+            titlebarGuide.topAnchor.constraint(equalTo: view.topAnchor),
+            titlebarGuide.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            titlebarGuide.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            titlebarGuide.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+            label.centerXAnchor.constraint(equalTo: titlebarGuide.centerXAnchor),
+            label.centerYAnchor.constraint(equalTo: titlebarGuide.centerYAnchor),
+            label.leadingAnchor.constraint(greaterThanOrEqualTo: titlebarGuide.leadingAnchor, constant: 220),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: titlebarGuide.trailingAnchor, constant: -220)
+        ])
+        centeredTitleLabel = label
     }
 
     private func buildInterface() {
@@ -1907,32 +2029,6 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         ])
 
         loadingMascotCoordinator?.setPersistentAnimation(persistentMascotAnimation())
-    }
-
-    private func configureToolbarButton(_ button: NSButton, symbol: String, tooltip: String, action: Selector) {
-        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: tooltip)
-        button.title = ""
-        button.toolTip = tooltip
-        button.bezelStyle = .texturedRounded
-        button.target = self
-        button.action = action
-        button.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            button.widthAnchor.constraint(equalToConstant: 32),
-            button.heightAnchor.constraint(equalToConstant: 28)
-        ])
-    }
-
-    private var titlebarActionButtons: [NSButton] {
-        [settingsButton, insightsButton, openButton, revealButton, copyButton]
-    }
-
-    private func configureTitlebarActionButtons() {
-        configureToolbarButton(settingsButton, symbol: "gearshape", tooltip: "Open Settings", action: #selector(openSettings(_:)))
-        configureToolbarButton(insightsButton, symbol: "chart.pie", tooltip: "Open Insights", action: #selector(openInsights(_:)))
-        configureToolbarButton(openButton, symbol: "arrow.up.forward.app", tooltip: "Open selected file", action: #selector(openSelected(_:)))
-        configureToolbarButton(revealButton, symbol: "folder", tooltip: "Reveal selected file in Finder", action: #selector(revealSelected(_:)))
-        configureToolbarButton(copyButton, symbol: "doc.on.doc", tooltip: "Copy selected path", action: #selector(copySelectedPath(_:)))
     }
 
     private func makeTableColumn(for column: Column) -> NSTableColumn {
@@ -3512,10 +3608,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func updateActionButtons() {
-        let enabled = !selectedRecords().isEmpty
-        openButton.isEnabled = enabled
-        revealButton.isEnabled = enabled
-        copyButton.isEnabled = enabled
+        titlebarToolbar?.validateVisibleItems()
     }
 
     private func moveResultSelection(delta: Int) {
