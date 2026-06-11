@@ -6,9 +6,9 @@ import Testing
 
 @Suite("Search toolbar")
 struct SearchToolbarTests {
-    @Test("titlebar actions open settings and insights instead of indexing actions")
+    @Test("titlebar actions use unified toolbar with centered title and open settings and insights instead of indexing actions")
     @MainActor
-    func titlebarActionsOpenSettingsAndInsightsInsteadOfIndexingActions() throws {
+    func titlebarActionsUseUnifiedToolbarWithCenteredTitleAndOpenSettingsAndInsightsInsteadOfIndexingActions() throws {
         let index = FileIndex(
             applicationName: "AllTheThingsToolbarTests-\(UUID().uuidString)",
             loadsSnapshotImmediately: false
@@ -20,11 +20,18 @@ struct SearchToolbarTests {
         let controller = SearchWindowController(index: index)
         let window = try #require(controller.window)
         let view = try #require(controller.window?.contentViewController?.view)
+        let toolbar = try #require(window.toolbar)
         let contentTooltips = Set(buttons(in: view).compactMap(\.toolTip))
-        let titlebarTooltips = Set(window.titlebarAccessoryViewControllers.flatMap { accessory in
-            buttons(in: accessory.view).compactMap(\.toolTip)
-        })
+        let titlebarTooltips = Set(toolbar.items.compactMap(\.toolTip))
+        let centeredTitleLabels = textFields(in: view).filter { $0.stringValue == window.title }
 
+        #expect(window.toolbarStyle == .unified)
+        #expect(window.titleVisibility == .hidden)
+        #expect(toolbar.displayMode == .iconOnly)
+        #expect(toolbar.sizeMode == .regular)
+        #expect(window.titlebarAccessoryViewControllers.isEmpty)
+        #expect(centeredTitleLabels.count == 1)
+        #expect(centeredTitleLabels.first?.alignment == .center)
         #expect(titlebarTooltips.contains("Open Settings"))
         #expect(titlebarTooltips.contains("Open Insights"))
         #expect(titlebarTooltips.contains("Open selected file"))
@@ -181,6 +188,15 @@ struct SearchToolbarTests {
         let current = (view as? NSButton).map { [$0] } ?? []
         return view.subviews.reduce(current) { partial, subview in
             partial + buttons(in: subview)
+        }
+    }
+
+    @MainActor
+    private func textFields(in view: NSView?) -> [NSTextField] {
+        guard let view else { return [] }
+        let current = (view as? NSTextField).map { [$0] } ?? []
+        return view.subviews.reduce(current) { partial, subview in
+            partial + textFields(in: subview)
         }
     }
 
