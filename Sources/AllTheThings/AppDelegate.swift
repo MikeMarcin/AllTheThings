@@ -24,6 +24,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSear
     private var statusItem: NSStatusItem?
     private var statusMenu: NSMenu?
     private var statusSearchField: NSSearchField?
+    private var isStatusSearchMenuTracking = false
     private var didPresentGlobalHotKeyRegistrationError = false
     private var didPresentGlobalAppSearchHotKeyRegistrationError = false
 
@@ -126,14 +127,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSear
     @discardableResult
     @MainActor
     private func showPrimaryWindow(activate: Bool) -> NSWindow? {
-        let controller: SearchWindowController
-        if let existingController = windowController {
-            controller = existingController
-        } else {
-            let newController = SearchWindowController(index: fileIndex)
-            windowController = newController
-            controller = newController
-        }
+        let controller = primarySearchWindowController()
 
         controller.showWindow(nil)
         NSApp.unhide(nil)
@@ -145,6 +139,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSear
         }
 
         return controller.window
+    }
+
+    @MainActor
+    private func showPrimaryWindowForStatusSearchPreview() -> NSWindow? {
+        let controller = primarySearchWindowController()
+        let shouldShowWindow = controller.window?.isVisible != true
+
+        if shouldShowWindow {
+            controller.suppressNextSearchFieldFocusOnAppear()
+            NSApp.unhide(nil)
+            controller.window?.deminiaturize(nil)
+            controller.window?.orderFrontRegardless()
+        }
+
+        return controller.window
+    }
+
+    @MainActor
+    private func primarySearchWindowController() -> SearchWindowController {
+        let controller: SearchWindowController
+        if let existingController = windowController {
+            controller = existingController
+        } else {
+            let newController = SearchWindowController(index: fileIndex)
+            windowController = newController
+            controller = newController
+        }
+
+        return controller
     }
 
     private static func launchedAsLoginItem() -> Bool {
@@ -904,6 +927,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSear
         searchField.target = self
         searchField.action = #selector(submitStatusSearch(_:))
         searchField.delegate = self
+        searchField.sendsSearchStringImmediately = false
+        searchField.sendsWholeSearchString = true
         searchField.focusRingType = .none
         searchField.font = .systemFont(ofSize: 15)
         container.addSubview(searchField)
@@ -976,17 +1001,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSear
         return image
     }
 
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        for item in menu.items where item.action == #selector(toggleHiddenFiles(_:)) {
+            item.state = defaults.bool(forKey: AppSettings.showHiddenFilesKey) ? .on : .off
+        }
+
+        for item in menu.items where item.action == #selector(toggleLaunchAtLoginFromStatusItem(_:)) {
+            item.state = LaunchAtLoginController.isEnabled ? .on : .off
+        }
+    }
+
     @MainActor
     private func showStatusMenu(relativeTo button: NSStatusBarButton) {
         guard let menu = statusMenu else { return }
+        _ = showPrimaryWindowForStatusSearchPreview()
         menuNeedsUpdate(menu)
+        isStatusSearchMenuTracking = true
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height + 2), in: button)
+        isStatusSearchMenuTracking = false
     }
 
     func menuWillOpen(_ menu: NSMenu) {
         guard menu === statusMenu, let field = statusSearchField else { return }
         field.stringValue = ""
+        scheduleStatusSearchFieldFocus()
+    }
 
+    @objc @MainActor private func focusStatusSearchFieldFromMenu() {
+        guard let field = statusSearchField, field.window != nil else { return }
+        let selectedRange = field.currentEditor()?.selectedRange
+            ?? NSRange(location: (field.stringValue as NSString).length, length: 0)
+        field.window?.makeFirstResponder(field)
+        field.currentEditor()?.selectedRange = selectedRange
+    }
+
+    private func scheduleStatusSearchFieldFocus() {
         NSObject.cancelPreviousPerformRequests(
             withTarget: self,
             selector: #selector(focusStatusSearchFieldFromMenu),
@@ -1000,44 +1049,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSear
         )
     }
 
-    @objc @MainActor private func focusStatusSearchFieldFromMenu() {
-        guard let field = statusSearchField, field.window != nil else { return }
-        field.window?.makeFirstResponder(field)
-        field.selectText(nil)
-    }
-
-    func menuNeedsUpdate(_ menu: NSMenu) {
-        for item in menu.items where item.action == #selector(toggleHiddenFiles(_:)) {
-            item.state = defaults.bool(forKey: AppSettings.showHiddenFilesKey) ? .on : .off
-        }
-
-        for item in menu.items where item.action == #selector(toggleLaunchAtLoginFromStatusItem(_:)) {
-            item.state = LaunchAtLoginController.isEnabled ? .on : .off
-        }
-    }
-
     func controlTextDidChange(_ notification: Notification) {
         guard
             let field = notification.object as? NSSearchField,
-            field === statusSearchField,
-            !field.stringValue.isEmpty
+            field === statusSearchField
         else {
             return
         }
 
         let query = field.stringValue
         Task { @MainActor in
-            self.openSearchWindowFromStatusSearch(query)
+            self.previewSearchWindowFromStatusSearch(query)
+            self.focusStatusSearchFieldFromMenu()
+            self.scheduleStatusSearchFieldFocus()
         }
     }
 
     @objc @MainActor private func submitStatusSearch(_ sender: NSSearchField) {
         let query = sender.stringValue
         if query.isEmpty {
-            focusSearchFromHotKey()
+            if Self.isReturnKeyEvent(NSApp.currentEvent) {
+                focusSearchFromHotKey()
+            } else {
+                previewSearchWindowFromStatusSearch(query)
+                focusStatusSearchFieldFromMenu()
+                scheduleStatusSearchFieldFocus()
+            }
         } else {
             openSearchWindowFromStatusSearch(query)
         }
+    }
+
+    private static func isReturnKeyEvent(_ event: NSEvent?) -> Bool {
+        guard event?.type == .keyDown else { return false }
+        return event?.keyCode == 36 || event?.keyCode == 76
     }
 
     @MainActor
@@ -1046,6 +1091,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSear
         statusSearchField?.stringValue = ""
         _ = showPrimaryWindow(activate: true)
         windowController?.focusSearchField(prefill: query)
+    }
+
+    @MainActor
+    private func previewSearchWindowFromStatusSearch(_ query: String) {
+        if !isStatusSearchMenuTracking {
+            _ = showPrimaryWindowForStatusSearchPreview()
+        }
+        windowController?.updateSearchQuery(query)
     }
 
     @MainActor

@@ -264,6 +264,18 @@ final class SearchWindowController: NSWindowController {
     }
 
     @MainActor
+    func updateSearchQuery(_ text: String) {
+        guard let viewController = window?.contentViewController as? SearchViewController else { return }
+        viewController.updateSearchQuery(text)
+    }
+
+    @MainActor
+    func suppressNextSearchFieldFocusOnAppear() {
+        guard let viewController = window?.contentViewController as? SearchViewController else { return }
+        viewController.suppressNextSearchFieldFocusOnAppear()
+    }
+
+    @MainActor
     func reindexConfiguredRootsFromSettings() {
         guard let viewController = window?.contentViewController as? SearchViewController else { return }
         viewController.reindexConfiguredRootsFromSettings()
@@ -790,6 +802,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var pendingExplanationKeys = Set<ExplanationCacheKey>()
     private var scheduledSearchSignature: SearchSignature?
     private var displayedSearchSignature: SearchSignature?
+    private var statusPreviewSearchText: String?
     private var sortSpec: SortSpec
     private var visibleColumns: Set<Column>
     private var indexedRoots: [URL]
@@ -813,6 +826,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var mascotFlightPlayback: MascotFlightPlayback?
     private var mascotFlightFallbackImage: NSImage?
     private var mascotFlightFrameIndex = 0
+    private var suppressesNextSearchFieldFocusOnAppear = false
     private nonisolated(unsafe) var mascotFlightFrameTimer: Timer?
     private var isMascotFlightInProgress = false
     private var isSetupMascotTuckInProgress = false
@@ -1012,7 +1026,11 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     override func viewDidAppear() {
         super.viewDidAppear()
-        focusSearchField(selectText: false)
+        if suppressesNextSearchFieldFocusOnAppear {
+            suppressesNextSearchFieldFocusOnAppear = false
+        } else {
+            focusSearchField(selectText: false)
+        }
 
         DispatchQueue.main.async { [weak self] in
             self?.startIndexingAfterFirstPaint()
@@ -1028,6 +1046,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     func focusSearchField(prefill text: String) {
+        statusPreviewSearchText = nil
         view.window?.makeFirstResponder(searchField)
         searchField.stringValue = text
         if let editor = searchField.currentEditor() {
@@ -1036,6 +1055,18 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         markSearchInputStarted()
         scheduleSearch(force: true)
         updateSetupSuggestions()
+    }
+
+    func updateSearchQuery(_ text: String) {
+        guard statusPreviewSearchText != text else { return }
+        statusPreviewSearchText = text
+        markSearchInputStarted()
+        scheduleSearch()
+        updateSetupSuggestions()
+    }
+
+    func suppressNextSearchFieldFocusOnAppear() {
+        suppressesNextSearchFieldFocusOnAppear = true
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int {
@@ -2740,7 +2771,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func currentSearchText() -> String {
-        (searchField.currentEditor()?.string ?? searchField.stringValue)
+        (statusPreviewSearchText ?? searchField.currentEditor()?.string ?? searchField.stringValue)
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
@@ -3785,6 +3816,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     @objc private func searchFieldDidChange(_ sender: NSSearchField) {
+        statusPreviewSearchText = nil
         markSearchInputStarted()
         scheduleSearch()
         updateSetupSuggestions()
