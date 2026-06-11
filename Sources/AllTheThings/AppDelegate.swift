@@ -713,7 +713,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSear
     }
 
     @MainActor
-    private func configureMainMenu() {
+    func configureMainMenu() {
+        let application = NSApplication.shared
         let mainMenu = NSMenu()
 
         let appItem = NSMenuItem()
@@ -739,7 +740,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSear
             action: #selector(showInsightsWindow(_:)),
             keyEquivalent: "i"
         )
-        insightsItem.keyEquivalentModifierMask = [.command, .option]
+        insightsItem.keyEquivalentModifierMask = [.command, .option, .shift]
         insightsItem.target = self
         appMenu.addItem(insightsItem)
 
@@ -754,11 +755,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSear
         appMenu.addItem(checkUpdatesItem)
 
         appMenu.addItem(.separator())
+
+        let servicesMenu = NSMenu(title: "Services")
+        let servicesItem = NSMenuItem(title: "Services", action: nil, keyEquivalent: "")
+        servicesItem.submenu = servicesMenu
+        appMenu.addItem(servicesItem)
+        application.servicesMenu = servicesMenu
+
+        appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Hide AllTheThings", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        let hideOthersItem = appMenu.addItem(
+            withTitle: "Hide Others",
+            action: #selector(NSApplication.hideOtherApplications(_:)),
+            keyEquivalent: "h"
+        )
+        hideOthersItem.keyEquivalentModifierMask = [.command, .option]
+        appMenu.addItem(
+            withTitle: "Show All",
+            action: #selector(NSApplication.unhideAllApplications(_:)),
+            keyEquivalent: ""
+        )
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Quit AllTheThings", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
         mainMenu.addItem(appItem)
+
+        let fileItem = NSMenuItem()
+        let fileMenu = NSMenu(title: "File")
+        fileMenu.addItem(withTitle: "Open", action: Selector(("openSelected:")), keyEquivalent: "o")
+        let quickLookItem = NSMenuItem(title: "Quick Look", action: Selector(("quickLookSelected:")), keyEquivalent: " ")
+        quickLookItem.keyEquivalentModifierMask = []
+        fileMenu.addItem(quickLookItem)
+        fileMenu.addItem(withTitle: "Get Info", action: Selector(("getInfoSelected:")), keyEquivalent: "i")
+        let moveToTrashItem = NSMenuItem(
+            title: "Move to Trash",
+            action: Selector(("moveSelectedToTrash:")),
+            keyEquivalent: "\u{8}"
+        )
+        moveToTrashItem.keyEquivalentModifierMask = [.command]
+        fileMenu.addItem(moveToTrashItem)
+        fileMenu.addItem(.separator())
+        fileMenu.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        fileItem.submenu = fileMenu
+        mainMenu.addItem(fileItem)
 
         let editItem = NSMenuItem()
         let editMenu = NSMenu(title: "Edit")
@@ -787,15 +826,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSear
         hiddenFilesItem.keyEquivalentModifierMask = [.command, .shift]
         hiddenFilesItem.target = self
         viewMenu.addItem(hiddenFilesItem)
+        viewMenu.addItem(.separator())
+
+        let matchDetailsItem = NSMenuItem(
+            title: "Show Match Details",
+            action: Selector(("showMatchDetails:")),
+            keyEquivalent: "i"
+        )
+        matchDetailsItem.keyEquivalentModifierMask = [.command, .option]
+        viewMenu.addItem(matchDetailsItem)
+
+        let nibItem = NSMenuItem(title: "Nib", action: nil, keyEquivalent: "")
+        let nibMenu = NSMenu(title: "Nib")
+        let toggleNibItem = NSMenuItem(
+            title: "Show Large Nib",
+            action: Selector(("toggleExpandedMascot:")),
+            keyEquivalent: "n"
+        )
+        toggleNibItem.keyEquivalentModifierMask = [.command, .option]
+        nibMenu.addItem(toggleNibItem)
+
+        let pauseNibItem = NSMenuItem(
+            title: "Pause Nib Animation",
+            action: Selector(("toggleMascotPlaybackPaused:")),
+            keyEquivalent: "n"
+        )
+        pauseNibItem.keyEquivalentModifierMask = [.command, .option, .shift]
+        nibMenu.addItem(pauseNibItem)
+
+        nibMenu.addItem(NSMenuItem(
+            title: "Reset Nib Position",
+            action: Selector(("resetMascotPosition:")),
+            keyEquivalent: ""
+        ))
+        nibItem.submenu = nibMenu
+        viewMenu.addItem(nibItem)
         viewItem.submenu = viewMenu
         mainMenu.addItem(viewItem)
 
         let windowItem = NSMenuItem()
         let windowMenu = NSMenu(title: "Window")
         windowMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.miniaturize(_:)), keyEquivalent: "m")
-        windowMenu.addItem(withTitle: "Show All", action: #selector(NSApplication.unhideAllApplications(_:)), keyEquivalent: "")
+        windowMenu.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
+        windowMenu.addItem(.separator())
+        windowMenu.addItem(withTitle: "Bring All to Front", action: #selector(NSApplication.arrangeInFront(_:)), keyEquivalent: "")
         windowItem.submenu = windowMenu
         mainMenu.addItem(windowItem)
+        application.windowsMenu = windowMenu
 
         let helpItem = NSMenuItem()
         let helpMenu = NSMenu(title: "Help")
@@ -835,7 +912,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSear
         helpItem.submenu = helpMenu
         mainMenu.addItem(helpItem)
 
-        NSApp.mainMenu = mainMenu
+        application.mainMenu = mainMenu
     }
 
     @MainActor

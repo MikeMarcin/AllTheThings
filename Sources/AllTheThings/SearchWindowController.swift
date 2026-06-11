@@ -344,7 +344,7 @@ private final class PassthroughTitlebarLabel: NSTextField {
     }
 }
 
-private final class SearchViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate, NSMenuDelegate, NSToolbarDelegate, NSToolbarItemValidation {
+private final class SearchViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate, NSMenuDelegate, NSToolbarDelegate, NSToolbarItemValidation, NSMenuItemValidation {
     private enum Palette {
         static let searchBandBackground = NSColor(name: nil) { appearance in
             if appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua {
@@ -579,7 +579,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     @MainActor
     private final class ExpandedMascotPresentationController {
         private let rootView: NSView
-        private let footerSlotView: NSView
+        private let footerSlotView: ClickableMascotView
         private let footerImageView: NSImageView
         private let expandedView: ClickableMascotView
         private let expandedImageView: NSImageView
@@ -600,7 +600,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         init(
             rootView: NSView,
-            footerSlotView: NSView,
+            footerSlotView: ClickableMascotView,
             footerImageView: NSImageView,
             expandedView: ClickableMascotView,
             expandedImageView: NSImageView,
@@ -733,6 +733,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             expandedView.toolTip = tooltip
             footerSlotView.toolTip = tooltip
             footerImageView.toolTip = tooltip
+            expandedView.accessibilityText = tooltip
+            footerSlotView.accessibilityText = tooltip
         }
 
         private func currentFooterFrame() -> NSRect {
@@ -782,12 +784,13 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private let tableView = FileTableView()
     private let headerMenu = NSMenu()
     private let scrollView = NSScrollView()
-    private let mascotSlotView = NSView()
+    private let mascotSlotView = ClickableMascotView()
     private let mascotImageView = NSImageView()
     private let expandedMascotView = ClickableMascotView()
     private let expandedMascotImageView = NSImageView()
     private let statusLabel = NSTextField(labelWithString: "")
     private let countLabel = NSTextField(labelWithString: "")
+    private let operationStatusLabel = NSTextField(labelWithString: "")
     private let versionLabel = NSTextField(labelWithString: "")
     private var titlebarToolbar: NSToolbar?
     private weak var centeredTitleLabel: NSTextField?
@@ -798,6 +801,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private let mascotFlightImageView = NSImageView()
 
     private var results: [SearchResult] = []
+    private var contextMenuTargetRow: Int?
     private var explanationCache: [ExplanationCacheKey: MatchExplanation] = [:]
     private var indexStats: IndexStats
     private var totalMatches = 0
@@ -846,6 +850,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var loadingOverlaySawActiveLoad = false
     private var userExpandedMascot = false
     private var userCollapsedExpandedMascotDuringOperation = false
+    private var isMascotPlaybackPaused = false
     private var wasImportantMascotOperationActive = false
     private var didRequestInitialSnapshotLoad = false
     private var didRequestInitialRebuild = false
@@ -858,6 +863,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var statusFooterMode: AppStatusFooterMode
     private var appFontFamilyName: String?
     private var appFontSize: CGFloat
+    private var matchDetailsPopover: NSPopover?
 
     private enum DefaultsKey {
         static let sortColumn = "ATTSortColumn"
@@ -1250,7 +1256,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
 
         menu.removeAllItems()
-        let records = selectedRecords()
+        let records = fileActionRecords()
         let hasSelection = !records.isEmpty
         let hasSingleSelection = records.count == 1
 
@@ -1262,6 +1268,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         menu.addItem(actionItem("Get Info", #selector(getInfoSelected(_:)), enabled: hasSingleSelection))
         menu.addItem(actionItem("Rename", #selector(renameSelected(_:)), enabled: hasSingleSelection))
         menu.addItem(actionItem("Quick Look", #selector(quickLookSelected(_:)), enabled: hasSelection))
+        menu.addItem(actionItem("Show Match Details", #selector(showMatchDetails(_:)), enabled: hasSingleSelection))
         menu.addItem(.separator())
         menu.addItem(actionItem("Copy", #selector(copy(_:)), enabled: hasSelection))
         menu.addItem(actionItem("Copy Path", #selector(copySelectedPath(_:)), enabled: hasSelection))
@@ -1271,6 +1278,14 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         if !terminalItems.isEmpty {
             menu.addItem(.separator())
             terminalItems.forEach { menu.addItem($0) }
+        }
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        guard menu === tableView.menu else { return }
+
+        DispatchQueue.main.async { [weak self] in
+            self?.setContextMenuTargetRow(nil)
         }
     }
 
@@ -1309,6 +1324,40 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     func validateToolbarItem(_ item: NSToolbarItem) -> Bool {
         titlebarToolbarItemIsEnabled(item.itemIdentifier)
+    }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        guard let action = menuItem.action else { return true }
+
+        let records = fileActionRecords()
+        switch action {
+        case #selector(openSelected(_:)),
+             #selector(revealSelected(_:)),
+             #selector(copy(_:)),
+             #selector(copySelectedPath(_:)):
+            return !records.isEmpty
+        case #selector(quickLookSelected(_:)):
+            return !records.isEmpty && !isSearchFieldEditing
+        case #selector(moveSelectedToTrash(_:)):
+            return !records.isEmpty && !isSearchFieldEditing
+        case #selector(getInfoSelected(_:)),
+             #selector(renameSelected(_:)):
+            return records.count == 1
+        case #selector(showMatchDetails(_:)):
+            return fileActionRow() != nil
+        case #selector(toggleExpandedMascot(_:)):
+            menuItem.title = mascotIsExpanded ? "Hide Large Nib" : "Show Large Nib"
+            menuItem.state = mascotIsExpanded ? .on : .off
+            return true
+        case #selector(toggleMascotPlaybackPaused(_:)):
+            menuItem.title = isMascotPlaybackPaused ? "Resume Nib Animation" : "Pause Nib Animation"
+            menuItem.state = isMascotPlaybackPaused ? .on : .off
+            return true
+        case #selector(resetMascotPosition(_:)):
+            return mascotIsExpanded || userExpandedMascot || userCollapsedExpandedMascotDuringOperation
+        default:
+            return true
+        }
     }
 
     private func titlebarToolbarItem(for itemIdentifier: NSToolbarItem.Identifier) -> NSToolbarItem? {
@@ -1440,6 +1489,18 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         tableView.copyPathAction = { [weak self] in
             self?.copySelectedPath(nil)
         }
+        tableView.quickLookAction = { [weak self] in
+            self?.quickLookSelected(nil)
+        }
+        tableView.getInfoAction = { [weak self] in
+            self?.getInfoSelected(nil)
+        }
+        tableView.moveToTrashAction = { [weak self] in
+            self?.moveSelectedToTrash(nil)
+        }
+        tableView.contextMenuTargetRowDidChange = { [weak self] row in
+            self?.setContextMenuTargetRow(row)
+        }
 
         let menu = NSMenu()
         menu.delegate = self
@@ -1457,6 +1518,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
         countLabel.translatesAutoresizingMaskIntoConstraints = false
+        operationStatusLabel.translatesAutoresizingMaskIntoConstraints = false
         versionLabel.translatesAutoresizingMaskIntoConstraints = false
         countLabel.textColor = .secondaryLabelColor
         countLabel.alignment = .center
@@ -1468,6 +1530,11 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         statusLabel.lineBreakMode = .byTruncatingMiddle
         statusLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
         statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        operationStatusLabel.textColor = .tertiaryLabelColor
+        operationStatusLabel.alignment = .right
+        operationStatusLabel.lineBreakMode = .byTruncatingMiddle
+        operationStatusLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        operationStatusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         versionLabel.textColor = .tertiaryLabelColor
         versionLabel.alignment = .right
         versionLabel.lineBreakMode = .byTruncatingHead
@@ -1479,6 +1546,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         footer.addSubview(mascotSlotView)
         footer.addSubview(statusLabel)
         footer.addSubview(countLabel)
+        footer.addSubview(operationStatusLabel)
         footer.addSubview(versionLabel)
         updateMascotPersistentAnimation()
 
@@ -1530,7 +1598,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             countLabel.centerXAnchor.constraint(equalTo: footer.centerXAnchor),
             countLabel.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
             countLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 260),
-            versionLabel.leadingAnchor.constraint(greaterThanOrEqualTo: countLabel.trailingAnchor, constant: 16),
+            operationStatusLabel.leadingAnchor.constraint(equalTo: countLabel.trailingAnchor, constant: 16),
+            operationStatusLabel.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
+            operationStatusLabel.trailingAnchor.constraint(lessThanOrEqualTo: versionLabel.leadingAnchor, constant: -16),
+            versionLabel.leadingAnchor.constraint(greaterThanOrEqualTo: operationStatusLabel.trailingAnchor, constant: 16),
             versionLabel.trailingAnchor.constraint(equalTo: footer.trailingAnchor, constant: -14),
             versionLabel.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
 
@@ -1553,6 +1624,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         tableView.rowHeight = max(20, baseSize + 8)
         countLabel.font = AppSettings.appFont(defaults: defaults)
         statusLabel.font = AppSettings.appFont(defaults: defaults)
+        operationStatusLabel.font = AppSettings.appFont(defaults: defaults)
         versionLabel.font = AppSettings.appFont(defaults: defaults)
         loadingLabel.font = AppSettings.appFont(defaults: defaults, sizeDelta: 2, weight: .medium)
     }
@@ -1562,14 +1634,18 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         mascotSlotView.wantsLayer = true
         mascotSlotView.layer?.masksToBounds = false
         mascotSlotView.toolTip = "Toggle large Nib"
+        mascotSlotView.accessibilityText = "Grow Nib"
+        mascotSlotView.onClick = { [weak self] in
+            self?.toggleExpandedMascot(nil)
+        }
         mascotSlotView.setContentHuggingPriority(.required, for: .horizontal)
         mascotSlotView.setContentCompressionResistancePriority(.required, for: .horizontal)
-        mascotSlotView.addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(toggleExpandedMascot(_:))))
 
         mascotSlotView.addSubview(mascotImageView)
         mascotImageView.translatesAutoresizingMaskIntoConstraints = false
         mascotImageView.imageAlignment = .alignCenter
         mascotImageView.toolTip = "Toggle large Nib"
+        mascotImageView.setAccessibilityElement(false)
         NSLayoutConstraint.activate([
             mascotSlotView.widthAnchor.constraint(equalToConstant: OperationMascotCoordinator.statusDisplaySize),
             mascotSlotView.heightAnchor.constraint(equalToConstant: OperationMascotCoordinator.footerSlotHeight),
@@ -1585,6 +1661,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         expandedMascotView.alphaValue = 1
         expandedMascotView.isHidden = true
         expandedMascotView.toolTip = "Shrink Nib"
+        expandedMascotView.accessibilityText = "Shrink Nib"
         expandedMascotView.onClick = { [weak self] in
             self?.toggleExpandedMascot(nil)
         }
@@ -1592,6 +1669,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         expandedMascotView.addSubview(expandedMascotImageView)
         expandedMascotImageView.translatesAutoresizingMaskIntoConstraints = false
         expandedMascotImageView.imageAlignment = .alignCenter
+        expandedMascotImageView.setAccessibilityElement(false)
         let coordinator = OperationMascotCoordinator(
             imageView: expandedMascotImageView,
             displaySize: OperationMascotCoordinator.statusDisplaySize
@@ -1936,7 +2014,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             let playback,
             playback.frameCount > 1,
             !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
-            !energyMode.suspendsMascotPlayback
+            !isMascotPlaybackSuspended
         else {
             mascotFlightImageView.image = fallbackImage
             return
@@ -1984,7 +2062,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private func updateMascotFlightFramePlaybackForEnergyMode() {
         guard isMascotFlightInProgress else { return }
 
-        if energyMode.suspendsMascotPlayback {
+        if isMascotPlaybackSuspended {
             mascotFlightFrameTimer?.invalidate()
             mascotFlightFrameTimer = nil
             mascotFlightImageView.image = mascotFlightFallbackImage
@@ -2064,7 +2142,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         item.isEnabled = enabled
 
         let submenu = NSMenu(title: "Open With")
-        guard enabled, let record = selectedRecord() else {
+        guard enabled, let record = fileActionRecord() else {
             let unavailable = NSMenuItem(title: "No Applications", action: nil, keyEquivalent: "")
             unavailable.isEnabled = false
             submenu.addItem(unavailable)
@@ -2151,17 +2229,21 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         let presentation = matchPresentation(for: explanation)
         let color = matchColor(for: explanation)
-        let placard = MatchPlacard(
+        cell.configure(
+            icon: matchIcon(for: presentation.iconClass, accessibilityDescription: presentation.label),
+            color: color,
+            placard: matchPlacard(for: explanation)
+        )
+    }
+
+    private func matchPlacard(for explanation: MatchExplanation) -> MatchPlacard {
+        let presentation = matchPresentation(for: explanation)
+        return MatchPlacard(
             title: presentation.title,
             scoreText: presentation.scoreText,
             detail: presentation.detail,
             reason: explanation.reason,
-            color: color
-        )
-        cell.configure(
-            icon: matchIcon(for: presentation.iconClass, accessibilityDescription: presentation.label),
-            color: color,
-            placard: placard
+            color: matchColor(for: explanation)
         )
     }
 
@@ -2771,6 +2853,18 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         setExpandedMascotVisible(true, animated: true)
     }
 
+    @objc private func toggleMascotPlaybackPaused(_ sender: Any?) {
+        isMascotPlaybackPaused.toggle()
+        applyMascotPlaybackSuspension()
+    }
+
+    @objc private func resetMascotPosition(_ sender: Any?) {
+        cancelPendingMascotExpansion()
+        userExpandedMascot = false
+        userCollapsedExpandedMascotDuringOperation = false
+        updateExpandedMascotForOperation(animated: true)
+    }
+
     private func updateExpandedMascotForOperation(from previousPhase: IndexPhase? = nil, animated: Bool) {
         let importantOperationActive = isImportantMascotOperation(indexStats)
         let wasOperationActive = wasImportantMascotOperationActive
@@ -2864,6 +2958,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         expandedMascotPresenter?.setExpanded(visible, animated: animated, context: currentMascotPresentationContext())
     }
 
+    private var mascotIsExpanded: Bool {
+        expandedMascotPresenter?.isExpanded == true
+    }
+
     private func currentMascotPresentationContext() -> MascotPresentationContext {
         MascotPresentationContext(
             setupMascotVisible: !indexingSetupOverlay.isHidden,
@@ -2885,6 +2983,11 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private func currentSearchText() -> String {
         (statusPreviewSearchText ?? searchField.currentEditor()?.string ?? searchField.stringValue)
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var isSearchFieldEditing: Bool {
+        guard let editor = searchField.currentEditor() else { return false }
+        return view.window?.firstResponder === editor
     }
 
     private func markSearchInputStarted() {
@@ -3018,12 +3121,16 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func applyMascotPlaybackSuspension() {
-        let suspended = energyMode.suspendsMascotPlayback
+        let suspended = isMascotPlaybackSuspended
         mascotCoordinator?.setPlaybackSuspended(suspended)
         expandedMascotPresenter?.setPlaybackSuspended(suspended)
         loadingMascotCoordinator?.setPlaybackSuspended(suspended)
         setupMascotCoordinator?.setPlaybackSuspended(suspended)
         updateMascotFlightFramePlaybackForEnergyMode()
+    }
+
+    private var isMascotPlaybackSuspended: Bool {
+        energyMode.suspendsMascotPlayback || isMascotPlaybackPaused
     }
 
     private func rebuildIndexForCurrentSettings() {
@@ -3533,7 +3640,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             applyFooterStatus(
                 shownText: shownText,
                 detailedCenterText: "\(shownText) • 0 indexed",
-                detailedLeftText: "\(memoryStatusText) • Setup needed • Choose what AllTheThings can search"
+                detailedMemoryText: memoryStatusText,
+                detailedOperationText: "Setup needed • Choose what AllTheThings can search"
             )
             return
         }
@@ -3550,26 +3658,32 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         applyFooterStatus(
             shownText: shownText,
             detailedCenterText: countSegments.joined(separator: " • "),
-            detailedLeftText: "\(memoryStatusText) • \(appSearchActive ? "Application search" : indexStatusText())"
+            detailedMemoryText: memoryStatusText,
+            detailedOperationText: appSearchActive ? "Application search" : indexStatusText()
         )
     }
 
     private func applyFooterStatus(
         shownText: String,
         detailedCenterText: String,
-        detailedLeftText: String
+        detailedMemoryText: String,
+        detailedOperationText: String
     ) {
         switch statusFooterMode {
         case .simple:
             statusLabel.stringValue = ""
             statusLabel.isHidden = true
+            operationStatusLabel.stringValue = ""
+            operationStatusLabel.isHidden = true
             countLabel.stringValue = shownText
             versionLabel.stringValue = ""
             versionLabel.isHidden = true
         case .detailed:
             statusLabel.isHidden = false
-            statusLabel.stringValue = detailedLeftText
+            statusLabel.stringValue = detailedOperationText
             countLabel.stringValue = detailedCenterText
+            operationStatusLabel.isHidden = false
+            operationStatusLabel.stringValue = detailedMemoryText
             versionLabel.isHidden = false
             versionLabel.stringValue = Self.footerVersionText()
         }
@@ -3609,6 +3723,13 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     private func updateActionButtons() {
         titlebarToolbar?.validateVisibleItems()
+    }
+
+    private func setContextMenuTargetRow(_ row: Int?) {
+        contextMenuTargetRow = row
+        if tableView.contextMenuTargetRow != row {
+            tableView.contextMenuTargetRow = row
+        }
     }
 
     private func moveResultSelection(delta: Int) {
@@ -3652,6 +3773,29 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             guard row >= 0, row < results.count else { return nil }
             return results[row].record
         }
+    }
+
+    private func fileActionRecord() -> FileRecord? {
+        fileActionRecords().first
+    }
+
+    private func fileActionRecords() -> [FileRecord] {
+        fileActionRowIndexes().compactMap { row in
+            guard row >= 0, row < results.count else { return nil }
+            return results[row].record
+        }
+    }
+
+    private func fileActionRow() -> Int? {
+        fileActionRowIndexes().first
+    }
+
+    private func fileActionRowIndexes() -> IndexSet {
+        FileActionTargeting.rowIndexes(
+            contextMenuTargetRow: contextMenuTargetRow,
+            selectedRowIndexes: tableView.selectedRowIndexes,
+            rowCount: results.count
+        )
     }
 
     private func highlightedPath(_ directoryPath: String, explanation: MatchExplanation?) -> NSAttributedString {
@@ -3992,21 +4136,28 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     @objc private func openSelected(_ sender: Any?) {
-        guard let record = selectedRecord() else { return }
+        let records = fileActionRecords()
+        guard !records.isEmpty else { return }
         index.recordFileAction(.open)
-        let opened = NSWorkspace.shared.open(record.url)
+        var failedRecords: [FileRecord] = []
+        for record in records where !NSWorkspace.shared.open(record.url) {
+            failedRecords.append(record)
+        }
         logFileAction(
             "open",
-            records: [record],
-            level: opened ? .info : .warning,
-            extraFields: ["success": .publicBool(opened)]
+            records: records,
+            level: failedRecords.isEmpty ? .info : .warning,
+            extraFields: [
+                "success": .publicBool(failedRecords.isEmpty),
+                "failureCount": .publicInt(failedRecords.count)
+            ]
         )
     }
 
     @objc private func openSelectedWithApplication(_ sender: NSMenuItem) {
         guard
             let applicationURL = sender.representedObject as? URL,
-            !selectedRecords().isEmpty
+            !fileActionRecords().isEmpty
         else {
             return
         }
@@ -4015,7 +4166,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     @objc private func openSelectedWithOtherApplication(_ sender: Any?) {
-        guard !selectedRecords().isEmpty else { return }
+        guard !fileActionRecords().isEmpty else { return }
 
         let panel = NSOpenPanel()
         panel.title = "Choose Application"
@@ -4039,7 +4190,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func openSelectedRecords(with applicationURL: URL) {
-        let records = selectedRecords()
+        let records = fileActionRecords()
         let urls = records.map(\.url)
         guard !urls.isEmpty else { return }
 
@@ -4063,7 +4214,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     @objc private func revealSelected(_ sender: Any?) {
-        let records = selectedRecords()
+        let records = fileActionRecords()
         let urls = records.map(\.url)
         guard !urls.isEmpty else { return }
         index.recordFileAction(.reveal)
@@ -4072,7 +4223,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     @objc private func moveSelectedToTrash(_ sender: Any?) {
-        let records = selectedRecords()
+        let records = fileActionRecords()
         guard !records.isEmpty else { return }
 
         var changedPaths: [String] = []
@@ -4115,7 +4266,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     @objc private func getInfoSelected(_ sender: Any?) {
-        guard let record = selectedRecord() else { return }
+        guard let record = fileActionRecord() else { return }
         let path = appleScriptStringLiteral(record.path)
         let source = """
         tell application "Finder"
@@ -4143,7 +4294,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     @objc private func renameSelected(_ sender: Any?) {
-        guard let record = selectedRecord() else { return }
+        guard let record = fileActionRecord() else { return }
 
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
         field.stringValue = record.name
@@ -4228,7 +4379,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     @objc private func quickLookSelected(_ sender: Any?) {
-        let records = selectedRecords()
+        let records = fileActionRecords()
         let paths = records.map(\.path)
         guard !paths.isEmpty else { return }
 
@@ -4253,10 +4404,49 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
     }
 
+    @objc private func showMatchDetails(_ sender: Any?) {
+        guard
+            let row = fileActionRow(),
+            row >= 0,
+            row < results.count,
+            let explanation = displayExplanation(for: results[row], schedulesAsyncExplanation: true)
+        else {
+            return
+        }
+
+        let placardView = MatchPlacardView(frame: NSRect(origin: .zero, size: NSSize(width: 316, height: 136)))
+        placardView.configure(matchPlacard(for: explanation))
+
+        let viewController = NSViewController()
+        viewController.view = placardView
+        viewController.preferredContentSize = NSSize(width: 316, height: 136)
+
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.contentSize = viewController.preferredContentSize
+        popover.contentViewController = viewController
+        matchDetailsPopover?.close()
+        matchDetailsPopover = popover
+
+        let anchorView = matchDetailsAnchorView(forRow: row)
+        popover.show(relativeTo: anchorView.bounds, of: anchorView, preferredEdge: .maxX)
+    }
+
+    private func matchDetailsAnchorView(forRow row: Int) -> NSView {
+        guard
+            let matchColumn = tableView.tableColumns.firstIndex(where: { $0.identifier.rawValue == Column.match.rawValue }),
+            let cell = tableView.view(atColumn: matchColumn, row: row, makeIfNecessary: false)
+        else {
+            return tableView
+        }
+
+        return cell
+    }
+
     @objc private func openTerminalHere(_ sender: NSMenuItem) {
         guard
             let serviceTitle = sender.representedObject as? String,
-            let record = selectedRecord()
+            let record = fileActionRecord()
         else {
             return
         }
@@ -4295,7 +4485,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func copySelectedFiles() {
-        let records = selectedRecords()
+        let records = fileActionRecords()
         guard !records.isEmpty else { return }
 
         let pasteboard = NSPasteboard.general
@@ -4307,7 +4497,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     @objc private func copySelectedPath(_ sender: Any?) {
-        let records = selectedRecords()
+        let records = fileActionRecords()
         guard !records.isEmpty else { return }
 
         NSPasteboard.general.clearContents()
