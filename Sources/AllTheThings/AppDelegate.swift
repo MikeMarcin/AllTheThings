@@ -1,5 +1,6 @@
 import AppKit
 import ATTCore
+import Carbon.HIToolbox
 import CoreServices
 
 // AppKit invokes these Objective-C delegate hooks during startup; hop to the
@@ -1140,7 +1141,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSear
 
     @MainActor
     private func makeAboutWindowController() -> NSWindowController {
-        let window = NSWindow(
+        let window = AboutWindow(
             contentRect: NSRect(x: 0, y: 0, width: 480, height: 520),
             styleMask: [.titled, .closable],
             backing: .buffered,
@@ -1309,5 +1310,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSear
         window.center()
 
         return NSWindowController(window: window)
+    }
+}
+
+private final class AboutWindow: NSWindow {
+    override func sendEvent(_ event: NSEvent) {
+        if shouldClose(for: event) {
+            close()
+            return
+        }
+
+        super.sendEvent(event)
+    }
+
+    private func shouldClose(for event: NSEvent) -> Bool {
+        event.type == .keyDown
+            && event.keyCode == UInt16(kVK_Escape)
+            && event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty
     }
 }
