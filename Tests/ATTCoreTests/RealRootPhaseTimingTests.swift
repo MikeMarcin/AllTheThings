@@ -77,7 +77,7 @@ struct RealRootPhaseTimingTests {
         try await start(index)
         try await waitUntilReady(index)
         let readyElapsed = Date().timeIntervalSince(started)
-        let optimizedElapsed = try await optimizedCompletionElapsedIfRequested(for: index, started: started)
+        let optimizationTimings = try await optimizationTimingsIfRequested(for: index, started: started)
         let captured = lock.withLock { events }
         let stats = index.currentStats()
         let diagnostics = index.currentDiagnostics()
@@ -86,7 +86,7 @@ struct RealRootPhaseTimingTests {
             roots: roots,
             repeatIndex: repeatIndex,
             readyElapsed: readyElapsed,
-            optimizedElapsed: optimizedElapsed,
+            optimizationTimings: optimizationTimings,
             stats: stats,
             diagnostics: diagnostics,
             events: captured
@@ -105,7 +105,8 @@ struct RealRootPhaseTimingTests {
         Self.applyDeferredOptimizationThresholdOverride(to: index)
         index.replaceRootsAndRebuild(roots, mode: .fresh)
         try await waitUntilReady(index)
-        try await waitUntilOptimized(index)
+        try await waitUntilCoreOptimized(index)
+        try await waitUntilPathGramCompleteOrInactive(index)
 
         var events: [(elapsed: TimeInterval, phase: IndexPhase, status: String, indexed: Int, discovered: Int)] = []
         let lock = NSLock()
@@ -125,7 +126,7 @@ struct RealRootPhaseTimingTests {
         _ = index.reconcileIndexedRootsInBackground(rootURLs: roots)
         try await waitUntilReady(index)
         let readyElapsed = Date().timeIntervalSince(started)
-        let optimizedElapsed = try await optimizedCompletionElapsedIfRequested(for: index, started: started)
+        let optimizationTimings = try await optimizationTimingsIfRequested(for: index, started: started)
         let captured = lock.withLock { events }
         let stats = index.currentStats()
         let diagnostics = index.currentDiagnostics()
@@ -134,7 +135,7 @@ struct RealRootPhaseTimingTests {
             roots: roots,
             repeatIndex: repeatIndex,
             readyElapsed: readyElapsed,
-            optimizedElapsed: optimizedElapsed,
+            optimizationTimings: optimizationTimings,
             stats: stats,
             diagnostics: diagnostics,
             events: captured
@@ -160,23 +161,63 @@ struct RealRootPhaseTimingTests {
         }
     }
 
-    private static func waitUntilOptimized(_ index: FileIndex) async throws {
+    private struct OptimizationTimings {
+        var coreOptimizedElapsed: TimeInterval?
+        var pathGramFirstShardElapsed: TimeInterval?
+        var pathGramCompleteElapsed: TimeInterval?
+    }
+
+    private static func waitUntilCoreOptimized(_ index: FileIndex) async throws {
         try await waitUntil(timeoutSeconds: 600) {
             let stats = index.currentStats()
             let diagnostics = index.currentDiagnostics()
             return !stats.isIndexing
-                && diagnostics.activeIndexJobs == 0
                 && diagnostics.recordStoreKind == .mapped
                 && diagnostics.optimizedCount == diagnostics.indexedCount
         }
     }
 
-    private static func optimizedCompletionElapsedIfRequested(for index: FileIndex, started: Date) async throws -> TimeInterval? {
+    private static func waitUntilPathGramFirstShardOrInactive(_ index: FileIndex) async throws {
+        try await waitUntil(timeoutSeconds: 600) {
+            let diagnostics = index.currentDiagnostics()
+            return diagnostics.pathGramIndexEnabled
+                || diagnostics.pathGramCoveredRowCount > 0
+                || (diagnostics.activeIndexJobs == 0 && diagnostics.pathGramTotalRowCount == 0)
+        }
+    }
+
+    private static func waitUntilPathGramCompleteOrInactive(_ index: FileIndex) async throws {
+        try await waitUntil(timeoutSeconds: 600) {
+            let diagnostics = index.currentDiagnostics()
+            guard diagnostics.pathGramTotalRowCount > 0 else {
+                return diagnostics.activeIndexJobs == 0
+            }
+            return diagnostics.pathGramIndexEnabled
+                && diagnostics.pathGramCoveredRowCount == diagnostics.pathGramTotalRowCount
+                && diagnostics.activeIndexJobs == 0
+        }
+    }
+
+    private static func optimizationTimingsIfRequested(for index: FileIndex, started: Date) async throws -> OptimizationTimings? {
         guard waitsForOptimizedCompletion else {
             return nil
         }
-        try await waitUntilOptimized(index)
-        return Date().timeIntervalSince(started)
+        try await waitUntilCoreOptimized(index)
+        let coreElapsed = Date().timeIntervalSince(started)
+        try await Task.sleep(nanoseconds: 25_000_000)
+        try await waitUntilPathGramFirstShardOrInactive(index)
+        let firstShardElapsed = index.currentDiagnostics().pathGramCoveredRowCount > 0
+            ? Date().timeIntervalSince(started)
+            : nil
+        try await waitUntilPathGramCompleteOrInactive(index)
+        let completeElapsed = index.currentDiagnostics().pathGramIndexEnabled
+            ? Date().timeIntervalSince(started)
+            : nil
+        return OptimizationTimings(
+            coreOptimizedElapsed: coreElapsed,
+            pathGramFirstShardElapsed: firstShardElapsed,
+            pathGramCompleteElapsed: completeElapsed
+        )
     }
 
     private static func waitUntil(
@@ -205,7 +246,7 @@ struct RealRootPhaseTimingTests {
         roots: [URL],
         repeatIndex: Int,
         readyElapsed: TimeInterval,
-        optimizedElapsed: TimeInterval?,
+        optimizationTimings: OptimizationTimings?,
         stats: IndexStats,
         diagnostics: FileIndexDiagnostics,
         events: [(elapsed: TimeInterval, phase: IndexPhase, status: String, indexed: Int, discovered: Int)]
@@ -221,12 +262,30 @@ struct RealRootPhaseTimingTests {
             "optimized_count": diagnostics.optimizedCount,
             "record_store_kind": diagnostics.recordStoreKind.rawValue,
             "active_index_jobs": diagnostics.activeIndexJobs,
+            "path_gram_index_enabled": diagnostics.pathGramIndexEnabled,
+            "path_gram_posting_count": diagnostics.pathGramPostingCount,
+            "path_gram_covered_row_count": diagnostics.pathGramCoveredRowCount,
+            "path_gram_total_row_count": diagnostics.pathGramTotalRowCount,
+            "name_gram_posting_count": diagnostics.nameGramPostingCount,
+            "component_gram_posting_count": diagnostics.componentGramPostingCount,
             "phase_events": phaseEventValues(events)
         ]
-        if let optimizedElapsed {
-            payload["optimized_elapsed_ms"] = Int((optimizedElapsed * 1000).rounded())
+        if let coreOptimizedElapsed = optimizationTimings?.coreOptimizedElapsed {
+            payload["optimized_elapsed_ms"] = Int((coreOptimizedElapsed * 1000).rounded())
+            payload["core_optimized_elapsed_ms"] = Int((coreOptimizedElapsed * 1000).rounded())
         } else {
             payload["optimized_elapsed_ms"] = NSNull()
+            payload["core_optimized_elapsed_ms"] = NSNull()
+        }
+        if let pathGramFirstShardElapsed = optimizationTimings?.pathGramFirstShardElapsed {
+            payload["path_gram_first_shard_elapsed_ms"] = Int((pathGramFirstShardElapsed * 1000).rounded())
+        } else {
+            payload["path_gram_first_shard_elapsed_ms"] = NSNull()
+        }
+        if let pathGramCompleteElapsed = optimizationTimings?.pathGramCompleteElapsed {
+            payload["path_gram_complete_elapsed_ms"] = Int((pathGramCompleteElapsed * 1000).rounded())
+        } else {
+            payload["path_gram_complete_elapsed_ms"] = NSNull()
         }
         let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
         return data.flatMap { String(data: $0, encoding: .utf8) } ?? "{}"

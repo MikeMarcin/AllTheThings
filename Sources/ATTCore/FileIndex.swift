@@ -433,6 +433,8 @@ struct FileIndexDiagnostics: Sendable {
     let pathGramIndexEnabled: Bool
     let pathGramKeyCount: Int
     let pathGramPostingCount: Int
+    let pathGramCoveredRowCount: Int
+    let pathGramTotalRowCount: Int
     let nameGramKeyCount: Int
     let nameGramPostingCount: Int
     let componentGramKeyCount: Int
@@ -497,6 +499,7 @@ public final class FileIndex: @unchecked Sendable {
     private static let checkpointRecordInterval = 100_000
     private static let checkpointTimeInterval: TimeInterval = 300
     private static let pathGramRecordLimit = 200_000
+    private static let pathGramShardSize = 2_048
     private static let pathGramTotalPathByteLimit = 24 * 1024 * 1024
     private static let defaultDeferredOptimizationRecordThreshold = 10_000
     private static let exactEmptyQuerySortLimit = 100_000
@@ -590,6 +593,8 @@ public final class FileIndex: @unchecked Sendable {
         let pathGramIndexEnabled: Bool
         let pathGramKeyCount: Int
         let pathGramPostingCount: Int
+        let pathGramCoveredRowCount: Int
+        let pathGramTotalRowCount: Int
         let nameGramKeyCount: Int
         let nameGramPostingCount: Int
         let componentGramKeyCount: Int
@@ -1021,6 +1026,8 @@ public final class FileIndex: @unchecked Sendable {
         let visibleModifiedDescending: [Int]
         let visibleModifiedAscending: [Int]
         let gramIndex: MappedIntPostingIndex?
+        let pathGramShards: [PathGramShard]
+        let pathGramExpectedRowCount: Int
         let nameGramIndex: MappedIntPostingIndex?
         let componentGramIndex: MappedIntPostingIndex?
         let resultPrefixCounts: [Int]
@@ -1037,6 +1044,19 @@ public final class FileIndex: @unchecked Sendable {
             let roots: [Int32]
         }
 
+        struct PathGramShard: Sendable {
+            let snapshotRevision: UInt64
+            let schemaVersion: Int
+            let rowCount: Int
+            let range: Range<Int>
+            let completedAt: Date
+            let index: MappedIntPostingIndex?
+
+            var coveredCount: Int {
+                max(0, range.upperBound - range.lowerBound)
+            }
+        }
+
         var count: Int { store.count }
         var resultCount: Int { store.storedResultCount ?? (0..<store.count).filter { store.isResultRow(at: $0) }.count }
         var virtualRowCount: Int { count - resultCount }
@@ -1045,11 +1065,18 @@ public final class FileIndex: @unchecked Sendable {
             resultCount == 0 || (hasSortedOrder && nameGramIndex != nil && componentGramIndex != nil)
         }
 
-        init(records: [FileRecord], roots: [String] = [], buildsSearchStructures: Bool = true) {
+        init(
+            records: [FileRecord],
+            roots: [String] = [],
+            buildsSearchStructures: Bool = true,
+            buildsPathGramIndex: Bool = true
+        ) {
             self.store = HeapPagedRecordStore(records: records, roots: roots)
             if buildsSearchStructures {
-                let buildsPathGramIndex = FileIndex.shouldBuildPathGramIndex(records: records)
+                let buildsPathGramIndex = buildsPathGramIndex && FileIndex.shouldBuildPathGramIndex(records: records)
                 self.gramIndex = buildsPathGramIndex ? Self.makePathGramIndex(store: store) : nil
+                self.pathGramShards = []
+                self.pathGramExpectedRowCount = buildsPathGramIndex ? store.count : 0
                 self.nameGramIndex = Self.makeNameGramIndex(store: store)
                 self.componentGramIndex = Self.makeComponentGramIndex(store: store)
                 self.resultPrefixCounts = Self.makeResultPrefixCounts(store: store, visibleOnly: false)
@@ -1074,12 +1101,16 @@ public final class FileIndex: @unchecked Sendable {
                 self.diagnostics = Self.makeDiagnostics(
                     pathGramIndexEnabled: gramIndex != nil,
                     gramIndex: gramIndex,
+                    pathGramShards: pathGramShards,
+                    pathGramExpectedRowCount: pathGramExpectedRowCount,
                     nameGramIndex: nameGramIndex,
                     componentGramIndex: componentGramIndex,
                     extensionIndex: extensionIndex
                 )
             } else {
                 self.gramIndex = nil
+                self.pathGramShards = []
+                self.pathGramExpectedRowCount = 0
                 self.nameGramIndex = nil
                 self.componentGramIndex = nil
                 self.resultPrefixCounts = []
@@ -1097,6 +1128,8 @@ public final class FileIndex: @unchecked Sendable {
                 self.diagnostics = Self.makeDiagnostics(
                     pathGramIndexEnabled: false,
                     gramIndex: gramIndex,
+                    pathGramShards: pathGramShards,
+                    pathGramExpectedRowCount: pathGramExpectedRowCount,
                     nameGramIndex: nameGramIndex,
                     componentGramIndex: componentGramIndex,
                     extensionIndex: extensionIndex
@@ -1104,11 +1137,13 @@ public final class FileIndex: @unchecked Sendable {
             }
         }
 
-        init(store: RecordStore, buildsSearchStructures: Bool = true) {
+        init(store: RecordStore, buildsSearchStructures: Bool = true, buildsPathGramIndex: Bool = true) {
             self.store = store
             if buildsSearchStructures {
-                let buildsPathGramIndex = FileIndex.shouldBuildPathGramIndex(store: store)
+                let buildsPathGramIndex = buildsPathGramIndex && FileIndex.shouldBuildPathGramIndex(store: store)
                 self.gramIndex = buildsPathGramIndex ? Self.makePathGramIndex(store: store) : nil
+                self.pathGramShards = []
+                self.pathGramExpectedRowCount = buildsPathGramIndex ? store.count : 0
                 self.nameGramIndex = Self.makeNameGramIndex(store: store)
                 self.componentGramIndex = Self.makeComponentGramIndex(store: store)
                 self.resultPrefixCounts = Self.makeResultPrefixCounts(store: store, visibleOnly: false)
@@ -1133,12 +1168,16 @@ public final class FileIndex: @unchecked Sendable {
                 self.diagnostics = Self.makeDiagnostics(
                     pathGramIndexEnabled: gramIndex != nil,
                     gramIndex: gramIndex,
+                    pathGramShards: pathGramShards,
+                    pathGramExpectedRowCount: pathGramExpectedRowCount,
                     nameGramIndex: nameGramIndex,
                     componentGramIndex: componentGramIndex,
                     extensionIndex: extensionIndex
                 )
             } else {
                 self.gramIndex = nil
+                self.pathGramShards = []
+                self.pathGramExpectedRowCount = 0
                 self.nameGramIndex = nil
                 self.componentGramIndex = nil
                 self.resultPrefixCounts = []
@@ -1156,6 +1195,8 @@ public final class FileIndex: @unchecked Sendable {
                 self.diagnostics = Self.makeDiagnostics(
                     pathGramIndexEnabled: false,
                     gramIndex: gramIndex,
+                    pathGramShards: pathGramShards,
+                    pathGramExpectedRowCount: pathGramExpectedRowCount,
                     nameGramIndex: nameGramIndex,
                     componentGramIndex: componentGramIndex,
                     extensionIndex: extensionIndex
@@ -1166,6 +1207,8 @@ public final class FileIndex: @unchecked Sendable {
         init(store: RecordStore, persistedStructures: PersistedSearchStructures) {
             self.store = store
             self.gramIndex = persistedStructures.pathGramIndex
+            self.pathGramShards = []
+            self.pathGramExpectedRowCount = persistedStructures.pathGramIndex == nil ? 0 : store.count
             self.nameGramIndex = persistedStructures.nameGramIndex
             self.componentGramIndex = persistedStructures.componentGramIndex ?? persistedStructures.nameGramIndex
             self.resultPrefixCounts = Self.makeResultPrefixCounts(store: store, visibleOnly: false)
@@ -1200,6 +1243,8 @@ public final class FileIndex: @unchecked Sendable {
             self.diagnostics = Self.makeDiagnostics(
                 pathGramIndexEnabled: gramIndex != nil,
                 gramIndex: gramIndex,
+                pathGramShards: pathGramShards,
+                pathGramExpectedRowCount: pathGramExpectedRowCount,
                 nameGramIndex: nameGramIndex,
                 componentGramIndex: componentGramIndex,
                 extensionIndex: extensionIndex
@@ -1210,6 +1255,8 @@ public final class FileIndex: @unchecked Sendable {
             store: RecordStore,
             modifiedDescending: [Int],
             gramIndex: MappedIntPostingIndex?,
+            pathGramShards: [PathGramShard] = [],
+            pathGramExpectedRowCount: Int = 0,
             nameGramIndex: MappedIntPostingIndex?,
             componentGramIndex: MappedIntPostingIndex?,
             extensionIndex: [String: [Int32]],
@@ -1245,6 +1292,8 @@ public final class FileIndex: @unchecked Sendable {
             self.visibleModifiedDescending = visibleModifiedDescending
             self.visibleModifiedAscending = Array(visibleModifiedDescending.reversed())
             self.gramIndex = gramIndex
+            self.pathGramShards = gramIndex == nil ? pathGramShards : []
+            self.pathGramExpectedRowCount = gramIndex == nil ? pathGramExpectedRowCount : store.count
             self.nameGramIndex = nameGramIndex
             self.componentGramIndex = componentGramIndex
             self.resultPrefixCounts = Self.makeResultPrefixCounts(store: store, visibleOnly: false)
@@ -1256,6 +1305,8 @@ public final class FileIndex: @unchecked Sendable {
             self.diagnostics = Self.makeDiagnostics(
                 pathGramIndexEnabled: gramIndex != nil,
                 gramIndex: gramIndex,
+                pathGramShards: self.pathGramShards,
+                pathGramExpectedRowCount: self.pathGramExpectedRowCount,
                 nameGramIndex: nameGramIndex,
                 componentGramIndex: componentGramIndex,
                 extensionIndex: extensionIndex
@@ -1294,6 +1345,8 @@ public final class FileIndex: @unchecked Sendable {
                 store: updatedStore,
                 modifiedDescending: mergedDescending,
                 gramIndex: gramIndex,
+                pathGramShards: [],
+                pathGramExpectedRowCount: gramIndex == nil ? 0 : updatedStore.count,
                 nameGramIndex: nameGramIndex,
                 componentGramIndex: componentGramIndex,
                 extensionIndex: extensionIndex,
@@ -1321,6 +1374,8 @@ public final class FileIndex: @unchecked Sendable {
                 store: store,
                 modifiedDescending: modifiedDescending,
                 gramIndex: gramIndex,
+                pathGramShards: pathGramShards,
+                pathGramExpectedRowCount: pathGramExpectedRowCount,
                 nameGramIndex: nameGramIndex ?? Self.makeNameGramIndex(store: store),
                 componentGramIndex: componentGramIndex ?? Self.makeComponentGramIndex(store: store),
                 extensionIndex: extensionIndex,
@@ -1339,6 +1394,8 @@ public final class FileIndex: @unchecked Sendable {
                 store: store,
                 modifiedDescending: modifiedDescending,
                 gramIndex: gramIndex,
+                pathGramShards: pathGramShards,
+                pathGramExpectedRowCount: pathGramExpectedRowCount,
                 nameGramIndex: nameGramIndex,
                 componentGramIndex: componentGramIndex,
                 extensionIndex: extensionIndex.isEmpty ? extensionData.extensionIndex : extensionIndex,
@@ -1356,6 +1413,8 @@ public final class FileIndex: @unchecked Sendable {
                 store: store,
                 modifiedDescending: Self.makeModifiedDescending(store: store),
                 gramIndex: gramIndex,
+                pathGramShards: pathGramShards,
+                pathGramExpectedRowCount: pathGramExpectedRowCount,
                 nameGramIndex: nameGramIndex,
                 componentGramIndex: componentGramIndex,
                 extensionIndex: extensionIndex,
@@ -1376,6 +1435,107 @@ public final class FileIndex: @unchecked Sendable {
                 store: store,
                 modifiedDescending: modifiedDescending,
                 gramIndex: Self.makePathGramIndex(store: store),
+                pathGramShards: [],
+                pathGramExpectedRowCount: store.count,
+                nameGramIndex: nameGramIndex,
+                componentGramIndex: componentGramIndex,
+                extensionIndex: extensionIndex,
+                childLinks: childLinks,
+                nameAscending: nameAscending,
+                nameDescending: nameDescending,
+                visibleCount: visibleCount,
+                hasSortedOrder: hasSortedOrder
+            )
+        }
+
+        func addingPathGramShard(_ shard: PathGramShard, expectedRowCount: Int) -> SearchSnapshot {
+            guard
+                gramIndex == nil,
+                shard.schemaVersion == store.schemaVersion,
+                shard.rowCount == store.count,
+                shard.range.lowerBound >= 0,
+                shard.range.lowerBound < shard.range.upperBound,
+                shard.range.upperBound <= store.count
+            else {
+                return self
+            }
+
+            var shards = pathGramShards.filter {
+                $0.schemaVersion == store.schemaVersion
+                    && $0.rowCount == store.count
+                    && !$0.range.overlaps(shard.range)
+            }
+            shards.append(shard)
+            shards.sort {
+                if $0.range.lowerBound != $1.range.lowerBound {
+                    return $0.range.lowerBound < $1.range.lowerBound
+                }
+                return $0.range.upperBound < $1.range.upperBound
+            }
+
+            return SearchSnapshot(
+                store: store,
+                modifiedDescending: modifiedDescending,
+                gramIndex: nil,
+                pathGramShards: shards,
+                pathGramExpectedRowCount: expectedRowCount,
+                nameGramIndex: nameGramIndex,
+                componentGramIndex: componentGramIndex,
+                extensionIndex: extensionIndex,
+                childLinks: childLinks,
+                nameAscending: nameAscending,
+                nameDescending: nameDescending,
+                visibleCount: visibleCount,
+                hasSortedOrder: hasSortedOrder
+            )
+        }
+
+        func addingCompletePathGramIndex(_ pathGramIndex: MappedIntPostingIndex?) -> SearchSnapshot {
+            guard let pathGramIndex else { return self }
+            return SearchSnapshot(
+                store: store,
+                modifiedDescending: modifiedDescending,
+                gramIndex: pathGramIndex,
+                pathGramShards: [],
+                pathGramExpectedRowCount: store.count,
+                nameGramIndex: nameGramIndex,
+                componentGramIndex: componentGramIndex,
+                extensionIndex: extensionIndex,
+                childLinks: childLinks,
+                nameAscending: nameAscending,
+                nameDescending: nameDescending,
+                visibleCount: visibleCount,
+                hasSortedOrder: hasSortedOrder
+            )
+        }
+
+        func removingPathGramAcceleration() -> SearchSnapshot {
+            guard gramIndex != nil || !pathGramShards.isEmpty || pathGramExpectedRowCount != 0 else { return self }
+            return SearchSnapshot(
+                store: store,
+                modifiedDescending: modifiedDescending,
+                gramIndex: nil,
+                pathGramShards: [],
+                pathGramExpectedRowCount: 0,
+                nameGramIndex: nameGramIndex,
+                componentGramIndex: componentGramIndex,
+                extensionIndex: extensionIndex,
+                childLinks: childLinks,
+                nameAscending: nameAscending,
+                nameDescending: nameDescending,
+                visibleCount: visibleCount,
+                hasSortedOrder: hasSortedOrder
+            )
+        }
+
+        func settingPathGramExpectedRowCount(_ expectedRowCount: Int) -> SearchSnapshot {
+            guard gramIndex == nil, pathGramExpectedRowCount != expectedRowCount else { return self }
+            return SearchSnapshot(
+                store: store,
+                modifiedDescending: modifiedDescending,
+                gramIndex: nil,
+                pathGramShards: pathGramShards,
+                pathGramExpectedRowCount: expectedRowCount,
                 nameGramIndex: nameGramIndex,
                 componentGramIndex: componentGramIndex,
                 extensionIndex: extensionIndex,
@@ -1424,31 +1584,96 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         func candidatePathIndices(containing tokenBytes: [UInt8]) -> [Int32]? {
-            guard let gramIndex else { return nil }
-
             let keys = FileIndex.searchGramKeys(for: tokenBytes)
             guard !keys.isEmpty else { return nil }
+            if let gramIndex {
+                return Self.candidates(in: gramIndex, keys: keys)
+            }
+            guard !pathGramShards.isEmpty else { return nil }
 
-            var postings: [[Int32]] = []
-            postings.reserveCapacity(keys.count)
-
-            for key in keys {
-                guard let values = gramIndex.values(for: key) else {
-                    return []
+            let token = String(decoding: tokenBytes, as: UTF8.self)
+            return partialPathGramCandidates(
+                keys: keys,
+                fallbackMatches: { rowID in
+                    store.normalizedPath(at: rowID).contains(token)
                 }
-                postings.append(values)
-            }
-
-            postings.sort { $0.count < $1.count }
-            if postings.count == 1 {
-                return postings[0]
-            }
-
-            return FileIndex.intersectPostingLists(postings)
+            )
         }
 
         func candidatePathIndices(containingAllBytes tokenBytes: [UInt8]) -> [Int32]? {
-            candidateIndices(in: gramIndex, containingAllBytes: tokenBytes)
+            if let candidates = candidateIndices(in: gramIndex, containingAllBytes: tokenBytes) {
+                return candidates
+            }
+            guard !pathGramShards.isEmpty, !tokenBytes.isEmpty else { return nil }
+
+            var keys: [Int] = []
+            keys.reserveCapacity(tokenBytes.count)
+            for byte in tokenBytes {
+                keys.append(FileIndex.searchGramKey(bytes: [byte], start: 0, length: 1))
+            }
+
+            return partialPathGramCandidates(
+                keys: keys,
+                fallbackMatches: { rowID in
+                    let pathBytes = Array(store.normalizedPath(at: rowID).utf8)
+                    return tokenBytes.allSatisfy { pathBytes.contains($0) }
+                }
+            )
+        }
+
+        private func partialPathGramCandidates(
+            keys: [Int],
+            fallbackMatches: (Int) -> Bool
+        ) -> [Int32]? {
+            let validShards = pathGramShards.filter {
+                $0.schemaVersion == store.schemaVersion
+                    && $0.rowCount == store.count
+                    && $0.range.lowerBound >= 0
+                    && $0.range.lowerBound < $0.range.upperBound
+                    && $0.range.upperBound <= store.count
+            }.sorted {
+                if $0.range.lowerBound != $1.range.lowerBound {
+                    return $0.range.lowerBound < $1.range.lowerBound
+                }
+                return $0.range.upperBound < $1.range.upperBound
+            }
+            guard !validShards.isEmpty else { return nil }
+
+            var included = Array(repeating: UInt8(0), count: store.count)
+            var candidates: [Int32] = []
+
+            func append(_ rowID: Int) {
+                guard rowID >= 0, rowID < included.count, included[rowID] == 0 else { return }
+                included[rowID] = 1
+                candidates.append(Int32(rowID))
+            }
+
+            for shard in validShards {
+                guard let index = shard.index else { continue }
+                let shardCandidates = Self.candidates(in: index, keys: keys) ?? []
+                for candidate in shardCandidates {
+                    append(Int(candidate))
+                }
+            }
+
+            var cursor = 0
+            for shard in validShards {
+                if cursor < shard.range.lowerBound {
+                    for rowID in cursor..<shard.range.lowerBound where fallbackMatches(rowID) {
+                        append(rowID)
+                    }
+                }
+                cursor = max(cursor, shard.range.upperBound)
+            }
+
+            if cursor < store.count {
+                for rowID in cursor..<store.count where fallbackMatches(rowID) {
+                    append(rowID)
+                }
+            }
+
+            candidates.sort()
+            return candidates
         }
 
         func candidateIndices(containing tokenBytes: [UInt8], field: FuzzyMatcher.QueryField) -> [Int32]? {
@@ -1466,6 +1691,27 @@ public final class FileIndex: @unchecked Sendable {
                 }
                 return FileIndex.unionPostingLists(pathCandidates, nameCandidates)
             }
+        }
+
+        private static func candidates(in postingIndex: MappedIntPostingIndex, keys: [Int]) -> [Int32]? {
+            guard !keys.isEmpty else { return nil }
+
+            var postings: [[Int32]] = []
+            postings.reserveCapacity(keys.count)
+
+            for key in keys {
+                guard let values = postingIndex.values(for: key) else {
+                    return []
+                }
+                postings.append(values)
+            }
+
+            postings.sort { $0.count < $1.count }
+            if postings.count == 1 {
+                return postings[0]
+            }
+
+            return FileIndex.intersectPostingLists(postings)
         }
 
         func candidateNameIndices(containing tokenBytes: [UInt8]) -> [Int32]? {
@@ -2053,10 +2299,27 @@ public final class FileIndex: @unchecked Sendable {
         private static func makePathGramIndex(store: RecordStore) -> MappedIntPostingIndex? {
             guard store.count <= FileIndex.pathGramRecordLimit else { return nil }
 
+            let index = makePathGramPostingMap(store: store, range: 0..<store.count)
+            return try? MappedIntPostingIndex.build(from: index, temporaryName: "att-path-postings")
+        }
+
+        static func makePathGramIndex(
+            store: RecordStore,
+            range: Range<Int>,
+            temporaryName: String
+        ) -> MappedIntPostingIndex? {
+            let index = makePathGramPostingMap(store: store, range: range)
+            return try? MappedIntPostingIndex.build(from: index, temporaryName: temporaryName)
+        }
+
+        static func makePathGramPostingMap(store: RecordStore, range: Range<Int>) -> [Int: [Int32]] {
             var index: [Int: [Int32]] = [:]
             var keys = Set<Int>()
+            let lowerBound = max(0, range.lowerBound)
+            let upperBound = min(store.count, range.upperBound)
+            guard lowerBound < upperBound else { return index }
 
-            for recordIndex in 0..<store.count {
+            for recordIndex in lowerBound..<upperBound {
                 keys.removeAll(keepingCapacity: true)
                 FileIndex.collectSearchGramKeys(from: store.normalizedPath(at: recordIndex), into: &keys)
 
@@ -2066,20 +2329,28 @@ public final class FileIndex: @unchecked Sendable {
                 }
             }
 
-            return try? MappedIntPostingIndex.build(from: index, temporaryName: "att-path-postings")
+            return index
         }
 
         private static func makeDiagnostics(
             pathGramIndexEnabled: Bool,
             gramIndex: MappedIntPostingIndex?,
+            pathGramShards: [PathGramShard],
+            pathGramExpectedRowCount: Int,
             nameGramIndex: MappedIntPostingIndex?,
             componentGramIndex: MappedIntPostingIndex?,
             extensionIndex: [String: [Int32]]
         ) -> SearchStructureDiagnostics {
-            SearchStructureDiagnostics(
+            let validShardCoveredCount = pathGramShards.reduce(0) { count, shard in
+                guard shard.index != nil || shard.coveredCount > 0 else { return count }
+                return count + shard.coveredCount
+            }
+            return SearchStructureDiagnostics(
                 pathGramIndexEnabled: pathGramIndexEnabled,
                 pathGramKeyCount: gramIndex?.keyCount ?? 0,
                 pathGramPostingCount: gramIndex?.postingCount ?? 0,
+                pathGramCoveredRowCount: gramIndex != nil ? pathGramExpectedRowCount : validShardCoveredCount,
+                pathGramTotalRowCount: pathGramExpectedRowCount,
                 nameGramKeyCount: nameGramIndex?.keyCount ?? 0,
                 nameGramPostingCount: nameGramIndex?.postingCount ?? 0,
                 componentGramKeyCount: componentGramIndex?.keyCount ?? 0,
@@ -2240,6 +2511,7 @@ public final class FileIndex: @unchecked Sendable {
     private var scannedRowCount: UInt64 = 0
     private var pathMaterializationCount: UInt64 = 0
     private var activeIndexJobs = 0
+    private var activePathGramBuildGeneration: UInt64?
     private var usageMetrics = IndexUsageMetrics()
     private var snapshotLoadState = SnapshotLoadState.notStarted
     private var indexing = false
@@ -2468,6 +2740,7 @@ public final class FileIndex: @unchecked Sendable {
         let rebuildStarted = Date()
         let currentGeneration = lock.withLock { () -> UInt64 in
             generation &+= 1
+            activePathGramBuildGeneration = nil
             snapshotLoadState = .finished
             roots = canonicalRoots.map(\.path)
             indexing = true
@@ -2579,6 +2852,7 @@ public final class FileIndex: @unchecked Sendable {
             }
 
             generation &+= 1
+            activePathGramBuildGeneration = nil
             indexing = true
             reconciling = true
             updating = false
@@ -5751,7 +6025,6 @@ public final class FileIndex: @unchecked Sendable {
                 optimizedSnapshot = optimizedSnapshot.addingNameGramIndex()
                 optimizedSnapshot = optimizedSnapshot.addingExtensionIndex()
                 optimizedSnapshot = optimizedSnapshot.addingModifiedSortOrder()
-                optimizedSnapshot = optimizedSnapshot.addingPathGramIndexIfBudgetAllows()
 
                 guard self.isCurrentGeneration(currentGeneration),
                       self.isSnapshotRevisionCurrent(baseSnapshotRevision)
@@ -5786,6 +6059,13 @@ public final class FileIndex: @unchecked Sendable {
 
                 if didApply {
                     self.publishStats()
+                    let appliedRevision = self.lock.withLock { self.searchSnapshotRevision }
+                    self.startPathGramBuildIfNeeded(
+                        snapshot: optimizedSnapshot,
+                        packageURL: self.snapshotURL,
+                        generation: currentGeneration,
+                        baseSnapshotRevision: appliedRevision
+                    )
                     MemoryTelemetry.log(
                         "rebuild.deferredOptimized.applied",
                         records: Self.countOnlyMetrics(for: optimizedSnapshot.store),
@@ -5933,29 +6213,18 @@ public final class FileIndex: @unchecked Sendable {
         if publishesIntermediateSnapshots {
             publishOptimizedSnapshot(
                 snapshot,
-                status: "Optimizing paths",
-                optimized: 0,
+                status: "Saving index",
+                optimized: snapshot.resultCount,
                 generation: currentGeneration
             )
         } else {
             publishRebuildStatus(
                 phase: .optimizing,
-                status: "Optimizing paths",
+                status: "Saving index",
                 discovered: records.count,
                 searchable: lock.withLock { searchSnapshot.resultCount },
-                optimized: 0,
-                isIndexing: true,
-                generation: currentGeneration
-            )
-        }
-
-        guard isCurrentGeneration(currentGeneration) else { return }
-        snapshot = snapshot.addingPathGramIndexIfBudgetAllows()
-        if publishesIntermediateSnapshots {
-            publishOptimizedSnapshot(
-                snapshot,
-                status: "Saving index",
                 optimized: snapshot.resultCount,
+                isIndexing: true,
                 generation: currentGeneration
             )
         }
@@ -6014,6 +6283,13 @@ public final class FileIndex: @unchecked Sendable {
 
         if didFinish {
             publishStats()
+            let revision = lock.withLock { searchSnapshotRevision }
+            startPathGramBuildIfNeeded(
+                snapshot: snapshot,
+                packageURL: snapshotURL,
+                generation: currentGeneration,
+                baseSnapshotRevision: revision
+            )
             MemoryTelemetry.log(
                 "rebuild.optimized.applied",
                 records: Self.countOnlyMetrics(for: snapshot.store),
@@ -6063,13 +6339,10 @@ public final class FileIndex: @unchecked Sendable {
         snapshot = snapshot.addingModifiedSortOrder()
         publishOptimizedSnapshot(
             snapshot,
-            status: "Optimizing paths",
-            optimized: 0,
+            status: "Saving index",
+            optimized: snapshot.resultCount,
             generation: currentGeneration
         )
-
-        guard isCurrentGeneration(currentGeneration) else { return }
-        snapshot = snapshot.addingPathGramIndexIfBudgetAllows()
 
         do {
             try persistSearchStructures(for: snapshot, packageURL: snapshotURL)
@@ -6101,7 +6374,202 @@ public final class FileIndex: @unchecked Sendable {
 
         if didFinish {
             publishStats()
+            let revision = lock.withLock { searchSnapshotRevision }
+            startPathGramBuildIfNeeded(
+                snapshot: snapshot,
+                packageURL: snapshotURL,
+                generation: currentGeneration,
+                baseSnapshotRevision: revision
+            )
             requestBackgroundReconciliation()
+        }
+    }
+
+    private func startPathGramBuildIfNeeded(
+        snapshot: SearchSnapshot,
+        packageURL: URL,
+        generation currentGeneration: UInt64,
+        baseSnapshotRevision: UInt64
+    ) {
+        guard snapshot.gramIndex == nil, FileIndex.shouldBuildPathGramIndex(store: snapshot.store) else {
+            return
+        }
+
+        var builderBaseRevision = baseSnapshotRevision
+        var publishedExpectedRowCount = false
+        let didMarkActive = lock.withLock { () -> Bool in
+            guard
+                generation == currentGeneration,
+                searchSnapshotRevision == baseSnapshotRevision,
+                searchSnapshot.store === snapshot.store,
+                activePathGramBuildGeneration == nil
+            else {
+                return false
+            }
+            activePathGramBuildGeneration = currentGeneration
+            if searchSnapshot.pathGramExpectedRowCount != snapshot.count {
+                searchSnapshot = searchSnapshot.settingPathGramExpectedRowCount(snapshot.count)
+                searchSnapshotRevision &+= 1
+                builderBaseRevision = searchSnapshotRevision
+                lastUpdated = Date()
+                publishedExpectedRowCount = true
+            }
+            return true
+        }
+        guard didMarkActive else { return }
+        if publishedExpectedRowCount {
+            publishStats()
+        }
+
+        let baseRevisionForBuilder = builderBaseRevision
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            let jobID = self.beginIndexJob("pathGramBuild")
+            defer {
+                self.lock.withLock {
+                    if self.activePathGramBuildGeneration == currentGeneration {
+                        self.activePathGramBuildGeneration = nil
+                    }
+                }
+                self.endIndexJob("pathGramBuild", jobID: jobID)
+            }
+
+            self.buildPathGramSidecar(
+                for: snapshot,
+                packageURL: packageURL,
+                generation: currentGeneration,
+                baseSnapshotRevision: baseRevisionForBuilder
+            )
+        }
+    }
+
+    private func buildPathGramSidecar(
+        for snapshot: SearchSnapshot,
+        packageURL: URL,
+        generation currentGeneration: UInt64,
+        baseSnapshotRevision: UInt64
+    ) {
+        let started = Date()
+        let rowCount = snapshot.count
+        let schemaVersion = snapshot.store.schemaVersion
+        var expectedRevision = baseSnapshotRevision
+        var fullPostingMap: [Int: [Int32]] = [:]
+        var completedShardCount = 0
+
+        for lowerBound in stride(from: 0, to: rowCount, by: Self.pathGramShardSize) {
+            guard isCurrentGeneration(currentGeneration), isSnapshotRevisionCurrent(expectedRevision) else {
+                return
+            }
+
+            let upperBound = min(rowCount, lowerBound + Self.pathGramShardSize)
+            let range = lowerBound..<upperBound
+            let shardMap = SearchSnapshot.makePathGramPostingMap(store: snapshot.store, range: range)
+            for (key, values) in shardMap {
+                fullPostingMap[key, default: []].append(contentsOf: values)
+            }
+
+            let shardIndex = try? MappedIntPostingIndex.build(
+                from: shardMap,
+                temporaryName: "att-path-postings-shard"
+            )
+            let shard = SearchSnapshot.PathGramShard(
+                snapshotRevision: expectedRevision,
+                schemaVersion: schemaVersion,
+                rowCount: rowCount,
+                range: range,
+                completedAt: Date(),
+                index: shardIndex
+            )
+
+            var published = false
+            let didPublish = lock.withLock { () -> Bool in
+                guard
+                    generation == currentGeneration,
+                    searchSnapshotRevision == expectedRevision,
+                    searchSnapshot.store === snapshot.store,
+                    searchSnapshot.gramIndex == nil
+                else {
+                    return false
+                }
+
+                searchSnapshot = searchSnapshot.addingPathGramShard(shard, expectedRowCount: rowCount)
+                searchSnapshotRevision &+= 1
+                expectedRevision = searchSnapshotRevision
+                lastUpdated = Date()
+                published = true
+                return true
+            }
+            guard didPublish, published else { return }
+            completedShardCount += 1
+            publishStats()
+        }
+
+        guard isCurrentGeneration(currentGeneration), isSnapshotRevisionCurrent(expectedRevision) else {
+            return
+        }
+
+        let completeIndex = try? MappedIntPostingIndex.build(
+            from: fullPostingMap,
+            temporaryName: "att-path-postings"
+        )
+        guard let completeIndex else { return }
+
+        var persistError: Error?
+        let didComplete = lock.withLock { () -> Bool in
+            guard
+                generation == currentGeneration,
+                searchSnapshotRevision == expectedRevision,
+                searchSnapshot.store === snapshot.store,
+                searchSnapshot.gramIndex == nil
+            else {
+                return false
+            }
+
+            do {
+                try completeIndex.write(
+                    to: packageURL.appendingPathComponent(SnapshotLayout.FileName.pathPostings, isDirectory: false)
+                )
+            } catch {
+                persistError = error
+                return false
+            }
+
+            searchSnapshot = searchSnapshot.addingCompletePathGramIndex(completeIndex)
+            searchSnapshotRevision &+= 1
+            lastUpdated = Date()
+            return true
+        }
+
+        if let persistError {
+            recordPersistFailure()
+            DiagnosticLogger.shared.log(
+                level: .error,
+                category: "index",
+                event: "index.pathGramSidecarPersistFailed",
+                fields: [
+                    "recordCount": .publicInt(rowCount),
+                    "error": .errorText(persistError.localizedDescription)
+                ]
+            )
+        }
+
+        if didComplete {
+            publishStats()
+            MemoryTelemetry.log(
+                "pathGrams.complete.applied",
+                records: Self.countOnlyMetrics(for: snapshot.store),
+                structures: lock.withLock { searchSnapshot.diagnostics },
+                activeIndexJobs: currentActiveIndexJobCount()
+            )
+            DiagnosticLogger.shared.log(
+                category: "index",
+                event: "index.pathGramSidecarFinished",
+                fields: [
+                    "recordCount": .publicInt(rowCount),
+                    "shardCount": .publicInt(completedShardCount),
+                    "durationSeconds": .publicDouble(Date().timeIntervalSince(started))
+                ]
+            )
         }
     }
 
@@ -6186,6 +6654,7 @@ public final class FileIndex: @unchecked Sendable {
     private func publishRootLimitFailure(count: Int) {
         lock.withLock {
             generation &+= 1
+            activePathGramBuildGeneration = nil
             indexing = false
             reconciling = false
             updating = false
@@ -6405,6 +6874,7 @@ public final class FileIndex: @unchecked Sendable {
         let currentGeneration = lock.withLock { () -> UInt64? in
             guard !indexing else { return nil }
             generation &+= 1
+            activePathGramBuildGeneration = nil
             indexing = true
             reconciling = false
             updating = true
@@ -6688,7 +7158,11 @@ public final class FileIndex: @unchecked Sendable {
             deletedRows: deletedRows
         )
         let shouldOptimizeOverlay = previousSnapshot.isOptimizedForSearch
-        let snapshot = SearchSnapshot(store: overlayStore, buildsSearchStructures: shouldOptimizeOverlay)
+        let snapshot = SearchSnapshot(
+            store: overlayStore,
+            buildsSearchStructures: shouldOptimizeOverlay,
+            buildsPathGramIndex: false
+        )
         let changedPathCount = upserts.count + deletedPrefixes.count
 
         let didApply = lock.withLock { () -> Bool in
@@ -7004,10 +7478,14 @@ public final class FileIndex: @unchecked Sendable {
                 exclusionPatterns: snapshotData.exclusionPatterns,
                 store: snapshotData.snapshot.store
             )
-            let persistedSnapshot = SearchSnapshot(
+            var persistedSnapshot = SearchSnapshot(
                 store: mappedStore,
-                buildsSearchStructures: snapshotData.snapshot.isOptimizedForSearch
+                buildsSearchStructures: true,
+                buildsPathGramIndex: false
             )
+            if snapshotData.snapshot.store.kind == .mapped, let existingPathGramIndex = snapshotData.snapshot.gramIndex {
+                persistedSnapshot = persistedSnapshot.addingCompletePathGramIndex(existingPathGramIndex)
+            }
             try persistSearchStructures(for: persistedSnapshot, packageURL: snapshotURL)
             MemoryTelemetry.log(
                 "snapshot.persist.finished",
@@ -7024,6 +7502,7 @@ public final class FileIndex: @unchecked Sendable {
                     "pendingRefreshPathCount": .publicInt(lock.withLock { pendingRefreshPaths.count })
                 ]
             )
+            var pathBuildRequest: (SearchSnapshot, UInt64, UInt64)?
             if snapshotData.snapshot.store.kind == .overlay || snapshotData.snapshot.store.kind == .heapPaged {
                 lock.withLock {
                     searchSnapshot = persistedSnapshot
@@ -7033,8 +7512,19 @@ public final class FileIndex: @unchecked Sendable {
                     searchableCount = persistedSnapshot.resultCount
                     optimizedCount = persistedSnapshot.isOptimizedForSearch ? persistedSnapshot.resultCount : 0
                     lastUpdated = Date()
+                    if persistedSnapshot.gramIndex == nil {
+                        pathBuildRequest = (persistedSnapshot, generation, searchSnapshotRevision)
+                    }
                 }
                 publishStats()
+            }
+            if let pathBuildRequest {
+                startPathGramBuildIfNeeded(
+                    snapshot: pathBuildRequest.0,
+                    packageURL: snapshotURL,
+                    generation: pathBuildRequest.1,
+                    baseSnapshotRevision: pathBuildRequest.2
+                )
             }
             return true
         } catch {
@@ -7417,9 +7907,7 @@ public final class FileIndex: @unchecked Sendable {
             guard store.count == manifest.recordCount else {
                 throw CocoaError(.fileReadCorruptFile)
             }
-            guard let searchStructures = loadPersistedSearchStructures(packageURL: snapshotURL, store: store) else {
-                throw CocoaError(.fileReadCorruptFile)
-            }
+            let searchStructures = loadPersistedSearchStructures(packageURL: snapshotURL, store: store) ?? .empty
             return LoadedMappedSnapshot(
                 manifest: manifest,
                 store: store,
@@ -7462,6 +7950,10 @@ public final class FileIndex: @unchecked Sendable {
             from: packageURL.appendingPathComponent(SnapshotLayout.FileName.componentPostings, isDirectory: false),
             fileManager: fileManager
         )
+        let expectedResultCount = store.storedResultCount ?? store.count
+        guard expectedResultCount == 0 || (nameGramIndex != nil && componentGramIndex != nil) else {
+            return nil
+        }
 
         return PersistedSearchStructures(
             modifiedDescending: modifiedDescending,
@@ -7639,6 +8131,8 @@ public final class FileIndex: @unchecked Sendable {
             pathGramIndexEnabled: searchSnapshot.diagnostics.pathGramIndexEnabled,
             pathGramKeyCount: searchSnapshot.diagnostics.pathGramKeyCount,
             pathGramPostingCount: searchSnapshot.diagnostics.pathGramPostingCount,
+            pathGramCoveredRowCount: searchSnapshot.diagnostics.pathGramCoveredRowCount,
+            pathGramTotalRowCount: searchSnapshot.diagnostics.pathGramTotalRowCount,
             nameGramKeyCount: searchSnapshot.diagnostics.nameGramKeyCount,
             nameGramPostingCount: searchSnapshot.diagnostics.nameGramPostingCount,
             componentGramKeyCount: searchSnapshot.diagnostics.componentGramKeyCount,
@@ -7747,6 +8241,79 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
+    func removePathGramAccelerationForTesting() {
+        indexQueue.sync {
+            lock.withLock {
+                searchSnapshot = searchSnapshot.removingPathGramAcceleration()
+                searchSnapshotRevision &+= 1
+                lastUpdated = Date()
+            }
+            publishStats()
+        }
+    }
+
+    func addPathGramShardForTesting(range rawRange: Range<Int>) {
+        indexQueue.sync {
+            let state = lock.withLock {
+                (snapshot: searchSnapshot, revision: searchSnapshotRevision)
+            }
+            let lowerBound = max(0, rawRange.lowerBound)
+            let upperBound = min(state.snapshot.count, rawRange.upperBound)
+            guard lowerBound < upperBound else { return }
+
+            let range = lowerBound..<upperBound
+            let shardMap = SearchSnapshot.makePathGramPostingMap(store: state.snapshot.store, range: range)
+            let shardIndex = try? MappedIntPostingIndex.build(
+                from: shardMap,
+                temporaryName: "att-path-postings-test-shard"
+            )
+            let shard = SearchSnapshot.PathGramShard(
+                snapshotRevision: state.revision,
+                schemaVersion: state.snapshot.store.schemaVersion,
+                rowCount: state.snapshot.count,
+                range: range,
+                completedAt: Date(),
+                index: shardIndex
+            )
+
+            lock.withLock {
+                guard searchSnapshotRevision == state.revision, searchSnapshot.store === state.snapshot.store else { return }
+                let snapshotWithoutCompleteSidecar = searchSnapshot.gramIndex == nil
+                    ? searchSnapshot
+                    : searchSnapshot.removingPathGramAcceleration()
+                searchSnapshot = snapshotWithoutCompleteSidecar.addingPathGramShard(
+                    shard,
+                    expectedRowCount: state.snapshot.count
+                )
+                searchSnapshotRevision &+= 1
+                lastUpdated = Date()
+            }
+            publishStats()
+        }
+    }
+
+    func completePathGramIndexForTesting() {
+        indexQueue.sync {
+            let state = lock.withLock {
+                (snapshot: searchSnapshot, revision: searchSnapshotRevision)
+            }
+            guard FileIndex.shouldBuildPathGramIndex(store: state.snapshot.store) else { return }
+            let pathGramIndex = SearchSnapshot.makePathGramIndex(
+                store: state.snapshot.store,
+                range: 0..<state.snapshot.count,
+                temporaryName: "att-path-postings-test-complete"
+            )
+
+            lock.withLock {
+                guard searchSnapshotRevision == state.revision, searchSnapshot.store === state.snapshot.store else { return }
+                searchSnapshot = searchSnapshot.addingCompletePathGramIndex(pathGramIndex)
+                searchSnapshotRevision &+= 1
+                lastUpdated = Date()
+            }
+            publishStats()
+        }
+    }
+
     func persistSnapshotForTesting() {
         _ = indexQueue.sync {
             persistSnapshot()
@@ -7786,6 +8353,7 @@ public final class FileIndex: @unchecked Sendable {
         let canonicalRoots = canonicalizedRoots(rootURLs)
         let generation = lock.withLock { () -> UInt64 in
             self.generation &+= 1
+            activePathGramBuildGeneration = nil
             roots = canonicalRoots.map(\.path)
             indexing = true
             reconciling = false

@@ -108,6 +108,163 @@ struct MemoryBudgetTests {
         #expect(!response.results.contains { $0.record.path == hiddenPath })
     }
 
+    @Test("medium synthetic indexes qualify for path gram postings")
+    func mediumSyntheticIndexesQualifyForPathGramPostings() {
+        let records = makeSyntheticRecords(count: 12_000)
+        let primary = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        let optimized = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        primary.replaceRecordsForTesting(records, buildsSearchStructures: false, phase: .scanning)
+        optimized.replaceRecordsForTesting(records)
+
+        let diagnostics = optimized.currentDiagnostics()
+        #expect(diagnostics.pathGramIndexEnabled)
+        #expect(diagnostics.pathGramKeyCount > 0)
+        #expect(diagnostics.pathGramPostingCount > 0)
+        #expect(diagnostics.nameGramPostingCount > 0)
+        #expect(diagnostics.componentGramPostingCount > 0)
+
+        let requests = [
+            SearchRequest(query: "path:module-1", sort: SortSpec(column: .name, ascending: true)),
+            SearchRequest(query: "path:project-1/module-0", sort: SortSpec(column: .name, ascending: true)),
+            SearchRequest(query: "File000010", sort: SortSpec(column: .name, ascending: true))
+        ]
+
+        for request in requests {
+            let primaryResponse = primary.search(request, maxResults: 50)
+            let optimizedResponse = optimized.search(request, maxResults: 50)
+
+            #expect(primaryResponse.totalMatches == optimizedResponse.totalMatches)
+            #expect(primaryResponse.results.map(\.record.path) == optimizedResponse.results.map(\.record.path))
+        }
+
+        let componentPathResponse = optimized.search(requests[0], maxResults: 50)
+        #expect(componentPathResponse.usesIndexedCandidates)
+    }
+
+    @Test("path gram acceleration states preserve query results")
+    func pathGramAccelerationStatesPreserveQueryResults() {
+        let records = [
+            makeRecord(path: "/tmp/allthethings-path/project/Sources/AppKit/SearchWindowController.swift", modifiedTime: 50),
+            makeRecord(path: "/tmp/allthethings-path/project/Sources/AppKit/HiddenThing.swift", isHidden: true, modifiedTime: 60),
+            makeRecord(path: "/tmp/allthethings-path/project/Sources/Core/FileIndex.swift", modifiedTime: 70),
+            makeRecord(path: "/tmp/allthethings-path/project/Tests/FileIndexTests.swift", modifiedTime: 40),
+            makeRecord(path: "/tmp/allthethings-path/project/README.md", modifiedTime: 30),
+            makeRecord(path: "/tmp/allthethings-path/other/Sources/AppKit/OtherWindow.swift", modifiedTime: 20)
+        ]
+        let primary = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        primary.replaceRecordsForTesting(records, buildsSearchStructures: false, phase: .scanning)
+
+        let requests = [
+            SearchRequest(query: "AppKit", sort: SortSpec(column: .name, ascending: true)),
+            SearchRequest(query: "path:Sources/AppKit", sort: SortSpec(column: .name, ascending: true)),
+            SearchRequest(query: "project/Sources/Core", sort: SortSpec(column: .modified, ascending: false)),
+            SearchRequest(query: "path:**/FileIndex*.swift", sort: SortSpec(column: .name, ascending: true)),
+            SearchRequest(query: "HiddenThing", sort: SortSpec(column: .name, ascending: true), includeHidden: false),
+            SearchRequest(query: "HiddenThing", sort: SortSpec(column: .modified, ascending: false), includeHidden: true)
+        ]
+
+        func assertMatchesPrimary(_ index: FileIndex) {
+            for request in requests {
+                let expected = primary.search(request, maxResults: 20)
+                let actual = index.search(request, maxResults: 20)
+                #expect(actual.totalMatches == expected.totalMatches)
+                #expect(actual.results.map(\.record.path) == expected.results.map(\.record.path))
+            }
+        }
+
+        let noShards = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        noShards.replaceRecordsForTesting(records)
+        noShards.removePathGramAccelerationForTesting()
+        #expect(!noShards.currentDiagnostics().pathGramIndexEnabled)
+        #expect(noShards.currentDiagnostics().pathGramCoveredRowCount == 0)
+        assertMatchesPrimary(noShards)
+
+        let oneShard = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        oneShard.replaceRecordsForTesting(records)
+        oneShard.removePathGramAccelerationForTesting()
+        oneShard.addPathGramShardForTesting(range: 0..<2)
+        #expect(!oneShard.currentDiagnostics().pathGramIndexEnabled)
+        #expect(oneShard.currentDiagnostics().pathGramCoveredRowCount == 2)
+        assertMatchesPrimary(oneShard)
+
+        let multipleShards = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        multipleShards.replaceRecordsForTesting(records)
+        multipleShards.removePathGramAccelerationForTesting()
+        multipleShards.addPathGramShardForTesting(range: 0..<2)
+        multipleShards.addPathGramShardForTesting(range: 4..<6)
+        #expect(!multipleShards.currentDiagnostics().pathGramIndexEnabled)
+        #expect(multipleShards.currentDiagnostics().pathGramCoveredRowCount == 4)
+        assertMatchesPrimary(multipleShards)
+
+        let completeSidecar = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        completeSidecar.replaceRecordsForTesting(records)
+        completeSidecar.removePathGramAccelerationForTesting()
+        completeSidecar.completePathGramIndexForTesting()
+        #expect(completeSidecar.currentDiagnostics().pathGramIndexEnabled)
+        #expect(completeSidecar.currentDiagnostics().pathGramCoveredRowCount == records.count)
+        assertMatchesPrimary(completeSidecar)
+    }
+
+    @Test("structural snapshot changes discard partial path gram shards")
+    func structuralSnapshotChangesDiscardPartialPathGramShards() {
+        var records = makeSyntheticRecords(count: 32)
+        let index = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        index.replaceRecordsForTesting(records)
+        index.removePathGramAccelerationForTesting()
+        index.addPathGramShardForTesting(range: 0..<16)
+        #expect(index.currentDiagnostics().pathGramCoveredRowCount == 16)
+
+        let addedPath = "/tmp/allthethings-memory/project-new/module-new/Added.swift"
+        records.append(FileRecord(
+            id: FileRecord.stableID(for: addedPath),
+            path: addedPath,
+            name: "Added.swift",
+            directoryPath: "/tmp/allthethings-memory/project-new/module-new",
+            fileExtension: "swift",
+            sizeBytes: 12,
+            modifiedTime: 42,
+            createdTime: nil,
+            isDirectory: false,
+            isHidden: false,
+            volumeName: "Synthetic",
+            normalizedName: FuzzyMatcher.normalize("Added.swift"),
+            normalizedPath: FuzzyMatcher.normalize(addedPath)
+        ))
+        index.replaceRecordsForTesting(records, buildsSearchStructures: false, phase: .scanning)
+
+        let diagnostics = index.currentDiagnostics()
+        #expect(!diagnostics.pathGramIndexEnabled)
+        #expect(diagnostics.pathGramCoveredRowCount == 0)
+        #expect(index.search(SearchRequest(
+            query: "path:project-new/module-new",
+            sort: SortSpec(column: .name, ascending: true)
+        ), maxResults: 10).results.map(\.record.path) == [addedPath])
+    }
+
     @Test("short fuzzy path tokens use component expansion without path postings")
     func shortFuzzyPathTokensUseComponentExpansionWithoutPathPostings() {
         let rootDirectory = "/tmp/allthethings-memory/"
