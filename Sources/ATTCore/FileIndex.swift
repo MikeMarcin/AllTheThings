@@ -498,6 +498,7 @@ public final class FileIndex: @unchecked Sendable {
     private static let checkpointTimeInterval: TimeInterval = 300
     private static let pathGramRecordLimit = 200_000
     private static let pathGramTotalPathByteLimit = 24 * 1024 * 1024
+    private static let defaultDeferredOptimizationRecordThreshold = 10_000
     private static let exactEmptyQuerySortLimit = 100_000
     private static let largeOverlayPersistDefaultDelay: TimeInterval = 30
     public static let maximumIndexedRootCount = RootAttributionTable.maximumRootCount
@@ -2221,6 +2222,7 @@ public final class FileIndex: @unchecked Sendable {
     private var exclusionEvaluationMode: ExclusionEvaluationMode = .compiledQuery
     private var scanFrontierMode: ScanFrontierMode = .singleDirectory
     private var scanFrontierBatchSize = 1
+    private var deferredOptimizationRecordThreshold = FileIndex.defaultDeferredOptimizationRecordThreshold
     private var lastScanFrontierMetrics = ScanFrontierMetrics()
     private var generation: UInt64 = 0
     private var persistRevision: UInt64 = 0
@@ -5652,6 +5654,172 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
+    private func publishReadySnapshotAndOptimizeInBackground(
+        records: [FileRecord],
+        initialStore: HeapPagedRecordStore,
+        generation currentGeneration: UInt64,
+        completionStatusPrefix: String
+    ) {
+        let snapshot = SearchSnapshot(store: initialStore, buildsSearchStructures: false)
+        let snapshotSettings = lock.withLock {
+            (
+                roots: roots,
+                exclusionPatterns: exclusionRules.patterns,
+                shouldReconcileAfterFinish: resumedFromCheckpoint && completionStatusPrefix == "Indexed"
+            )
+        }
+
+        var readySnapshotRevision: UInt64?
+        let didFinish = lock.withLock { () -> Bool in
+            guard generation == currentGeneration else {
+                return false
+            }
+
+            self.recordsByPath.removeAll(keepingCapacity: false)
+            searchSnapshot = snapshot
+            searchSnapshotRevision &+= 1
+            readySnapshotRevision = searchSnapshotRevision
+            indexing = false
+            if reconciling {
+                clearActiveReconciliationWithoutLock()
+            }
+            reconciling = false
+            updating = false
+            phase = .ready
+            discoveredCount = snapshot.resultCount
+            searchableCount = snapshot.resultCount
+            optimizedCount = 0
+            status = "\(completionStatusPrefix) \(snapshot.resultCount.formatted()) files"
+            lastUpdated = Date()
+            activeOperationStartedAt = nil
+            resumedFromCheckpoint = false
+            completedSnapshotRebuilds &+= 1
+            return true
+        }
+
+        guard didFinish else { return }
+        publishStats()
+        MemoryTelemetry.log(
+            "rebuild.primary.ready",
+            records: Self.countOnlyMetrics(for: snapshot.store),
+            structures: snapshot.diagnostics,
+            activeIndexJobs: currentActiveIndexJobCount()
+        )
+        if snapshotSettings.shouldReconcileAfterFinish {
+            requestBackgroundReconciliation()
+        }
+        optimizeAndPersistSnapshotInBackground(
+            records: records,
+            roots: snapshotSettings.roots,
+            exclusionPatterns: snapshotSettings.exclusionPatterns,
+            generation: currentGeneration,
+            baseSnapshotRevision: readySnapshotRevision ?? 0
+        )
+    }
+
+    private func optimizeAndPersistSnapshotInBackground(
+        records: [FileRecord],
+        roots: [String],
+        exclusionPatterns: [String],
+        generation currentGeneration: UInt64,
+        baseSnapshotRevision: UInt64
+    ) {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            let jobID = self.beginIndexJob("deferredOptimize")
+            defer { self.endIndexJob("deferredOptimize", jobID: jobID) }
+
+            guard self.isCurrentGeneration(currentGeneration),
+                  self.isSnapshotRevisionCurrent(baseSnapshotRevision)
+            else { return }
+
+            let started = Date()
+            let packageURL = SnapshotLayout.temporaryPackageURL(in: self.supportDirectory)
+            do {
+                try MappedRecordStore.writePackage(
+                    records: records,
+                    roots: roots,
+                    exclusionPatterns: exclusionPatterns,
+                    packageURL: packageURL,
+                    fileManager: self.fileManager
+                )
+                let mappedStore = try MappedRecordStore(
+                    packageURL: packageURL,
+                    schemaVersion: SnapshotLayout.schemaVersion
+                )
+                var optimizedSnapshot = SearchSnapshot(store: mappedStore, buildsSearchStructures: false)
+                optimizedSnapshot = optimizedSnapshot.addingNameGramIndex()
+                optimizedSnapshot = optimizedSnapshot.addingExtensionIndex()
+                optimizedSnapshot = optimizedSnapshot.addingModifiedSortOrder()
+                optimizedSnapshot = optimizedSnapshot.addingPathGramIndexIfBudgetAllows()
+
+                guard self.isCurrentGeneration(currentGeneration),
+                      self.isSnapshotRevisionCurrent(baseSnapshotRevision)
+                else {
+                    try? self.fileManager.removeItem(at: packageURL)
+                    return
+                }
+
+                try self.persistSearchStructures(for: optimizedSnapshot, packageURL: packageURL)
+
+                guard self.isCurrentGeneration(currentGeneration),
+                      self.isSnapshotRevisionCurrent(baseSnapshotRevision)
+                else {
+                    try? self.fileManager.removeItem(at: packageURL)
+                    return
+                }
+
+                try self.installMappedSnapshotPackage(packageURL)
+
+                let didApply = self.lock.withLock { () -> Bool in
+                    guard self.generation == currentGeneration,
+                          self.searchSnapshotRevision == baseSnapshotRevision else {
+                        return false
+                    }
+
+                    self.searchSnapshot = optimizedSnapshot
+                    self.searchSnapshotRevision &+= 1
+                    self.optimizedCount = optimizedSnapshot.isOptimizedForSearch ? optimizedSnapshot.resultCount : 0
+                    self.lastUpdated = Date()
+                    return true
+                }
+
+                if didApply {
+                    self.publishStats()
+                    MemoryTelemetry.log(
+                        "rebuild.deferredOptimized.applied",
+                        records: Self.countOnlyMetrics(for: optimizedSnapshot.store),
+                        structures: optimizedSnapshot.diagnostics,
+                        activeIndexJobs: self.currentActiveIndexJobCount()
+                    )
+                    DiagnosticLogger.shared.log(
+                        category: "index",
+                        event: "index.deferredOptimizationFinished",
+                        fields: [
+                            "recordCount": .publicInt(optimizedSnapshot.resultCount),
+                            "durationSeconds": .publicDouble(Date().timeIntervalSince(started))
+                        ]
+                    )
+                } else {
+                    self.schedulePersist()
+                }
+            } catch {
+                try? self.fileManager.removeItem(at: packageURL)
+                self.recordPersistFailure()
+                DiagnosticLogger.shared.log(
+                    level: .error,
+                    category: "index",
+                    event: "index.deferredOptimizationFailed",
+                    fields: [
+                        "recordCount": .publicInt(records.count),
+                        "durationSeconds": .publicDouble(Date().timeIntervalSince(started)),
+                        "error": .errorText(error.localizedDescription)
+                    ]
+                )
+            }
+        }
+    }
+
     private func optimizeAndPublish(
         recordsByPath: [String: FileRecord],
         initialStore: HeapPagedRecordStore,
@@ -5660,6 +5828,19 @@ public final class FileIndex: @unchecked Sendable {
         completionStatusPrefix: String = "Indexed"
     ) {
         let records = Array(recordsByPath.values)
+        let deferredOptimizationThreshold = lock.withLock {
+            deferredOptimizationRecordThreshold
+        }
+        if records.count >= deferredOptimizationThreshold {
+            publishReadySnapshotAndOptimizeInBackground(
+                records: records,
+                initialStore: initialStore,
+                generation: currentGeneration,
+                completionStatusPrefix: completionStatusPrefix
+            )
+            return
+        }
+
         var snapshot = SearchSnapshot(store: initialStore, buildsSearchStructures: false)
         var pendingMappedPackageURL: URL?
 
@@ -5960,17 +6141,22 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         do {
-            if fileManager.fileExists(atPath: snapshotURL.path) {
-                try fileManager.removeItem(at: snapshotURL)
-            }
-            try fileManager.moveItem(at: packageURL, to: snapshotURL)
-            removeScanCheckpoint()
-            cleanupObsoleteIndexFiles()
+            try installMappedSnapshotPackage(packageURL)
             return true
         } catch {
             failIndexing("Could not install compact index: \(error.localizedDescription)", generation: currentGeneration)
             return false
         }
+    }
+
+    private func installMappedSnapshotPackage(_ packageURL: URL) throws {
+        if fileManager.fileExists(atPath: snapshotURL.path) {
+            try fileManager.removeItem(at: snapshotURL)
+        }
+        try fileManager.moveItem(at: packageURL, to: snapshotURL)
+        removeScanCheckpoint()
+        cleanupObsoleteIndexFiles()
+        invalidateStorageInsightsCache()
     }
 
     private func failIndexing(_ message: String, generation currentGeneration: UInt64) {
@@ -7555,6 +7741,12 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
+    func setDeferredOptimizationRecordThresholdForTesting(_ threshold: Int) {
+        lock.withLock {
+            deferredOptimizationRecordThreshold = max(threshold, 0)
+        }
+    }
+
     func persistSnapshotForTesting() {
         _ = indexQueue.sync {
             persistSnapshot()
@@ -8064,6 +8256,12 @@ public final class FileIndex: @unchecked Sendable {
     private func isPersistRevisionCurrent(_ candidate: UInt64) -> Bool {
         lock.withLock {
             persistRevision == candidate
+        }
+    }
+
+    private func isSnapshotRevisionCurrent(_ candidate: UInt64) -> Bool {
+        lock.withLock {
+            searchSnapshotRevision == candidate
         }
     }
 

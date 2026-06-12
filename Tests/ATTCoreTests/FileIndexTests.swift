@@ -361,6 +361,106 @@ struct FileIndexTests {
         #expect(!compiledPaths.contains(generatedDirectory.path))
     }
 
+    @Test("deferred optimization publishes complete rebuild results and later persists optimized snapshot")
+    func deferredOptimizationPublishesCompleteRebuildResults() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        let sourceDirectory = root.appendingPathComponent("Sources", isDirectory: true)
+        try fileManager.createDirectory(at: sourceDirectory, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        let appFile = sourceDirectory.appendingPathComponent("App.swift")
+        let readmeFile = root.appendingPathComponent("README.md")
+        try "app".write(to: appFile, atomically: true, encoding: .utf8)
+        try "readme".write(to: readmeFile, atomically: true, encoding: .utf8)
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        defer {
+            try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName))
+        }
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        index.setDeferredOptimizationRecordThresholdForTesting(1)
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+
+        try await waitUntil {
+            !index.currentStats().isIndexing
+        }
+
+        let paths = allIndexedPaths(in: index)
+        #expect(paths.contains(root.path))
+        #expect(paths.contains(sourceDirectory.path))
+        #expect(paths.contains(appFile.path))
+        #expect(paths.contains(readmeFile.path))
+
+        let response = index.search(SearchRequest(
+            query: "App",
+            sort: SortSpec(column: .relevance, ascending: false),
+            includeHidden: true
+        ), maxResults: 10)
+        #expect(response.results.contains { $0.record.path == appFile.path })
+
+        try await waitUntil(timeout: .seconds(10)) {
+            let diagnostics = index.currentDiagnostics()
+            return diagnostics.recordStoreKind == .mapped
+                && diagnostics.optimizedCount == diagnostics.indexedCount
+        }
+
+        let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
+        let reloadedPaths = allIndexedPaths(in: reloaded)
+        #expect(reloadedPaths == allIndexedPaths(in: index))
+    }
+
+    @Test("deferred optimization preserves scoped reconcile results")
+    func deferredOptimizationPreservesScopedReconcileResults() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        let sourceDirectory = root.appendingPathComponent("Sources", isDirectory: true)
+        try fileManager.createDirectory(at: sourceDirectory, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        let removedFile = sourceDirectory.appendingPathComponent("Removed.swift")
+        let retainedFile = sourceDirectory.appendingPathComponent("Retained.swift")
+        let addedFile = sourceDirectory.appendingPathComponent("Added.swift")
+        try "removed".write(to: removedFile, atomically: true, encoding: .utf8)
+        try "retained".write(to: retainedFile, atomically: true, encoding: .utf8)
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        defer {
+            try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName))
+        }
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        index.setDeferredOptimizationRecordThresholdForTesting(1)
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil {
+            !index.currentStats().isIndexing
+        }
+
+        try fileManager.removeItem(at: removedFile)
+        try "added".write(to: addedFile, atomically: true, encoding: .utf8)
+        index.reconcileIndexedRootsInBackground(rootURLs: [sourceDirectory])
+
+        try await waitUntil(timeout: .seconds(10)) {
+            !index.currentStats().isIndexing
+        }
+
+        let paths = allIndexedPaths(in: index)
+        #expect(paths.contains(addedFile.path))
+        #expect(paths.contains(retainedFile.path))
+        #expect(!paths.contains(removedFile.path))
+
+        try await waitUntil(timeout: .seconds(10)) {
+            let diagnostics = index.currentDiagnostics()
+            return diagnostics.recordStoreKind == .mapped
+                && diagnostics.optimizedCount == diagnostics.indexedCount
+        }
+    }
+
     @Test("frontier batch modes match single-directory full rebuild paths")
     func frontierBatchModesMatchSingleDirectoryFullRebuildPaths() async throws {
         let fileManager = FileManager.default
