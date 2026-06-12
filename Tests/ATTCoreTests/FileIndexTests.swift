@@ -1005,19 +1005,26 @@ struct FileIndexTests {
 
         let visibleFile = root.appendingPathComponent("Visible.swift")
         let hiddenFile = root.appendingPathComponent(".Secret.swift")
+        let finderHiddenFile = root.appendingPathComponent("FinderHidden.swift")
         let hiddenDirectory = root.appendingPathComponent(".git", isDirectory: true)
         let hiddenChild = hiddenDirectory.appendingPathComponent("config")
         try fileManager.createDirectory(at: hiddenDirectory, withIntermediateDirectories: true)
         try "visible".write(to: visibleFile, atomically: true, encoding: .utf8)
         try "secret".write(to: hiddenFile, atomically: true, encoding: .utf8)
+        try "finder hidden".write(to: finderHiddenFile, atomically: true, encoding: .utf8)
         try "config".write(to: hiddenChild, atomically: true, encoding: .utf8)
+        let chflagsResult = chflags(finderHiddenFile.path, UInt32(UF_HIDDEN))
+        #expect(chflagsResult == 0)
+        defer {
+            _ = chflags(finderHiddenFile.path, 0)
+        }
 
         let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)")
         index.replaceRootsAndRebuild([root])
 
         try await waitUntil {
             let stats = index.currentStats()
-            return !stats.isIndexing && stats.indexedCount >= 5
+            return !stats.isIndexing && stats.indexedCount >= 6
         }
 
         var response = index.search(SearchRequest(
@@ -1027,6 +1034,7 @@ struct FileIndexTests {
         ), maxResults: 20)
         #expect(response.results.contains { $0.record.path == visibleFile.path })
         #expect(!response.results.contains { $0.record.path == hiddenFile.path })
+        #expect(!response.results.contains { $0.record.path == finderHiddenFile.path })
         #expect(!response.results.contains { $0.record.path == hiddenChild.path })
 
         response = index.search(SearchRequest(
@@ -1050,6 +1058,13 @@ struct FileIndexTests {
             includeHidden: false
         ), maxResults: 20)
         #expect(response.results.isEmpty)
+
+        response = index.search(SearchRequest(
+            query: "FinderHidden",
+            sort: SortSpec(column: .relevance, ascending: false),
+            includeHidden: true
+        ), maxResults: 20)
+        #expect(response.results.contains { $0.record.path == finderHiddenFile.path })
     }
 
     @Test("optimized search keeps fuzzy and acronym filename matches")
