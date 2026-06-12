@@ -230,6 +230,137 @@ struct FileIndexTests {
         #expect(!searchPaths(in: index, query: "cdef", includeHidden: true).contains(object.path))
     }
 
+    @Test("compiled exclusion mode matches legacy full rebuild paths")
+    func compiledExclusionModeMatchesLegacyFullRebuildPaths() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        let sourceDirectory = root.appendingPathComponent("Sources", isDirectory: true)
+        let gitHooksDirectory = root.appendingPathComponent(".git/hooks", isDirectory: true)
+        let gitObjectsDirectory = root.appendingPathComponent(".git/objects/ab", isDirectory: true)
+        let nodeModuleDirectory = root.appendingPathComponent("node_modules/pkg", isDirectory: true)
+        let cacheDirectory = root.appendingPathComponent(".cache/build", isDirectory: true)
+        let nestedRoot = root.appendingPathComponent("NestedRoot", isDirectory: true)
+        let nestedSourceDirectory = nestedRoot.appendingPathComponent("Sources", isDirectory: true)
+        try fileManager.createDirectory(at: sourceDirectory, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: gitHooksDirectory, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: gitObjectsDirectory, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: nodeModuleDirectory, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: nestedSourceDirectory, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        let appSource = sourceDirectory.appendingPathComponent("App.swift")
+        let appReadme = sourceDirectory.appendingPathComponent("README.md")
+        let gitConfig = root.appendingPathComponent(".git/config")
+        let gitHook = gitHooksDirectory.appendingPathComponent("pre-commit")
+        let gitObject = gitObjectsDirectory.appendingPathComponent("cdef")
+        let nodeModuleFile = nodeModuleDirectory.appendingPathComponent("Skipped.js")
+        let cacheFile = cacheDirectory.appendingPathComponent("Cache.db")
+        let nestedSource = nestedSourceDirectory.appendingPathComponent("Nested.swift")
+        try "app".write(to: appSource, atomically: true, encoding: .utf8)
+        try "readme".write(to: appReadme, atomically: true, encoding: .utf8)
+        try "config".write(to: gitConfig, atomically: true, encoding: .utf8)
+        try "hook".write(to: gitHook, atomically: true, encoding: .utf8)
+        try "object".write(to: gitObject, atomically: true, encoding: .utf8)
+        try "module".write(to: nodeModuleFile, atomically: true, encoding: .utf8)
+        try "cache".write(to: cacheFile, atomically: true, encoding: .utf8)
+        try "nested".write(to: nestedSource, atomically: true, encoding: .utf8)
+
+        let roots = [root, nestedRoot]
+        let legacyPaths = try await indexedPaths(
+            roots: roots,
+            mode: .legacyRules,
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)"
+        )
+        let compiledPaths = try await indexedPaths(
+            roots: roots,
+            mode: .compiledQuery,
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)"
+        )
+
+        #expect(compiledPaths == legacyPaths)
+        #expect(compiledPaths.contains(appSource.path))
+        #expect(compiledPaths.contains(appReadme.path))
+        #expect(compiledPaths.contains(gitConfig.path))
+        #expect(compiledPaths.contains(gitHook.path))
+        #expect(compiledPaths.contains(nestedSource.path))
+        #expect(!compiledPaths.contains(gitObject.path))
+        #expect(!compiledPaths.contains(nodeModuleFile.path))
+        #expect(!compiledPaths.contains(cacheFile.path))
+    }
+
+    @Test("compiled exclusion mode matches legacy scoped update paths")
+    func compiledExclusionModeMatchesLegacyScopedUpdatePaths() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        let patterns = [
+            "*",
+            "!*/",
+            "Generated/",
+            "!Generated/Keep.swift"
+        ]
+        let legacyAppName = "AllTheThingsTests-\(UUID().uuidString)"
+        let compiledAppName = "AllTheThingsTests-\(UUID().uuidString)"
+        defer {
+            try? fileManager.removeItem(at: supportDirectory(applicationName: legacyAppName))
+            try? fileManager.removeItem(at: supportDirectory(applicationName: compiledAppName))
+        }
+
+        let legacyIndex = FileIndex(
+            applicationName: legacyAppName,
+            loadsSnapshotImmediately: false,
+            exclusionPatterns: patterns
+        )
+        legacyIndex.setExclusionEvaluationModeForTesting(.legacyRules)
+        let compiledIndex = FileIndex(
+            applicationName: compiledAppName,
+            loadsSnapshotImmediately: false,
+            exclusionPatterns: patterns
+        )
+        compiledIndex.setExclusionEvaluationModeForTesting(.compiledQuery)
+
+        legacyIndex.replaceRootsAndRebuild([root], mode: .fresh)
+        compiledIndex.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil {
+            !legacyIndex.currentStats().isIndexing && !compiledIndex.currentStats().isIndexing
+        }
+
+        let generatedDirectory = root.appendingPathComponent("Generated", isDirectory: true)
+        try fileManager.createDirectory(at: generatedDirectory, withIntermediateDirectories: true)
+        let kept = generatedDirectory.appendingPathComponent("Keep.swift")
+        let dropped = generatedDirectory.appendingPathComponent("Drop.swift")
+        try "kept".write(to: kept, atomically: true, encoding: .utf8)
+        try "dropped".write(to: dropped, atomically: true, encoding: .utf8)
+
+        let legacyBefore = legacyIndex.currentDiagnostics()
+        let compiledBefore = compiledIndex.currentDiagnostics()
+        legacyIndex.update(paths: [generatedDirectory.path])
+        compiledIndex.update(paths: [generatedDirectory.path])
+
+        try await waitUntil {
+            legacyIndex.currentDiagnostics().completedRefreshBatches > legacyBefore.completedRefreshBatches
+                && compiledIndex.currentDiagnostics().completedRefreshBatches > compiledBefore.completedRefreshBatches
+                && !legacyIndex.currentStats().isIndexing
+                && !compiledIndex.currentStats().isIndexing
+        }
+
+        let legacyPaths = allIndexedPaths(in: legacyIndex)
+        let compiledPaths = allIndexedPaths(in: compiledIndex)
+        #expect(compiledPaths == legacyPaths)
+        #expect(compiledPaths.contains(kept.path))
+        #expect(!compiledPaths.contains(dropped.path))
+        #expect(!compiledPaths.contains(generatedDirectory.path))
+    }
+
     @Test("same-path update preserves optimized search structures")
     func samePathUpdatePreservesOptimizedSearchStructures() async throws {
         let fileManager = FileManager.default
@@ -1716,6 +1847,37 @@ struct FileIndexTests {
             sort: SortSpec(column: .name, ascending: true),
             includeHidden: includeHidden
         ), maxResults: 50).results.map(\.record.path)
+    }
+
+    private func allIndexedPaths(in index: FileIndex) -> [String] {
+        index.search(SearchRequest(
+            query: "",
+            sort: SortSpec(column: .path, ascending: true),
+            includeHidden: true
+        ), maxResults: 20_000).results.map(\.record.path)
+    }
+
+    private func indexedPaths(
+        roots: [URL],
+        mode: ExclusionEvaluationMode,
+        applicationName: String,
+        exclusionPatterns: [String] = FileExclusionRules.defaultPatterns
+    ) async throws -> [String] {
+        let index = FileIndex(
+            applicationName: applicationName,
+            loadsSnapshotImmediately: false,
+            exclusionPatterns: exclusionPatterns
+        )
+        index.setExclusionEvaluationModeForTesting(mode)
+        defer {
+            try? FileManager.default.removeItem(at: supportDirectory(applicationName: applicationName))
+        }
+
+        index.replaceRootsAndRebuild(roots, mode: .fresh)
+        try await waitUntil {
+            !index.currentStats().isIndexing
+        }
+        return allIndexedPaths(in: index)
     }
 
     private func supportDirectory(applicationName: String) -> URL {
