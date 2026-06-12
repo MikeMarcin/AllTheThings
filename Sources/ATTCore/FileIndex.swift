@@ -452,6 +452,11 @@ struct FileIndexDiagnostics: Sendable {
     let resumedFromCheckpoint: Bool
 }
 
+enum ExclusionEvaluationMode: String, Sendable, CaseIterable {
+    case compiledQuery
+    case legacyRules
+}
+
 public final class FileIndex: @unchecked Sendable {
     private static let maximumRefreshBatchPaths = 512
     private static let primaryPublishRecordInterval = 25_000
@@ -2107,6 +2112,7 @@ public final class FileIndex: @unchecked Sendable {
     private var searchSnapshotRevision: UInt64 = 0
     private var roots: [String] = []
     private var exclusionRules: FileExclusionRules
+    private var exclusionEvaluationMode: ExclusionEvaluationMode = .compiledQuery
     private var generation: UInt64 = 0
     private var persistRevision: UInt64 = 0
     private var pendingRefreshPaths = Set<String>()
@@ -5249,6 +5255,12 @@ public final class FileIndex: @unchecked Sendable {
     ) -> ScanResult? {
         let rootPaths = rootURLs.map(\.path)
         let ruleRootPaths = exclusionRootPaths ?? rootPaths
+        let evaluationMode = lock.withLock { exclusionEvaluationMode }
+        let rootPreflightExclusionQuery = makeExclusionQuery(
+            exclusions: exclusions,
+            rootPaths: ruleRootPaths,
+            evaluationMode: evaluationMode
+        )
         let currentCount = lock.withLock { searchSnapshot.count }
         let state = ConcurrentScanState(
             reservedCapacity: max(8_192, currentCount, checkpoint?.store.count ?? 0),
@@ -5314,6 +5326,7 @@ public final class FileIndex: @unchecked Sendable {
                     for: root,
                     exclusions: exclusions,
                     rootPaths: ruleRootPaths,
+                    query: rootPreflightExclusionQuery,
                     isDirectory: true
                 )
                 guard rootDecision != .prune else {
@@ -5340,6 +5353,11 @@ public final class FileIndex: @unchecked Sendable {
                     state.markStopped()
                     return
                 }
+                let workerExclusionQuery = self.makeExclusionQuery(
+                    exclusions: exclusions,
+                    rootPaths: ruleRootPaths,
+                    evaluationMode: evaluationMode
+                )
 
                 var batch: [FileRecord] = []
                 batch.reserveCapacity(256)
@@ -5365,6 +5383,7 @@ public final class FileIndex: @unchecked Sendable {
                                 for: child,
                                 exclusions: exclusions,
                                 rootPaths: ruleRootPaths,
+                                query: workerExclusionQuery,
                                 isDirectory: isDirectory
                             )
                             guard decision != .prune else { return }
@@ -6084,9 +6103,15 @@ public final class FileIndex: @unchecked Sendable {
         let indexState = lock.withLock {
             (
                 exclusions: exclusionRules,
-                rootPaths: roots
+                rootPaths: roots,
+                evaluationMode: exclusionEvaluationMode
             )
         }
+        let exclusionQuery = makeExclusionQuery(
+            exclusions: indexState.exclusions,
+            rootPaths: indexState.rootPaths,
+            evaluationMode: indexState.evaluationMode
+        )
         var upserts: [String: FileRecord] = [:]
         var deletedPrefixes: [String] = []
         var reconciledDirectoryPrefixes: [String] = []
@@ -6101,6 +6126,7 @@ public final class FileIndex: @unchecked Sendable {
                         for: url,
                         exclusions: indexState.exclusions,
                         rootPaths: indexState.rootPaths,
+                        query: exclusionQuery,
                         isDirectory: isDirectory.boolValue
                     )
                     guard decision != .prune else { return }
@@ -6115,6 +6141,7 @@ public final class FileIndex: @unchecked Sendable {
                             root: url,
                             exclusions: indexState.exclusions,
                             rootPaths: indexState.rootPaths,
+                            query: exclusionQuery,
                             generation: currentGeneration
                         ) {
                             reconciledDirectoryPrefixes.append(url.path)
@@ -6128,12 +6155,14 @@ public final class FileIndex: @unchecked Sendable {
                         for: url,
                         exclusions: indexState.exclusions,
                         rootPaths: indexState.rootPaths,
+                        query: exclusionQuery,
                         isDirectory: false
                     )
                     let directoryDecision = exclusionDecision(
                         for: url,
                         exclusions: indexState.exclusions,
                         rootPaths: indexState.rootPaths,
+                        query: exclusionQuery,
                         isDirectory: true
                     )
                     guard fileDecision != .prune || directoryDecision != .prune else { return }
@@ -6337,6 +6366,7 @@ public final class FileIndex: @unchecked Sendable {
         root: URL,
         exclusions: FileExclusionRules,
         rootPaths: [String],
+        query: FileExclusionQuery?,
         generation currentGeneration: UInt64
     ) -> [String: FileRecord]? {
         var records: [String: FileRecord] = [:]
@@ -6350,6 +6380,7 @@ public final class FileIndex: @unchecked Sendable {
                 for: directory,
                 exclusions: exclusions,
                 rootPaths: rootPaths,
+                query: query,
                 isDirectory: isDirectory
             )
             guard decision != .prune else { return true }
@@ -6370,6 +6401,7 @@ public final class FileIndex: @unchecked Sendable {
                     for: child,
                     exclusions: exclusions,
                     rootPaths: rootPaths,
+                    query: query,
                     isDirectory: childIsDirectory
                 )
                 guard childDecision != .prune else { return true }
@@ -7289,6 +7321,12 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
+    func setExclusionEvaluationModeForTesting(_ mode: ExclusionEvaluationMode) {
+        lock.withLock {
+            exclusionEvaluationMode = mode
+        }
+    }
+
     func persistSnapshotForTesting() {
         _ = indexQueue.sync {
             persistSnapshot()
@@ -7831,13 +7869,30 @@ public final class FileIndex: @unchecked Sendable {
         rootPaths.contains { path == $0 || path.hasPrefix($0 + "/") }
     }
 
+    private func makeExclusionQuery(
+        exclusions: FileExclusionRules,
+        rootPaths: [String],
+        evaluationMode: ExclusionEvaluationMode
+    ) -> FileExclusionQuery? {
+        switch evaluationMode {
+        case .compiledQuery:
+            return exclusions.makeQuery(roots: rootPaths)
+        case .legacyRules:
+            return nil
+        }
+    }
+
     private func exclusionDecision(
         for url: URL,
         exclusions: FileExclusionRules,
         rootPaths: [String],
+        query: FileExclusionQuery?,
         isDirectory: Bool? = nil
     ) -> FileExclusionRules.Decision {
-        exclusions.decision(url: url, roots: rootPaths, isDirectory: isDirectory)
+        if let query, let isDirectory {
+            return query.decision(path: url.path, isDirectory: isDirectory)
+        }
+        return exclusions.decision(url: url, roots: rootPaths, isDirectory: isDirectory)
     }
 
     private func canScanDirectory(_ url: URL) -> Bool {

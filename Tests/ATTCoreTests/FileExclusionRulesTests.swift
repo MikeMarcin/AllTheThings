@@ -1,4 +1,4 @@
-import ATTCore
+@testable import ATTCore
 import Dispatch
 import Foundation
 import Testing
@@ -244,6 +244,95 @@ struct FileExclusionRulesTests {
         }
 
         #expect(recorder.messages.isEmpty)
+    }
+
+    @Test("compiled query matches full rules for fixture matrix")
+    func compiledQueryMatchesFullRulesForFixtureMatrix() {
+        assertCompiledQueryParity(
+            patterns: FileExclusionRules.defaultPatterns,
+            roots: ["/tmp/project"],
+            samples: [
+                ("/tmp/project", true),
+                ("/tmp/project/Sources/App.swift", false),
+                ("/tmp/project/node_modules", true),
+                ("/tmp/project/node_modules/react/index.js", false),
+                ("/tmp/project/.git", true),
+                ("/tmp/project/.git/config", false),
+                ("/tmp/project/.git/hooks", true),
+                ("/tmp/project/.git/hooks/pre-commit", false),
+                ("/tmp/project/.git/objects", true),
+                ("/tmp/project/.git/objects/ab/cdef", false),
+                ("/tmp/project/Library", true),
+                ("/tmp/project/Library/Caches", true),
+                ("/tmp/project/Library/Caches/com.example/cache.db", false),
+                ("/tmp/project/Example.app/Contents/_CodeSignature", true),
+                ("/tmp/project/Example.app/Contents/_CodeSignature/CodeResources", false),
+                ("/tmp/project/.build/arm64-apple-macosx/debug/index/store", true),
+                ("/tmp/project/.build/arm64-apple-macosx/debug/index/store/v5/records/unit", false),
+                ("/tmp/project/Engine/Binaries/ThirdParty/DotNet/8.0/sdk/tool.dll", false),
+                ("/tmp/project/Engine/Source/Runtime/Engine/Private/Generated.cpp", false)
+            ]
+        )
+
+        assertCompiledQueryParity(
+            patterns: [
+                "*",
+                "!*/",
+                "!*.swift",
+                "Generated/",
+                "!Generated/Keep.swift",
+                "Logs/"
+            ],
+            roots: ["/tmp/project"],
+            samples: [
+                ("/tmp/project/Sources", true),
+                ("/tmp/project/Sources/App.swift", false),
+                ("/tmp/project/Sources/README.md", false),
+                ("/tmp/project/Generated", true),
+                ("/tmp/project/Generated/Keep.swift", false),
+                ("/tmp/project/Generated/Drop.swift", false),
+                ("/tmp/project/Logs", true),
+                ("/tmp/project/Logs/Debug.log", false)
+            ]
+        )
+
+        assertCompiledQueryParity(
+            patterns: FileExclusionRules.defaultPatterns,
+            roots: ["/tmp/project", "/tmp/project/Nested"],
+            samples: [
+                ("/tmp/project/Nested", true),
+                ("/tmp/project/Nested/Sources/App.swift", false),
+                ("/tmp/project/Nested/.cache", true),
+                ("/tmp/project/Nested/.cache/build.db", false),
+                ("/tmp/project/Nested/.git", true),
+                ("/tmp/project/Nested/.git/config", false),
+                ("/tmp/project/Nested/.git/objects/ab/cdef", false)
+            ]
+        )
+    }
+
+    private func assertCompiledQueryParity(
+        patterns: [String],
+        roots: [String],
+        samples: [(path: String, isDirectory: Bool)]
+    ) {
+        let rules = FileExclusionRules(patterns: patterns)
+        let query = rules.makeQuery(roots: roots)
+
+        for sample in samples {
+            var instrumentation = FileExclusionQuery.Instrumentation()
+            let queryDecision = query.decision(
+                path: sample.path,
+                isDirectory: sample.isDirectory,
+                instrumentation: &instrumentation
+            )
+            let fullDecision = rules.decision(
+                url: URL(fileURLWithPath: sample.path, isDirectory: sample.isDirectory),
+                roots: roots,
+                isDirectory: sample.isDirectory
+            )
+            #expect(queryDecision == fullDecision)
+        }
     }
 }
 
