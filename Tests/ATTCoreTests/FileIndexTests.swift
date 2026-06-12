@@ -1213,8 +1213,8 @@ struct FileIndexTests {
         #expect(diagnostics.recordStoreKind == .mapped)
         #expect(diagnostics.optimizedCount == diagnostics.indexedCount)
         #expect(diagnostics.nameGramPostingCount > 0)
-        #expect(diagnostics.pathGramIndexEnabled)
-        #expect(diagnostics.pathGramPostingCount > 0)
+        #expect(!diagnostics.pathGramIndexEnabled)
+        #expect(diagnostics.pathGramPostingCount == 0)
         #expect(diagnostics.columnarSidecarsLoaded)
         #expect(diagnostics.visibleCount == diagnostics.indexedCount)
         #expect(diagnostics.visibleModifiedOrderCount == diagnostics.indexedCount)
@@ -1230,6 +1230,31 @@ struct FileIndexTests {
         #expect(FileManager.default.fileExists(atPath: packageURL.appendingPathComponent(SnapshotLayout.FileName.visibleModifiedOrder).path))
         #expect(reloaded.search(SearchRequest(
             query: "swc",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 5).results.contains { $0.record.name == "SearchWindowController.swift" })
+    }
+
+    @Test("persisted complete path gram sidecars reload")
+    func persistedCompletePathGramSidecarsReload() throws {
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        index.replaceRecordsForTesting([
+            makeRecord(path: "/tmp/allthethings-tests/project/Sources/SearchWindowController.swift"),
+            makeRecord(path: "/tmp/allthethings-tests/project/README.md")
+        ])
+        index.persistSnapshotForTesting()
+        index.completePathGramIndexForTesting()
+        index.persistSnapshotForTesting()
+
+        let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
+        let diagnostics = reloaded.currentDiagnostics()
+
+        #expect(diagnostics.recordStoreKind == .mapped)
+        #expect(diagnostics.pathGramIndexEnabled)
+        #expect(diagnostics.pathGramPostingCount > 0)
+        #expect(diagnostics.pathGramCoveredRowCount == diagnostics.pathGramTotalRowCount)
+        #expect(reloaded.search(SearchRequest(
+            query: "path:Sources/SearchWindowController",
             sort: SortSpec(column: .relevance, ascending: false)
         ), maxResults: 5).results.contains { $0.record.name == "SearchWindowController.swift" })
     }
@@ -1274,8 +1299,8 @@ struct FileIndexTests {
         }
     }
 
-    @Test("missing v7 sidecars invalidate persisted snapshots")
-    func missingV7SidecarsInvalidatePersistedSnapshots() throws {
+    @Test("missing v7 sidecars load unoptimized persisted records")
+    func missingV7SidecarsLoadUnoptimizedPersistedRecords() async throws {
         let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
         let supportDirectory = supportDirectory(applicationName: applicationName)
         defer {
@@ -1287,15 +1312,97 @@ struct FileIndexTests {
             makeRecord(path: "/tmp/allthethings-tests/project/Alpha.swift")
         ])
         index.persistSnapshotForTesting()
+        try await waitUntil {
+            index.currentDiagnostics().activeIndexJobs == 0
+        }
 
         let packageURL = SnapshotLayout.packageURL(in: supportDirectory)
-        try FileManager.default.removeItem(at: packageURL.appendingPathComponent(SnapshotLayout.FileName.rootID))
+        try FileManager.default.removeItem(at: packageURL.appendingPathComponent(SnapshotLayout.FileName.modifiedOrder))
 
         let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
         let diagnostics = reloaded.currentDiagnostics()
-        #expect(diagnostics.indexedCount == 0)
-        #expect(diagnostics.recordStoreKind == .empty)
-        #expect(!FileManager.default.fileExists(atPath: packageURL.path))
+        #expect(diagnostics.indexedCount == 1)
+        #expect(diagnostics.recordStoreKind == .mapped)
+        #expect(FileManager.default.fileExists(atPath: packageURL.path))
+
+        let response = reloaded.search(SearchRequest(
+            query: "Alpha",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10)
+        #expect(response.results.map(\.record.name) == ["Alpha.swift"])
+    }
+
+    @Test("empty required v7 sidecars load unoptimized persisted records")
+    func emptyRequiredV7SidecarsLoadUnoptimizedPersistedRecords() async throws {
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let supportDirectory = supportDirectory(applicationName: applicationName)
+        defer {
+            try? FileManager.default.removeItem(at: supportDirectory)
+        }
+
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        index.replaceRecordsForTesting([
+            makeRecord(path: "/tmp/att-query-regression/project/Alpha.swift")
+        ])
+        index.persistSnapshotForTesting()
+        try await waitUntil {
+            index.currentDiagnostics().activeIndexJobs == 0
+        }
+
+        let packageURL = SnapshotLayout.packageURL(in: supportDirectory)
+        try Data().write(to: packageURL.appendingPathComponent(SnapshotLayout.FileName.namePostings))
+
+        let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
+        let diagnostics = reloaded.currentDiagnostics()
+        #expect(diagnostics.indexedCount == 1)
+        #expect(diagnostics.recordStoreKind == .mapped)
+        #expect(FileManager.default.fileExists(atPath: packageURL.path))
+
+        let response = reloaded.search(SearchRequest(
+            query: "Alpha",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10)
+        #expect(response.results.map(\.record.name) == ["Alpha.swift"])
+    }
+
+    @Test("persisting unoptimized final snapshots writes core search sidecars")
+    func persistingUnoptimizedFinalSnapshotsWritesCoreSearchSidecars() throws {
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let supportDirectory = supportDirectory(applicationName: applicationName)
+        defer {
+            try? FileManager.default.removeItem(at: supportDirectory)
+        }
+
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        index.replaceRecordsForTesting([
+            makeRecord(path: "/tmp/att-query-regression/project/Tests/FileIndexTests.swift"),
+            makeRecord(path: "/tmp/att-query-regression/project/Sources/TestRunner.swift"),
+            makeRecord(path: "/tmp/att-query-regression/project/README.md")
+        ], buildsSearchStructures: false)
+        index.persistSnapshotForTesting()
+
+        let packageURL = SnapshotLayout.packageURL(in: supportDirectory)
+        for fileName in [
+            SnapshotLayout.FileName.modifiedOrder,
+            SnapshotLayout.FileName.visibleModifiedOrder,
+            SnapshotLayout.FileName.namePostings,
+            SnapshotLayout.FileName.componentPostings
+        ] {
+            let attributes = try FileManager.default.attributesOfItem(
+                atPath: packageURL.appendingPathComponent(fileName).path
+            )
+            #expect((attributes[.size] as? NSNumber)?.intValue ?? 0 > 0)
+        }
+
+        let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
+        let response = reloaded.search(SearchRequest(
+            query: "test",
+            sort: SortSpec(column: .size, ascending: false)
+        ), maxResults: 10)
+
+        #expect(response.usesIndexedCandidates)
+        #expect(response.totalMatches == 2)
+        #expect(Set(response.results.map(\.record.name)) == ["FileIndexTests.swift", "TestRunner.swift"])
     }
 
     @Test("partial checkpoints load as searchable unoptimized snapshots")
@@ -1877,6 +1984,30 @@ struct FileIndexTests {
             sort: SortSpec(column: .relevance, ascending: false)
         ), maxResults: 10)
         #expect(!fullScanResponse.usesIndexedCandidates)
+    }
+
+    @Test("plain test query finds names when sorted by size")
+    func plainTestQueryFindsNamesWhenSortedBySize() {
+        let root = "/tmp/att-query-regression/project"
+        let records = [
+            makeRecord(path: "\(root)/Tests/FileIndexTests.swift"),
+            makeRecord(path: "\(root)/Sources/TestRunner.swift"),
+            makeRecord(path: "\(root)/README.md")
+        ]
+        let index = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        index.replaceRecordsForTesting(records)
+
+        let response = index.search(SearchRequest(
+            query: "test",
+            sort: SortSpec(column: .size, ascending: false)
+        ), maxResults: 10)
+
+        #expect(response.usesIndexedCandidates)
+        #expect(response.totalMatches == 2)
+        #expect(Set(response.results.map(\.record.name)) == ["FileIndexTests.swift", "TestRunner.swift"])
     }
 
     @Test("exact extension searches use extension postings without row scans")

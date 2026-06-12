@@ -201,7 +201,7 @@ struct FileIndexInsightsTests {
     }
 
     @Test("first launch date is write once and clear keeps metrics sidecars")
-    func firstLaunchDateIsWriteOnceAndClearKeepsMetricsSidecars() throws {
+    func firstLaunchDateIsWriteOnceAndClearKeepsMetricsSidecars() async throws {
         let fileManager = FileManager.default
         let applicationName = "AllTheThingsInsights-\(UUID().uuidString)"
         let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
@@ -211,13 +211,16 @@ struct FileIndexInsightsTests {
 
         index.recordAppLaunch(appVersion: "1.0")
         let firstLaunch = try #require(index.currentInsightsSnapshot().lifetime.firstLaunchDate)
-        Thread.sleep(forTimeInterval: 0.01)
+        try await Task.sleep(for: .milliseconds(10))
         index.recordAppLaunch(appVersion: "1.1")
 
         let cursorURL = index.dataDirectoryURL.appendingPathComponent("fsevents-cursors.json", isDirectory: false)
         try Data("{}".utf8).write(to: cursorURL)
         index.replaceRecordsForTesting([makeRecord(path: "/tmp/AllTheThingsPrivate/Alpha.swift", size: 12)])
         index.persistSnapshotForTesting()
+        try await waitUntil {
+            index.currentDiagnostics().activeIndexJobs == 0
+        }
 
         try index.clearPersistedIndexData()
 
