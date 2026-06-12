@@ -754,6 +754,28 @@ public final class FileIndex: @unchecked Sendable {
         let operationStartedAt: Date
     }
 
+    private struct FileSystemRecordCandidate {
+        let url: URL
+        let path: String
+        let isDirectory: Bool
+        let isSymlink: Bool
+        let record: FileRecord
+    }
+
+    private final class ScanVolumeNameCache: @unchecked Sendable {
+        private var volumeNamesByDevice: [dev_t: String] = [:]
+
+        func volumeName(for url: URL, statBlock: stat) -> String {
+            if let cached = volumeNamesByDevice[statBlock.st_dev] {
+                return cached
+            }
+
+            let volumeName = (try? url.resourceValues(forKeys: [.volumeNameKey]))?.volumeName ?? ""
+            volumeNamesByDevice[statBlock.st_dev] = volumeName
+            return volumeName
+        }
+    }
+
     private final class ConcurrentScanState: @unchecked Sendable {
         private let condition = NSCondition()
         private var pendingDirectories: [URL] = []
@@ -5409,6 +5431,7 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         if checkpoint == nil {
+            let rootVolumeNameCache = ScanVolumeNameCache()
             for root in rootURLs {
                 var isDirectory: ObjCBool = false
                 guard fileManager.fileExists(atPath: root.path, isDirectory: &isDirectory) else {
@@ -5423,21 +5446,28 @@ public final class FileIndex: @unchecked Sendable {
                     logSkippedRoot(root, reason: "unreadable")
                     continue
                 }
+                guard let rootCandidate = fileSystemRecordCandidate(
+                    for: root,
+                    volumeNameCache: rootVolumeNameCache
+                ) else {
+                    logSkippedRoot(root, reason: "unreadable")
+                    continue
+                }
                 let rootDecision = exclusionDecision(
                     for: root,
                     exclusions: exclusions,
                     rootPaths: ruleRootPaths,
                     query: rootPreflightExclusionQuery,
-                    isDirectory: true
+                    isDirectory: rootCandidate.isDirectory
                 )
                 guard rootDecision != .prune else {
                     logSkippedRoot(root, reason: "excluded")
                     continue
                 }
-                if rootDecision.shouldIndex, let rootRecord = FileRecord(url: root) {
-                    state.addInitialRecord(rootRecord)
+                if rootDecision.shouldIndex {
+                    state.addInitialRecord(rootCandidate.record)
                 }
-                if rootDecision.shouldDescend {
+                if rootCandidate.isDirectory, !rootCandidate.isSymlink, rootDecision.shouldDescend {
                     state.enqueue(root)
                 }
             }
@@ -5459,6 +5489,7 @@ public final class FileIndex: @unchecked Sendable {
                     rootPaths: ruleRootPaths,
                     evaluationMode: scanConfiguration.evaluationMode
                 )
+                let volumeNameCache = ScanVolumeNameCache()
 
                 var batch: [FileRecord] = []
                 batch.reserveCapacity(256)
@@ -5490,25 +5521,29 @@ public final class FileIndex: @unchecked Sendable {
                             }
 
                             autoreleasepool {
-                                let values = try? child.resourceValues(forKeys: FileRecord.resourceKeys)
-                                let isDirectory = values?.isDirectory == true
-                                let decision = self.exclusionDecision(
+                                guard let candidate = self.fileSystemRecordCandidate(
                                     for: child,
+                                    volumeNameCache: volumeNameCache
+                                ) else {
+                                    return
+                                }
+                                let decision = self.exclusionDecision(
+                                    for: candidate.url,
                                     exclusions: exclusions,
                                     rootPaths: ruleRootPaths,
                                     query: workerExclusionQuery,
-                                    isDirectory: isDirectory
+                                    isDirectory: candidate.isDirectory
                                 )
                                 guard decision != .prune else { return }
-                                guard !(isDirectory && self.isLikelyLoop(child)) else {
+                                guard !(candidate.isDirectory && candidate.isSymlink) else {
                                     return
                                 }
 
-                                if decision.shouldIndex, let record = FileRecord(url: child, resourceValues: values) {
-                                    batch.append(record)
+                                if decision.shouldIndex {
+                                    batch.append(candidate.record)
                                 }
 
-                                if isDirectory, decision.shouldDescend {
+                                if candidate.isDirectory, decision.shouldDescend {
                                     if usesBatchedEnqueue {
                                         childDirectories.append(child)
                                     } else {
@@ -6242,31 +6277,37 @@ public final class FileIndex: @unchecked Sendable {
         var deletedPrefixes: [String] = []
         var reconciledDirectoryPrefixes: [String] = []
         var requiresDirectoryReconciliation = false
+        let updateVolumeNameCache = ScanVolumeNameCache()
 
         for path in paths {
             autoreleasepool {
                 let url = URL(fileURLWithPath: path).standardizedFileURL
-                var isDirectory: ObjCBool = false
-                if fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory) {
-                    let decision = exclusionDecision(
+                if fileManager.fileExists(atPath: url.path) {
+                    guard let candidate = fileSystemRecordCandidate(
                         for: url,
+                        volumeNameCache: updateVolumeNameCache
+                    ) else {
+                        return
+                    }
+                    let decision = exclusionDecision(
+                        for: candidate.url,
                         exclusions: indexState.exclusions,
                         rootPaths: indexState.rootPaths,
                         query: exclusionQuery,
-                        isDirectory: isDirectory.boolValue
+                        isDirectory: candidate.isDirectory
                     )
                     guard decision != .prune else { return }
 
-                    if decision.shouldIndex, let record = FileRecord(url: url) {
-                        upserts[record.path] = record
+                    if decision.shouldIndex {
+                        upserts[candidate.record.path] = candidate.record
                     }
 
-                    if isDirectory.boolValue, decision.shouldDescend {
+                    if candidate.isDirectory, !candidate.isSymlink, decision.shouldDescend {
                         requiresDirectoryReconciliation = true
                         let scannedRecords: [String: FileRecord]?
                         if indexState.frontierMode == .singleDirectory {
                             scannedRecords = scanDirectoryForUpdate(
-                                root: url,
+                                root: candidate.url,
                                 exclusions: indexState.exclusions,
                                 rootPaths: indexState.rootPaths,
                                 query: exclusionQuery,
@@ -6519,50 +6560,36 @@ public final class FileIndex: @unchecked Sendable {
         generation currentGeneration: UInt64
     ) -> [String: FileRecord]? {
         var records: [String: FileRecord] = [:]
+        let volumeNameCache = ScanVolumeNameCache()
 
-        func visit(_ directory: URL) -> Bool {
+        func visit(_ url: URL) -> Bool {
             guard isCurrentGeneration(currentGeneration) else { return false }
 
-            let values = try? directory.resourceValues(forKeys: FileRecord.resourceKeys)
-            let isDirectory = values?.isDirectory == true
+            guard let candidate = fileSystemRecordCandidate(
+                for: url,
+                volumeNameCache: volumeNameCache
+            ) else {
+                return true
+            }
             let decision = exclusionDecision(
-                for: directory,
+                for: candidate.url,
                 exclusions: exclusions,
                 rootPaths: rootPaths,
                 query: query,
-                isDirectory: isDirectory
+                isDirectory: candidate.isDirectory
             )
             guard decision != .prune else { return true }
 
-            if decision.shouldIndex, let record = FileRecord(url: directory, resourceValues: values) {
-                records[record.path] = record
+            if decision.shouldIndex {
+                records[candidate.record.path] = candidate.record
             }
 
-            guard isDirectory, decision.shouldDescend else { return true }
-            guard !isLikelyLoop(directory) else { return true }
-
-            return enumerateShallowChildURLs(in: directory) { child in
-                guard isCurrentGeneration(currentGeneration) else { return false }
-
-                let childValues = try? child.resourceValues(forKeys: FileRecord.resourceKeys)
-                let childIsDirectory = childValues?.isDirectory == true
-                let childDecision = exclusionDecision(
-                    for: child,
-                    exclusions: exclusions,
-                    rootPaths: rootPaths,
-                    query: query,
-                    isDirectory: childIsDirectory
-                )
-                guard childDecision != .prune else { return true }
-
-                if childIsDirectory, childDecision.shouldDescend {
-                    return visit(child)
-                }
-
-                if childDecision.shouldIndex, let record = FileRecord(url: child, resourceValues: childValues) {
-                    records[record.path] = record
-                }
+            guard candidate.isDirectory, !candidate.isSymlink, decision.shouldDescend else {
                 return true
+            }
+
+            return enumerateShallowChildURLs(in: candidate.url) { child in
+                visit(child)
             }
         }
 
@@ -6587,6 +6614,43 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         return true
+    }
+
+    private func fileSystemRecordCandidate(
+        for url: URL,
+        volumeNameCache: ScanVolumeNameCache
+    ) -> FileSystemRecordCandidate? {
+        let standardizedURL = url.standardizedFileURL
+        let path = standardizedURL.path
+        var statBlock = stat()
+        let result = path.withCString { lstat($0, &statBlock) }
+        guard result == 0 else { return nil }
+
+        let isDirectory = Self.isDirectoryMode(statBlock.st_mode)
+        let isSymlink = Self.isSymbolicLinkMode(statBlock.st_mode)
+        let volumeName = volumeNameCache.volumeName(for: standardizedURL, statBlock: statBlock)
+        let record = FileRecord.fileIndexStatDerived(
+            path: path,
+            statBlock: statBlock,
+            isDirectory: isDirectory,
+            volumeName: volumeName
+        )
+
+        return FileSystemRecordCandidate(
+            url: standardizedURL,
+            path: path,
+            isDirectory: isDirectory,
+            isSymlink: isSymlink,
+            record: record
+        )
+    }
+
+    private static func isDirectoryMode(_ mode: mode_t) -> Bool {
+        mode & mode_t(S_IFMT) == mode_t(S_IFDIR)
+    }
+
+    private static func isSymbolicLinkMode(_ mode: mode_t) -> Bool {
+        mode & mode_t(S_IFMT) == mode_t(S_IFLNK)
     }
 
     private static let direntRecordLengthOffset = MemoryLayout<dirent>.offset(of: \.d_reclen)!
@@ -8096,11 +8160,6 @@ public final class FileIndex: @unchecked Sendable {
         )
     }
 
-    private func isLikelyLoop(_ url: URL) -> Bool {
-        let values = try? url.resourceValues(forKeys: [.isSymbolicLinkKey])
-        return values?.isSymbolicLink == true
-    }
-
     private static func compare(_ lhs: SearchMatch, _ rhs: SearchMatch, snapshot: SearchSnapshot, sort: SortSpec, queryIsEmpty: Bool) -> Bool {
         compareRecords(
             lhs: snapshot.view(at: lhs.rowID),
@@ -8202,6 +8261,48 @@ public final class FileIndex: @unchecked Sendable {
         case .fresh:
             return "fresh"
         }
+    }
+}
+
+private extension FileRecord {
+    static func fileIndexStatDerived(
+        path: String,
+        statBlock: stat,
+        isDirectory: Bool,
+        volumeName: String
+    ) -> FileRecord {
+        let name = (path as NSString).lastPathComponent.isEmpty ? path : (path as NSString).lastPathComponent
+        let directoryPath = (path as NSString).deletingLastPathComponent
+        let size = statBlock.st_size > 0 ? UInt64(statBlock.st_size) : 0
+        let modifiedTime = timeIntervalSinceReferenceDate(statBlock.st_mtimespec)
+        let createdTime = statBlock.st_birthtimespec.tv_sec > 0
+            ? timeIntervalSinceReferenceDate(statBlock.st_birthtimespec)
+            : nil
+        let isHidden = pathIsHidden(path)
+            || (statBlock.st_flags & UInt32(bitPattern: UF_HIDDEN)) != 0
+
+        return FileRecord(
+            id: stableID(for: path),
+            path: path,
+            name: name,
+            directoryPath: directoryPath,
+            fileExtension: (name as NSString).pathExtension.lowercased(),
+            sizeBytes: isDirectory ? 0 : size,
+            modifiedTime: modifiedTime,
+            createdTime: createdTime,
+            isDirectory: isDirectory,
+            isHidden: isHidden,
+            volumeName: volumeName,
+            normalizedName: FuzzyMatcher.normalize(name),
+            normalizedPath: FuzzyMatcher.normalize(path)
+        )
+    }
+
+    private static func timeIntervalSinceReferenceDate(_ timespec: timespec) -> TimeInterval {
+        Date(
+            timeIntervalSince1970: TimeInterval(timespec.tv_sec)
+                + TimeInterval(timespec.tv_nsec) / 1_000_000_000
+        ).timeIntervalSinceReferenceDate
     }
 }
 
