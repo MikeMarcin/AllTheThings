@@ -361,6 +361,143 @@ struct FileIndexTests {
         #expect(!compiledPaths.contains(generatedDirectory.path))
     }
 
+    @Test("frontier batch modes match single-directory full rebuild paths")
+    func frontierBatchModesMatchSingleDirectoryFullRebuildPaths() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        let sourceDirectory = root.appendingPathComponent("Sources", isDirectory: true)
+        let gitHooksDirectory = root.appendingPathComponent(".git/hooks", isDirectory: true)
+        let gitObjectsDirectory = root.appendingPathComponent(".git/objects/ab", isDirectory: true)
+        let nodeModuleDirectory = root.appendingPathComponent("node_modules/pkg", isDirectory: true)
+        let cacheDirectory = root.appendingPathComponent(".cache/build", isDirectory: true)
+        let nestedRoot = root.appendingPathComponent("NestedRoot", isDirectory: true)
+        let nestedSourceDirectory = nestedRoot.appendingPathComponent("Sources", isDirectory: true)
+        try fileManager.createDirectory(at: sourceDirectory, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: gitHooksDirectory, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: gitObjectsDirectory, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: nodeModuleDirectory, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: nestedSourceDirectory, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        let included = sourceDirectory.appendingPathComponent("App.swift")
+        let gitConfig = root.appendingPathComponent(".git/config")
+        let gitHook = gitHooksDirectory.appendingPathComponent("pre-commit")
+        let gitObject = gitObjectsDirectory.appendingPathComponent("cdef")
+        let nodeModuleFile = nodeModuleDirectory.appendingPathComponent("Skipped.js")
+        let cacheFile = cacheDirectory.appendingPathComponent("Cache.db")
+        let nestedSource = nestedSourceDirectory.appendingPathComponent("Nested.swift")
+        try "app".write(to: included, atomically: true, encoding: .utf8)
+        try "config".write(to: gitConfig, atomically: true, encoding: .utf8)
+        try "hook".write(to: gitHook, atomically: true, encoding: .utf8)
+        try "object".write(to: gitObject, atomically: true, encoding: .utf8)
+        try "module".write(to: nodeModuleFile, atomically: true, encoding: .utf8)
+        try "cache".write(to: cacheFile, atomically: true, encoding: .utf8)
+        try "nested".write(to: nestedSource, atomically: true, encoding: .utf8)
+
+        let roots = [root, nestedRoot]
+        let baseline = try await indexedPaths(
+            roots: roots,
+            mode: .compiledQuery,
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            frontierMode: .singleDirectory,
+            frontierBatchSize: 1
+        )
+
+        for frontierMode in ScanFrontierMode.allCases where frontierMode != .singleDirectory {
+            let paths = try await indexedPaths(
+                roots: roots,
+                mode: .compiledQuery,
+                applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+                frontierMode: frontierMode,
+                frontierBatchSize: 4
+            )
+            #expect(paths == baseline)
+        }
+
+        #expect(baseline.contains(included.path))
+        #expect(baseline.contains(gitConfig.path))
+        #expect(baseline.contains(gitHook.path))
+        #expect(baseline.contains(nestedSource.path))
+        #expect(!baseline.contains(gitObject.path))
+        #expect(!baseline.contains(nodeModuleFile.path))
+        #expect(!baseline.contains(cacheFile.path))
+    }
+
+    @Test("frontier batch modes match single-directory scoped update paths")
+    func frontierBatchModesMatchSingleDirectoryScopedUpdatePaths() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        let patterns = [
+            "*",
+            "!*/",
+            "Generated/",
+            "!Generated/Keep.swift"
+        ]
+        let modes = ScanFrontierMode.allCases
+        var indexes: [(mode: ScanFrontierMode, index: FileIndex, applicationName: String, before: FileIndexDiagnostics)] = []
+        indexes.reserveCapacity(modes.count)
+        defer {
+            for item in indexes {
+                try? fileManager.removeItem(at: supportDirectory(applicationName: item.applicationName))
+            }
+        }
+
+        for mode in modes {
+            let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+            let index = FileIndex(
+                applicationName: applicationName,
+                loadsSnapshotImmediately: false,
+                exclusionPatterns: patterns
+            )
+            index.setScanFrontierBatchingForTesting(mode: mode, batchSize: 4)
+            index.replaceRootsAndRebuild([root], mode: .fresh)
+            indexes.append((mode, index, applicationName, index.currentDiagnostics()))
+        }
+
+        try await waitUntil {
+            indexes.allSatisfy { !$0.index.currentStats().isIndexing }
+        }
+        indexes = indexes.map { item in
+            (item.mode, item.index, item.applicationName, item.index.currentDiagnostics())
+        }
+
+        let generatedDirectory = root.appendingPathComponent("Generated", isDirectory: true)
+        try fileManager.createDirectory(at: generatedDirectory, withIntermediateDirectories: true)
+        let kept = generatedDirectory.appendingPathComponent("Keep.swift")
+        let dropped = generatedDirectory.appendingPathComponent("Drop.swift")
+        try "kept".write(to: kept, atomically: true, encoding: .utf8)
+        try "dropped".write(to: dropped, atomically: true, encoding: .utf8)
+
+        for item in indexes {
+            item.index.update(paths: [generatedDirectory.path])
+        }
+
+        try await waitUntil {
+            indexes.allSatisfy { item in
+                item.index.currentDiagnostics().completedRefreshBatches > item.before.completedRefreshBatches
+                    && !item.index.currentStats().isIndexing
+            }
+        }
+
+        let baseline = allIndexedPaths(in: try #require(indexes.first { $0.mode == .singleDirectory }?.index))
+        for item in indexes where item.mode != .singleDirectory {
+            #expect(allIndexedPaths(in: item.index) == baseline)
+        }
+        #expect(baseline.contains(kept.path))
+        #expect(!baseline.contains(dropped.path))
+        #expect(!baseline.contains(generatedDirectory.path))
+    }
+
     @Test("same-path update preserves optimized search structures")
     func samePathUpdatePreservesOptimizedSearchStructures() async throws {
         let fileManager = FileManager.default
@@ -1861,7 +1998,9 @@ struct FileIndexTests {
         roots: [URL],
         mode: ExclusionEvaluationMode,
         applicationName: String,
-        exclusionPatterns: [String] = FileExclusionRules.defaultPatterns
+        exclusionPatterns: [String] = FileExclusionRules.defaultPatterns,
+        frontierMode: ScanFrontierMode = .singleDirectory,
+        frontierBatchSize: Int = 1
     ) async throws -> [String] {
         let index = FileIndex(
             applicationName: applicationName,
@@ -1869,6 +2008,7 @@ struct FileIndexTests {
             exclusionPatterns: exclusionPatterns
         )
         index.setExclusionEvaluationModeForTesting(mode)
+        index.setScanFrontierBatchingForTesting(mode: frontierMode, batchSize: frontierBatchSize)
         defer {
             try? FileManager.default.removeItem(at: supportDirectory(applicationName: applicationName))
         }

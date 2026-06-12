@@ -450,11 +450,40 @@ struct FileIndexDiagnostics: Sendable {
     let pathMaterializationCount: UInt64
     let lastCheckpointAt: Date?
     let resumedFromCheckpoint: Bool
+    let scanFrontierMetrics: ScanFrontierMetrics
 }
 
 enum ExclusionEvaluationMode: String, Sendable, CaseIterable {
     case compiledQuery
     case legacyRules
+}
+
+enum ScanFrontierMode: String, Sendable, CaseIterable {
+    case singleDirectory
+    case batchedEnqueue
+    case batchedClaim
+    case batchedClaimAndEnqueue
+
+    var usesBatchedClaim: Bool {
+        self == .batchedClaim || self == .batchedClaimAndEnqueue
+    }
+
+    var usesBatchedEnqueue: Bool {
+        self == .batchedEnqueue || self == .batchedClaimAndEnqueue
+    }
+}
+
+struct ScanFrontierMetrics: Sendable, Equatable {
+    var enqueueCallCount: UInt64 = 0
+    var enqueuedDirectoryCount: UInt64 = 0
+    var claimCallCount: UInt64 = 0
+    var claimedDirectoryCount: UInt64 = 0
+    var finishCallCount: UInt64 = 0
+    var finishedDirectoryCount: UInt64 = 0
+    var maxPendingDirectoryCount: Int = 0
+    var maxActiveDirectoryCount: Int = 0
+    var appendCallCount: UInt64 = 0
+    var appendedRecordCount: UInt64 = 0
 }
 
 public final class FileIndex: @unchecked Sendable {
@@ -708,6 +737,7 @@ public final class FileIndex: @unchecked Sendable {
         let records: [String: FileRecord]
         let store: HeapPagedRecordStore
         let visited: Int
+        let frontierMetrics: ScanFrontierMetrics
     }
 
     private struct ScanProgress {
@@ -740,6 +770,7 @@ public final class FileIndex: @unchecked Sendable {
         private var lastCheckpointCount = 0
         private var lastCheckpointAt = Date.distantPast
         private let operationStartedAt: Date
+        private var frontierMetrics = ScanFrontierMetrics()
 
         init(
             reservedCapacity: Int,
@@ -762,16 +793,33 @@ public final class FileIndex: @unchecked Sendable {
             for directory in pendingDirectories where !completedDirectories.contains(directory.path) {
                 self.pendingDirectories.append(directory)
             }
+            frontierMetrics.maxPendingDirectoryCount = self.pendingDirectories.count
         }
 
         func enqueue(_ directory: URL) {
+            enqueue(contentsOf: [directory])
+        }
+
+        func enqueue(contentsOf directories: [URL]) {
+            guard !directories.isEmpty else { return }
+
             condition.lock()
-            guard !completedDirectories.contains(directory.path) else {
-                condition.unlock()
-                return
+            frontierMetrics.enqueueCallCount += 1
+            var enqueuedCount = 0
+            for directory in directories where !completedDirectories.contains(directory.path) {
+                pendingDirectories.append(directory)
+                enqueuedCount += 1
             }
-            pendingDirectories.append(directory)
-            condition.signal()
+            frontierMetrics.enqueuedDirectoryCount += UInt64(enqueuedCount)
+            frontierMetrics.maxPendingDirectoryCount = max(
+                frontierMetrics.maxPendingDirectoryCount,
+                pendingDirectories.count
+            )
+            if enqueuedCount > 1 {
+                condition.broadcast()
+            } else if enqueuedCount == 1 {
+                condition.signal()
+            }
             condition.unlock()
         }
 
@@ -794,26 +842,52 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         func nextDirectory() -> URL? {
+            nextDirectories(maxCount: 1).first
+        }
+
+        func nextDirectories(maxCount requestedMaxCount: Int) -> [URL] {
             condition.lock()
             defer { condition.unlock() }
+            frontierMetrics.claimCallCount += 1
 
             while pendingDirectories.isEmpty, !activeDirectories.isEmpty, !shouldStop {
                 condition.wait()
             }
 
             guard !shouldStop, !(pendingDirectories.isEmpty && activeDirectories.isEmpty) else {
-                return nil
+                return []
             }
 
-            let directory = pendingDirectories.removeLast()
-            activeDirectories.insert(directory.path)
-            return directory
+            let count = min(max(requestedMaxCount, 1), pendingDirectories.count)
+            var directories: [URL] = []
+            directories.reserveCapacity(count)
+            for _ in 0..<count {
+                let directory = pendingDirectories.removeLast()
+                activeDirectories.insert(directory.path)
+                directories.append(directory)
+            }
+            frontierMetrics.claimedDirectoryCount += UInt64(directories.count)
+            frontierMetrics.maxActiveDirectoryCount = max(
+                frontierMetrics.maxActiveDirectoryCount,
+                activeDirectories.count
+            )
+            return directories
         }
 
         func finishDirectory(_ directory: URL) {
+            finishDirectories([directory])
+        }
+
+        func finishDirectories(_ directories: [URL]) {
+            guard !directories.isEmpty else { return }
+
             condition.lock()
-            activeDirectories.remove(directory.path)
-            completedDirectories.insert(directory.path)
+            frontierMetrics.finishCallCount += 1
+            for directory in directories {
+                activeDirectories.remove(directory.path)
+                completedDirectories.insert(directory.path)
+            }
+            frontierMetrics.finishedDirectoryCount += UInt64(directories.count)
             if shouldStop || (pendingDirectories.isEmpty && activeDirectories.isEmpty) {
                 condition.broadcast()
             } else {
@@ -826,6 +900,8 @@ public final class FileIndex: @unchecked Sendable {
             guard !batch.isEmpty else { return }
 
             condition.lock()
+            frontierMetrics.appendCallCount += 1
+            frontierMetrics.appendedRecordCount += UInt64(batch.count)
             for record in batch {
                 let isNew = records[record.path] == nil
                 records[record.path] = record
@@ -899,7 +975,15 @@ public final class FileIndex: @unchecked Sendable {
         func result() -> (ScanResult, Bool) {
             condition.lock()
             defer { condition.unlock() }
-            return (ScanResult(records: records, store: builder.snapshot(includesPathIndex: true), visited: visited), shouldStop)
+            return (
+                ScanResult(
+                    records: records,
+                    store: builder.snapshot(includesPathIndex: true),
+                    visited: visited,
+                    frontierMetrics: frontierMetrics
+                ),
+                shouldStop
+            )
         }
     }
 
@@ -2113,6 +2197,9 @@ public final class FileIndex: @unchecked Sendable {
     private var roots: [String] = []
     private var exclusionRules: FileExclusionRules
     private var exclusionEvaluationMode: ExclusionEvaluationMode = .compiledQuery
+    private var scanFrontierMode: ScanFrontierMode = .singleDirectory
+    private var scanFrontierBatchSize = 1
+    private var lastScanFrontierMetrics = ScanFrontierMetrics()
     private var generation: UInt64 = 0
     private var persistRevision: UInt64 = 0
     private var pendingRefreshPaths = Set<String>()
@@ -5118,6 +5205,7 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         guard isCurrentGeneration(currentGeneration) else { return }
+        recordScanFrontierMetrics(scanResult.frontierMetrics, generation: currentGeneration)
         let publishesIntermediateSnapshots = shouldPublishSearchableSnapshotsDuringScan()
         if publishesIntermediateSnapshots {
             publishPrimary(scanResult.store, scanResult.visited, true)
@@ -5202,6 +5290,7 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         guard isCurrentGeneration(currentGeneration) else { return }
+        recordScanFrontierMetrics(scanResult.frontierMetrics, generation: currentGeneration)
         let recordsByPath: [String: FileRecord]
         let initialStore: HeapPagedRecordStore
         if reconcilesAllRoots {
@@ -5249,18 +5338,29 @@ public final class FileIndex: @unchecked Sendable {
         exclusionRootPaths: [String]? = nil,
         writesCheckpoints: Bool = true,
         publishesScanStatus: Bool = true,
+        publishesIntermediateSnapshots: Bool = true,
         workerCount: Int,
         workerQoS: DispatchQoS.QoSClass,
         progress: @escaping @Sendable (_ store: HeapPagedRecordStore, _ visited: Int, _ force: Bool) -> Void
     ) -> ScanResult? {
         let rootPaths = rootURLs.map(\.path)
         let ruleRootPaths = exclusionRootPaths ?? rootPaths
-        let evaluationMode = lock.withLock { exclusionEvaluationMode }
+        let scanConfiguration = lock.withLock {
+            (
+                evaluationMode: exclusionEvaluationMode,
+                frontierMode: scanFrontierMode,
+                frontierBatchSize: scanFrontierBatchSize
+            )
+        }
         let rootPreflightExclusionQuery = makeExclusionQuery(
             exclusions: exclusions,
             rootPaths: ruleRootPaths,
-            evaluationMode: evaluationMode
+            evaluationMode: scanConfiguration.evaluationMode
         )
+        let claimBatchSize = scanConfiguration.frontierMode.usesBatchedClaim
+            ? max(scanConfiguration.frontierBatchSize, 1)
+            : 1
+        let usesBatchedEnqueue = scanConfiguration.frontierMode.usesBatchedEnqueue
         let currentCount = lock.withLock { searchSnapshot.count }
         let state = ConcurrentScanState(
             reservedCapacity: max(8_192, currentCount, checkpoint?.store.count ?? 0),
@@ -5278,6 +5378,7 @@ public final class FileIndex: @unchecked Sendable {
             progress(result.store, result.visited, force)
         }
         let publishSearchableSnapshot: @Sendable (_ force: Bool) -> Void = { [weak self] force in
+            guard publishesIntermediateSnapshots else { return }
             guard self?.shouldPublishSearchableSnapshotsDuringScan() ?? true else {
                 return
             }
@@ -5356,69 +5457,92 @@ public final class FileIndex: @unchecked Sendable {
                 let workerExclusionQuery = self.makeExclusionQuery(
                     exclusions: exclusions,
                     rootPaths: ruleRootPaths,
-                    evaluationMode: evaluationMode
+                    evaluationMode: scanConfiguration.evaluationMode
                 )
 
                 var batch: [FileRecord] = []
                 batch.reserveCapacity(256)
 
-                    while true {
-                        guard let directory = state.nextDirectory() else { break }
+                scanLoop: while true {
+                    let directories = state.nextDirectories(maxCount: claimBatchSize)
+                    guard !directories.isEmpty else { break }
+
+                    var finishedDirectories: [URL] = []
+                    finishedDirectories.reserveCapacity(directories.count)
+
+                    for directory in directories {
                         guard self.isCurrentGeneration(currentGeneration) else {
-                            state.finishDirectory(directory)
+                            finishedDirectories.append(directory)
+                            state.finishDirectories(finishedDirectories)
                             state.markStopped()
-                            break
+                            break scanLoop
                         }
 
-                    self.enumerateShallowChildURLs(in: directory) { child in
-                        if !self.isCurrentGeneration(currentGeneration) {
-                            state.markStopped()
-                            return false
+                        var childDirectories: [URL] = []
+                        if usesBatchedEnqueue {
+                            childDirectories.reserveCapacity(32)
                         }
 
-                        autoreleasepool {
-                            let values = try? child.resourceValues(forKeys: FileRecord.resourceKeys)
-                            let isDirectory = values?.isDirectory == true
-                            let decision = self.exclusionDecision(
-                                for: child,
-                                exclusions: exclusions,
-                                rootPaths: ruleRootPaths,
-                                query: workerExclusionQuery,
-                                isDirectory: isDirectory
-                            )
-                            guard decision != .prune else { return }
-                            guard !(isDirectory && self.isLikelyLoop(child)) else {
-                                return
+                        _ = self.enumerateShallowChildURLs(in: directory) { child in
+                            if !self.isCurrentGeneration(currentGeneration) {
+                                state.markStopped()
+                                return false
                             }
 
-                            if decision.shouldIndex, let record = FileRecord(url: child, resourceValues: values) {
-                                batch.append(record)
+                            autoreleasepool {
+                                let values = try? child.resourceValues(forKeys: FileRecord.resourceKeys)
+                                let isDirectory = values?.isDirectory == true
+                                let decision = self.exclusionDecision(
+                                    for: child,
+                                    exclusions: exclusions,
+                                    rootPaths: ruleRootPaths,
+                                    query: workerExclusionQuery,
+                                    isDirectory: isDirectory
+                                )
+                                guard decision != .prune else { return }
+                                guard !(isDirectory && self.isLikelyLoop(child)) else {
+                                    return
+                                }
+
+                                if decision.shouldIndex, let record = FileRecord(url: child, resourceValues: values) {
+                                    batch.append(record)
+                                }
+
+                                if isDirectory, decision.shouldDescend {
+                                    if usesBatchedEnqueue {
+                                        childDirectories.append(child)
+                                    } else {
+                                        state.enqueue(child)
+                                    }
+                                }
                             }
 
-                            if isDirectory, decision.shouldDescend {
-                                state.enqueue(child)
+                            if batch.count >= 256 {
+                                state.append(batch)
+                                batch.removeAll(keepingCapacity: true)
+                                publishStatus(state.statusIfNeeded(force: false))
+                                publishSearchableSnapshot(false)
+                                checkpointProgress(state.checkpointIfNeeded(force: false), false)
                             }
+                            return true
                         }
 
-                        if batch.count >= 256 {
+                        if usesBatchedEnqueue {
+                            state.enqueue(contentsOf: childDirectories)
+                        }
+
+                        if !batch.isEmpty {
                             state.append(batch)
                             batch.removeAll(keepingCapacity: true)
                             publishStatus(state.statusIfNeeded(force: false))
                             publishSearchableSnapshot(false)
                             checkpointProgress(state.checkpointIfNeeded(force: false), false)
                         }
-                        return true
+
+                        finishedDirectories.append(directory)
                     }
 
-                    if !batch.isEmpty {
-                        state.append(batch)
-                        batch.removeAll(keepingCapacity: true)
-                        publishStatus(state.statusIfNeeded(force: false))
-                        publishSearchableSnapshot(false)
-                        checkpointProgress(state.checkpointIfNeeded(force: false), false)
-                    }
-
-                    state.finishDirectory(directory)
+                    state.finishDirectories(finishedDirectories)
                 }
             }
         }
@@ -6079,6 +6203,7 @@ public final class FileIndex: @unchecked Sendable {
             scheduleUpdateDrainIfNeeded(delay: .milliseconds(0))
             return
         }
+        recordScanFrontierMetrics(ScanFrontierMetrics(), generation: currentGeneration)
         publishStats()
 
         let jobID = beginIndexJob("update")
@@ -6104,7 +6229,8 @@ public final class FileIndex: @unchecked Sendable {
             (
                 exclusions: exclusionRules,
                 rootPaths: roots,
-                evaluationMode: exclusionEvaluationMode
+                evaluationMode: exclusionEvaluationMode,
+                frontierMode: scanFrontierMode
             )
         }
         let exclusionQuery = makeExclusionQuery(
@@ -6137,13 +6263,36 @@ public final class FileIndex: @unchecked Sendable {
 
                     if isDirectory.boolValue, decision.shouldDescend {
                         requiresDirectoryReconciliation = true
-                        if let scannedRecords = scanDirectoryForUpdate(
-                            root: url,
-                            exclusions: indexState.exclusions,
-                            rootPaths: indexState.rootPaths,
-                            query: exclusionQuery,
-                            generation: currentGeneration
-                        ) {
+                        let scannedRecords: [String: FileRecord]?
+                        if indexState.frontierMode == .singleDirectory {
+                            scannedRecords = scanDirectoryForUpdate(
+                                root: url,
+                                exclusions: indexState.exclusions,
+                                rootPaths: indexState.rootPaths,
+                                query: exclusionQuery,
+                                generation: currentGeneration
+                            )
+                        } else {
+                            let scanResult = scanConcurrently(
+                                roots: [url],
+                                exclusions: indexState.exclusions,
+                                generation: currentGeneration,
+                                checkpoint: nil,
+                                operationStartedAt: updateStarted,
+                                exclusionRootPaths: indexState.rootPaths,
+                                writesCheckpoints: false,
+                                publishesScanStatus: false,
+                                publishesIntermediateSnapshots: false,
+                                workerCount: Self.refreshScanWorkerCount(),
+                                workerQoS: .utility,
+                                progress: { _, _, _ in }
+                            )
+                            if let scanResult {
+                                recordScanFrontierMetrics(scanResult.frontierMetrics, generation: currentGeneration)
+                            }
+                            scannedRecords = scanResult?.records
+                        }
+                        if let scannedRecords {
                             reconciledDirectoryPrefixes.append(url.path)
                             for (path, record) in scannedRecords {
                                 upserts[path] = record
@@ -7208,6 +7357,13 @@ public final class FileIndex: @unchecked Sendable {
         lock.withLock { activeIndexJobs }
     }
 
+    private func recordScanFrontierMetrics(_ metrics: ScanFrontierMetrics, generation currentGeneration: UInt64) {
+        lock.withLock {
+            guard generation == currentGeneration else { return }
+            lastScanFrontierMetrics = metrics
+        }
+    }
+
     func currentDiagnostics() -> FileIndexDiagnostics {
         lock.withLock {
             currentDiagnosticsWithoutLock()
@@ -7249,7 +7405,8 @@ public final class FileIndex: @unchecked Sendable {
             scannedRowCount: scannedRowCount,
             pathMaterializationCount: pathMaterializationCount,
             lastCheckpointAt: lastCheckpointAt,
-            resumedFromCheckpoint: resumedFromCheckpoint
+            resumedFromCheckpoint: resumedFromCheckpoint,
+            scanFrontierMetrics: lastScanFrontierMetrics
         )
     }
 
@@ -7324,6 +7481,13 @@ public final class FileIndex: @unchecked Sendable {
     func setExclusionEvaluationModeForTesting(_ mode: ExclusionEvaluationMode) {
         lock.withLock {
             exclusionEvaluationMode = mode
+        }
+    }
+
+    func setScanFrontierBatchingForTesting(mode: ScanFrontierMode, batchSize: Int = 1) {
+        lock.withLock {
+            scanFrontierMode = mode
+            scanFrontierBatchSize = min(max(batchSize, 1), 1_024)
         }
     }
 
