@@ -102,6 +102,26 @@ enum AppSettings {
         "vendor/"
     ]
 
+    private final class SettingsNotificationObject: @unchecked Sendable {
+        let defaults: UserDefaults
+
+        init(defaults: UserDefaults) {
+            self.defaults = defaults
+        }
+    }
+
+    static func postSettingsDidChangeNotification(_ name: Notification.Name, defaults: UserDefaults) {
+        guard !Thread.isMainThread else {
+            NotificationCenter.default.post(name: name, object: defaults)
+            return
+        }
+
+        let object = SettingsNotificationObject(defaults: defaults)
+        DispatchQueue.main.sync {
+            NotificationCenter.default.post(name: name, object: object.defaults)
+        }
+    }
+
     static func registerDefaults(_ defaults: UserDefaults = .standard) {
         defaults.register(defaults: [
             allowMultipleInstancesKey: false,
@@ -152,7 +172,7 @@ enum AppSettings {
                 "theme": .publicString(preference.rawValue)
             ]
         )
-        NotificationCenter.default.post(name: themePreferenceDidChangeNotification, object: defaults)
+        postSettingsDidChangeNotification(themePreferenceDidChangeNotification, defaults: defaults)
     }
 
     static func globalSearchHotKeyEnabled(defaults: UserDefaults = .standard) -> Bool {
@@ -191,7 +211,7 @@ enum AppSettings {
                 "modifiers": .publicInt(Int(hotKey.modifiers))
             ]
         )
-        NotificationCenter.default.post(name: globalSearchHotKeyDidChangeNotification, object: defaults)
+        postSettingsDidChangeNotification(globalSearchHotKeyDidChangeNotification, defaults: defaults)
     }
 
     static func globalAppSearchHotKeyEnabled(defaults: UserDefaults = .standard) -> Bool {
@@ -230,7 +250,7 @@ enum AppSettings {
                 "modifiers": .publicInt(Int(hotKey.modifiers))
             ]
         )
-        NotificationCenter.default.post(name: globalAppSearchHotKeyDidChangeNotification, object: defaults)
+        postSettingsDidChangeNotification(globalAppSearchHotKeyDidChangeNotification, defaults: defaults)
     }
 
     static func menuBarIconEnabled(defaults: UserDefaults = .standard) -> Bool {
@@ -249,7 +269,7 @@ enum AppSettings {
                 "enabled": .publicBool(enabled)
             ]
         )
-        NotificationCenter.default.post(name: menuBarIconDidChangeNotification, object: defaults)
+        postSettingsDidChangeNotification(menuBarIconDidChangeNotification, defaults: defaults)
     }
 
     static func statusFooterMode(defaults: UserDefaults = .standard) -> AppStatusFooterMode {
@@ -275,7 +295,7 @@ enum AppSettings {
                 "mode": .publicString(mode.rawValue)
             ]
         )
-        NotificationCenter.default.post(name: statusFooterModeDidChangeNotification, object: defaults)
+        postSettingsDidChangeNotification(statusFooterModeDidChangeNotification, defaults: defaults)
     }
 
     static func diagnosticLogLevel(defaults: UserDefaults = .standard) -> DiagnosticLogLevel {
@@ -305,7 +325,7 @@ enum AppSettings {
                 "level": .publicString(level.rawValue)
             ]
         )
-        NotificationCenter.default.post(name: diagnosticLogLevelDidChangeNotification, object: defaults)
+        postSettingsDidChangeNotification(diagnosticLogLevelDidChangeNotification, defaults: defaults)
     }
 
     static func indexedRoots(defaults: UserDefaults = .standard) -> [URL] {
@@ -344,7 +364,7 @@ enum AppSettings {
                 "roots": .pathArray(paths)
             ]
         )
-        NotificationCenter.default.post(name: indexedRootsDidChangeNotification, object: defaults)
+        postSettingsDidChangeNotification(indexedRootsDidChangeNotification, defaults: defaults)
     }
 
     static func resetIndexedRoots(defaults: UserDefaults = .standard) {
@@ -391,7 +411,7 @@ enum AppSettings {
                 "roots": .pathArray(paths)
             ]
         )
-        NotificationCenter.default.post(name: appSearchRootsDidChangeNotification, object: defaults)
+        postSettingsDidChangeNotification(appSearchRootsDidChangeNotification, defaults: defaults)
     }
 
     static func resetAppSearchRoots(defaults: UserDefaults = .standard) {
@@ -415,7 +435,7 @@ enum AppSettings {
                 "patterns": .privateString(patterns.joined(separator: "\n"))
             ]
         )
-        NotificationCenter.default.post(name: exclusionPatternsDidChangeNotification, object: defaults)
+        postSettingsDidChangeNotification(exclusionPatternsDidChangeNotification, defaults: defaults)
     }
 
     static func resetExclusionPatterns(defaults: UserDefaults = .standard) {
