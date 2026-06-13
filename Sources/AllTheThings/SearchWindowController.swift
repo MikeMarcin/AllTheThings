@@ -56,6 +56,27 @@ enum AppRuntimeStatusFormatter {
 }
 
 enum SearchWindowPresentation {
+    struct IndexStatusFooterText: Equatable {
+        let operationText: String
+        let detailText: String
+
+        var combinedText: String {
+            if operationText.isEmpty {
+                return detailText
+            }
+            if detailText.isEmpty {
+                return operationText
+            }
+            return "\(operationText) • \(detailText)"
+        }
+    }
+
+    struct DetailedFooterText: Equatable {
+        let centerText: String
+        let operationText: String
+        let rightText: String
+    }
+
     nonisolated static func isImportantMascotOperation(_ stats: IndexStats) -> Bool {
         guard !stats.isUpdating else { return false }
         guard stats.activityPresentation != .backgroundCatchUp else { return false }
@@ -92,49 +113,102 @@ enum SearchWindowPresentation {
         stats indexStats: IndexStats,
         now: Date = Date()
     ) -> String {
+        indexStatusFooterText(
+            indexedRootsIsEmpty: indexedRootsIsEmpty,
+            fseventCatchUpStartedAt: fseventCatchUpStartedAt,
+            stats: indexStats,
+            now: now
+        ).combinedText
+    }
+
+    nonisolated static func indexStatusFooterText(
+        indexedRootsIsEmpty: Bool,
+        fseventCatchUpStartedAt: Date?,
+        stats indexStats: IndexStats,
+        now: Date = Date()
+    ) -> IndexStatusFooterText {
         if indexedRootsIsEmpty {
-            return "No folders"
+            return IndexStatusFooterText(operationText: "No folders", detailText: "")
         }
 
         if let fseventCatchUpStartedAt {
             let elapsed = max(now.timeIntervalSince(fseventCatchUpStartedAt), 0)
-            return AppRuntimeStatusFormatter.catchUpStatus(elapsed: elapsed)
+            return IndexStatusFooterText(
+                operationText: detailText(["Catching up changes", AppRuntimeStatusFormatter.operationElapsed(elapsed)]),
+                detailText: searchableDetail(stats: indexStats)
+            )
         }
 
         switch indexStats.phase {
         case .idle:
-            return indexStats.status
+            return IndexStatusFooterText(operationText: indexStats.status, detailText: "")
         case .loading:
-            return "Loading • \(indexStats.status)"
+            return IndexStatusFooterText(operationText: "Loading", detailText: indexStats.status)
         case .scanning:
-            let elapsedSuffix = operationElapsedSuffix(startedAt: indexStats.activeOperationStartedAt, now: now)
+            let searchableDetail = searchableDetail(stats: indexStats)
             if indexStats.activityPresentation == .backgroundCatchUp {
-                return "\(indexStats.status) • \(indexStats.searchableCount.formatted()) searchable\(elapsedSuffix)"
+                return IndexStatusFooterText(
+                    operationText: operationText(indexStats.status, stats: indexStats, now: now),
+                    detailText: searchableDetail
+                )
             }
             if indexStats.isUpdating {
-                return "\(indexStats.status) • \(indexStats.searchableCount.formatted()) searchable\(elapsedSuffix)"
+                return IndexStatusFooterText(
+                    operationText: operationText(indexStats.status, stats: indexStats, now: now),
+                    detailText: searchableDetail
+                )
             }
             if indexStats.status == "Reconciling changed folders" {
-                return "\(indexStats.status) • \(indexStats.searchableCount.formatted()) searchable\(elapsedSuffix)"
+                return IndexStatusFooterText(
+                    operationText: operationText(indexStats.status, stats: indexStats, now: now),
+                    detailText: searchableDetail
+                )
             }
             let verb = indexStats.isReconciling ? "Reconciling" : "Indexing"
-            return "\(verb) \(indexStats.discoveredCount.formatted()) discovered • \(indexStats.searchableCount.formatted()) searchable\(elapsedSuffix)"
+            return IndexStatusFooterText(
+                operationText: operationText(
+                    "\(verb) \(indexStats.discoveredCount.formatted()) discovered",
+                    stats: indexStats,
+                    now: now
+                ),
+                detailText: searchableDetail
+            )
         case .optimizing:
-            let elapsedSuffix = operationElapsedSuffix(startedAt: indexStats.activeOperationStartedAt, now: now)
+            let detail = searchableDetail(stats: indexStats)
             if indexStats.activityPresentation == .backgroundCatchUp {
-                return "Catching up changes • \(indexStats.searchableCount.formatted()) searchable\(elapsedSuffix)"
+                return IndexStatusFooterText(
+                    operationText: operationText("Catching up changes", stats: indexStats, now: now),
+                    detailText: detail
+                )
             }
-            return "\(indexStats.status) • \(indexStats.searchableCount.formatted()) searchable\(elapsedSuffix)"
+            return IndexStatusFooterText(
+                operationText: operationText(indexStats.status, stats: indexStats, now: now),
+                detailText: detail
+            )
         case .saving:
-            let elapsedSuffix = operationElapsedSuffix(startedAt: indexStats.activeOperationStartedAt, now: now)
+            let detail = searchableDetail(stats: indexStats)
             if indexStats.activityPresentation == .backgroundCatchUp {
-                return "Catching up changes • \(indexStats.searchableCount.formatted()) searchable\(elapsedSuffix)"
+                return IndexStatusFooterText(
+                    operationText: operationText("Catching up changes", stats: indexStats, now: now),
+                    detailText: detail
+                )
             }
-            return "Saving index • \(indexStats.searchableCount.formatted()) searchable\(elapsedSuffix)"
+            return IndexStatusFooterText(
+                operationText: operationText("Saving index", stats: indexStats, now: now),
+                detailText: detail
+            )
         case .ready:
-            return AppRuntimeStatusFormatter.readyStatus(status: indexStats.status, lastUpdated: indexStats.lastUpdated)
+            let status = AppRuntimeStatusFormatter.readyStatus(status: indexStats.status, lastUpdated: indexStats.lastUpdated)
+            let pieces = status.components(separatedBy: " • ")
+            if pieces.count >= 2 {
+                return IndexStatusFooterText(
+                    operationText: pieces[0],
+                    detailText: pieces.dropFirst().joined(separator: " • ")
+                )
+            }
+            return IndexStatusFooterText(operationText: status, detailText: "")
         case .failed:
-            return indexStats.status
+            return IndexStatusFooterText(operationText: indexStats.status, detailText: "")
         }
     }
 
@@ -147,10 +221,91 @@ enum SearchWindowPresentation {
         }
     }
 
-    nonisolated private static func operationElapsedSuffix(startedAt: Date?, now: Date = Date()) -> String {
-        guard let startedAt else { return "" }
+    nonisolated private static func operationText(_ text: String, stats indexStats: IndexStats, now: Date) -> String {
+        detailText([
+            text,
+            operationElapsedText(startedAt: indexStats.activeOperationStartedAt, now: now)
+        ])
+    }
+
+    nonisolated private static func searchableDetail(stats indexStats: IndexStats) -> String {
+        "\(indexStats.searchableCount.formatted()) searchable"
+    }
+
+    nonisolated private static func operationElapsedText(startedAt: Date?, now: Date = Date()) -> String? {
+        guard let startedAt else { return nil }
         let elapsed = max(now.timeIntervalSince(startedAt), 0)
-        return " • \(AppRuntimeStatusFormatter.operationElapsed(elapsed))"
+        return AppRuntimeStatusFormatter.operationElapsed(elapsed)
+    }
+
+    nonisolated static func detailText(_ segments: [String?]) -> String {
+        segments.compactMap { segment in
+            guard let segment, !segment.isEmpty else { return nil }
+            return segment
+        }.joined(separator: " • ")
+    }
+
+    nonisolated static func shouldShowSearchElapsedText(
+        displayedSearchSignatureIsSet: Bool,
+        queryElapsed: TimeInterval,
+        initialQueryElapsed: TimeInterval?,
+        isRefiningSearchResults: Bool,
+        hasFinalSearchTiming: Bool
+    ) -> Bool {
+        displayedSearchSignatureIsSet
+            && (queryElapsed > 0
+                || initialQueryElapsed != nil
+                || isRefiningSearchResults
+                || hasFinalSearchTiming)
+    }
+
+    nonisolated static func searchElapsedText(
+        queryElapsed: TimeInterval,
+        initialQueryElapsed: TimeInterval?,
+        isRefiningSearchResults: Bool,
+        hasFinalSearchTiming: Bool
+    ) -> String {
+        let finalMilliseconds = Int((queryElapsed * 1_000).rounded())
+        guard let initialQueryElapsed else {
+            return "\(finalMilliseconds) ms"
+        }
+
+        let initialMilliseconds = Int((initialQueryElapsed * 1_000).rounded())
+        if isRefiningSearchResults {
+            return "\(initialMilliseconds) ms (refining)"
+        }
+
+        guard hasFinalSearchTiming else {
+            return "\(initialMilliseconds) ms"
+        }
+
+        return "\(initialMilliseconds) ms (\(finalMilliseconds) ms)"
+    }
+
+    nonisolated static func operationStatusText(operationText: String, searchElapsedText: String?) -> String {
+        detailText([operationText, searchElapsedText])
+    }
+
+    nonisolated static func detailedFooterText(
+        shownText: String,
+        operationText: String,
+        detailText: String,
+        appSearchScopeText: String?,
+        memoryStatusText: String,
+        searchElapsedText: String?
+    ) -> DetailedFooterText {
+        DetailedFooterText(
+            centerText: shownText,
+            operationText: operationStatusText(
+                operationText: operationText,
+                searchElapsedText: searchElapsedText
+            ),
+            rightText: Self.detailText([
+                detailText,
+                appSearchScopeText,
+                memoryStatusText
+            ])
+        )
     }
 }
 
@@ -1527,14 +1682,14 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         countLabel.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
         statusLabel.textColor = .tertiaryLabelColor
         statusLabel.alignment = .left
-        statusLabel.lineBreakMode = .byTruncatingMiddle
+        statusLabel.lineBreakMode = .byTruncatingTail
         statusLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
         statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         operationStatusLabel.textColor = .tertiaryLabelColor
         operationStatusLabel.alignment = .right
-        operationStatusLabel.lineBreakMode = .byTruncatingMiddle
+        operationStatusLabel.lineBreakMode = .byTruncatingTail
         operationStatusLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        operationStatusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        operationStatusLabel.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
         versionLabel.textColor = .tertiaryLabelColor
         versionLabel.alignment = .right
         versionLabel.lineBreakMode = .byTruncatingHead
@@ -3637,36 +3792,57 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let appSearchActive = ApplicationSearchQuery.parse(currentSearchText()) != nil
         let shownText = "\(results.count.formatted()) shown / \(totalMatches.formatted()) matches"
         guard AppSettings.indexingSetupCompleted(defaults: defaults) || appSearchActive else {
+            let footerText = SearchWindowPresentation.detailedFooterText(
+                shownText: shownText,
+                operationText: "Setup needed",
+                detailText: "Choose what AllTheThings can search",
+                appSearchScopeText: nil,
+                memoryStatusText: memoryStatusText,
+                searchElapsedText: nil
+            )
             applyFooterStatus(
                 shownText: shownText,
-                detailedCenterText: "\(shownText) • 0 indexed",
-                detailedMemoryText: memoryStatusText,
-                detailedOperationText: "Setup needed • Choose what AllTheThings can search"
+                detailedCenterText: footerText.centerText,
+                detailedRightText: footerText.rightText,
+                detailedOperationText: footerText.operationText
             )
             return
         }
 
-        let indexed = indexStats.indexedCount.formatted()
-        var countSegments = [
-            shownText,
-            appSearchActive ? "\(AppSettings.appSearchRoots(defaults: defaults).count.formatted()) app folders" : "\(indexed) indexed"
-        ]
-        if !currentSearchText().isEmpty {
-            countSegments.append(searchElapsedText())
+        let appSearchScopeText = appSearchActive
+            ? "\(AppSettings.appSearchRoots(defaults: defaults).count.formatted()) app folders"
+            : nil
+        let searchElapsedStatusText: String?
+        if shouldShowSearchElapsedText() {
+            searchElapsedStatusText = searchElapsedText()
+        } else {
+            searchElapsedStatusText = nil
         }
+
+        let footerStatus = appSearchActive
+            ? SearchWindowPresentation.IndexStatusFooterText(operationText: "Application search", detailText: "")
+            : indexStatusFooterText()
+        let footerText = SearchWindowPresentation.detailedFooterText(
+            shownText: shownText,
+            operationText: footerStatus.operationText,
+            detailText: footerStatus.detailText,
+            appSearchScopeText: appSearchScopeText,
+            memoryStatusText: memoryStatusText,
+            searchElapsedText: searchElapsedStatusText
+        )
 
         applyFooterStatus(
             shownText: shownText,
-            detailedCenterText: countSegments.joined(separator: " • "),
-            detailedMemoryText: memoryStatusText,
-            detailedOperationText: appSearchActive ? "Application search" : indexStatusText()
+            detailedCenterText: footerText.centerText,
+            detailedRightText: footerText.rightText,
+            detailedOperationText: footerText.operationText
         )
     }
 
     private func applyFooterStatus(
         shownText: String,
         detailedCenterText: String,
-        detailedMemoryText: String,
+        detailedRightText: String,
         detailedOperationText: String
     ) {
         switch statusFooterMode {
@@ -3683,7 +3859,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             statusLabel.stringValue = detailedOperationText
             countLabel.stringValue = detailedCenterText
             operationStatusLabel.isHidden = false
-            operationStatusLabel.stringValue = detailedMemoryText
+            operationStatusLabel.stringValue = detailedRightText
             versionLabel.isHidden = false
             versionLabel.stringValue = Self.footerVersionText()
         }
@@ -3696,25 +3872,26 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func searchElapsedText() -> String {
-        let finalMilliseconds = Int((queryElapsed * 1_000).rounded())
-        guard let initialQueryElapsed else {
-            return "\(finalMilliseconds) ms"
-        }
-
-        let initialMilliseconds = Int((initialQueryElapsed * 1_000).rounded())
-        if isRefiningSearchResults {
-            return "\(initialMilliseconds) ms (refining)"
-        }
-
-        guard hasFinalSearchTiming else {
-            return "\(initialMilliseconds) ms"
-        }
-
-        return "\(initialMilliseconds) ms (\(finalMilliseconds) ms)"
+        SearchWindowPresentation.searchElapsedText(
+            queryElapsed: queryElapsed,
+            initialQueryElapsed: initialQueryElapsed,
+            isRefiningSearchResults: isRefiningSearchResults,
+            hasFinalSearchTiming: hasFinalSearchTiming
+        )
     }
 
-    private func indexStatusText() -> String {
-        SearchWindowPresentation.indexStatusText(
+    private func shouldShowSearchElapsedText() -> Bool {
+        SearchWindowPresentation.shouldShowSearchElapsedText(
+            displayedSearchSignatureIsSet: displayedSearchSignature != nil,
+            queryElapsed: queryElapsed,
+            initialQueryElapsed: initialQueryElapsed,
+            isRefiningSearchResults: isRefiningSearchResults,
+            hasFinalSearchTiming: hasFinalSearchTiming
+        )
+    }
+
+    private func indexStatusFooterText() -> SearchWindowPresentation.IndexStatusFooterText {
+        SearchWindowPresentation.indexStatusFooterText(
             indexedRootsIsEmpty: indexedRoots.isEmpty,
             fseventCatchUpStartedAt: fseventCatchUpStartedAt,
             stats: indexStats
