@@ -1576,9 +1576,11 @@ public final class FileIndex: @unchecked Sendable {
                     return sort.ascending ? modifiedAscending : modifiedDescending
                 }
                 return sort.ascending ? visibleModifiedAscending : visibleModifiedDescending
+            case .name:
+                return sort.ascending ? nameAscending : nameDescending
             case .relevance where queryIsEmpty:
                 return includeHidden ? modifiedDescending : visibleModifiedDescending
-            case .relevance, .name, .path, .created, .size, .fileExtension, .kind, .volume, .root:
+            case .relevance, .path, .created, .size, .fileExtension, .kind, .volume, .root:
                 return nil
             }
         }

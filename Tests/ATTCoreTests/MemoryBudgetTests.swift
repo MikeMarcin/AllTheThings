@@ -479,6 +479,42 @@ struct MemoryBudgetTests {
         #expect(!response.results.contains { $0.record.name == "File000000.swift" })
     }
 
+    @Test("large empty optimized snapshots honor name sort order")
+    func largeEmptyOptimizedSnapshotsHonorNameSortOrder() {
+        let records = Array(makeSyntheticRecords(
+            count: 120_000,
+            directoryPadding: String(repeating: "x", count: 220)
+        ).reversed())
+        let index = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        index.replaceRecordsForTesting(records)
+
+        let diagnostics = index.currentDiagnostics()
+        #expect(diagnostics.indexedCount == records.count)
+        #expect(diagnostics.optimizedCount == records.count)
+        #expect(!diagnostics.pathGramIndexEnabled)
+
+        let ascending = index.search(SearchRequest(
+            query: "",
+            sort: SortSpec(column: .name, ascending: true)
+        ), maxResults: 25)
+        #expect(ascending.totalMatches == records.count)
+        #expect(ascending.results.count == 25)
+        #expect(ascending.results.first?.record.name == "File000000.swift")
+        #expect(ascending.results.last?.record.name == "File000024.swift")
+
+        let descending = index.search(SearchRequest(
+            query: "",
+            sort: SortSpec(column: .name, ascending: false)
+        ), maxResults: 25)
+        #expect(descending.totalMatches == records.count)
+        #expect(descending.results.count == 25)
+        #expect(descending.results.first?.record.name == "File119999.swift")
+        #expect(descending.results.last?.record.name == "File119975.swift")
+    }
+
     @Test("primary-only and optimized snapshots return the same matches")
     func primaryOnlyAndOptimizedSnapshotsReturnSameMatches() {
         var records = makeSyntheticRecords(count: 50_000)
