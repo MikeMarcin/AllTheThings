@@ -107,6 +107,7 @@ For this repository's Nib mascot, use:
   - `Resources/NibOperationIdleStrip.png`, 8 frames, 4 fps
   - `Resources/NibOperationIndexingStrip.png`, 16 frames, 5 fps
   - `Resources/NibOperationSearchingStrip.png`, 16 frames, 8 fps
+  - `Resources/NibOperationSearchRefiningStrip.png`, 16 frames, 8 fps
   - `Resources/NibOperationOptimizingStrip.png`, 16 frames, 5 fps
   - `Resources/NibOperationFileChangedStrip.png`, 6 frames, 6 fps
   - `Resources/NibOperationSuccessStrip.png`, 8 frames, 6 fps

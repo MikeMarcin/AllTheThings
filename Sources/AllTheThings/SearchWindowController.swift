@@ -85,10 +85,11 @@ enum SearchWindowPresentation {
 
     nonisolated static func persistentMascotAnimation(
         stats: IndexStats,
-        hasActiveSearch: Bool
+        hasActiveSearch: Bool,
+        isRefiningSearchResults: Bool = false
     ) -> OperationMascotAnimation {
         if stats.activityPresentation == .backgroundCatchUp {
-            return hasActiveSearch ? .searching : .idle
+            return hasActiveSearch ? (isRefiningSearchResults ? .searchRefining : .searching) : .idle
         }
 
         if stats.isUpdating {
@@ -104,7 +105,7 @@ enum SearchWindowPresentation {
             break
         }
 
-        return hasActiveSearch ? .searching : .idle
+        return hasActiveSearch ? (isRefiningSearchResults ? .searchRefining : .searching) : .idle
     }
 
     nonisolated static func indexStatusText(
@@ -3544,7 +3545,11 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func persistentMascotAnimation() -> OperationMascotAnimation {
-        SearchWindowPresentation.persistentMascotAnimation(stats: indexStats, hasActiveSearch: activeSearchToken != nil)
+        SearchWindowPresentation.persistentMascotAnimation(
+            stats: indexStats,
+            hasActiveSearch: activeSearchToken != nil,
+            isRefiningSearchResults: isRefiningSearchResults
+        )
     }
 
     private func currentSearchText() -> String {

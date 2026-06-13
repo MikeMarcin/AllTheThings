@@ -161,6 +161,11 @@ struct SearchToolbarTests {
         #expect(!SearchWindowPresentation.isImportantMascotOperation(stats))
         #expect(SearchWindowPresentation.persistentMascotAnimation(stats: stats, hasActiveSearch: false) == .idle)
         #expect(SearchWindowPresentation.persistentMascotAnimation(stats: stats, hasActiveSearch: true) == .searching)
+        #expect(SearchWindowPresentation.persistentMascotAnimation(
+            stats: stats,
+            hasActiveSearch: true,
+            isRefiningSearchResults: true
+        ) == .searchRefining)
     }
 
     @Test("search timing presentation stays available independent of query text")
@@ -293,6 +298,11 @@ struct SearchToolbarTests {
         #expect(status.contains("Reconciling"))
         #expect(SearchWindowPresentation.isImportantMascotOperation(stats))
         #expect(SearchWindowPresentation.persistentMascotAnimation(stats: stats, hasActiveSearch: false) == .indexing)
+        #expect(SearchWindowPresentation.persistentMascotAnimation(
+            stats: stats,
+            hasActiveSearch: true,
+            isRefiningSearchResults: true
+        ) == .indexing)
     }
 
     @MainActor
