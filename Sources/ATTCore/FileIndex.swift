@@ -1059,6 +1059,18 @@ public final class FileIndex: @unchecked Sendable {
 
         var count: Int { store.count }
         var resultCount: Int { store.storedResultCount ?? (0..<store.count).filter { store.isResultRow(at: $0) }.count }
+        var visibleResultCount: Int? {
+            if let visibleCount {
+                return visibleCount
+            }
+            if let count = visibleResultPrefixCounts.last {
+                return count
+            }
+            if hasSortedOrder {
+                return visibleModifiedDescending.count
+            }
+            return store.storedVisibleCount
+        }
         var virtualRowCount: Int { count - resultCount }
         var records: [FileRecord] { store.allRecords() }
         var isOptimizedForSearch: Bool {
@@ -3047,6 +3059,20 @@ public final class FileIndex: @unchecked Sendable {
         search(request, maxResults: maxResults, shouldCancel: { false }) ?? SearchResponse(results: [], totalMatches: 0, elapsed: 0)
     }
 
+    private static func shouldPromoteSortedOrderForEmptyQuery(
+        snapshot: SearchSnapshot,
+        request: SearchRequest,
+        parsedQuery: FuzzyMatcher.ParsedQuery,
+        maxResults: Int,
+        canPromoteSortedOrder: Bool
+    ) -> Bool {
+        canPromoteSortedOrder
+            && parsedQuery.isEmpty
+            && maxResults > 0
+            && !snapshot.hasSortedOrder
+            && (request.sort.column == .name || request.sort.column == .modified || request.sort.column == .relevance)
+    }
+
     public func search(
         _ request: SearchRequest,
         maxResults: Int = 2_000,
@@ -3069,21 +3095,64 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         let snapshotData = lock.withLock {
-            (snapshot: searchSnapshot, revision: searchSnapshotRevision)
+            (
+                snapshot: searchSnapshot,
+                revision: searchSnapshotRevision,
+                canPromoteSortedOrder: !indexing && !reconciling && !updating
+            )
         }
-        let snapshot = snapshotData.snapshot
-        let snapshotRevision = snapshotData.revision
+        var snapshot = snapshotData.snapshot
+        var snapshotRevision = snapshotData.revision
 
         guard !shouldCancel() else { return nil }
 
         let trimmedQuery = request.query.trimmingCharacters(in: .whitespacesAndNewlines)
         let parsedQuery = FuzzyMatcher.parse(trimmedQuery)
         let boundedMaxResults = max(maxResults, 0)
+
+        if Self.shouldPromoteSortedOrderForEmptyQuery(
+            snapshot: snapshot,
+            request: request,
+            parsedQuery: parsedQuery,
+            maxResults: boundedMaxResults,
+            canPromoteSortedOrder: snapshotData.canPromoteSortedOrder
+        ) {
+            let promotedSnapshot = snapshot.addingModifiedSortOrder()
+            let installedRevision = lock.withLock { () -> UInt64? in
+                guard searchSnapshot === snapshot, searchSnapshotRevision == snapshotRevision else {
+                    return nil
+                }
+
+                searchSnapshot = promotedSnapshot
+                searchSnapshotRevision &+= 1
+                lastUpdated = Date()
+                if promotedSnapshot.isOptimizedForSearch {
+                    optimizedCount = promotedSnapshot.resultCount
+                }
+                return searchSnapshotRevision
+            }
+
+            if let installedRevision {
+                snapshot = promotedSnapshot
+                snapshotRevision = installedRevision
+                publishStats()
+            } else {
+                let refreshedSnapshotData = lock.withLock {
+                    (snapshot: searchSnapshot, revision: searchSnapshotRevision)
+                }
+                snapshot = refreshedSnapshotData.snapshot
+                snapshotRevision = refreshedSnapshotData.revision
+            }
+        }
+
+        guard !shouldCancel() else { return nil }
+
         var matches: [SearchMatch] = []
         matches.reserveCapacity(min(snapshot.count, boundedMaxResults))
         let trimThreshold = boundedMaxResults > 0 ? boundedMaxResults * 5 : 0
         var total = 0
         var shouldSortMatches = true
+        var emptyQueryScannedRowCount: Int?
 
         func sortAndLimitMatches() {
             guard boundedMaxResults > 0 else { return }
@@ -3117,21 +3186,59 @@ public final class FileIndex: @unchecked Sendable {
                 queryIsEmpty: true,
                 includeHidden: request.includeHidden
             ) {
-                for (offset, index) in orderedRecords.enumerated() {
-                    if offset.isMultiple(of: 512), shouldCancel() {
-                        return nil
+                let knownTotal: Int?
+                if request.includeHidden {
+                    knownTotal = snapshot.resultCount
+                } else if let visibleCount = snapshot.visibleResultCount {
+                    knownTotal = visibleCount
+                } else if request.sort.column == .modified || request.sort.column == .relevance {
+                    knownTotal = orderedRecords.count
+                } else {
+                    knownTotal = nil
+                }
+
+                if let knownTotal {
+                    total = knownTotal
+                    shouldSortMatches = false
+                    let targetResultCount = min(boundedMaxResults, knownTotal)
+                    var scannedRows = 0
+
+                    if targetResultCount > 0 {
+                        for (offset, index) in orderedRecords.enumerated() {
+                            if offset.isMultiple(of: 512), shouldCancel() {
+                                return nil
+                            }
+
+                            scannedRows += 1
+                            guard snapshot.store.isResultRow(at: index) else { continue }
+                            guard request.includeHidden || snapshot.isVisible(at: index) else { continue }
+                            matches.append(SearchMatch(rowID: index, score: 0))
+                            if matches.count == targetResultCount {
+                                break
+                            }
+                        }
                     }
-                    appendMatch(rowID: index, score: 0)
+                    emptyQueryScannedRowCount = scannedRows
+                } else {
+                    for (offset, index) in orderedRecords.enumerated() {
+                        if offset.isMultiple(of: 512), shouldCancel() {
+                            return nil
+                        }
+                        appendMatch(rowID: index, score: 0)
+                    }
                 }
             } else if snapshot.count > Self.exactEmptyQuerySortLimit, boundedMaxResults > 0, request.sort.column != .root {
                 shouldSortMatches = false
-                let canStopAtResultLimit = request.includeHidden || snapshot.visibleCount != nil
+                let visibleResultCount = snapshot.visibleResultCount
+                let canStopAtResultLimit = request.includeHidden || visibleResultCount != nil
                 var matchedVisibleCount = 0
+                var scannedRows = 0
                 for index in 0..<snapshot.count {
                     if index.isMultiple(of: 512), shouldCancel() {
                         return nil
                     }
 
+                    scannedRows += 1
                     guard request.includeHidden || snapshot.isVisible(at: index) else {
                         continue
                     }
@@ -3144,7 +3251,8 @@ public final class FileIndex: @unchecked Sendable {
                     }
                 }
 
-                total = request.includeHidden ? snapshot.resultCount : (snapshot.visibleCount ?? matchedVisibleCount)
+                total = request.includeHidden ? snapshot.resultCount : (visibleResultCount ?? matchedVisibleCount)
+                emptyQueryScannedRowCount = scannedRows
             } else {
                 for index in 0..<snapshot.count {
                     if index.isMultiple(of: 512), shouldCancel() {
@@ -3245,7 +3353,7 @@ public final class FileIndex: @unchecked Sendable {
                 executionPath: .emptyQuerySortedOrder,
                 indexesUsed: request.includeHidden ? [.modifiedOrder] : [.modifiedOrder, .visibleBitset],
                 candidateCount: total,
-                scannedRowCount: min(snapshot.count, total),
+                scannedRowCount: emptyQueryScannedRowCount ?? min(snapshot.count, total),
                 elapsed: elapsed
             )
         } else {
@@ -7932,13 +8040,13 @@ public final class FileIndex: @unchecked Sendable {
         ) else {
             return nil
         }
-        guard let visibleModifiedDescending = CompactSearchStructureFiles.loadModifiedOrder(
-            from: packageURL.appendingPathComponent(SnapshotLayout.FileName.visibleModifiedOrder, isDirectory: false),
-            expectedCount: store.storedVisibleCount ?? 0,
-            rowIDUpperBound: store.count,
-            fileManager: fileManager
-        ) else {
-            return nil
+        let visibleModifiedDescending = store.storedVisibleCount.flatMap { visibleCount in
+            CompactSearchStructureFiles.loadModifiedOrder(
+                from: packageURL.appendingPathComponent(SnapshotLayout.FileName.visibleModifiedOrder, isDirectory: false),
+                expectedCount: visibleCount,
+                rowIDUpperBound: store.count,
+                fileManager: fileManager
+            )
         }
         let nameGramIndex = try? MappedIntPostingIndex.load(
             from: packageURL.appendingPathComponent(SnapshotLayout.FileName.namePostings, isDirectory: false),
