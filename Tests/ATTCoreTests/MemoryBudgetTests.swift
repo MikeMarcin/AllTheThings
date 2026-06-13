@@ -526,57 +526,6 @@ struct MemoryBudgetTests {
         #expect(descending.results.last?.record.name == "File119975.swift")
     }
 
-    @Test("opt-in real snapshot modified preview benchmark")
-    func optInRealSnapshotModifiedPreviewBenchmark() {
-        guard ProcessInfo.processInfo.environment["ATT_REAL_SNAPSHOT_SEARCH_BENCH"] == "1" else {
-            return
-        }
-
-        let supportDirectory = try! applicationSupportDirectory(for: "AllTheThings")
-        let manifestURL = SnapshotLayout.packageURL(in: supportDirectory)
-            .appendingPathComponent(SnapshotLayout.FileName.manifest, isDirectory: false)
-        let manifest = try! JSONDecoder().decode(
-            CompactSnapshotManifest.self,
-            from: Data(contentsOf: manifestURL)
-        )
-        let index = FileIndex(
-            applicationName: "AllTheThings",
-            loadsSnapshotImmediately: true,
-            exclusionPatterns: manifest.exclusionPatterns
-        )
-        let diagnostics = index.currentDiagnostics()
-        print(
-            """
-            ATT_REAL_SNAPSHOT indexed=\(diagnostics.indexedCount) visible=\(diagnostics.visibleCount ?? -1) \
-            result=\(diagnostics.resultCount) mappedBytes=\(diagnostics.mappedByteSize) \
-            pathGrams=\(diagnostics.pathGramPostingCount) nameGrams=\(diagnostics.nameGramPostingCount) \
-            componentGrams=\(diagnostics.componentGramPostingCount) visibleModified=\(diagnostics.visibleModifiedOrderCount)
-            """
-        )
-
-        let request = SearchRequest(
-            query: "test",
-            sort: SortSpec(column: .modified, ascending: false),
-            includeHidden: false,
-            mode: .interactivePreview
-        )
-        let started = Date()
-        let response = index.search(request, maxResults: 2_000)
-        let wallElapsed = Date().timeIntervalSince(started)
-        let profile = response.executionProfile
-        let indexesUsed = profile.indexesUsed.map(\.rawValue).sorted().joined(separator: ",")
-        let firstPath = response.results.first?.record.path ?? "<none>"
-        print(
-            """
-            ATT_REAL_SNAPSHOT_PREVIEW query=test sort=modified_desc shown=\(response.results.count) \
-            total=\(response.totalMatches) wallMs=\(Int(wallElapsed * 1000)) \
-            indexMs=\(Int(response.elapsed * 1000)) path=\(profile.executionPath.rawValue) \
-            indexes=\(indexesUsed) candidates=\(profile.candidateCount) scanned=\(profile.scannedRowCount) \
-            fallback=\(profile.didFallbackToFullScan) first=\(firstPath)
-            """
-        )
-    }
-
     @Test("primary-only and optimized snapshots return the same matches")
     func primaryOnlyAndOptimizedSnapshotsReturnSameMatches() {
         var records = makeSyntheticRecords(count: 50_000)

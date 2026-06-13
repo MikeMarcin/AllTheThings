@@ -3568,15 +3568,7 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         var pathContainsCache: [Int: Bool] = [:]
-        let pathScanLimit: Int
-        switch field {
-        case .path:
-            pathScanLimit = max(maxResults * 25, 20_000)
-        case .any:
-            pathScanLimit = max(maxResults * 12, 20_000)
-        case .name:
-            pathScanLimit = maxResults
-        }
+        let pathScanLimit = field == .path ? max(maxResults * 25, 20_000) : max(maxResults * 4, 8_000)
         var selectedRows = Set<Int>()
         selectedRows.reserveCapacity(maxResults)
 
