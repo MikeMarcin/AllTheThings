@@ -146,12 +146,68 @@ struct SearchToolbarTests {
             stats: stats,
             now: now
         )
+        let footerStatus = SearchWindowPresentation.indexStatusFooterText(
+            indexedRootsIsEmpty: false,
+            fseventCatchUpStartedAt: nil,
+            stats: stats,
+            now: now
+        )
 
         #expect(status.contains("Catching up changes"))
+        #expect(footerStatus.operationText == "Catching up changes • 12s")
+        #expect(footerStatus.detailText == "10 searchable")
+        #expect(footerStatus.combinedText == status)
         #expect(!status.contains("Reconciling"))
         #expect(!SearchWindowPresentation.isImportantMascotOperation(stats))
         #expect(SearchWindowPresentation.persistentMascotAnimation(stats: stats, hasActiveSearch: false) == .idle)
         #expect(SearchWindowPresentation.persistentMascotAnimation(stats: stats, hasActiveSearch: true) == .searching)
+    }
+
+    @Test("search timing presentation stays available independent of query text")
+    func searchTimingPresentationStaysAvailableIndependentOfQueryText() {
+        #expect(SearchWindowPresentation.shouldShowSearchElapsedText(
+            displayedSearchSignatureIsSet: true,
+            queryElapsed: 0.042,
+            initialQueryElapsed: nil,
+            isRefiningSearchResults: false,
+            hasFinalSearchTiming: true
+        ))
+        #expect(SearchWindowPresentation.searchElapsedText(
+            queryElapsed: 0.042,
+            initialQueryElapsed: nil,
+            isRefiningSearchResults: false,
+            hasFinalSearchTiming: true
+        ) == "42 ms")
+        #expect(SearchWindowPresentation.searchElapsedText(
+            queryElapsed: 1.2,
+            initialQueryElapsed: 0.08,
+            isRefiningSearchResults: true,
+            hasFinalSearchTiming: false
+        ) == "80 ms (refining)")
+        #expect(SearchWindowPresentation.searchElapsedText(
+            queryElapsed: 1.2,
+            initialQueryElapsed: 0.08,
+            isRefiningSearchResults: false,
+            hasFinalSearchTiming: true
+        ) == "80 ms (1200 ms)")
+        let footerText = SearchWindowPresentation.detailedFooterText(
+            shownText: "2,000 shown / 955,841 matches",
+            operationText: "Ready",
+            detailText: "Caught up 974,301 files",
+            appSearchScopeText: nil,
+            memoryStatusText: "Memory 215.8 MB",
+            searchElapsedText: "80 ms (1200 ms)"
+        )
+        #expect(footerText.centerText == "2,000 shown / 955,841 matches")
+        #expect(footerText.operationText == "Ready • 80 ms (1200 ms)")
+        #expect(footerText.rightText == "Caught up 974,301 files • Memory 215.8 MB")
+        #expect(!SearchWindowPresentation.shouldShowSearchElapsedText(
+            displayedSearchSignatureIsSet: false,
+            queryElapsed: 0.042,
+            initialQueryElapsed: nil,
+            isRefiningSearchResults: false,
+            hasFinalSearchTiming: true
+        ))
     }
 
     @Test("foreground reconcile still presents as important reconcile")
