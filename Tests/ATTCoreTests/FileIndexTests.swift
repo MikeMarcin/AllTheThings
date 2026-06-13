@@ -2287,6 +2287,30 @@ struct FileIndexTests {
             try? FileManager.default.removeItem(at: index.dataDirectoryURL)
         }
         index.replaceRecordsForTesting(records)
+        #expect(index.currentDiagnostics().pathGramIndexEnabled)
+
+        let optimizedPreviewResponse = index.search(SearchRequest(
+            query: "test",
+            sort: SortSpec(column: .modified, ascending: false),
+            includeHidden: false,
+            mode: .interactivePreview
+        ), maxResults: 10)
+        let optimizedCompleteResponse = index.search(SearchRequest(
+            query: "test",
+            sort: SortSpec(column: .modified, ascending: false),
+            includeHidden: false
+        ), maxResults: 10)
+
+        let expectedNames = (0..<10).map { offset in
+            String(format: "TestFile%06d.txt", recordCount - offset - 1)
+        }
+        #expect(optimizedPreviewResponse.results.map(\.record.name) == expectedNames)
+        #expect(optimizedPreviewResponse.totalMatches == recordCount)
+        #expect(optimizedPreviewResponse.executionProfile.scannedRowCount <= 10)
+        #expect(optimizedCompleteResponse.results.map(\.record.name) == expectedNames)
+        #expect(optimizedCompleteResponse.totalMatches == recordCount)
+        #expect(optimizedCompleteResponse.executionProfile.scannedRowCount <= 10)
+
         index.persistSnapshotForTesting()
         let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
         #expect(!reloaded.currentDiagnostics().pathGramIndexEnabled)
@@ -2303,14 +2327,12 @@ struct FileIndexTests {
             includeHidden: false
         ), maxResults: 10)
 
-        let expectedNames = (0..<10).map { offset in
-            String(format: "TestFile%06d.txt", recordCount - offset - 1)
-        }
         #expect(previewResponse.results.map(\.record.name) == expectedNames)
-        #expect(previewResponse.totalMatches == 10)
+        #expect(previewResponse.totalMatches == recordCount)
         #expect(previewResponse.executionProfile.scannedRowCount <= 10)
         #expect(completeResponse.results.map(\.record.name) == expectedNames)
         #expect(completeResponse.totalMatches == recordCount)
+        #expect(completeResponse.executionProfile.scannedRowCount <= 10)
     }
 
     @Test("overlay allRecords uses base bulk materialization")
