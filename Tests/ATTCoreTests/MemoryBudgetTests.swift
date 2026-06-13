@@ -627,6 +627,143 @@ struct MemoryBudgetTests {
         #expect(response.executionProfile.scannedRowCount == 25)
     }
 
+    @Test("large mapped relevance previews return partial ranked name matches")
+    func largeMappedRelevancePreviewsReturnPartialRankedNameMatches() {
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let recordCount = 30_000
+        let matchingRows = 75
+        let directoryPadding = String(repeating: "x", count: 900)
+        let records = (0..<recordCount).map { index in
+            let name = index < matchingRows
+                ? "search-\(String(format: "%06d", index)).swift"
+                : "other-\(String(format: "%06d", index)).swift"
+            return makeRecord(
+                path: "/tmp/allthethings-memory/\(directoryPadding)search-root-\(index % 256)/\(name)",
+                modifiedTime: TimeInterval(index)
+            )
+        }
+
+        let index = FileIndex(
+            applicationName: applicationName,
+            loadsSnapshotImmediately: false
+        )
+        defer {
+            try? FileManager.default.removeItem(at: index.dataDirectoryURL)
+        }
+        index.replaceRecordsForTesting(records)
+        #expect(!index.currentDiagnostics().pathGramIndexEnabled)
+        index.persistSnapshotForTesting()
+
+        let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
+        #expect(reloaded.currentDiagnostics().recordStoreKind == .mapped)
+        #expect(!reloaded.currentDiagnostics().pathGramIndexEnabled)
+
+        let response = reloaded.search(SearchRequest(
+            query: "search",
+            sort: SortSpec(column: .relevance, ascending: false),
+            includeHidden: false,
+            mode: .interactivePreview
+        ), maxResults: 200)
+
+        #expect(response.results.count == matchingRows)
+        #expect(response.totalMatches == matchingRows)
+        #expect(response.results.first?.record.name == "search-000000.swift")
+        #expect(response.results.last?.record.name == "search-000074.swift")
+        #expect(response.usesIndexedCandidates)
+        #expect(response.executionProfile.executionPath == .optimizedSortedFastPath)
+        #expect(response.executionProfile.indexesUsed.contains(.nameGrams))
+        #expect(!response.executionProfile.indexesUsed.contains(.pathGrams))
+        #expect(!response.executionProfile.didFallbackToFullScan)
+        #expect(response.executionProfile.scannedRowCount <= recordCount + matchingRows)
+    }
+
+    @Test("large mapped name previews return partial ranked name matches")
+    func largeMappedNamePreviewsReturnPartialRankedNameMatches() {
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let recordCount = 30_000
+        let matchingRows = 75
+        let directoryPadding = String(repeating: "x", count: 900)
+        let records = (0..<recordCount).map { index in
+            let name = index < matchingRows
+                ? "search-\(String(format: "%06d", index)).swift"
+                : "other-\(String(format: "%06d", index)).swift"
+            return makeRecord(
+                path: "/tmp/allthethings-memory/\(directoryPadding)search-root-\(index % 256)/\(name)",
+                modifiedTime: TimeInterval(index)
+            )
+        }
+
+        let index = FileIndex(
+            applicationName: applicationName,
+            loadsSnapshotImmediately: false
+        )
+        defer {
+            try? FileManager.default.removeItem(at: index.dataDirectoryURL)
+        }
+        index.replaceRecordsForTesting(records)
+        #expect(!index.currentDiagnostics().pathGramIndexEnabled)
+        index.persistSnapshotForTesting()
+
+        let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
+        #expect(reloaded.currentDiagnostics().recordStoreKind == .mapped)
+        #expect(!reloaded.currentDiagnostics().pathGramIndexEnabled)
+
+        let response = reloaded.search(SearchRequest(
+            query: "search",
+            sort: SortSpec(column: .name, ascending: true),
+            includeHidden: false,
+            mode: .interactivePreview
+        ), maxResults: 200)
+
+        #expect(response.results.count == matchingRows)
+        #expect(response.totalMatches == matchingRows)
+        #expect(response.results.first?.record.name == "search-000000.swift")
+        #expect(response.results.last?.record.name == "search-000074.swift")
+        #expect(response.usesIndexedCandidates)
+        #expect(response.executionProfile.executionPath == .optimizedSortedFastPath)
+        #expect(response.executionProfile.indexesUsed.contains(.nameGrams))
+        #expect(!response.executionProfile.indexesUsed.contains(.pathGrams))
+        #expect(!response.executionProfile.didFallbackToFullScan)
+        #expect(response.executionProfile.scannedRowCount <= recordCount + matchingRows)
+    }
+
+    @Test("large relevance previews do not fall back while waiting for name postings")
+    func largeRelevancePreviewsDoNotFallBackWhileWaitingForNamePostings() {
+        let recordCount = 40_000
+        let matchingRows = 100
+        let records = (0..<recordCount).map { index in
+            let name = index < matchingRows
+                ? "test-\(String(format: "%06d", index)).swift"
+                : "other-\(String(format: "%06d", index)).swift"
+            return makeRecord(
+                path: "/tmp/allthethings-memory/relevance-preview/\(index % 256)/\(name)",
+                modifiedTime: TimeInterval(index)
+            )
+        }
+        let index = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        index.replaceRecordsForTesting(records, buildsSearchStructures: false)
+        #expect(index.currentDiagnostics().nameGramPostingCount == 0)
+
+        let response = index.search(SearchRequest(
+            query: "test",
+            sort: SortSpec(column: .relevance, ascending: false),
+            includeHidden: false,
+            mode: .interactivePreview
+        ), maxResults: 25)
+
+        #expect(response.results.count == 25)
+        #expect(response.totalMatches == matchingRows)
+        #expect(response.results.first?.record.name == "test-000000.swift")
+        #expect(!response.usesIndexedCandidates)
+        #expect(response.executionProfile.executionPath == .optimizedSortedFastPath)
+        #expect(!response.executionProfile.indexesUsed.contains(.nameGrams))
+        #expect(!response.executionProfile.didFallbackToFullScan)
+        #expect(response.executionProfile.scannedRowCount == recordCount)
+    }
+
     @Test("large modified previews do not fall back while waiting for name postings")
     func largeModifiedPreviewsDoNotFallBackWhileWaitingForNamePostings() {
         let recordCount = 40_000
