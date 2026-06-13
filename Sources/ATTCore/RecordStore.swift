@@ -256,6 +256,7 @@ protocol RecordStore: AnyObject, Sendable {
     func isVisible(at index: Int) -> Bool
     func normalizedPath(at index: Int, contains token: String, cache: inout [Int: Bool]) -> Bool
     func normalizedName(at index: Int, contains token: String) -> Bool
+    func normalizedName(at index: Int, contains tokenBytes: [UInt8]) -> Bool
     func isHiddenInPath(at index: Int, cache: inout [Int: Bool]) -> Bool
 }
 
@@ -352,6 +353,10 @@ extension RecordStore {
 
     func normalizedName(at index: Int, contains token: String) -> Bool {
         normalizedName(at: index).contains(token)
+    }
+
+    func normalizedName(at index: Int, contains tokenBytes: [UInt8]) -> Bool {
+        normalizedName(at: index).contains(String(decoding: tokenBytes, as: UTF8.self))
     }
 
     func isHiddenInPath(at index: Int, cache: inout [Int: Bool]) -> Bool {
@@ -931,6 +936,13 @@ final class ReplacingRecordStore: RecordStore {
         return replacement.normalizedName.contains(token)
     }
 
+    func normalizedName(at index: Int, contains tokenBytes: [UInt8]) -> Bool {
+        guard let replacement = replacements[index] else {
+            return base.normalizedName(at: index, contains: tokenBytes)
+        }
+        return replacement.normalizedName.contains(String(decoding: tokenBytes, as: UTF8.self))
+    }
+
     func isHiddenInPath(at index: Int, cache: inout [Int: Bool]) -> Bool {
         !isVisible(at: index)
     }
@@ -1334,10 +1346,15 @@ final class MappedRecordStore: RecordStore {
     }
     func normalizedName(at index: Int, contains token: String) -> Bool {
         guard !token.isEmpty else { return false }
+        return normalizedName(at: index, contains: Array(token.utf8))
+    }
+
+    func normalizedName(at index: Int, contains tokenBytes: [UInt8]) -> Bool {
+        guard !tokenBytes.isEmpty else { return false }
         let offset = rowOffset(for: index)
         let lower = Int(recordsData.readUInt64LE(at: offset + 52))
         let length = Int(recordsData.readUInt32LE(at: offset + 60))
-        return stringsData.containsBytes(Array(token.utf8), in: lower..<(lower + length))
+        return stringsData.containsBytes(tokenBytes, in: lower..<(lower + length))
     }
     func normalizedPath(at index: Int) -> String {
         if let cached = cache.normalizedPath(for: index) {

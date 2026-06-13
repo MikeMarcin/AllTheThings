@@ -3310,7 +3310,31 @@ public final class FileIndex: @unchecked Sendable {
                 return finish(fastResponse)
             }
 
+            if let fastResponse = Self.fastModifiedNameOnlyInteractivePreviewScan(
+                snapshot: snapshot,
+                request: request,
+                parsedQuery: parsedQuery,
+                maxResults: boundedMaxResults,
+                started: started,
+                snapshotRevision: snapshotRevision,
+                shouldCancel: shouldCancel
+            ) {
+                return finish(fastResponse)
+            }
+
             if let fastResponse = Self.fastRelevanceInteractivePreviewSearch(
+                snapshot: snapshot,
+                request: request,
+                parsedQuery: parsedQuery,
+                maxResults: boundedMaxResults,
+                started: started,
+                snapshotRevision: snapshotRevision,
+                shouldCancel: shouldCancel
+            ) {
+                return finish(fastResponse)
+            }
+
+            if let fastResponse = Self.fastNameCandidateInteractivePreviewSearch(
                 snapshot: snapshot,
                 request: request,
                 parsedQuery: parsedQuery,
@@ -3681,6 +3705,103 @@ public final class FileIndex: @unchecked Sendable {
         )
     }
 
+    private static func fastModifiedNameOnlyInteractivePreviewScan(
+        snapshot: SearchSnapshot,
+        request: SearchRequest,
+        parsedQuery: FuzzyMatcher.ParsedQuery,
+        maxResults: Int,
+        started: Date,
+        snapshotRevision: UInt64,
+        shouldCancel: @Sendable () -> Bool
+    ) -> SearchResponse? {
+        guard
+            request.mode == .interactivePreview,
+            request.sort.column == .modified,
+            !snapshot.hasModifiedSortOrder,
+            maxResults > 0,
+            parsedQuery.negative.isEmpty,
+            parsedQuery.positive.count == 1,
+            let clause = parsedQuery.positive.first,
+            clause.alternatives.count == 1,
+            let part = clause.alternatives.first,
+            case .text(let field, let pattern, let mode) = part,
+            field != .path,
+            mode == .fuzzy || mode == .exact,
+            !pattern.token.isEmpty,
+            !tokenContainsPathSeparator(pattern.token)
+        else {
+            return nil
+        }
+
+        var matches: [SearchMatch] = []
+        matches.reserveCapacity(maxResults)
+        let trimThreshold = maxResults * 5
+        let tokenBytes = Array(pattern.token.utf8)
+        var total = 0
+        var scannedRows = 0
+
+        func sortAndLimitMatches() {
+            matches.sort {
+                compare($0, $1, snapshot: snapshot, sort: request.sort, queryIsEmpty: false)
+            }
+            if matches.count > maxResults {
+                matches.removeSubrange(maxResults..<matches.count)
+            }
+        }
+
+        for rowID in 0..<snapshot.count {
+            if rowID.isMultiple(of: 512), shouldCancel() {
+                return nil
+            }
+
+            scannedRows += 1
+            guard snapshot.store.isResultRow(at: rowID) else { continue }
+            guard request.includeHidden || snapshot.isVisible(at: rowID) else { continue }
+            guard snapshot.store.normalizedName(at: rowID, contains: tokenBytes) else { continue }
+            guard let explanation = cheapIndexedNameExplanation(
+                snapshot: snapshot,
+                rowID: rowID,
+                token: pattern.token,
+                mode: mode
+            ) else {
+                continue
+            }
+
+            total += 1
+            matches.append(SearchMatch(rowID: rowID, score: explanation.score, match: explanation))
+            if matches.count > trimThreshold {
+                sortAndLimitMatches()
+            }
+        }
+
+        guard total > 0 else {
+            return nil
+        }
+
+        guard !shouldCancel() else { return nil }
+        sortAndLimitMatches()
+
+        let elapsed = Date().timeIntervalSince(started)
+        var indexesUsed: Set<SearchIndexUse> = []
+        if !request.includeHidden {
+            indexesUsed.insert(.visibleBitset)
+        }
+        return SearchResponse(
+            results: materialize(matches, from: snapshot),
+            totalMatches: total,
+            elapsed: elapsed,
+            snapshotRevision: snapshotRevision,
+            usesIndexedCandidates: false,
+            executionProfile: SearchExecutionProfile(
+                executionPath: .optimizedSortedFastPath,
+                indexesUsed: indexesUsed,
+                candidateCount: snapshot.count,
+                scannedRowCount: scannedRows,
+                elapsed: elapsed
+            )
+        )
+    }
+
     private static func modifiedPreviewResponseFromNameCandidates(
         snapshot: SearchSnapshot,
         request: SearchRequest,
@@ -3849,6 +3970,7 @@ public final class FileIndex: @unchecked Sendable {
         heap.reserveCapacity(maxResults)
         var totalNameMatches = 0
         var scannedRows = 0
+        var scannedPrefixOrder = false
 
         func precedes(_ lhs: RelevancePreviewCandidate, _ rhs: RelevancePreviewCandidate) -> Bool {
             if lhs.qualityCode != rhs.qualityCode {
@@ -3857,7 +3979,7 @@ public final class FileIndex: @unchecked Sendable {
             if lhs.normalizedName != rhs.normalizedName {
                 return lhs.normalizedName < rhs.normalizedName
             }
-            return lhs.path < rhs.path
+            return lhs.rowID < rhs.rowID
         }
 
         func isWorse(_ lhs: RelevancePreviewCandidate, than rhs: RelevancePreviewCandidate) -> Bool {
@@ -3908,7 +4030,6 @@ public final class FileIndex: @unchecked Sendable {
                 rowID: rowID,
                 qualityCode: indexedQualityCode(explanation.quality),
                 normalizedName: snapshot.store.normalizedName(at: rowID),
-                path: snapshot.store.path(at: rowID),
                 match: explanation
             )
         }
@@ -3918,6 +4039,7 @@ public final class FileIndex: @unchecked Sendable {
                 SearchMatch(rowID: $0.rowID, score: $0.match.score, match: $0.match)
             }
             let elapsed = Date().timeIntervalSince(started)
+            let usesIndexedCandidates = !indexesUsed.isEmpty
             var indexesUsed = indexesUsed
             if !request.includeHidden {
                 indexesUsed.insert(.visibleBitset)
@@ -3927,7 +4049,7 @@ public final class FileIndex: @unchecked Sendable {
                 totalMatches: max(totalNameMatches, matches.count),
                 elapsed: elapsed,
                 snapshotRevision: snapshotRevision,
-                usesIndexedCandidates: true,
+                usesIndexedCandidates: usesIndexedCandidates,
                 executionProfile: SearchExecutionProfile(
                     executionPath: .optimizedSortedFastPath,
                     indexesUsed: indexesUsed,
@@ -3939,6 +4061,7 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         if snapshot.hasSortedOrder, !snapshot.nameAscending.isEmpty {
+            scannedPrefixOrder = true
             let lowerBound = lowerBoundName(in: snapshot.nameAscending, snapshot: snapshot, key: pattern.token)
             var cursor = lowerBound
             while cursor < snapshot.nameAscending.count {
@@ -3988,43 +4111,220 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         let tokenBytes = Array(pattern.token.utf8)
-        guard let nameCandidates = snapshot.candidateNameIndices(containing: tokenBytes), !nameCandidates.isEmpty else {
-            return nil
-        }
+        let nameCandidates = snapshot.candidateNameIndices(containing: tokenBytes)
 
-        for (offset, candidate) in nameCandidates.enumerated() {
-            if offset.isMultiple(of: 512), shouldCancel() {
-                return nil
-            }
-
-            let rowID = Int(candidate)
-            guard rowID >= 0, rowID < snapshot.count else { continue }
+        func visitCandidate(rowID: Int) {
+            guard rowID >= 0, rowID < snapshot.count else { return }
             scannedRows += 1
-            guard snapshot.store.isResultRow(at: rowID) else { continue }
-            guard request.includeHidden || snapshot.isVisible(at: rowID) else { continue }
+            guard snapshot.store.isResultRow(at: rowID) else { return }
+            guard request.includeHidden || snapshot.isVisible(at: rowID) else { return }
+            guard snapshot.store.normalizedName(at: rowID, contains: tokenBytes) else { return }
             guard let explanation = cheapLiteralNameExplanation(
                 snapshot: snapshot,
                 rowID: rowID,
                 token: pattern.token,
                 mode: mode
             ) else {
-                continue
+                return
             }
 
             let qualityCode = indexedQualityCode(explanation.quality)
-            guard qualityCode > weakPathCeiling else { continue }
-            guard !snapshot.store.normalizedName(at: rowID).hasPrefix(pattern.token) else { continue }
+            guard qualityCode > weakPathCeiling else { return }
+            if scannedPrefixOrder {
+                guard !snapshot.store.normalizedName(at: rowID).hasPrefix(pattern.token) else { return }
+            }
 
             totalNameMatches += 1
             appendToHeap(makeCandidate(rowID: rowID, explanation: explanation))
         }
 
-        guard heap.count == maxResults else {
+        if let nameCandidates {
+            for (offset, candidate) in nameCandidates.enumerated() {
+                if offset.isMultiple(of: 512), shouldCancel() {
+                    return nil
+                }
+                visitCandidate(rowID: Int(candidate))
+            }
+        } else {
+            for rowID in 0..<snapshot.count {
+                if rowID.isMultiple(of: 512), shouldCancel() {
+                    return nil
+                }
+                visitCandidate(rowID: rowID)
+            }
+        }
+
+        guard !heap.isEmpty else {
             return nil
         }
 
         guard !shouldCancel() else { return nil }
-        return response(candidateCount: nameCandidates.count, indexesUsed: [.nameGrams])
+        var indexesUsed: Set<SearchIndexUse> = []
+        if nameCandidates != nil {
+            indexesUsed.insert(.nameGrams)
+        }
+        return response(candidateCount: nameCandidates?.count ?? snapshot.count, indexesUsed: indexesUsed)
+    }
+
+    private static func fastNameCandidateInteractivePreviewSearch(
+        snapshot: SearchSnapshot,
+        request: SearchRequest,
+        parsedQuery: FuzzyMatcher.ParsedQuery,
+        maxResults: Int,
+        started: Date,
+        snapshotRevision: UInt64,
+        shouldCancel: @Sendable () -> Bool
+    ) -> SearchResponse? {
+        guard
+            request.mode == .interactivePreview,
+            request.sort.column == .name,
+            !snapshot.hasSortedOrder,
+            maxResults > 0,
+            parsedQuery.negative.isEmpty,
+            parsedQuery.positive.count == 1,
+            let clause = parsedQuery.positive.first,
+            clause.alternatives.count == 1,
+            let part = clause.alternatives.first,
+            case .text(let field, let pattern, let mode) = part,
+            field != .path,
+            mode == .fuzzy || mode == .exact,
+            !pattern.token.isEmpty,
+            !tokenContainsPathSeparator(pattern.token)
+        else {
+            return nil
+        }
+
+        let tokenBytes = Array(pattern.token.utf8)
+        let nameCandidates = snapshot.candidateNameIndices(containing: tokenBytes)
+        let ascending = request.sort.ascending
+        var heap: [NamePreviewCandidate] = []
+        heap.reserveCapacity(maxResults)
+        var totalNameMatches = 0
+        var scannedRows = 0
+
+        func precedes(_ lhs: NamePreviewCandidate, _ rhs: NamePreviewCandidate) -> Bool {
+            if lhs.qualityCode != rhs.qualityCode {
+                return lhs.qualityCode > rhs.qualityCode
+            }
+            if lhs.normalizedName != rhs.normalizedName {
+                return ascending ? lhs.normalizedName < rhs.normalizedName : lhs.normalizedName > rhs.normalizedName
+            }
+            return lhs.rowID < rhs.rowID
+        }
+
+        func isWorse(_ lhs: NamePreviewCandidate, than rhs: NamePreviewCandidate) -> Bool {
+            precedes(rhs, lhs)
+        }
+
+        func siftUp(_ startIndex: Int) {
+            var child = startIndex
+            while child > 0 {
+                let parent = (child - 1) / 2
+                guard isWorse(heap[child], than: heap[parent]) else { break }
+                heap.swapAt(child, parent)
+                child = parent
+            }
+        }
+
+        func siftDown(_ startIndex: Int) {
+            var parent = startIndex
+            while true {
+                let left = parent * 2 + 1
+                let right = left + 1
+                var candidate = parent
+
+                if left < heap.count, isWorse(heap[left], than: heap[candidate]) {
+                    candidate = left
+                }
+                if right < heap.count, isWorse(heap[right], than: heap[candidate]) {
+                    candidate = right
+                }
+                guard candidate != parent else { break }
+                heap.swapAt(parent, candidate)
+                parent = candidate
+            }
+        }
+
+        func appendToHeap(_ candidate: NamePreviewCandidate) {
+            if heap.count < maxResults {
+                heap.append(candidate)
+                siftUp(heap.count - 1)
+            } else if let worst = heap.first, precedes(candidate, worst) {
+                heap[0] = candidate
+                siftDown(0)
+            }
+        }
+
+        func visitCandidate(rowID: Int) {
+            scannedRows += 1
+            guard rowID >= 0, rowID < snapshot.count else { return }
+            guard snapshot.store.isResultRow(at: rowID) else { return }
+            guard request.includeHidden || snapshot.isVisible(at: rowID) else { return }
+            guard snapshot.store.normalizedName(at: rowID, contains: tokenBytes) else { return }
+            guard let explanation = cheapLiteralNameExplanation(
+                snapshot: snapshot,
+                rowID: rowID,
+                token: pattern.token,
+                mode: mode
+            ) else {
+                return
+            }
+
+            totalNameMatches += 1
+            appendToHeap(NamePreviewCandidate(
+                rowID: rowID,
+                qualityCode: indexedQualityCode(explanation.quality),
+                normalizedName: snapshot.store.normalizedName(at: rowID),
+                match: explanation
+            ))
+        }
+
+        if let nameCandidates {
+            for (offset, candidate) in nameCandidates.enumerated() {
+                if offset.isMultiple(of: 512), shouldCancel() {
+                    return nil
+                }
+                visitCandidate(rowID: Int(candidate))
+            }
+        } else {
+            for rowID in 0..<snapshot.count {
+                if rowID.isMultiple(of: 512), shouldCancel() {
+                    return nil
+                }
+                visitCandidate(rowID: rowID)
+            }
+        }
+
+        guard !heap.isEmpty else {
+            return nil
+        }
+
+        guard !shouldCancel() else { return nil }
+        let matches = heap.sorted(by: precedes).map {
+            SearchMatch(rowID: $0.rowID, score: $0.match.score, match: $0.match)
+        }
+        let elapsed = Date().timeIntervalSince(started)
+        var indexesUsed: Set<SearchIndexUse> = []
+        if nameCandidates != nil {
+            indexesUsed.insert(.nameGrams)
+        }
+        if !request.includeHidden {
+            indexesUsed.insert(.visibleBitset)
+        }
+        return SearchResponse(
+            results: materialize(matches, from: snapshot),
+            totalMatches: totalNameMatches,
+            elapsed: elapsed,
+            snapshotRevision: snapshotRevision,
+            usesIndexedCandidates: nameCandidates != nil,
+            executionProfile: SearchExecutionProfile(
+                executionPath: .optimizedSortedFastPath,
+                indexesUsed: indexesUsed,
+                candidateCount: nameCandidates?.count ?? snapshot.count,
+                scannedRowCount: scannedRows,
+                elapsed: elapsed
+            )
+        )
     }
 
     private static func fastNameInteractivePreviewSearch(
@@ -4079,13 +4379,13 @@ public final class FileIndex: @unchecked Sendable {
         selectedRows.reserveCapacity(maxResults)
         var scannedRows = 0
 
-        func appendNameMatch(rowID: Int) {
+        func appendNameMatch(rowID: Int, requiresCandidateMembership: Bool = true) {
             guard matches.count < maxResults else { return }
-            guard selectedRows.insert(rowID).inserted else { return }
             guard rowID >= 0, rowID < snapshot.count else { return }
+            guard !selectedRows.contains(rowID) else { return }
             guard snapshot.store.isResultRow(at: rowID) else { return }
             guard request.includeHidden || snapshot.isVisible(at: rowID) else { return }
-            if let candidateRows, candidateRows[rowID] == 0 {
+            if requiresCandidateMembership, let candidateRows, candidateRows[rowID] == 0 {
                 return
             }
             guard let explanation = cheapLiteralNameExplanation(
@@ -4096,6 +4396,7 @@ public final class FileIndex: @unchecked Sendable {
             ) else {
                 return
             }
+            guard selectedRows.insert(rowID).inserted else { return }
             matches.append(SearchMatch(rowID: rowID, score: explanation.score, match: explanation))
         }
 
@@ -4117,7 +4418,7 @@ public final class FileIndex: @unchecked Sendable {
             }
 
             for rowID in prefixRows where snapshot.store.normalizedName(at: rowID) == token {
-                appendNameMatch(rowID: rowID)
+                appendNameMatch(rowID: rowID, requiresCandidateMembership: false)
                 if matches.count == maxResults {
                     break
                 }
@@ -4127,7 +4428,7 @@ public final class FileIndex: @unchecked Sendable {
                 let prefixRemainder = prefixRows.filter { snapshot.store.normalizedName(at: $0) != token }
                 let orderedPrefixRows = request.sort.ascending ? prefixRemainder : prefixRemainder.reversed()
                 for rowID in orderedPrefixRows {
-                    appendNameMatch(rowID: rowID)
+                    appendNameMatch(rowID: rowID, requiresCandidateMembership: false)
                     if matches.count == maxResults {
                         break
                     }
@@ -5040,11 +5341,17 @@ public final class FileIndex: @unchecked Sendable {
         let match: MatchExplanation?
     }
 
+    private struct NamePreviewCandidate {
+        let rowID: Int
+        let qualityCode: UInt8
+        let normalizedName: String
+        let match: MatchExplanation
+    }
+
     private struct RelevancePreviewCandidate {
         let rowID: Int
         let qualityCode: UInt8
         let normalizedName: String
-        let path: String
         let match: MatchExplanation
     }
 
@@ -6388,6 +6695,11 @@ public final class FileIndex: @unchecked Sendable {
                     "recordCount": .publicInt(snapshot.resultCount),
                     "rootCount": .publicInt(persisted.manifest.roots.count),
                     "optimizedForSearch": .publicBool(loadedOptimized),
+                    "modifiedOrderCount": .publicInt(snapshot.modifiedDescending.count),
+                    "visibleModifiedOrderCount": .publicInt(snapshot.visibleModifiedDescending.count),
+                    "nameGramPostingCount": .publicInt(snapshot.diagnostics.nameGramPostingCount),
+                    "componentGramPostingCount": .publicInt(snapshot.diagnostics.componentGramPostingCount),
+                    "pathGramPostingCount": .publicInt(snapshot.diagnostics.pathGramPostingCount),
                     "durationSeconds": .publicDouble(Date().timeIntervalSince(started))
                 ],
                 diagnosticFields: [
@@ -8443,20 +8755,26 @@ public final class FileIndex: @unchecked Sendable {
         )
 
         do {
-            let mappedStore = try persistMappedSnapshot(
+            var persistedSnapshot: SearchSnapshot?
+            _ = try persistMappedSnapshot(
                 roots: snapshotData.roots,
                 exclusionPatterns: snapshotData.exclusionPatterns,
                 store: snapshotData.snapshot.store
-            )
-            var persistedSnapshot = SearchSnapshot(
-                store: mappedStore,
-                buildsSearchStructures: true,
-                buildsPathGramIndex: false
-            )
-            if snapshotData.snapshot.store.kind == .mapped, let existingPathGramIndex = snapshotData.snapshot.gramIndex {
-                persistedSnapshot = persistedSnapshot.addingCompletePathGramIndex(existingPathGramIndex)
+            ) { mappedStore, packageURL in
+                var snapshot = SearchSnapshot(
+                    store: mappedStore,
+                    buildsSearchStructures: true,
+                    buildsPathGramIndex: false
+                )
+                if snapshotData.snapshot.store.kind == .mapped, let existingPathGramIndex = snapshotData.snapshot.gramIndex {
+                    snapshot = snapshot.addingCompletePathGramIndex(existingPathGramIndex)
+                }
+                try persistSearchStructures(for: snapshot, packageURL: packageURL)
+                persistedSnapshot = snapshot
             }
-            try persistSearchStructures(for: persistedSnapshot, packageURL: snapshotURL)
+            guard let persistedSnapshot else {
+                throw CocoaError(.fileWriteUnknown)
+            }
             MemoryTelemetry.log(
                 "snapshot.persist.finished",
                 records: metrics,
@@ -8468,6 +8786,12 @@ public final class FileIndex: @unchecked Sendable {
                 event: "index.snapshotPersistFinished",
                 fields: [
                     "recordCount": .publicInt(metrics.recordCount),
+                    "optimizedForSearch": .publicBool(persistedSnapshot.isOptimizedForSearch),
+                    "modifiedOrderCount": .publicInt(persistedSnapshot.modifiedDescending.count),
+                    "visibleModifiedOrderCount": .publicInt(persistedSnapshot.visibleModifiedDescending.count),
+                    "nameGramPostingCount": .publicInt(persistedSnapshot.diagnostics.nameGramPostingCount),
+                    "componentGramPostingCount": .publicInt(persistedSnapshot.diagnostics.componentGramPostingCount),
+                    "pathGramPostingCount": .publicInt(persistedSnapshot.diagnostics.pathGramPostingCount),
                     "durationSeconds": .publicDouble(Date().timeIntervalSince(started)),
                     "pendingRefreshPathCount": .publicInt(lock.withLock { pendingRefreshPaths.count })
                 ]
@@ -8522,7 +8846,12 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
-    private func persistMappedSnapshot(roots: [String], exclusionPatterns: [String], store: RecordStore) throws -> MappedRecordStore {
+    private func persistMappedSnapshot(
+        roots: [String],
+        exclusionPatterns: [String],
+        store: RecordStore,
+        preparePackageBeforeInstall: (MappedRecordStore, URL) throws -> Void = { _, _ in }
+    ) throws -> MappedRecordStore {
         cleanupStaleTemporaryFiles()
         let temporaryURL = SnapshotLayout.temporaryPackageURL(in: supportDirectory)
         defer {
@@ -8539,6 +8868,9 @@ public final class FileIndex: @unchecked Sendable {
             fileManager: fileManager
         )
 
+        let mappedStore = try MappedRecordStore(packageURL: temporaryURL, schemaVersion: SnapshotLayout.schemaVersion)
+        try preparePackageBeforeInstall(mappedStore, temporaryURL)
+
         if fileManager.fileExists(atPath: snapshotURL.path) {
             try fileManager.removeItem(at: snapshotURL)
         }
@@ -8546,7 +8878,7 @@ public final class FileIndex: @unchecked Sendable {
         removeScanCheckpoint()
         cleanupObsoleteIndexFiles()
         invalidateStorageInsightsCache()
-        return try MappedRecordStore(packageURL: snapshotURL, schemaVersion: SnapshotLayout.schemaVersion)
+        return mappedStore
     }
 
     private func persistSearchStructures(for snapshot: SearchSnapshot, packageURL: URL) throws {
