@@ -68,6 +68,39 @@ struct AppSettingsTests {
         #expect(AppSettings.indexedRoots(defaults: defaults) == AppSettings.suggestedDefaultIndexedRoots())
     }
 
+    @Test("settings change notifications are delivered on the main thread")
+    func settingsChangeNotificationsAreDeliveredOnMainThread() throws {
+        let (defaults, suiteName) = try makeDefaults()
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        let probe = NotificationThreadProbe()
+        let notificationReceived = DispatchSemaphore(value: 0)
+        let observer = NotificationCenter.default.addObserver(
+            forName: AppSettings.indexedRootsDidChangeNotification,
+            object: defaults,
+            queue: nil
+        ) { _ in
+            probe.record(Thread.isMainThread)
+            notificationReceived.signal()
+        }
+        defer {
+            NotificationCenter.default.removeObserver(observer)
+        }
+
+        let defaultsBox = UserDefaultsThreadBox(defaults)
+        DispatchQueue.global(qos: .userInitiated).async {
+            AppSettings.saveIndexedRoots(
+                [URL(fileURLWithPath: "/tmp/AllTheThingsThreadedSettings", isDirectory: true)],
+                defaults: defaultsBox.defaults
+            )
+        }
+
+        #expect(notificationReceived.wait(timeout: .now() + 2) == .success)
+        #expect(probe.receivedOnMainThread)
+    }
+
     @Test("default indexed roots exclude Applications")
     func defaultIndexedRootsExcludeApplications() {
         let paths = AppSettings.suggestedDefaultIndexedRoots().map(\.standardizedFileURL.path)
@@ -321,6 +354,31 @@ struct AppSettingsTests {
         let defaults = try #require(UserDefaults(suiteName: suiteName))
         defaults.removePersistentDomain(forName: suiteName)
         return (defaults, suiteName)
+    }
+}
+
+private final class UserDefaultsThreadBox: @unchecked Sendable {
+    let defaults: UserDefaults
+
+    init(_ defaults: UserDefaults) {
+        self.defaults = defaults
+    }
+}
+
+private final class NotificationThreadProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var receivedOnMain = false
+
+    var receivedOnMainThread: Bool {
+        lock.withLock {
+            receivedOnMain
+        }
+    }
+
+    func record(_ isMainThread: Bool) {
+        lock.withLock {
+            receivedOnMain = isMainThread
+        }
     }
 }
 

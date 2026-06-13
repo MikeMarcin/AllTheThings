@@ -48,7 +48,7 @@ extension AppSettings {
 
         defaults.set(normalizedFamilyName ?? "", forKey: appFontFamilyNameKey)
         defaults.synchronize()
-        NotificationCenter.default.post(name: appFontDidChangeNotification, object: defaults)
+        postSettingsDidChangeNotification(appFontDidChangeNotification, defaults: defaults)
     }
 
     static func saveAppFontSize(_ fontSize: CGFloat, defaults: UserDefaults = .standard) {
@@ -57,14 +57,14 @@ extension AppSettings {
 
         defaults.set(Double(normalizedSize), forKey: appFontSizeKey)
         defaults.synchronize()
-        NotificationCenter.default.post(name: appFontDidChangeNotification, object: defaults)
+        postSettingsDidChangeNotification(appFontDidChangeNotification, defaults: defaults)
     }
 
     static func resetAppFont(defaults: UserDefaults = .standard) {
         defaults.removeObject(forKey: appFontFamilyNameKey)
         defaults.removeObject(forKey: appFontSizeKey)
         defaults.synchronize()
-        NotificationCenter.default.post(name: appFontDidChangeNotification, object: defaults)
+        postSettingsDidChangeNotification(appFontDidChangeNotification, defaults: defaults)
     }
 
     static func matchColor(
@@ -102,13 +102,13 @@ extension AppSettings {
         hexes[key] = hex
         defaults.set(hexes, forKey: storageKey)
         defaults.synchronize()
-        NotificationCenter.default.post(name: matchColorsDidChangeNotification, object: defaults)
+        postSettingsDidChangeNotification(matchColorsDidChangeNotification, defaults: defaults)
     }
 
     static func resetMatchColors(isDark: Bool, defaults: UserDefaults = .standard) {
         defaults.removeObject(forKey: matchColorStorageKey(isDark: isDark))
         defaults.synchronize()
-        NotificationCenter.default.post(name: matchColorsDidChangeNotification, object: defaults)
+        postSettingsDidChangeNotification(matchColorsDidChangeNotification, defaults: defaults)
     }
 
     static func defaultMatchColorHexes(isDark: Bool) -> [String: String] {
