@@ -309,6 +309,45 @@ enum SearchWindowPresentation {
     }
 }
 
+enum SearchRunReconciliation {
+    nonisolated static func canApplyResponse(generationMatches: Bool, tokenMatches: Bool) -> Bool {
+        generationMatches && tokenMatches
+    }
+
+    nonisolated static func fullCancellationKeepsSearchActive(
+        hasPendingPreview: Bool,
+        tokenCancelled: Bool
+    ) -> Bool {
+        hasPendingPreview && !tokenCancelled
+    }
+
+    nonisolated static func previewApplicationCompletesSearch(fullSearchAlreadyFinished: Bool) -> Bool {
+        fullSearchAlreadyFinished
+    }
+
+    nonisolated static func shouldRejectFinalEmptyResponse(
+        existingResultCount: Int,
+        displayedMatchesResponseSignature: Bool,
+        responseResultCount: Int,
+        responseTotalMatches: Int,
+        responseSnapshotRevision: UInt64?,
+        currentSnapshotRevision: UInt64
+    ) -> Bool {
+        guard
+            existingResultCount > 0,
+            displayedMatchesResponseSignature,
+            responseResultCount == 0,
+            responseTotalMatches == 0,
+            let responseSnapshotRevision,
+            responseSnapshotRevision < currentSnapshotRevision
+        else {
+            return false
+        }
+
+        return true
+    }
+}
+
 @MainActor
 enum ExpandedMascotLayout {
     struct Target: Equatable {
@@ -970,6 +1009,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var pendingSearchInputStartedAt: Date?
     private var queryGeneration: UInt64 = 0
     private var activeSearchToken: SearchCancellationToken?
+    private var pendingPreviewSearchToken: SearchCancellationToken?
+    private var activeSearchFullFinished = false
+    private var activeSearchNeedsRetryAfterPreview = false
     private var explanationGeneration: UInt64 = 0
     private var activeExplanationToken = SearchCancellationToken()
     private var pendingExplanationKeys = Set<ExplanationCacheKey>()
@@ -2540,6 +2582,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let redisplaysCurrentSignature = signature == displayedSearchSignature
 
         activeSearchToken?.cancel()
+        pendingPreviewSearchToken = nil
+        activeSearchFullFinished = false
+        activeSearchNeedsRetryAfterPreview = false
         let token = SearchCancellationToken()
         activeSearchToken = token
         let searchStartedAt: Date
@@ -2578,10 +2623,19 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let index = self.index
         let budgetTimeout = SearchBudgetTimeout()
         let trimmedQuery = request.query.trimmingCharacters(in: .whitespacesAndNewlines)
-        let shouldRunPreviewSearch = appSearchQuery == nil
-            && !trimmedQuery.isEmpty
-            && (request.sort.column == .name || request.sort.column == .modified)
-            && signature != displayedSearchSignature
+        let previewSkipReason: String?
+        if appSearchQuery != nil {
+            previewSkipReason = "applicationSearch"
+        } else if trimmedQuery.isEmpty {
+            previewSkipReason = "emptyQuery"
+        } else if request.sort.column != .name && request.sort.column != .modified {
+            previewSkipReason = "unsupportedSort"
+        } else if signature == displayedSearchSignature {
+            previewSkipReason = "alreadyDisplayed"
+        } else {
+            previewSkipReason = nil
+        }
+        let shouldRunPreviewSearch = previewSkipReason == nil
         let previewRequest = SearchRequest(
             query: request.query,
             sort: request.sort,
@@ -2592,18 +2646,48 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let applicationSearchCatalog = self.applicationSearchCatalog
 
         if shouldRunPreviewSearch {
+            pendingPreviewSearchToken = token
+            logSearchPreviewScheduled(signature: signature, generation: generation)
             searchPreviewQueue.async { [weak self] in
-                guard !token.isCancelled else { return }
+                guard !token.isCancelled else {
+                    DispatchQueue.main.async { [weak self] in
+                        self?.logSearchPreviewRejected(
+                            signature: signature,
+                            reason: "tokenCancelledBeforeStart",
+                            generation: generation,
+                            token: token
+                        )
+                    }
+                    return
+                }
                 guard let previewResponse = index.search(previewRequest, shouldCancel: { token.isCancelled }) else {
+                    DispatchQueue.main.async { [weak self] in
+                        self?.handlePreviewSearchCancelled(
+                            signature: signature,
+                            token: token,
+                            generation: generation,
+                            reason: token.isCancelled ? "tokenCancelled" : "nilResponse"
+                        )
+                    }
                     return
                 }
 
                 DispatchQueue.main.async { [weak self] in
-                    guard
-                        let self,
-                        self.queryGeneration == generation,
-                        self.activeSearchToken === token
-                    else {
+                    guard let self else { return }
+                    let generationMatches = self.queryGeneration == generation
+                    let tokenMatches = self.activeSearchToken === token
+                    guard SearchRunReconciliation.canApplyResponse(
+                        generationMatches: generationMatches,
+                        tokenMatches: tokenMatches
+                    ) else {
+                        self.logSearchPreviewRejected(
+                            signature: signature,
+                            reason: "staleResponse",
+                            generation: generation,
+                            token: token,
+                            generationMatches: generationMatches,
+                            tokenMatches: tokenMatches
+                        )
                         return
                     }
                     self.applySearchResponse(
@@ -2615,6 +2699,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                     )
                 }
             }
+        } else if let previewSkipReason {
+            logSearchPreviewSkipped(signature: signature, reason: previewSkipReason, generation: generation)
         }
 
         searchQueue.async {
@@ -2652,8 +2738,15 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             guard let response else {
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
-                    self.clearSearchTokenIfCurrent(token)
-                    if budgetTimeout.didTimeOut, !self.shouldBudgetSearchDuringIndexing(request: request) {
+                    let shouldRetry = budgetTimeout.didTimeOut && !self.shouldBudgetSearchDuringIndexing(request: request)
+                    let keptPendingPreview = self.handleFullSearchCancelled(
+                        signature: signature,
+                        token: token,
+                        generation: generation,
+                        budgetTimedOut: budgetTimeout.didTimeOut,
+                        retryAfterPreview: shouldRetry
+                    )
+                    if shouldRetry, !keptPendingPreview {
                         self.scheduleSearch(force: true)
                     }
                 }
@@ -2661,7 +2754,23 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             }
 
             DispatchQueue.main.async { [weak self] in
-                guard let self, self.queryGeneration == generation, self.activeSearchToken === token else { return }
+                guard let self else { return }
+                let generationMatches = self.queryGeneration == generation
+                let tokenMatches = self.activeSearchToken === token
+                guard SearchRunReconciliation.canApplyResponse(
+                    generationMatches: generationMatches,
+                    tokenMatches: tokenMatches
+                ) else {
+                    self.logFullSearchRejected(
+                        signature: signature,
+                        reason: "staleResponse",
+                        generation: generation,
+                        token: token,
+                        generationMatches: generationMatches,
+                        tokenMatches: tokenMatches
+                    )
+                    return
+                }
                 self.applySearchResponse(
                     response,
                     signature: signature,
@@ -2681,6 +2790,225 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
     }
 
+    private func handlePreviewSearchCancelled(
+        signature: SearchSignature,
+        token: SearchCancellationToken,
+        generation: UInt64,
+        reason: String
+    ) {
+        let generationMatches = queryGeneration == generation
+        let tokenMatches = activeSearchToken === token
+        logSearchPreviewRejected(
+            signature: signature,
+            reason: reason,
+            generation: generation,
+            token: token,
+            generationMatches: generationMatches,
+            tokenMatches: tokenMatches
+        )
+
+        guard generationMatches, tokenMatches else { return }
+        if pendingPreviewSearchToken === token {
+            pendingPreviewSearchToken = nil
+        }
+        if activeSearchFullFinished {
+            clearSearchTokenIfCurrent(token)
+        }
+    }
+
+    private func handleFullSearchCancelled(
+        signature: SearchSignature,
+        token: SearchCancellationToken,
+        generation: UInt64,
+        budgetTimedOut: Bool,
+        retryAfterPreview: Bool
+    ) -> Bool {
+        let generationMatches = queryGeneration == generation
+        let tokenMatches = activeSearchToken === token
+        let hasPendingPreview = pendingPreviewSearchToken === token
+        let reason = budgetTimedOut ? "budgetTimeout" : (token.isCancelled ? "tokenCancelled" : "nilResponse")
+        logSearchFullCancelled(
+            signature: signature,
+            reason: reason,
+            generation: generation,
+            token: token,
+            generationMatches: generationMatches,
+            tokenMatches: tokenMatches,
+            hasPendingPreview: hasPendingPreview,
+            budgetTimedOut: budgetTimedOut,
+            retryAfterPreview: retryAfterPreview
+        )
+
+        guard generationMatches, tokenMatches else { return false }
+        activeSearchFullFinished = true
+        activeSearchNeedsRetryAfterPreview = retryAfterPreview
+        if SearchRunReconciliation.fullCancellationKeepsSearchActive(
+            hasPendingPreview: hasPendingPreview,
+            tokenCancelled: token.isCancelled
+        ) {
+            isRefiningSearchResults = true
+            updateStatus()
+            updateLoadingOverlay()
+            updateMascotPersistentAnimation()
+            return true
+        }
+
+        activeSearchNeedsRetryAfterPreview = false
+        clearSearchTokenIfCurrent(token)
+        return false
+    }
+
+    private func logSearchPreviewScheduled(signature: SearchSignature, generation: UInt64) {
+        DiagnosticLogger.shared.log(
+            category: "search",
+            event: "search.previewScheduled",
+            fields: searchLifecycleFields(signature: signature, reason: "scheduled", generation: generation),
+            diagnosticFields: ["query": .query(signature.query)]
+        )
+    }
+
+    private func logSearchPreviewSkipped(signature: SearchSignature, reason: String, generation: UInt64) {
+        DiagnosticLogger.shared.log(
+            category: "search",
+            event: "search.previewSkipped",
+            fields: searchLifecycleFields(signature: signature, reason: reason, generation: generation),
+            diagnosticFields: ["query": .query(signature.query)]
+        )
+    }
+
+    private func logSearchPreviewRejected(
+        signature: SearchSignature,
+        reason: String,
+        generation: UInt64,
+        token: SearchCancellationToken,
+        generationMatches: Bool? = nil,
+        tokenMatches: Bool? = nil
+    ) {
+        var fields = searchLifecycleFields(signature: signature, reason: reason, generation: generation)
+        fields["tokenCancelled"] = .publicBool(token.isCancelled)
+        fields["generationMatches"] = .publicBool(generationMatches ?? (queryGeneration == generation))
+        fields["tokenMatches"] = .publicBool(tokenMatches ?? (activeSearchToken === token))
+        fields["fullSearchFinished"] = .publicBool(activeSearchFullFinished)
+        DiagnosticLogger.shared.log(
+            category: "search",
+            event: "search.previewRejected",
+            fields: fields,
+            diagnosticFields: ["query": .query(signature.query)]
+        )
+    }
+
+    private func logSearchFullCancelled(
+        signature: SearchSignature,
+        reason: String,
+        generation: UInt64,
+        token: SearchCancellationToken,
+        generationMatches: Bool,
+        tokenMatches: Bool,
+        hasPendingPreview: Bool,
+        budgetTimedOut: Bool,
+        retryAfterPreview: Bool
+    ) {
+        var fields = searchLifecycleFields(signature: signature, reason: reason, generation: generation)
+        fields["tokenCancelled"] = .publicBool(token.isCancelled)
+        fields["generationMatches"] = .publicBool(generationMatches)
+        fields["tokenMatches"] = .publicBool(tokenMatches)
+        fields["hasPendingPreview"] = .publicBool(hasPendingPreview)
+        fields["budgetTimedOut"] = .publicBool(budgetTimedOut)
+        fields["retryAfterPreview"] = .publicBool(retryAfterPreview)
+        DiagnosticLogger.shared.log(
+            category: "search",
+            event: "search.fullCancelled",
+            fields: fields,
+            diagnosticFields: ["query": .query(signature.query)]
+        )
+    }
+
+    private func logFullSearchRejected(
+        signature: SearchSignature,
+        reason: String,
+        generation: UInt64,
+        token: SearchCancellationToken,
+        generationMatches: Bool,
+        tokenMatches: Bool
+    ) {
+        var fields = searchLifecycleFields(signature: signature, reason: reason, generation: generation)
+        fields["tokenCancelled"] = .publicBool(token.isCancelled)
+        fields["generationMatches"] = .publicBool(generationMatches)
+        fields["tokenMatches"] = .publicBool(tokenMatches)
+        DiagnosticLogger.shared.log(
+            category: "search",
+            event: "search.fullRejected",
+            fields: fields,
+            diagnosticFields: ["query": .query(signature.query)]
+        )
+    }
+
+    private func logFinalSearchRejected(
+        _ response: SearchResponse,
+        signature: SearchSignature,
+        reason: String,
+        elapsed: TimeInterval,
+        generation: UInt64
+    ) {
+        var fields = searchResponseLogFields(
+            response,
+            signature: signature,
+            elapsed: elapsed,
+            profile: response.executionProfile
+        )
+        fields["reason"] = .publicString(reason)
+        fields["generation"] = .publicUInt64(generation)
+        fields["currentSnapshotRevision"] = .publicUInt64(indexStats.snapshotRevision)
+        if let responseSnapshotRevision = response.snapshotRevision {
+            fields["responseSnapshotRevision"] = .publicUInt64(responseSnapshotRevision)
+        }
+        DiagnosticLogger.shared.log(
+            level: .warning,
+            category: "search",
+            event: "search.fullRejected",
+            fields: fields,
+            diagnosticFields: ["query": .query(signature.query)]
+        )
+    }
+
+    private func searchLifecycleFields(
+        signature: SearchSignature,
+        reason: String,
+        generation: UInt64
+    ) -> [String: DiagnosticLogFieldValue] {
+        [
+            "sortColumn": .publicString(signature.sort.column.rawValue),
+            "sortAscending": .publicBool(signature.sort.ascending),
+            "includeHidden": .publicBool(signature.includeHidden),
+            "reason": .publicString(reason),
+            "generation": .publicUInt64(generation)
+        ]
+    }
+
+    private func searchResponseLogFields(
+        _ response: SearchResponse,
+        signature: SearchSignature,
+        elapsed: TimeInterval,
+        profile: SearchExecutionProfile
+    ) -> [String: DiagnosticLogFieldValue] {
+        [
+            "sortColumn": .publicString(signature.sort.column.rawValue),
+            "sortAscending": .publicBool(signature.sort.ascending),
+            "includeHidden": .publicBool(signature.includeHidden),
+            "displayedResultCount": .publicInt(response.results.count),
+            "totalMatches": .publicInt(response.totalMatches),
+            "uiLatencySeconds": .publicDouble(elapsed),
+            "indexLatencySeconds": .publicDouble(response.elapsed),
+            "usesIndexedCandidates": .publicBool(response.usesIndexedCandidates),
+            "executionPath": .publicString(profile.executionPath.rawValue),
+            "indexesUsed": .publicStringArray(profile.indexesUsed.map(\.rawValue).sorted()),
+            "candidateCount": .publicInt(profile.candidateCount),
+            "scannedRowCount": .publicInt(profile.scannedRowCount),
+            "fallbackToFullScan": .publicBool(profile.didFallbackToFullScan),
+            "staleRetry": .publicBool(profile.wasStaleRetry)
+        ]
+    }
+
     private func applySearchResponse(
         _ response: SearchResponse,
         signature: SearchSignature,
@@ -2690,15 +3018,75 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     ) {
         guard activeSearchToken === token else { return }
         let elapsed = max(Date().timeIntervalSince(searchStartedAt), 0)
-        if isFinal {
+        if
+            isFinal,
+            SearchRunReconciliation.shouldRejectFinalEmptyResponse(
+                existingResultCount: results.count,
+                displayedMatchesResponseSignature: displayedSearchSignature == signature,
+                responseResultCount: response.results.count,
+                responseTotalMatches: response.totalMatches,
+                responseSnapshotRevision: response.snapshotRevision,
+                currentSnapshotRevision: indexStats.snapshotRevision
+            )
+        {
+            logFinalSearchRejected(
+                response,
+                signature: signature,
+                reason: "staleEmptyWouldClearPreview",
+                elapsed: elapsed,
+                generation: queryGeneration
+            )
+            activeSearchFullFinished = true
+            pendingPreviewSearchToken = nil
             activeSearchToken = nil
+            activeSearchNeedsRetryAfterPreview = false
+            isRefiningSearchResults = false
+            hasFinalSearchTiming = true
+            queryElapsed = elapsed
+            activeSearchStartedAt = nil
+            stopSearchStatusTimer()
+            updateStatus()
+            updateLoadingOverlay()
+            updateActionButtons()
+            updateMascotPersistentAnimation()
+            if signature == scheduledSearchSignature {
+                scheduleSearch(force: true)
+            }
+            return
+        }
+
+        if isFinal {
+            activeSearchFullFinished = true
+            pendingPreviewSearchToken = nil
+            activeSearchToken = nil
+            activeSearchNeedsRetryAfterPreview = false
             isRefiningSearchResults = false
             hasFinalSearchTiming = true
             activeSearchStartedAt = nil
             stopSearchStatusTimer()
         } else {
+            if pendingPreviewSearchToken === token {
+                pendingPreviewSearchToken = nil
+            }
             initialQueryElapsed = elapsed
-            isRefiningSearchResults = true
+            let completesSearch = SearchRunReconciliation.previewApplicationCompletesSearch(
+                fullSearchAlreadyFinished: activeSearchFullFinished
+            )
+            if completesSearch {
+                let needsRetry = activeSearchNeedsRetryAfterPreview
+                activeSearchNeedsRetryAfterPreview = false
+                activeSearchToken = nil
+                isRefiningSearchResults = false
+                activeSearchStartedAt = nil
+                stopSearchStatusTimer()
+                if needsRetry, signature == scheduledSearchSignature {
+                    DispatchQueue.main.async { [weak self] in
+                        self?.scheduleSearch(force: true)
+                    }
+                }
+            } else {
+                isRefiningSearchResults = true
+            }
             hasFinalSearchTiming = false
         }
         if displayedSearchSignature?.query != signature.query {
@@ -2720,48 +3108,28 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             DiagnosticLogger.shared.log(
                 category: "search",
                 event: "search.displayed",
-                fields: [
-                    "sortColumn": .publicString(signature.sort.column.rawValue),
-                    "sortAscending": .publicBool(signature.sort.ascending),
-                    "includeHidden": .publicBool(signature.includeHidden),
-                    "displayedResultCount": .publicInt(response.results.count),
-                    "totalMatches": .publicInt(response.totalMatches),
-                    "uiLatencySeconds": .publicDouble(elapsed),
-                    "indexLatencySeconds": .publicDouble(response.elapsed),
-                    "usesIndexedCandidates": .publicBool(response.usesIndexedCandidates)
-                ],
+                fields: searchResponseLogFields(
+                    response,
+                    signature: signature,
+                    elapsed: elapsed,
+                    profile: profile
+                ),
                 diagnosticFields: [
-                    "query": .query(signature.query),
-                    "executionPath": .publicString(profile.executionPath.rawValue),
-                    "indexesUsed": .publicStringArray(profile.indexesUsed.map(\.rawValue).sorted()),
-                    "candidateCount": .publicInt(profile.candidateCount),
-                    "scannedRowCount": .publicInt(profile.scannedRowCount),
-                    "fallbackToFullScan": .publicBool(profile.didFallbackToFullScan),
-                    "staleRetry": .publicBool(profile.wasStaleRetry)
+                    "query": .query(signature.query)
                 ]
             )
         } else {
             DiagnosticLogger.shared.log(
                 category: "search",
                 event: "search.previewDisplayed",
-                fields: [
-                    "sortColumn": .publicString(signature.sort.column.rawValue),
-                    "sortAscending": .publicBool(signature.sort.ascending),
-                    "includeHidden": .publicBool(signature.includeHidden),
-                    "displayedResultCount": .publicInt(response.results.count),
-                    "totalMatches": .publicInt(response.totalMatches),
-                    "uiLatencySeconds": .publicDouble(elapsed),
-                    "indexLatencySeconds": .publicDouble(response.elapsed),
-                    "usesIndexedCandidates": .publicBool(response.usesIndexedCandidates)
-                ],
+                fields: searchResponseLogFields(
+                    response,
+                    signature: signature,
+                    elapsed: elapsed,
+                    profile: profile
+                ),
                 diagnosticFields: [
-                    "query": .query(signature.query),
-                    "executionPath": .publicString(profile.executionPath.rawValue),
-                    "indexesUsed": .publicStringArray(profile.indexesUsed.map(\.rawValue).sorted()),
-                    "candidateCount": .publicInt(profile.candidateCount),
-                    "scannedRowCount": .publicInt(profile.scannedRowCount),
-                    "fallbackToFullScan": .publicBool(profile.didFallbackToFullScan),
-                    "staleRetry": .publicBool(profile.wasStaleRetry)
+                    "query": .query(signature.query)
                 ]
             )
         }
@@ -2770,6 +3138,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private func clearSearchTokenIfCurrent(_ token: SearchCancellationToken) {
         guard activeSearchToken === token else { return }
         activeSearchToken = nil
+        pendingPreviewSearchToken = nil
+        activeSearchFullFinished = false
+        activeSearchNeedsRetryAfterPreview = false
         isRefiningSearchResults = false
         activeSearchStartedAt = nil
         stopSearchStatusTimer()
@@ -2783,6 +3154,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         if activeSearchToken != nil {
             activeSearchToken?.cancel()
             activeSearchToken = nil
+            pendingPreviewSearchToken = nil
+            activeSearchFullFinished = false
+            activeSearchNeedsRetryAfterPreview = false
             activeSearchStartedAt = nil
             stopSearchStatusTimer()
             queryGeneration &+= 1
@@ -3329,6 +3703,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private func rebuildIndexForCurrentSettings() {
         activeSearchToken?.cancel()
         activeSearchToken = nil
+        pendingPreviewSearchToken = nil
+        activeSearchFullFinished = false
+        activeSearchNeedsRetryAfterPreview = false
         stopSearchStatusTimer()
         scheduledSearchSignature = nil
         displayedSearchSignature = nil
