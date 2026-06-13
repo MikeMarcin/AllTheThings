@@ -1059,6 +1059,9 @@ public final class FileIndex: @unchecked Sendable {
 
         var count: Int { store.count }
         var resultCount: Int { store.storedResultCount ?? (0..<store.count).filter { store.isResultRow(at: $0) }.count }
+        var hasModifiedSortOrder: Bool {
+            resultCount == 0 || modifiedDescending.count == resultCount
+        }
         var visibleResultCount: Int? {
             if let visibleCount {
                 return visibleCount
@@ -1234,14 +1237,20 @@ public final class FileIndex: @unchecked Sendable {
             if let modifiedDescending = persistedStructures.modifiedDescending, modifiedDescending.count == expectedModifiedCount {
                 self.modifiedDescending = modifiedDescending
                 self.modifiedAscending = Array(modifiedDescending.reversed())
-                let sortedByName = Self.makeNameAscending(store: store)
-                self.nameAscending = sortedByName
-                self.nameDescending = Array(sortedByName.reversed())
                 let visibleModifiedDescending = persistedStructures.visibleModifiedDescending
                     ?? Self.makeVisibleModifiedDescending(modifiedDescending: modifiedDescending, store: store)
                 self.visibleModifiedDescending = visibleModifiedDescending
                 self.visibleModifiedAscending = Array(visibleModifiedDescending.reversed())
-                self.hasSortedOrder = true
+                if nameGramIndex != nil, componentGramIndex != nil {
+                    let sortedByName = Self.makeNameAscending(store: store)
+                    self.nameAscending = sortedByName
+                    self.nameDescending = Array(sortedByName.reversed())
+                    self.hasSortedOrder = true
+                } else {
+                    self.nameAscending = []
+                    self.nameDescending = []
+                    self.hasSortedOrder = false
+                }
             } else {
                 self.modifiedDescending = []
                 self.modifiedAscending = []
@@ -1438,6 +1447,23 @@ public final class FileIndex: @unchecked Sendable {
             )
         }
 
+        func addingModifiedSortOrderOnly() -> SearchSnapshot {
+            guard !hasModifiedSortOrder else { return self }
+            return SearchSnapshot(
+                store: store,
+                modifiedDescending: Self.makeModifiedDescending(store: store),
+                gramIndex: gramIndex,
+                pathGramShards: pathGramShards,
+                pathGramExpectedRowCount: pathGramExpectedRowCount,
+                nameGramIndex: nameGramIndex,
+                componentGramIndex: componentGramIndex,
+                extensionIndex: extensionIndex,
+                childLinks: childLinks,
+                visibleCount: visibleCount,
+                hasSortedOrder: hasSortedOrder
+            )
+        }
+
         func addingPathGramIndexIfBudgetAllows() -> SearchSnapshot {
             guard gramIndex == nil else { return self }
             guard FileIndex.shouldBuildPathGramIndex(store: store) else {
@@ -1580,17 +1606,18 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         func orderedIndices(for sort: SortSpec, queryIsEmpty: Bool, includeHidden: Bool) -> [Int]? {
-            guard hasSortedOrder else { return nil }
-
             switch sort.column {
             case .modified:
+                guard hasModifiedSortOrder else { return nil }
                 if includeHidden {
                     return sort.ascending ? modifiedAscending : modifiedDescending
                 }
                 return sort.ascending ? visibleModifiedAscending : visibleModifiedDescending
             case .name:
+                guard hasSortedOrder else { return nil }
                 return sort.ascending ? nameAscending : nameDescending
             case .relevance where queryIsEmpty:
+                guard hasModifiedSortOrder else { return nil }
                 return includeHidden ? modifiedDescending : visibleModifiedDescending
             case .relevance, .path, .created, .size, .fileExtension, .kind, .volume, .root:
                 return nil
@@ -3066,11 +3093,18 @@ public final class FileIndex: @unchecked Sendable {
         maxResults: Int,
         canPromoteSortedOrder: Bool
     ) -> Bool {
-        canPromoteSortedOrder
-            && parsedQuery.isEmpty
-            && maxResults > 0
-            && !snapshot.hasSortedOrder
-            && (request.sort.column == .name || request.sort.column == .modified || request.sort.column == .relevance)
+        guard canPromoteSortedOrder, parsedQuery.isEmpty, maxResults > 0 else {
+            return false
+        }
+
+        switch request.sort.column {
+        case .name:
+            return !snapshot.hasSortedOrder
+        case .modified, .relevance:
+            return !snapshot.hasModifiedSortOrder
+        case .path, .created, .size, .fileExtension, .kind, .volume, .root:
+            return false
+        }
     }
 
     public func search(
@@ -3117,7 +3151,9 @@ public final class FileIndex: @unchecked Sendable {
             maxResults: boundedMaxResults,
             canPromoteSortedOrder: snapshotData.canPromoteSortedOrder
         ) {
-            let promotedSnapshot = snapshot.addingModifiedSortOrder()
+            let promotedSnapshot = request.sort.column == .name
+                ? snapshot.addingModifiedSortOrder()
+                : snapshot.addingModifiedSortOrderOnly()
             let installedRevision = lock.withLock { () -> UInt64? in
                 guard searchSnapshot === snapshot, searchSnapshotRevision == snapshotRevision else {
                     return nil
@@ -3870,7 +3906,14 @@ public final class FileIndex: @unchecked Sendable {
             return nil
         }
 
-        if request.sort.column == .modified, snapshot.hasSortedOrder {
+        if request.sort.column == .modified, snapshot.hasModifiedSortOrder {
+            let isPreview = request.mode == .interactivePreview
+            var directNameRows = Array(repeating: UInt8(0), count: snapshot.count)
+            for candidate in exactNameCandidates {
+                let rowID = Int(candidate)
+                guard rowID >= 0, rowID < snapshot.count else { continue }
+                directNameRows[rowID] = 1
+            }
             var candidateSet = Set<Int>()
             candidateSet.reserveCapacity(exactPathCandidates.count)
             for candidate in exactPathCandidates {
@@ -3888,21 +3931,41 @@ public final class FileIndex: @unchecked Sendable {
             var matches: [SearchMatch] = []
             matches.reserveCapacity(min(candidateSet.count, maxResults))
             var total = 0
+            var scannedRows = 0
 
             for (offset, rowID) in orderedRows.enumerated() {
                 if offset.isMultiple(of: 512), shouldCancel() {
                     return nil
                 }
+                scannedRows += 1
                 guard candidateSet.contains(rowID) else { continue }
                 guard snapshot.store.isResultRow(at: rowID) else { continue }
                 guard request.includeHidden || snapshot.isVisible(at: rowID) else { continue }
-                guard let explanation = FuzzyMatcher.explain(record: snapshot.view(at: rowID), parsedQuery: parsedQuery) else {
+                let explanation: MatchExplanation
+                if directNameRows[rowID] != 0, field != .path, let nameExplanation = cheapIndexedNameExplanation(
+                    snapshot: snapshot,
+                    rowID: rowID,
+                    token: pattern.token,
+                    mode: mode
+                ) {
+                    explanation = nameExplanation
+                } else if field != .name {
+                    explanation = cheapIndexedPathExplanation(
+                        snapshot: snapshot,
+                        rowID: rowID,
+                        token: pattern.token,
+                        mode: mode
+                    )
+                } else {
                     continue
                 }
 
                 total += 1
                 if maxResults > 0 {
                     matches.append(SearchMatch(rowID: rowID, score: explanation.score, match: explanation))
+                    if isPreview, matches.count == maxResults {
+                        break
+                    }
                 }
             }
 
@@ -3928,6 +3991,7 @@ public final class FileIndex: @unchecked Sendable {
                     executionPath: .pathGramIndex,
                     indexesUsed: [.nameGrams, .pathGrams, .modifiedOrder],
                     candidateCount: exactPathCandidates.count,
+                    scannedRowCount: scannedRows,
                     elapsed: elapsed
                 )
             )
@@ -7552,7 +7616,7 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     @discardableResult
-    private func persistSnapshot() -> Bool {
+    private func persistSnapshot(schedulesPathGramBuild: Bool = true) -> Bool {
         let snapshotData = lock.withLock {
             (
                 roots: roots,
@@ -7622,7 +7686,7 @@ public final class FileIndex: @unchecked Sendable {
                     searchableCount = persistedSnapshot.resultCount
                     optimizedCount = persistedSnapshot.isOptimizedForSearch ? persistedSnapshot.resultCount : 0
                     lastUpdated = Date()
-                    if persistedSnapshot.gramIndex == nil {
+                    if schedulesPathGramBuild, persistedSnapshot.gramIndex == nil {
                         pathBuildRequest = (persistedSnapshot, generation, searchSnapshotRevision)
                     }
                 }
@@ -7691,7 +7755,7 @@ public final class FileIndex: @unchecked Sendable {
 
     private func persistSearchStructures(for snapshot: SearchSnapshot, packageURL: URL) throws {
         let modifiedOrderURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.modifiedOrder, isDirectory: false)
-        if snapshot.hasSortedOrder {
+        if snapshot.hasModifiedSortOrder {
             try CompactSearchStructureFiles.writeModifiedOrder(
                 snapshot.modifiedDescending,
                 to: modifiedOrderURL
@@ -7701,7 +7765,7 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         let visibleModifiedOrderURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.visibleModifiedOrder, isDirectory: false)
-        if snapshot.hasSortedOrder {
+        if snapshot.hasModifiedSortOrder {
             try CompactSearchStructureFiles.writeModifiedOrder(
                 snapshot.visibleModifiedDescending,
                 to: visibleModifiedOrderURL
@@ -8060,11 +8124,6 @@ public final class FileIndex: @unchecked Sendable {
             from: packageURL.appendingPathComponent(SnapshotLayout.FileName.componentPostings, isDirectory: false),
             fileManager: fileManager
         )
-        let expectedResultCount = store.storedResultCount ?? store.count
-        guard expectedResultCount == 0 || (nameGramIndex != nil && componentGramIndex != nil) else {
-            return nil
-        }
-
         return PersistedSearchStructures(
             modifiedDescending: modifiedDescending,
             visibleModifiedDescending: visibleModifiedDescending,
@@ -8426,7 +8485,7 @@ public final class FileIndex: @unchecked Sendable {
 
     func persistSnapshotForTesting() {
         _ = indexQueue.sync {
-            persistSnapshot()
+            persistSnapshot(schedulesPathGramBuild: false)
         }
     }
 

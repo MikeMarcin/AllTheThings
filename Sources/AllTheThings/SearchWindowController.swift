@@ -965,6 +965,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var isRefiningSearchResults = false
     private var hasFinalSearchTiming = false
     private var activeSearchStartedAt: Date?
+    private nonisolated(unsafe) var searchStatusTimer: Timer?
     private var pendingSearchInputStartedAt: Date?
     private var queryGeneration: UInt64 = 0
     private var activeSearchToken: SearchCancellationToken?
@@ -1135,6 +1136,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     deinit {
         activeFSEventReplay?.cancel()
+        searchStatusTimer?.invalidate()
+        searchStatusTimer = nil
         memoryStatusTask?.cancel()
         activeExplanationToken.cancel()
         pendingMascotExpansion?.cancel()
@@ -2551,6 +2554,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             hasFinalSearchTiming = false
         }
         pendingSearchInputStartedAt = nil
+        queryElapsed = 0
+        startSearchStatusTimerIfNeeded()
         updateMascotPersistentAnimation()
 
         let queryChanged = displayedSearchSignature?.query != signature.query
@@ -2574,7 +2579,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let trimmedQuery = request.query.trimmingCharacters(in: .whitespacesAndNewlines)
         let shouldRunPreviewSearch = appSearchQuery == nil
             && !trimmedQuery.isEmpty
-            && request.sort.column == .name
+            && (request.sort.column == .name || request.sort.column == .modified)
             && signature != displayedSearchSignature
         let previewRequest = SearchRequest(
             query: request.query,
@@ -2684,6 +2689,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             isRefiningSearchResults = false
             hasFinalSearchTiming = true
             activeSearchStartedAt = nil
+            stopSearchStatusTimer()
         } else {
             initialQueryElapsed = elapsed
             isRefiningSearchResults = true
@@ -2736,6 +2742,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         activeSearchToken = nil
         isRefiningSearchResults = false
         activeSearchStartedAt = nil
+        stopSearchStatusTimer()
         updateStatus()
         updateLoadingOverlay()
         updateMascotPersistentAnimation()
@@ -2747,6 +2754,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             activeSearchToken?.cancel()
             activeSearchToken = nil
             activeSearchStartedAt = nil
+            stopSearchStatusTimer()
             queryGeneration &+= 1
         }
 
@@ -3291,6 +3299,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private func rebuildIndexForCurrentSettings() {
         activeSearchToken?.cancel()
         activeSearchToken = nil
+        stopSearchStatusTimer()
         scheduledSearchSignature = nil
         displayedSearchSignature = nil
         results.removeAll(keepingCapacity: true)
@@ -3784,10 +3793,34 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
     }
 
+    private func startSearchStatusTimerIfNeeded() {
+        guard searchStatusTimer == nil else { return }
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, self.activeSearchToken != nil else { return }
+                self.updateActiveSearchElapsed()
+                self.updateStatus()
+            }
+        }
+        searchStatusTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func stopSearchStatusTimer() {
+        searchStatusTimer?.invalidate()
+        searchStatusTimer = nil
+    }
+
+    private func updateActiveSearchElapsed(now: Date = Date()) {
+        guard activeSearchToken != nil, let activeSearchStartedAt else { return }
+        queryElapsed = max(now.timeIntervalSince(activeSearchStartedAt), 0)
+    }
+
     private func updateStatus(refreshesMemory: Bool = false) {
         if refreshesMemory {
             refreshMemoryStatus()
         }
+        updateActiveSearchElapsed()
 
         let appSearchActive = ApplicationSearchQuery.parse(currentSearchText()) != nil
         let shownText = "\(results.count.formatted()) shown / \(totalMatches.formatted()) matches"
@@ -3819,9 +3852,14 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             searchElapsedStatusText = nil
         }
 
-        let footerStatus = appSearchActive
-            ? SearchWindowPresentation.IndexStatusFooterText(operationText: "Application search", detailText: "")
-            : indexStatusFooterText()
+        let footerStatus: SearchWindowPresentation.IndexStatusFooterText
+        if activeSearchToken != nil {
+            footerStatus = SearchWindowPresentation.IndexStatusFooterText(operationText: "Searching", detailText: "")
+        } else if appSearchActive {
+            footerStatus = SearchWindowPresentation.IndexStatusFooterText(operationText: "Application search", detailText: "")
+        } else {
+            footerStatus = indexStatusFooterText()
+        }
         let footerText = SearchWindowPresentation.detailedFooterText(
             shownText: shownText,
             operationText: footerStatus.operationText,
@@ -3882,7 +3920,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     private func shouldShowSearchElapsedText() -> Bool {
         SearchWindowPresentation.shouldShowSearchElapsedText(
-            displayedSearchSignatureIsSet: displayedSearchSignature != nil,
+            displayedSearchSignatureIsSet: displayedSearchSignature != nil || activeSearchToken != nil,
             queryElapsed: queryElapsed,
             initialQueryElapsed: initialQueryElapsed,
             isRefiningSearchResults: isRefiningSearchResults,
