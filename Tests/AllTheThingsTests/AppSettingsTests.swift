@@ -108,6 +108,27 @@ struct AppSettingsTests {
         #expect(!paths.contains("/Applications"))
     }
 
+    @Test("legacy default indexed roots move Applications to app search defaults")
+    func legacyDefaultIndexedRootsMoveApplicationsToAppSearchDefaults() throws {
+        let (defaults, suiteName) = try makeDefaults()
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        let legacyRoots = AppSettings.suggestedDefaultIndexedRoots()
+            + [URL(fileURLWithPath: "/Applications", isDirectory: true)]
+        defaults.set(legacyRoots.map(\.standardizedFileURL.path), forKey: AppSettings.indexedRootsKey)
+        defaults.set(true, forKey: AppSettings.indexedRootsInitializedKey)
+
+        AppSettings.registerDefaults(defaults)
+
+        let indexedPaths = AppSettings.indexedRoots(defaults: defaults).map(\.standardizedFileURL.path)
+        let appSearchPaths = AppSettings.appSearchRoots(defaults: defaults).map(\.standardizedFileURL.path)
+        #expect(indexedPaths == AppSettings.suggestedDefaultIndexedRoots().map(\.standardizedFileURL.path))
+        #expect(!indexedPaths.contains("/Applications"))
+        #expect(appSearchPaths.contains("/Applications"))
+    }
+
     @Test("app search roots default save and reset separately from indexed roots")
     func appSearchRootsDefaultSaveAndResetSeparatelyFromIndexedRoots() throws {
         let (defaults, suiteName) = try makeDefaults()

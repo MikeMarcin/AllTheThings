@@ -55,6 +55,7 @@ enum AppSettings {
     static let indexingSetupCompletedKey = "ATTIndexingSetupCompleted"
     static let exclusionPatternsKey = "ATTExclusionPatterns"
     static let exclusionDefaultsVersionKey = "ATTExclusionDefaultsVersion"
+    static let indexedRootDefaultsVersionKey = "ATTIndexedRootDefaultsVersion"
     static let globalSearchHotKeyDidChangeNotification = Notification.Name("com.allthethings.settings.globalSearchHotKeyDidChange")
     static let globalAppSearchHotKeyDidChangeNotification = Notification.Name("com.allthethings.settings.globalAppSearchHotKeyDidChange")
     static let menuBarIconDidChangeNotification = Notification.Name("com.allthethings.settings.menuBarIconDidChange")
@@ -68,6 +69,7 @@ enum AppSettings {
     static let exclusionPatternsDidChangeNotification = Notification.Name("com.allthethings.settings.exclusionPatternsDidChange")
 
     private static let currentExclusionDefaultsVersion = 10
+    private static let currentIndexedRootDefaultsVersion = 2
     private static let versionOneDefaultExclusionPatterns = [
         "node_modules/",
         "DerivedData/",
@@ -146,6 +148,7 @@ enum AppSettings {
             darkMatchColorsKey: defaultMatchColorHexes(isDark: true),
             exclusionPatternsKey: FileExclusionRules.defaultPatterns
         ])
+        migrateIndexedRootDefaults(defaults)
         migrateExclusionDefaults(defaults)
     }
 
@@ -473,14 +476,18 @@ enum AppSettings {
 
     static func suggestedDefaultAppSearchRoots() -> [URL] {
         let fileManager = FileManager.default
-        let home = fileManager.homeDirectoryForCurrentUser
-        let candidates = [
+        let candidates = defaultAppSearchRootCandidates()
+
+        return uniqueRoots(candidates.filter { fileManager.fileExists(atPath: $0.path) })
+    }
+
+    private static func defaultAppSearchRootCandidates() -> [URL] {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        return [
             URL(fileURLWithPath: "/Applications", isDirectory: true),
             URL(fileURLWithPath: "/System/Applications", isDirectory: true),
             home.appendingPathComponent("Applications", isDirectory: true)
         ]
-
-        return uniqueRoots(candidates.filter { fileManager.fileExists(atPath: $0.path) })
     }
 
     private static func savedIndexedRootURLs(defaults: UserDefaults) -> [URL] {
@@ -505,6 +512,32 @@ enum AppSettings {
         }
 
         return unique
+    }
+
+    private static func migrateIndexedRootDefaults(_ defaults: UserDefaults) {
+        let currentVersion = defaults.integer(forKey: indexedRootDefaultsVersionKey)
+        guard currentVersion < currentIndexedRootDefaultsVersion else { return }
+        defer {
+            defaults.set(currentIndexedRootDefaultsVersion, forKey: indexedRootDefaultsVersionKey)
+            defaults.synchronize()
+        }
+
+        guard
+            let rawPaths = defaults.array(forKey: indexedRootsKey) as? [String],
+            !rawPaths.isEmpty
+        else {
+            return
+        }
+
+        let savedRoots = uniqueRoots(rawPaths.map { URL(fileURLWithPath: $0, isDirectory: true) })
+        let appRootPaths = Set(defaultAppSearchRootCandidates().map(\.standardizedFileURL.path))
+        let filteredRoots = savedRoots.filter { !appRootPaths.contains($0.standardizedFileURL.path) }
+        guard filteredRoots.count != savedRoots.count else { return }
+
+        let defaultIndexedPaths = suggestedDefaultIndexedRoots().map(\.standardizedFileURL.path)
+        guard filteredRoots.map(\.standardizedFileURL.path) == defaultIndexedPaths else { return }
+
+        defaults.set(defaultIndexedPaths, forKey: indexedRootsKey)
     }
 
     private static func migrateExclusionDefaults(_ defaults: UserDefaults) {
