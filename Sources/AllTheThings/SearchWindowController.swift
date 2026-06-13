@@ -349,6 +349,29 @@ enum SearchRunReconciliation {
     }
 }
 
+enum SearchPreviewScheduling {
+    nonisolated static func skipReason(
+        appSearchActive: Bool,
+        trimmedQuery: String,
+        sortColumn: SortColumn,
+        signatureAlreadyDisplayed: Bool
+    ) -> String? {
+        if appSearchActive {
+            return "applicationSearch"
+        }
+        if trimmedQuery.isEmpty {
+            return "emptyQuery"
+        }
+        if sortColumn != .relevance && sortColumn != .name && sortColumn != .modified {
+            return "unsupportedSort"
+        }
+        if signatureAlreadyDisplayed {
+            return "alreadyDisplayed"
+        }
+        return nil
+    }
+}
+
 @MainActor
 enum ExpandedMascotLayout {
     struct Target: Equatable {
@@ -2624,18 +2647,12 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let index = self.index
         let budgetTimeout = SearchBudgetTimeout()
         let trimmedQuery = request.query.trimmingCharacters(in: .whitespacesAndNewlines)
-        let previewSkipReason: String?
-        if appSearchQuery != nil {
-            previewSkipReason = "applicationSearch"
-        } else if trimmedQuery.isEmpty {
-            previewSkipReason = "emptyQuery"
-        } else if request.sort.column != .name && request.sort.column != .modified {
-            previewSkipReason = "unsupportedSort"
-        } else if signature == displayedSearchSignature {
-            previewSkipReason = "alreadyDisplayed"
-        } else {
-            previewSkipReason = nil
-        }
+        let previewSkipReason = SearchPreviewScheduling.skipReason(
+            appSearchActive: appSearchQuery != nil,
+            trimmedQuery: trimmedQuery,
+            sortColumn: request.sort.column,
+            signatureAlreadyDisplayed: signature == displayedSearchSignature
+        )
         let shouldRunPreviewSearch = previewSkipReason == nil
         let previewRequest = SearchRequest(
             query: request.query,
