@@ -3310,6 +3310,18 @@ public final class FileIndex: @unchecked Sendable {
                 return finish(fastResponse)
             }
 
+            if let fastResponse = Self.fastRelevanceInteractivePreviewSearch(
+                snapshot: snapshot,
+                request: request,
+                parsedQuery: parsedQuery,
+                maxResults: boundedMaxResults,
+                started: started,
+                snapshotRevision: snapshotRevision,
+                shouldCancel: shouldCancel
+            ) {
+                return finish(fastResponse)
+            }
+
             if let fastResponse = Self.fastNameInteractivePreviewSearch(
                 snapshot: snapshot,
                 request: request,
@@ -3803,6 +3815,216 @@ public final class FileIndex: @unchecked Sendable {
                 elapsed: elapsed
             )
         )
+    }
+
+    private static func fastRelevanceInteractivePreviewSearch(
+        snapshot: SearchSnapshot,
+        request: SearchRequest,
+        parsedQuery: FuzzyMatcher.ParsedQuery,
+        maxResults: Int,
+        started: Date,
+        snapshotRevision: UInt64,
+        shouldCancel: @Sendable () -> Bool
+    ) -> SearchResponse? {
+        guard
+            request.mode == .interactivePreview,
+            request.sort.column == .relevance,
+            maxResults > 0,
+            parsedQuery.negative.isEmpty,
+            parsedQuery.positive.count == 1,
+            let clause = parsedQuery.positive.first,
+            clause.alternatives.count == 1,
+            let part = clause.alternatives.first,
+            case .text(let field, let pattern, let mode) = part,
+            field != .path,
+            mode == .fuzzy || mode == .exact,
+            !pattern.token.isEmpty,
+            !tokenContainsPathSeparator(pattern.token)
+        else {
+            return nil
+        }
+
+        let weakPathCeiling = indexedQualityCode(MatchQuality(matchClass: .weakPath, scoreBin: 4))
+        var heap: [RelevancePreviewCandidate] = []
+        heap.reserveCapacity(maxResults)
+        var totalNameMatches = 0
+        var scannedRows = 0
+
+        func precedes(_ lhs: RelevancePreviewCandidate, _ rhs: RelevancePreviewCandidate) -> Bool {
+            if lhs.qualityCode != rhs.qualityCode {
+                return lhs.qualityCode > rhs.qualityCode
+            }
+            if lhs.normalizedName != rhs.normalizedName {
+                return lhs.normalizedName < rhs.normalizedName
+            }
+            return lhs.path < rhs.path
+        }
+
+        func isWorse(_ lhs: RelevancePreviewCandidate, than rhs: RelevancePreviewCandidate) -> Bool {
+            precedes(rhs, lhs)
+        }
+
+        func siftUp(_ startIndex: Int) {
+            var child = startIndex
+            while child > 0 {
+                let parent = (child - 1) / 2
+                guard isWorse(heap[child], than: heap[parent]) else { break }
+                heap.swapAt(child, parent)
+                child = parent
+            }
+        }
+
+        func siftDown(_ startIndex: Int) {
+            var parent = startIndex
+            while true {
+                let left = parent * 2 + 1
+                let right = left + 1
+                var candidate = parent
+
+                if left < heap.count, isWorse(heap[left], than: heap[candidate]) {
+                    candidate = left
+                }
+                if right < heap.count, isWorse(heap[right], than: heap[candidate]) {
+                    candidate = right
+                }
+                guard candidate != parent else { break }
+                heap.swapAt(parent, candidate)
+                parent = candidate
+            }
+        }
+
+        func appendToHeap(_ candidate: RelevancePreviewCandidate) {
+            if heap.count < maxResults {
+                heap.append(candidate)
+                siftUp(heap.count - 1)
+            } else if let worst = heap.first, precedes(candidate, worst) {
+                heap[0] = candidate
+                siftDown(0)
+            }
+        }
+
+        func makeCandidate(rowID: Int, explanation: MatchExplanation) -> RelevancePreviewCandidate {
+            RelevancePreviewCandidate(
+                rowID: rowID,
+                qualityCode: indexedQualityCode(explanation.quality),
+                normalizedName: snapshot.store.normalizedName(at: rowID),
+                path: snapshot.store.path(at: rowID),
+                match: explanation
+            )
+        }
+
+        func response(candidateCount: Int, indexesUsed: Set<SearchIndexUse>) -> SearchResponse {
+            let matches = heap.sorted(by: precedes).map {
+                SearchMatch(rowID: $0.rowID, score: $0.match.score, match: $0.match)
+            }
+            let elapsed = Date().timeIntervalSince(started)
+            var indexesUsed = indexesUsed
+            if !request.includeHidden {
+                indexesUsed.insert(.visibleBitset)
+            }
+            return SearchResponse(
+                results: materialize(matches, from: snapshot),
+                totalMatches: max(totalNameMatches, matches.count),
+                elapsed: elapsed,
+                snapshotRevision: snapshotRevision,
+                usesIndexedCandidates: true,
+                executionProfile: SearchExecutionProfile(
+                    executionPath: .optimizedSortedFastPath,
+                    indexesUsed: indexesUsed,
+                    candidateCount: candidateCount,
+                    scannedRowCount: scannedRows,
+                    elapsed: elapsed
+                )
+            )
+        }
+
+        if snapshot.hasSortedOrder, !snapshot.nameAscending.isEmpty {
+            let lowerBound = lowerBoundName(in: snapshot.nameAscending, snapshot: snapshot, key: pattern.token)
+            var cursor = lowerBound
+            while cursor < snapshot.nameAscending.count {
+                if cursor.isMultiple(of: 512), shouldCancel() {
+                    return nil
+                }
+
+                let rowID = snapshot.nameAscending[cursor]
+                let normalizedName = snapshot.store.normalizedName(at: rowID)
+                guard normalizedName.hasPrefix(pattern.token) else { break }
+
+                let groupName = normalizedName
+                var group: [RelevancePreviewCandidate] = []
+                while cursor < snapshot.nameAscending.count {
+                    let groupRowID = snapshot.nameAscending[cursor]
+                    guard snapshot.store.normalizedName(at: groupRowID) == groupName else { break }
+                    cursor += 1
+                    scannedRows += 1
+                    guard groupRowID >= 0, groupRowID < snapshot.count else { continue }
+                    guard snapshot.store.isResultRow(at: groupRowID) else { continue }
+                    guard request.includeHidden || snapshot.isVisible(at: groupRowID) else { continue }
+                    guard let explanation = cheapLiteralNameExplanation(
+                        snapshot: snapshot,
+                        rowID: groupRowID,
+                        token: pattern.token,
+                        mode: mode
+                    ) else {
+                        continue
+                    }
+
+                    let candidate = makeCandidate(rowID: groupRowID, explanation: explanation)
+                    guard candidate.qualityCode > weakPathCeiling else { continue }
+                    totalNameMatches += 1
+                    group.append(candidate)
+                }
+
+                group.sort(by: precedes)
+                for candidate in group {
+                    appendToHeap(candidate)
+                }
+
+                if heap.count == maxResults {
+                    guard !shouldCancel() else { return nil }
+                    return response(candidateCount: scannedRows, indexesUsed: [.nameGrams])
+                }
+            }
+        }
+
+        let tokenBytes = Array(pattern.token.utf8)
+        guard let nameCandidates = snapshot.candidateNameIndices(containing: tokenBytes), !nameCandidates.isEmpty else {
+            return nil
+        }
+
+        for (offset, candidate) in nameCandidates.enumerated() {
+            if offset.isMultiple(of: 512), shouldCancel() {
+                return nil
+            }
+
+            let rowID = Int(candidate)
+            guard rowID >= 0, rowID < snapshot.count else { continue }
+            scannedRows += 1
+            guard snapshot.store.isResultRow(at: rowID) else { continue }
+            guard request.includeHidden || snapshot.isVisible(at: rowID) else { continue }
+            guard let explanation = cheapLiteralNameExplanation(
+                snapshot: snapshot,
+                rowID: rowID,
+                token: pattern.token,
+                mode: mode
+            ) else {
+                continue
+            }
+
+            let qualityCode = indexedQualityCode(explanation.quality)
+            guard qualityCode > weakPathCeiling else { continue }
+            guard !snapshot.store.normalizedName(at: rowID).hasPrefix(pattern.token) else { continue }
+
+            totalNameMatches += 1
+            appendToHeap(makeCandidate(rowID: rowID, explanation: explanation))
+        }
+
+        guard heap.count == maxResults else {
+            return nil
+        }
+
+        guard !shouldCancel() else { return nil }
+        return response(candidateCount: nameCandidates.count, indexesUsed: [.nameGrams])
     }
 
     private static func fastNameInteractivePreviewSearch(
@@ -4816,6 +5038,14 @@ public final class FileIndex: @unchecked Sendable {
         let normalizedName: String
         let path: String
         let match: MatchExplanation?
+    }
+
+    private struct RelevancePreviewCandidate {
+        let rowID: Int
+        let qualityCode: UInt8
+        let normalizedName: String
+        let path: String
+        let match: MatchExplanation
     }
 
     private static func nameSortedPathSubstringMatches(

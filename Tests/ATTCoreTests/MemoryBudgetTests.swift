@@ -576,6 +576,57 @@ struct MemoryBudgetTests {
         #expect(response.executionProfile.scannedRowCount <= 25)
     }
 
+    @Test("large mapped relevance previews return ranked name matches without path postings")
+    func largeMappedRelevancePreviewsReturnRankedNameMatchesWithoutPathPostings() {
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let recordCount = 30_000
+        let directoryPadding = String(repeating: "x", count: 900)
+        let records = (0..<recordCount).map { index in
+            makeRecord(
+                path: "/tmp/allthethings-memory/\(directoryPadding)project-\(index % 256)/test-\(String(format: "%06d", index)).swift",
+                modifiedTime: TimeInterval(recordCount - index)
+            )
+        }
+
+        let index = FileIndex(
+            applicationName: applicationName,
+            loadsSnapshotImmediately: false
+        )
+        defer {
+            try? FileManager.default.removeItem(at: index.dataDirectoryURL)
+        }
+        index.replaceRecordsForTesting(records)
+        #expect(!index.currentDiagnostics().pathGramIndexEnabled)
+        index.persistSnapshotForTesting()
+
+        let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
+        let diagnostics = reloaded.currentDiagnostics()
+        #expect(diagnostics.recordStoreKind == .mapped)
+        #expect(!diagnostics.pathGramIndexEnabled)
+        #expect(diagnostics.nameGramPostingCount > 0)
+
+        let response = reloaded.search(SearchRequest(
+            query: "test",
+            sort: SortSpec(column: .relevance, ascending: false),
+            includeHidden: false,
+            mode: .interactivePreview
+        ), maxResults: 25)
+
+        let expectedNames = (0..<25).map { index in
+            String(format: "test-%06d.swift", index)
+        }
+        #expect(response.results.map(\.record.name) == expectedNames)
+        #expect(response.totalMatches == 25)
+        #expect(response.results.count == 25)
+        #expect(response.usesIndexedCandidates)
+        #expect(response.executionProfile.executionPath == .optimizedSortedFastPath)
+        #expect(response.executionProfile.indexesUsed.contains(.nameGrams))
+        #expect(!response.executionProfile.indexesUsed.contains(.pathGrams))
+        #expect(!response.executionProfile.didFallbackToFullScan)
+        #expect(response.executionProfile.candidateCount == 25)
+        #expect(response.executionProfile.scannedRowCount == 25)
+    }
+
     @Test("large modified previews do not fall back while waiting for name postings")
     func largeModifiedPreviewsDoNotFallBackWhileWaitingForNamePostings() {
         let recordCount = 40_000

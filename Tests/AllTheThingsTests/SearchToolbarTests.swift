@@ -233,6 +233,34 @@ struct SearchToolbarTests {
         #expect(!SearchRunReconciliation.previewApplicationCompletesSearch(fullSearchAlreadyFinished: false))
     }
 
+    @Test("search preview scheduling includes relevance sort")
+    func searchPreviewSchedulingIncludesRelevanceSort() {
+        #expect(SearchPreviewScheduling.skipReason(
+            appSearchActive: false,
+            trimmedQuery: "test",
+            sortColumn: .relevance,
+            signatureAlreadyDisplayed: false
+        ) == nil)
+        #expect(SearchPreviewScheduling.skipReason(
+            appSearchActive: false,
+            trimmedQuery: "test",
+            sortColumn: .name,
+            signatureAlreadyDisplayed: false
+        ) == nil)
+        #expect(SearchPreviewScheduling.skipReason(
+            appSearchActive: false,
+            trimmedQuery: "test",
+            sortColumn: .modified,
+            signatureAlreadyDisplayed: false
+        ) == nil)
+        #expect(SearchPreviewScheduling.skipReason(
+            appSearchActive: false,
+            trimmedQuery: "test",
+            sortColumn: .path,
+            signatureAlreadyDisplayed: false
+        ) == "unsupportedSort")
+    }
+
     @Test("search run reconciliation rejects stale responses")
     func searchRunReconciliationRejectsStaleResponses() {
         #expect(SearchRunReconciliation.canApplyResponse(generationMatches: true, tokenMatches: true))
