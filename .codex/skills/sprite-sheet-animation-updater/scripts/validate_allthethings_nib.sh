@@ -20,6 +20,7 @@ STRIPS = {
     "NibOperationIdleStrip.png": 8,
     "NibOperationIndexingStrip.png": 16,
     "NibOperationSearchingStrip.png": 16,
+    "NibOperationSearchRefiningStrip.png": 16,
     "NibOperationOptimizingStrip.png": 16,
     "NibOperationFileChangedStrip.png": 6,
     "NibOperationSuccessStrip.png": 8,

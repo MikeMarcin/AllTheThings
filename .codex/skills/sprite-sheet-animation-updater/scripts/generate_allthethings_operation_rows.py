@@ -2,7 +2,7 @@
 """Regenerate AllTheThings Nib operation animations and standalone strips.
 
 This script keeps Nib's approved idle/fidget bodies on model and redraws the
-searching/indexing/optimizing props as longer, smoother loops inside the fixed cell grid.
+searching/refining/indexing/optimizing props as longer, smoother loops inside the fixed cell grid.
 It also builds the first-run standalone welcome and flydown strips from those
 same approved body frames plus deterministic overlays. A contact sheet of every
 animation is written for audit only; app code loads the individual strips.
@@ -23,6 +23,7 @@ OPERATION_STRIPS = {
     "idle": "NibOperationIdleStrip",
     "indexing": "NibOperationIndexingStrip",
     "searching": "NibOperationSearchingStrip",
+    "search_refining": "NibOperationSearchRefiningStrip",
     "optimizing": "NibOperationOptimizingStrip",
     "file_changed": "NibOperationFileChangedStrip",
     "success": "NibOperationSuccessStrip",
@@ -39,7 +40,7 @@ STANDALONE_STRIPS = {
     "intro_welcome": "NibIntroWelcomeStrip",
     "flydown": "NibFlydownStrip",
 }
-PAPER_HEAVY_PREVIEW_NAMES = {"indexing", "intro-welcome", "flydown"}
+PAPER_HEAVY_PREVIEW_NAMES = {"indexing", "search_refining", "intro-welcome", "flydown"}
 SCALE = 4
 INTRO_FRAME_COUNT = 32
 FLYDOWN_FRAME_COUNT = 10
@@ -402,6 +403,103 @@ def draw_searching_frame(strips: dict[str, list[Image.Image]], frame_index: int,
     draw_sparkle(canvas, (92, 41), (phase + 0.58) % 1.0, max_radius=2)
     if frame_index in (5, 6, 13, 14):
         draw_motion_lines(canvas, "right", 0.32)
+
+    return canvas
+
+
+def draw_refining_results_card(canvas: Image.Image, phase: float) -> None:
+    overlay = Image.new("RGBA", (CELL_WIDTH * SCALE, CELL_HEIGHT * SCALE), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    x0 = 121 * SCALE
+    y0 = int((40 + sin(phase * 2 * pi) * 0.6) * SCALE)
+    width = 27 * SCALE
+    height = 32 * SCALE
+    radius = 4 * SCALE
+
+    shadow = Image.new("RGBA", overlay.size, (0, 0, 0, 0))
+    shadow_draw = ImageDraw.Draw(shadow)
+    shadow_draw.rounded_rectangle(
+        [x0 + 2 * SCALE, y0 + 2 * SCALE, x0 + width + 2 * SCALE, y0 + height + 2 * SCALE],
+        radius=radius,
+        fill=(0, 0, 0, 42),
+    )
+    overlay.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(0.9 * SCALE)))
+
+    draw.rounded_rectangle(
+        [x0, y0, x0 + width, y0 + height],
+        radius=radius,
+        fill=(248, 250, 252, 255),
+        outline=(178, 178, 176, 235),
+        width=SCALE,
+    )
+
+    for row in range(3):
+        row_y = y0 + (8 + row * 8) * SCALE
+        pulse = smoothstep(1 - abs(((phase * 3) % 3) - row))
+        strength = 0.45 + 0.35 * pulse
+        bullet_fill = (99, 164, 222, int(105 + 95 * strength))
+        line_fill = (132, 166, 188, int(92 + 76 * strength))
+        draw.ellipse(
+            [x0 + 6 * SCALE, row_y - 1.5 * SCALE, x0 + 9 * SCALE, row_y + 1.5 * SCALE],
+            fill=bullet_fill,
+        )
+        draw.rounded_rectangle(
+            [x0 + 12 * SCALE, row_y - SCALE, x0 + (24 - (row % 2) * 3) * SCALE, row_y + SCALE],
+            radius=SCALE,
+            fill=line_fill,
+        )
+
+    canvas.alpha_composite(overlay.resize((CELL_WIDTH, CELL_HEIGHT), Image.Resampling.LANCZOS))
+
+
+def draw_filter_funnel(canvas: Image.Image, center: tuple[float, float], phase: float, alpha: float) -> None:
+    if alpha <= 0.03:
+        return
+
+    overlay = Image.new("RGBA", (CELL_WIDTH * SCALE, CELL_HEIGHT * SCALE), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    cx = center[0] * SCALE
+    cy = center[1] * SCALE
+    wobble = sin(phase * 2 * pi) * 0.6 * SCALE
+    opacity = int(178 * alpha)
+    shadow_opacity = int(44 * alpha)
+
+    points = [
+        (cx - 10 * SCALE + wobble, cy - 7 * SCALE),
+        (cx + 10 * SCALE + wobble, cy - 7 * SCALE),
+        (cx + 4 * SCALE + wobble, cy + 1 * SCALE),
+        (cx + 2 * SCALE + wobble, cy + 8 * SCALE),
+        (cx - 2 * SCALE + wobble, cy + 8 * SCALE),
+        (cx - 4 * SCALE + wobble, cy + 1 * SCALE),
+    ]
+    shadow_points = [(x + 1.4 * SCALE, y + 1.8 * SCALE) for x, y in points]
+    draw.polygon(shadow_points, fill=(0, 0, 0, shadow_opacity))
+    draw.polygon(points, fill=(184, 196, 203, opacity), outline=(111, 126, 137, opacity))
+    draw.line(
+        [(cx - 8 * SCALE + wobble, cy - 4 * SCALE), (cx + 8 * SCALE + wobble, cy - 4 * SCALE)],
+        fill=(236, 247, 255, int(105 * alpha)),
+        width=SCALE,
+    )
+
+    canvas.alpha_composite(overlay.resize((CELL_WIDTH, CELL_HEIGHT), Image.Resampling.LANCZOS))
+
+
+def draw_search_refining_frame(strips: dict[str, list[Image.Image]], frame_index: int, frame_count: int) -> Image.Image:
+    canvas = Image.new("RGBA", (CELL_WIDTH, CELL_HEIGHT), (0, 0, 0, 0))
+    phase = frame_index / frame_count
+    theta = phase * 2 * pi
+
+    paste_alpha(canvas, strips["idle"][0], (0, 0))
+    draw_refining_results_card(canvas, phase)
+
+    funnel_alpha = smoothstep(min(phase / 0.18, max(0.0, (0.82 - phase) / 0.18)))
+    draw_filter_funnel(
+        canvas,
+        (129 + 1.0 * sin(theta), 31 + 2.8 * smoothstep((phase + 0.15) % 1.0)),
+        phase,
+        funnel_alpha * 0.72,
+    )
 
     return canvas
 
@@ -769,6 +867,7 @@ def generate(repo_root: Path, frame_count: int, write_artifacts: bool) -> None:
         "idle": load_strip(resources / "NibOperationIdleStrip.png"),
         "indexing": [draw_indexing_frame(strips, index, frame_count) for index in range(frame_count)],
         "searching": [draw_searching_frame(strips, index, frame_count) for index in range(frame_count)],
+        "search_refining": [draw_search_refining_frame(strips, index, frame_count) for index in range(frame_count)],
         "optimizing": [draw_optimizing_frame(strips, index, frame_count) for index in range(frame_count)],
         "file_changed": load_strip(resources / "NibOperationFileChangedStrip.png"),
         "success": load_strip(resources / "NibOperationSuccessStrip.png"),

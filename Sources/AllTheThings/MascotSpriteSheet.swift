@@ -5,6 +5,7 @@ enum OperationMascotAnimation: String, CaseIterable {
     case idle
     case indexing
     case searching
+    case searchRefining
     case optimizing
     case updating
     case fileChanged
@@ -16,6 +17,7 @@ enum OperationMascotAnimation: String, CaseIterable {
         case .idle: "NibOperationIdleStrip"
         case .indexing: "NibOperationIndexingStrip"
         case .searching: "NibOperationSearchingStrip"
+        case .searchRefining: "NibOperationSearchRefiningStrip"
         case .optimizing: "NibOperationOptimizingStrip"
         case .updating: "NibOperationFileChangedStrip"
         case .fileChanged: "NibOperationFileChangedStrip"
@@ -29,6 +31,7 @@ enum OperationMascotAnimation: String, CaseIterable {
         case .idle: 8
         case .indexing: 16
         case .searching: 16
+        case .searchRefining: 16
         case .optimizing: 16
         case .updating: 6
         case .fileChanged: 6
@@ -42,6 +45,7 @@ enum OperationMascotAnimation: String, CaseIterable {
         case .idle: 4
         case .indexing: 5
         case .searching: 8
+        case .searchRefining: 8
         case .optimizing: 5
         case .updating: 6
         case .fileChanged: 6
@@ -52,7 +56,7 @@ enum OperationMascotAnimation: String, CaseIterable {
 
     var loops: Bool {
         switch self {
-        case .idle, .indexing, .searching, .optimizing, .updating:
+        case .idle, .indexing, .searching, .searchRefining, .optimizing, .updating:
             true
         case .fileChanged, .success, .error:
             false
@@ -64,6 +68,7 @@ enum OperationMascotAnimation: String, CaseIterable {
         case .idle: "Idle"
         case .indexing: "Indexing files"
         case .searching: "Searching files"
+        case .searchRefining: "Refining search results"
         case .optimizing: "Optimizing files"
         case .updating: "Updating changed paths"
         case .fileChanged: "File changed"
@@ -76,7 +81,7 @@ enum OperationMascotAnimation: String, CaseIterable {
         switch self {
         case .idle:
             0
-        case .searching, .updating, .fileChanged, .success, .error:
+        case .searching, .searchRefining, .updating, .fileChanged, .success, .error:
             1
         case .indexing, .optimizing:
             2
@@ -839,7 +844,7 @@ final class OperationMascotCoordinator {
             amplitude = 0.6
             duration = 2.8
             tilt = 0.004
-        case .indexing, .searching, .optimizing:
+        case .indexing, .searching, .searchRefining, .optimizing:
             amplitude = 2.4
             duration = 1.15
             tilt = 0.025

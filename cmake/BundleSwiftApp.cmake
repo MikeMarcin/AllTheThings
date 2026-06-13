@@ -72,6 +72,7 @@ set(APP_RESOURCE_FILES
     "NibOperationIdleStrip.png"
     "NibOperationIndexingStrip.png"
     "NibOperationSearchingStrip.png"
+    "NibOperationSearchRefiningStrip.png"
     "NibOperationOptimizingStrip.png"
     "NibOperationFileChangedStrip.png"
     "NibOperationSuccessStrip.png"
