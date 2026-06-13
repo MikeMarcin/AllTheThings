@@ -1093,6 +1093,61 @@ struct FileIndexTests {
         #expect(response.results.map(\.record.name) == ["Alpha.swift", "Beta.swift"])
     }
 
+    @Test("empty query name sort returns first page without walking full ordered snapshot")
+    func emptyQueryNameSortReturnsFirstPageWithoutWalkingFullOrderedSnapshot() {
+        let records = (0..<2_500).reversed().map { index in
+            makeRecord(path: String(format: "/tmp/att-empty-name-sort/File%04d.txt", index))
+        }
+        let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)", loadsSnapshotImmediately: false)
+        defer {
+            try? FileManager.default.removeItem(at: index.dataDirectoryURL)
+        }
+        index.replaceRecordsForTesting(records)
+
+        let response = index.search(SearchRequest(
+            query: "",
+            sort: SortSpec(column: .name, ascending: true)
+        ), maxResults: 10)
+
+        #expect(response.totalMatches == records.count)
+        #expect(response.results.map(\.record.name) == (0..<10).map { String(format: "File%04d.txt", $0) })
+        #expect(response.executionProfile.executionPath == .emptyQuerySortedOrder)
+        #expect(response.executionProfile.scannedRowCount <= 10)
+    }
+
+    @Test("empty query name sort promotes ready unsorted snapshots")
+    func emptyQueryNameSortPromotesReadyUnsortedSnapshots() {
+        let recordCount = 100_050
+        let records = (0..<recordCount).reversed().map { index in
+            makeRecord(path: String(format: "/tmp/att-empty-unsorted-name-sort/File%06d.txt", index))
+        }
+        let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)", loadsSnapshotImmediately: false)
+        defer {
+            try? FileManager.default.removeItem(at: index.dataDirectoryURL)
+        }
+        index.replaceRecordsForTesting(records, buildsSearchStructures: false, phase: .ready)
+
+        let firstResponse = index.search(SearchRequest(
+            query: "",
+            sort: SortSpec(column: .name, ascending: true),
+            includeHidden: false
+        ), maxResults: 10)
+        let secondResponse = index.search(SearchRequest(
+            query: "",
+            sort: SortSpec(column: .name, ascending: true),
+            includeHidden: false
+        ), maxResults: 10)
+
+        let expectedNames = (0..<10).map { String(format: "File%06d.txt", $0) }
+        #expect(firstResponse.totalMatches == recordCount)
+        #expect(firstResponse.results.map(\.record.name) == expectedNames)
+        #expect(firstResponse.executionProfile.executionPath == .emptyQuerySortedOrder)
+        #expect(firstResponse.executionProfile.scannedRowCount <= 10)
+        #expect(secondResponse.totalMatches == recordCount)
+        #expect(secondResponse.results.map(\.record.name) == expectedNames)
+        #expect(secondResponse.executionProfile.scannedRowCount <= 10)
+    }
+
     @Test("search can hide hidden files")
     func searchCanHideHiddenFiles() async throws {
         let fileManager = FileManager.default
