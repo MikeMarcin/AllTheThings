@@ -654,7 +654,6 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private enum SearchScheduling {
-        static let interactivePreviewSearchBudget: TimeInterval = 0.75
         static let unoptimizedIndexingSearchBudget: TimeInterval = 0.75
     }
 
@@ -2592,85 +2591,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let appSearchRoots = appSearchQuery == nil ? [] : AppSettings.appSearchRoots(defaults: defaults)
         let applicationSearchCatalog = self.applicationSearchCatalog
 
-        let enqueueFullSearch: @Sendable () -> Void = {
-            self.searchQueue.async {
-                guard !token.isCancelled else {
-                    DispatchQueue.main.async { [weak self] in
-                        self?.clearSearchTokenIfCurrent(token)
-                    }
-                    return
-                }
-
-                let fullSearchStartedAt = Date()
-                let shouldCancelSearch: @Sendable () -> Bool = {
-                    if token.isCancelled {
-                        return true
-                    }
-                    if
-                        appSearchQuery == nil,
-                        Self.shouldBudgetSearchDuringIndexing(request: request, stats: index.currentStats()),
-                        Date().timeIntervalSince(fullSearchStartedAt) >= SearchScheduling.unoptimizedIndexingSearchBudget
-                    {
-                        budgetTimeout.markTimedOut()
-                        return true
-                    }
-                    return false
-                }
-                let response = appSearchQuery.map { appQuery in
-                    applicationSearchCatalog.search(
-                        queryText: appQuery.searchText,
-                        roots: appSearchRoots,
-                        sort: request.sort,
-                        shouldCancel: shouldCancelSearch
-                    )
-                } ?? index.search(request, shouldCancel: shouldCancelSearch)
-
-                guard let response else {
-                    DispatchQueue.main.async { [weak self] in
-                        guard let self else { return }
-                        self.clearSearchTokenIfCurrent(token)
-                        if budgetTimeout.didTimeOut, !self.shouldBudgetSearchDuringIndexing(request: request) {
-                            self.scheduleSearch(force: true)
-                        }
-                    }
-                    return
-                }
-
-                DispatchQueue.main.async { [weak self] in
-                    guard let self, self.queryGeneration == generation, self.activeSearchToken === token else { return }
-                    self.applySearchResponse(
-                        response,
-                        signature: signature,
-                        token: token,
-                        searchStartedAt: searchStartedAt,
-                        isFinal: true
-                    )
-                    if
-                        response.usesIndexedCandidates,
-                        let responseRevision = response.snapshotRevision,
-                        responseRevision < self.indexStats.snapshotRevision,
-                        signature == self.scheduledSearchSignature
-                    {
-                        self.scheduleSearch(force: true)
-                    }
-                }
-            }
-        }
-
         if shouldRunPreviewSearch {
-            searchPreviewQueue.async {
+            searchPreviewQueue.async { [weak self] in
                 guard !token.isCancelled else { return }
-                let previewStartedAt = Date()
-                let previewResponse = index.search(previewRequest, shouldCancel: {
-                    if token.isCancelled {
-                        return true
-                    }
-                    return Date().timeIntervalSince(previewStartedAt) >= SearchScheduling.interactivePreviewSearchBudget
-                })
-
-                guard !token.isCancelled else { return }
-                guard let previewResponse else {
-                    enqueueFullSearch()
+                guard let previewResponse = index.search(previewRequest, shouldCancel: { token.isCancelled }) else {
                     return
                 }
 
@@ -2689,11 +2613,71 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                         searchStartedAt: searchStartedAt,
                         isFinal: false
                     )
-                    enqueueFullSearch()
                 }
             }
-        } else {
-            enqueueFullSearch()
+        }
+
+        searchQueue.async {
+            guard !token.isCancelled else {
+                DispatchQueue.main.async { [weak self] in
+                    self?.clearSearchTokenIfCurrent(token)
+                }
+                return
+            }
+
+            let fullSearchStartedAt = Date()
+            let shouldCancelSearch: @Sendable () -> Bool = {
+                if token.isCancelled {
+                    return true
+                }
+                if
+                    appSearchQuery == nil,
+                    Self.shouldBudgetSearchDuringIndexing(request: request, stats: index.currentStats()),
+                    Date().timeIntervalSince(fullSearchStartedAt) >= SearchScheduling.unoptimizedIndexingSearchBudget
+                {
+                    budgetTimeout.markTimedOut()
+                    return true
+                }
+                return false
+            }
+            let response = appSearchQuery.map { appQuery in
+                applicationSearchCatalog.search(
+                    queryText: appQuery.searchText,
+                    roots: appSearchRoots,
+                    sort: request.sort,
+                    shouldCancel: shouldCancelSearch
+                )
+            } ?? index.search(request, shouldCancel: shouldCancelSearch)
+
+            guard let response else {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.clearSearchTokenIfCurrent(token)
+                    if budgetTimeout.didTimeOut, !self.shouldBudgetSearchDuringIndexing(request: request) {
+                        self.scheduleSearch(force: true)
+                    }
+                }
+                return
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.queryGeneration == generation, self.activeSearchToken === token else { return }
+                self.applySearchResponse(
+                    response,
+                    signature: signature,
+                    token: token,
+                    searchStartedAt: searchStartedAt,
+                    isFinal: true
+                )
+                if
+                    response.usesIndexedCandidates,
+                    let responseRevision = response.snapshotRevision,
+                    responseRevision < self.indexStats.snapshotRevision,
+                    signature == self.scheduledSearchSignature
+                {
+                    self.scheduleSearch(force: true)
+                }
+            }
         }
     }
 
