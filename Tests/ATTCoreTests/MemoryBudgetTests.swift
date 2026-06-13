@@ -496,6 +496,17 @@ struct MemoryBudgetTests {
         #expect(diagnostics.optimizedCount == records.count)
         #expect(!diagnostics.pathGramIndexEnabled)
 
+        let modifiedPreview = index.search(SearchRequest(
+            query: "File",
+            sort: SortSpec(column: .modified, ascending: false),
+            mode: .interactivePreview
+        ), maxResults: 25)
+        #expect(modifiedPreview.totalMatches == 25)
+        #expect(modifiedPreview.results.count == 25)
+        #expect(modifiedPreview.results.first?.record.name == "File119999.swift")
+        #expect(modifiedPreview.results.last?.record.name == "File119975.swift")
+        #expect(modifiedPreview.executionProfile.scannedRowCount <= 25)
+
         let ascending = index.search(SearchRequest(
             query: "",
             sort: SortSpec(column: .name, ascending: true)
