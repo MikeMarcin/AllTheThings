@@ -3310,6 +3310,18 @@ public final class FileIndex: @unchecked Sendable {
                 return finish(fastResponse)
             }
 
+            if let fastResponse = Self.fastNameInteractivePreviewSearch(
+                snapshot: snapshot,
+                request: request,
+                parsedQuery: parsedQuery,
+                maxResults: boundedMaxResults,
+                started: started,
+                snapshotRevision: snapshotRevision,
+                shouldCancel: shouldCancel
+            ) {
+                return finish(fastResponse)
+            }
+
             if let fastResponse = Self.fastComponentNameSortedSearch(
                 snapshot: snapshot,
                 request: request,
@@ -3791,6 +3803,171 @@ public final class FileIndex: @unchecked Sendable {
                 elapsed: elapsed
             )
         )
+    }
+
+    private static func fastNameInteractivePreviewSearch(
+        snapshot: SearchSnapshot,
+        request: SearchRequest,
+        parsedQuery: FuzzyMatcher.ParsedQuery,
+        maxResults: Int,
+        started: Date,
+        snapshotRevision: UInt64,
+        shouldCancel: @Sendable () -> Bool
+    ) -> SearchResponse? {
+        guard
+            request.mode == .interactivePreview,
+            request.sort.column == .name,
+            snapshot.hasSortedOrder,
+            maxResults > 0,
+            parsedQuery.negative.isEmpty,
+            parsedQuery.positive.count == 1,
+            let clause = parsedQuery.positive.first,
+            clause.alternatives.count == 1,
+            let part = clause.alternatives.first,
+            case .text(let field, let pattern, let mode) = part,
+            field != .path,
+            mode == .fuzzy || mode == .exact,
+            !pattern.token.isEmpty,
+            !tokenContainsPathSeparator(pattern.token),
+            !snapshot.nameAscending.isEmpty
+        else {
+            return nil
+        }
+
+        let token = pattern.token
+        let tokenBytes = Array(token.utf8)
+        let nameCandidates = snapshot.candidateNameIndices(containing: tokenBytes)
+        var candidateRows: [UInt8]?
+        if let nameCandidates {
+            var rows = Array(repeating: UInt8(0), count: snapshot.count)
+            for (offset, candidate) in nameCandidates.enumerated() {
+                if offset.isMultiple(of: 512), shouldCancel() {
+                    return nil
+                }
+                let rowID = Int(candidate)
+                guard rowID >= 0, rowID < snapshot.count else { continue }
+                rows[rowID] = 1
+            }
+            candidateRows = rows
+        }
+
+        var matches: [SearchMatch] = []
+        matches.reserveCapacity(maxResults)
+        var selectedRows = Set<Int>()
+        selectedRows.reserveCapacity(maxResults)
+        var scannedRows = 0
+
+        func appendNameMatch(rowID: Int) {
+            guard matches.count < maxResults else { return }
+            guard selectedRows.insert(rowID).inserted else { return }
+            guard rowID >= 0, rowID < snapshot.count else { return }
+            guard snapshot.store.isResultRow(at: rowID) else { return }
+            guard request.includeHidden || snapshot.isVisible(at: rowID) else { return }
+            if let candidateRows, candidateRows[rowID] == 0 {
+                return
+            }
+            guard let explanation = cheapLiteralNameExplanation(
+                snapshot: snapshot,
+                rowID: rowID,
+                token: token,
+                mode: mode
+            ) else {
+                return
+            }
+            matches.append(SearchMatch(rowID: rowID, score: explanation.score, match: explanation))
+        }
+
+        let lowerBound = lowerBoundName(in: snapshot.nameAscending, snapshot: snapshot, key: token)
+        if lowerBound < snapshot.nameAscending.count {
+            var prefixRows: [Int] = []
+            prefixRows.reserveCapacity(maxResults)
+            var cursor = lowerBound
+            while cursor < snapshot.nameAscending.count {
+                if cursor.isMultiple(of: 512), shouldCancel() {
+                    return nil
+                }
+                let rowID = snapshot.nameAscending[cursor]
+                let normalizedName = snapshot.store.normalizedName(at: rowID)
+                guard normalizedName.hasPrefix(token) else { break }
+                scannedRows += 1
+                prefixRows.append(rowID)
+                cursor += 1
+            }
+
+            for rowID in prefixRows where snapshot.store.normalizedName(at: rowID) == token {
+                appendNameMatch(rowID: rowID)
+                if matches.count == maxResults {
+                    break
+                }
+            }
+
+            if matches.count < maxResults {
+                let prefixRemainder = prefixRows.filter { snapshot.store.normalizedName(at: $0) != token }
+                let orderedPrefixRows = request.sort.ascending ? prefixRemainder : prefixRemainder.reversed()
+                for rowID in orderedPrefixRows {
+                    appendNameMatch(rowID: rowID)
+                    if matches.count == maxResults {
+                        break
+                    }
+                }
+            }
+        }
+
+        if matches.count < maxResults {
+            let order = request.sort.ascending ? snapshot.nameAscending : snapshot.nameDescending
+            let scanLimit = min(order.count, max(maxResults * 250, 250_000))
+            for (offset, rowID) in order.prefix(scanLimit).enumerated() {
+                if offset.isMultiple(of: 512), shouldCancel() {
+                    return nil
+                }
+                scannedRows += 1
+                appendNameMatch(rowID: rowID)
+                if matches.count == maxResults {
+                    break
+                }
+            }
+        }
+
+        guard !matches.isEmpty else {
+            return nil
+        }
+
+        let elapsed = Date().timeIntervalSince(started)
+        var indexesUsed: Set<SearchIndexUse> = []
+        if nameCandidates != nil {
+            indexesUsed.insert(.nameGrams)
+        }
+        if !request.includeHidden {
+            indexesUsed.insert(.visibleBitset)
+        }
+        return SearchResponse(
+            results: materialize(matches, from: snapshot),
+            totalMatches: matches.count,
+            elapsed: elapsed,
+            snapshotRevision: snapshotRevision,
+            usesIndexedCandidates: true,
+            executionProfile: SearchExecutionProfile(
+                executionPath: .optimizedSortedFastPath,
+                indexesUsed: indexesUsed,
+                candidateCount: nameCandidates?.count ?? matches.count,
+                scannedRowCount: scannedRows,
+                elapsed: elapsed
+            )
+        )
+    }
+
+    private static func lowerBoundName(in order: [Int], snapshot: SearchSnapshot, key: String) -> Int {
+        var low = 0
+        var high = order.count
+        while low < high {
+            let middle = low + (high - low) / 2
+            if snapshot.store.normalizedName(at: order[middle]) < key {
+                low = middle + 1
+            } else {
+                high = middle
+            }
+        }
+        return low
     }
 
     private static func fastComponentNameSortedSearch(

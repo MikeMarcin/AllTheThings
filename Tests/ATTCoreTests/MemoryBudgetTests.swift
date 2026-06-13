@@ -621,6 +621,51 @@ struct MemoryBudgetTests {
         #expect(response.executionProfile.scannedRowCount < recordCount)
     }
 
+    @Test("large name previews use promoted name order without name postings")
+    func largeNamePreviewsUsePromotedNameOrderWithoutNamePostings() {
+        let recordCount = 40_000
+        let matchingRows = 100
+        let records = (0..<recordCount).map { index in
+            let name = index < matchingRows
+                ? "test-\(String(format: "%06d", index)).swift"
+                : "other-\(String(format: "%06d", index)).swift"
+            return makeRecord(
+                path: "/tmp/allthethings-memory/name-preview/\(index % 256)/\(name)",
+                modifiedTime: TimeInterval(index)
+            )
+        }
+        let index = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        index.replaceRecordsForTesting(records, buildsSearchStructures: false)
+
+        let warmup = index.search(SearchRequest(
+            query: "",
+            sort: SortSpec(column: .name, ascending: false)
+        ), maxResults: 25)
+        #expect(warmup.executionProfile.executionPath == .emptyQuerySortedOrder)
+        #expect(index.currentDiagnostics().nameGramPostingCount == 0)
+
+        let response = index.search(SearchRequest(
+            query: "test",
+            sort: SortSpec(column: .name, ascending: false),
+            includeHidden: false,
+            mode: .interactivePreview
+        ), maxResults: 25)
+
+        let expectedNames = (0..<25).map { offset in
+            String(format: "test-%06d.swift", matchingRows - offset - 1)
+        }
+        #expect(response.results.map(\.record.name) == expectedNames)
+        #expect(response.totalMatches == 25)
+        #expect(response.usesIndexedCandidates)
+        #expect(response.executionProfile.executionPath == .optimizedSortedFastPath)
+        #expect(!response.executionProfile.indexesUsed.contains(.nameGrams))
+        #expect(!response.executionProfile.didFallbackToFullScan)
+        #expect(response.executionProfile.scannedRowCount < recordCount)
+    }
+
     @Test("primary-only and optimized snapshots return the same matches")
     func primaryOnlyAndOptimizedSnapshotsReturnSameMatches() {
         var records = makeSyntheticRecords(count: 50_000)
