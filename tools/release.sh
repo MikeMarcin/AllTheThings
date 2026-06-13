@@ -8,9 +8,10 @@ APP_PATH="${ROOT_DIR}/build/${APP_NAME}.app"
 DIST_ROOT="${ROOT_DIR}/build/releases"
 DEFAULT_CODESIGN_IDENTITY="Developer ID Application: Michael Marcin (YTQKP2V2A8)"
 DEFAULT_NOTARY_PROFILE="AllTheThings-notary"
+RELEASE_BUILD_PRESET="app"
 
 CONFIGURE_PRESET="${CONFIGURE_PRESET:-default}"
-BUILD_PRESET="${BUILD_PRESET:-app}"
+BUILD_PRESET="${BUILD_PRESET:-${RELEASE_BUILD_PRESET}}"
 CODESIGN_IDENTITY="${APPLE_CODESIGN_IDENTITY:-${DEFAULT_CODESIGN_IDENTITY}}"
 CODESIGN_ENTITLEMENTS="${CODESIGN_ENTITLEMENTS:-}"
 NOTARY_PROFILE="${APPLE_NOTARY_PROFILE:-${DEFAULT_NOTARY_PROFILE}}"
@@ -47,7 +48,7 @@ Environment:
   APPLE_NOTARY_PROFILE     xcrun notarytool keychain profile name. Default: ${DEFAULT_NOTARY_PROFILE}.
   CODESIGN_ENTITLEMENTS    Optional entitlements plist path.
   CONFIGURE_PRESET         CMake configure preset. Default: default.
-  BUILD_PRESET             CMake build preset. Default: app.
+  BUILD_PRESET             CMake build preset. Must be app for release packaging.
 EOF
 }
 
@@ -150,6 +151,10 @@ done
 
 [[ -f "${INFO_PLIST}" ]] || fail "Info.plist not found: ${INFO_PLIST}"
 
+if [[ "${BUILD_PRESET}" != "${RELEASE_BUILD_PRESET}" ]]; then
+    fail "Release packaging requires BUILD_PRESET=${RELEASE_BUILD_PRESET}, which builds Swift with -c release. Got BUILD_PRESET=${BUILD_PRESET}."
+fi
+
 require_command cmake
 require_command codesign
 require_command ditto
@@ -216,7 +221,7 @@ else
     log "Skipping tests and native safety checks"
 fi
 
-log "Building app bundle"
+log "Building optimized release app bundle"
 cmake --build --preset "${BUILD_PRESET}"
 
 [[ -d "${APP_PATH}" ]] || fail "Expected app bundle was not built: ${APP_PATH}"
