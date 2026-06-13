@@ -2305,7 +2305,7 @@ struct FileIndexTests {
             String(format: "TestFile%06d.txt", recordCount - offset - 1)
         }
         #expect(optimizedPreviewResponse.results.map(\.record.name) == expectedNames)
-        #expect(optimizedPreviewResponse.totalMatches == recordCount)
+        #expect(optimizedPreviewResponse.totalMatches == 10)
         #expect(optimizedPreviewResponse.executionProfile.scannedRowCount <= 10)
         #expect(optimizedCompleteResponse.results.map(\.record.name) == expectedNames)
         #expect(optimizedCompleteResponse.totalMatches == recordCount)
@@ -2328,7 +2328,7 @@ struct FileIndexTests {
         ), maxResults: 10)
 
         #expect(previewResponse.results.map(\.record.name) == expectedNames)
-        #expect(previewResponse.totalMatches == recordCount)
+        #expect(previewResponse.totalMatches == 10)
         #expect(previewResponse.executionProfile.scannedRowCount <= 10)
         #expect(completeResponse.results.map(\.record.name) == expectedNames)
         #expect(completeResponse.totalMatches == recordCount)

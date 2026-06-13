@@ -3298,6 +3298,18 @@ public final class FileIndex: @unchecked Sendable {
                 }
             }
         } else {
+            if let fastResponse = Self.fastModifiedInteractivePreviewSearch(
+                snapshot: snapshot,
+                request: request,
+                parsedQuery: parsedQuery,
+                maxResults: boundedMaxResults,
+                started: started,
+                snapshotRevision: snapshotRevision,
+                shouldCancel: shouldCancel
+            ) {
+                return finish(fastResponse)
+            }
+
             if let fastResponse = Self.fastComponentNameSortedSearch(
                 snapshot: snapshot,
                 request: request,
@@ -3420,6 +3432,206 @@ public final class FileIndex: @unchecked Sendable {
                 rootPath: snapshot.rootPath(at: $0.rowID)
             )
         }
+    }
+
+    private static func fastModifiedInteractivePreviewSearch(
+        snapshot: SearchSnapshot,
+        request: SearchRequest,
+        parsedQuery: FuzzyMatcher.ParsedQuery,
+        maxResults: Int,
+        started: Date,
+        snapshotRevision: UInt64,
+        shouldCancel: @Sendable () -> Bool
+    ) -> SearchResponse? {
+        guard
+            request.mode == .interactivePreview,
+            request.sort.column == .modified,
+            snapshot.hasModifiedSortOrder,
+            maxResults > 0,
+            parsedQuery.negative.isEmpty,
+            parsedQuery.positive.count == 1,
+            let clause = parsedQuery.positive.first,
+            clause.alternatives.count == 1,
+            let part = clause.alternatives.first,
+            case .text(let field, let pattern, let mode) = part,
+            mode == .fuzzy || mode == .exact,
+            !pattern.token.isEmpty,
+            !tokenContainsPathSeparator(pattern.token)
+        else {
+            return nil
+        }
+
+        let orderedRows = request.includeHidden
+            ? (request.sort.ascending ? snapshot.modifiedAscending : snapshot.modifiedDescending)
+            : (request.sort.ascending ? snapshot.visibleModifiedAscending : snapshot.visibleModifiedDescending)
+        guard !orderedRows.isEmpty else {
+            return nil
+        }
+
+        var matches: [SearchMatch] = []
+        matches.reserveCapacity(maxResults)
+        var scannedRows = 0
+        var directNameRows: [UInt8]?
+        var directNameCandidateCount = 0
+        var usedNameGrams = false
+        if field != .path {
+            guard let nameCandidates = snapshot.candidateNameIndices(containing: Array(pattern.token.utf8)) else {
+                return nil
+            }
+            usedNameGrams = true
+            directNameCandidateCount = nameCandidates.count
+            if nameCandidates.isEmpty {
+                if field == .name {
+                    let elapsed = Date().timeIntervalSince(started)
+                    return SearchResponse(
+                        results: [],
+                        totalMatches: 0,
+                        elapsed: elapsed,
+                        snapshotRevision: snapshotRevision,
+                        usesIndexedCandidates: true,
+                        executionProfile: SearchExecutionProfile(
+                            executionPath: .optimizedSortedFastPath,
+                            indexesUsed: [.nameGrams, .modifiedOrder],
+                            candidateCount: 0,
+                            scannedRowCount: 0,
+                            elapsed: elapsed
+                        )
+                    )
+                }
+            } else if field == .name {
+                var nameMatches: [SearchMatch] = []
+                nameMatches.reserveCapacity(min(maxResults, nameCandidates.count))
+                for (offset, candidate) in nameCandidates.enumerated() {
+                    if offset.isMultiple(of: 512), shouldCancel() {
+                        return nil
+                    }
+                    let rowID = Int(candidate)
+                    guard rowID >= 0, rowID < snapshot.count else { continue }
+                    guard snapshot.store.isResultRow(at: rowID) else { continue }
+                    guard request.includeHidden || snapshot.isVisible(at: rowID) else { continue }
+                    guard let explanation = cheapIndexedNameExplanation(
+                        snapshot: snapshot,
+                        rowID: rowID,
+                        token: pattern.token,
+                        mode: mode
+                    ) else {
+                        continue
+                    }
+                    nameMatches.append(SearchMatch(rowID: rowID, score: explanation.score, match: explanation))
+                }
+
+                let total = nameMatches.count
+                nameMatches.sort {
+                    compare($0, $1, snapshot: snapshot, sort: request.sort, queryIsEmpty: false)
+                }
+                if nameMatches.count > maxResults {
+                    nameMatches.removeSubrange(maxResults..<nameMatches.count)
+                }
+
+                guard !shouldCancel() else { return nil }
+                let elapsed = Date().timeIntervalSince(started)
+                var indexesUsed: Set<SearchIndexUse> = [.nameGrams, .modifiedOrder]
+                if !request.includeHidden {
+                    indexesUsed.insert(.visibleBitset)
+                }
+                return SearchResponse(
+                    results: materialize(nameMatches, from: snapshot),
+                    totalMatches: total,
+                    elapsed: elapsed,
+                    snapshotRevision: snapshotRevision,
+                    usesIndexedCandidates: true,
+                    executionProfile: SearchExecutionProfile(
+                        executionPath: .optimizedSortedFastPath,
+                        indexesUsed: indexesUsed,
+                        candidateCount: nameCandidates.count,
+                        scannedRowCount: nameCandidates.count,
+                        elapsed: elapsed
+                    )
+                )
+            } else {
+                var rows = Array(repeating: UInt8(0), count: snapshot.count)
+                for candidate in nameCandidates {
+                    let rowID = Int(candidate)
+                    guard rowID >= 0, rowID < snapshot.count else { continue }
+                    rows[rowID] = 1
+                }
+                directNameRows = rows
+            }
+        }
+
+        var indexesUsed: Set<SearchIndexUse> = [.modifiedOrder]
+        if usedNameGrams {
+            indexesUsed.insert(.nameGrams)
+        }
+        if !request.includeHidden {
+            indexesUsed.insert(.visibleBitset)
+        }
+
+        var pathContainsCache: [Int: Bool] = [:]
+        let pathScanLimit = field == .path ? max(maxResults * 25, 20_000) : max(maxResults * 4, 8_000)
+        var selectedRows = Set<Int>()
+        selectedRows.reserveCapacity(maxResults)
+
+        for (offset, rowID) in orderedRows.enumerated() {
+            if offset.isMultiple(of: 512), shouldCancel() {
+                return nil
+            }
+            if scannedRows >= pathScanLimit, field != .name {
+                break
+            }
+
+            scannedRows += 1
+            guard rowID >= 0, rowID < snapshot.count else { continue }
+            guard snapshot.store.isResultRow(at: rowID) else { continue }
+            guard request.includeHidden || snapshot.isVisible(at: rowID) else { continue }
+
+            let explanation: MatchExplanation
+            if
+                let directNameRows,
+                directNameRows[rowID] != 0,
+                let nameExplanation = cheapIndexedNameExplanation(
+                    snapshot: snapshot,
+                    rowID: rowID,
+                    token: pattern.token,
+                    mode: mode
+                )
+            {
+                explanation = nameExplanation
+            } else if field != .name,
+                      snapshot.store.normalizedPath(at: rowID, contains: pattern.token, cache: &pathContainsCache) {
+                explanation = cheapIndexedPathExplanation(
+                    snapshot: snapshot,
+                    rowID: rowID,
+                    token: pattern.token,
+                    mode: mode
+                )
+            } else {
+                continue
+            }
+
+            guard selectedRows.insert(rowID).inserted else { continue }
+            matches.append(SearchMatch(rowID: rowID, score: explanation.score, match: explanation))
+            if matches.count == maxResults {
+                break
+            }
+        }
+
+        guard !shouldCancel() else { return nil }
+        let elapsed = Date().timeIntervalSince(started)
+        return SearchResponse(
+            results: materialize(matches, from: snapshot),
+            totalMatches: matches.count,
+            elapsed: elapsed,
+            snapshotRevision: snapshotRevision,
+            usesIndexedCandidates: true,
+            executionProfile: SearchExecutionProfile(
+                executionPath: .optimizedSortedFastPath,
+                indexesUsed: indexesUsed,
+                candidateCount: max(matches.count, directNameCandidateCount),
+                scannedRowCount: scannedRows,
+                elapsed: elapsed
+            )
+        )
     }
 
     private static func fastComponentNameSortedSearch(
