@@ -3871,7 +3871,6 @@ public final class FileIndex: @unchecked Sendable {
         guard
             request.sort.column != .relevance,
             request.sort.column != .path,
-            snapshot.gramIndex == nil,
             snapshot.nameGramIndex != nil,
             parsedQuery.negative.isEmpty,
             parsedQuery.positive.count == 1,
@@ -3893,12 +3892,16 @@ public final class FileIndex: @unchecked Sendable {
         case .name:
             exactPathCandidates = exactNameCandidates
         case .any, .path:
-            guard let pathCandidates = snapshot.candidatePathIndicesByComponentExpansion(
-                containing: pattern.token,
-                shouldCancel: shouldCancel
-            ) else {
-                return nil
+            let pathCandidates: [Int32]?
+            if let gramCandidates = snapshot.candidatePathIndices(containing: tokenBytes) {
+                pathCandidates = gramCandidates
+            } else {
+                pathCandidates = snapshot.candidatePathIndicesByComponentExpansion(
+                    containing: pattern.token,
+                    shouldCancel: shouldCancel
+                )
             }
+            guard let pathCandidates else { return nil }
             exactPathCandidates = field == .any ? unionPostingLists(pathCandidates, exactNameCandidates) : pathCandidates
         }
 
@@ -3907,19 +3910,24 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         if request.sort.column == .modified, snapshot.hasModifiedSortOrder {
-            let isPreview = request.mode == .interactivePreview
-            var directNameRows = Array(repeating: UInt8(0), count: snapshot.count)
+            let candidateMask: UInt8 = 1
+            let directNameMask: UInt8 = 2
+            var rowMarkers = Array(repeating: UInt8(0), count: snapshot.count)
             for candidate in exactNameCandidates {
                 let rowID = Int(candidate)
                 guard rowID >= 0, rowID < snapshot.count else { continue }
-                directNameRows[rowID] = 1
+                rowMarkers[rowID] |= directNameMask
             }
-            var candidateSet = Set<Int>()
-            candidateSet.reserveCapacity(exactPathCandidates.count)
+            var total = 0
             for candidate in exactPathCandidates {
                 let rowID = Int(candidate)
                 guard rowID >= 0, rowID < snapshot.count else { continue }
-                candidateSet.insert(rowID)
+                guard snapshot.store.isResultRow(at: rowID) else { continue }
+                guard request.includeHidden || snapshot.isVisible(at: rowID) else { continue }
+                if rowMarkers[rowID] & candidateMask == 0 {
+                    rowMarkers[rowID] |= candidateMask
+                    total += 1
+                }
             }
 
             let orderedRows: [Int]
@@ -3929,41 +3937,41 @@ public final class FileIndex: @unchecked Sendable {
                 orderedRows = request.sort.ascending ? snapshot.visibleModifiedAscending : snapshot.visibleModifiedDescending
             }
             var matches: [SearchMatch] = []
-            matches.reserveCapacity(min(candidateSet.count, maxResults))
-            var total = 0
+            let targetResultCount = maxResults > 0 ? min(maxResults, total) : 0
+            matches.reserveCapacity(targetResultCount)
             var scannedRows = 0
 
-            for (offset, rowID) in orderedRows.enumerated() {
-                if offset.isMultiple(of: 512), shouldCancel() {
-                    return nil
-                }
-                scannedRows += 1
-                guard candidateSet.contains(rowID) else { continue }
-                guard snapshot.store.isResultRow(at: rowID) else { continue }
-                guard request.includeHidden || snapshot.isVisible(at: rowID) else { continue }
-                let explanation: MatchExplanation
-                if directNameRows[rowID] != 0, field != .path, let nameExplanation = cheapIndexedNameExplanation(
-                    snapshot: snapshot,
-                    rowID: rowID,
-                    token: pattern.token,
-                    mode: mode
-                ) {
-                    explanation = nameExplanation
-                } else if field != .name {
-                    explanation = cheapIndexedPathExplanation(
+            if targetResultCount > 0 {
+                for (offset, rowID) in orderedRows.enumerated() {
+                    if offset.isMultiple(of: 512), shouldCancel() {
+                        return nil
+                    }
+                    scannedRows += 1
+                    guard rowMarkers[rowID] & candidateMask != 0 else { continue }
+
+                    let explanation: MatchExplanation
+                    if rowMarkers[rowID] & directNameMask != 0,
+                       field != .path,
+                       let nameExplanation = cheapIndexedNameExplanation(
                         snapshot: snapshot,
                         rowID: rowID,
                         token: pattern.token,
                         mode: mode
-                    )
-                } else {
-                    continue
-                }
+                    ) {
+                        explanation = nameExplanation
+                    } else if field != .name {
+                        explanation = cheapIndexedPathExplanation(
+                            snapshot: snapshot,
+                            rowID: rowID,
+                            token: pattern.token,
+                            mode: mode
+                        )
+                    } else {
+                        continue
+                    }
 
-                total += 1
-                if maxResults > 0 {
                     matches.append(SearchMatch(rowID: rowID, score: explanation.score, match: explanation))
-                    if isPreview, matches.count == maxResults {
+                    if matches.count == targetResultCount {
                         break
                     }
                 }
@@ -3974,12 +3982,6 @@ public final class FileIndex: @unchecked Sendable {
             }
 
             guard !shouldCancel() else { return nil }
-            matches.sort {
-                compare($0, $1, snapshot: snapshot, sort: request.sort, queryIsEmpty: false)
-            }
-            if matches.count > maxResults {
-                matches.removeSubrange(maxResults..<matches.count)
-            }
             let elapsed = Date().timeIntervalSince(started)
             return SearchResponse(
                 results: materialize(matches, from: snapshot),
