@@ -1148,6 +1148,44 @@ struct FileIndexTests {
         #expect(secondResponse.executionProfile.scannedRowCount <= 10)
     }
 
+    @Test("empty query modified sort promotes ready unsorted snapshots")
+    func emptyQueryModifiedSortPromotesReadyUnsortedSnapshots() {
+        let recordCount = 100_050
+        let records = (0..<recordCount).reversed().map { index in
+            makeRecord(
+                path: String(format: "/tmp/att-empty-unsorted-modified-sort/File%06d.txt", index),
+                modifiedTime: TimeInterval(index)
+            )
+        }
+        let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)", loadsSnapshotImmediately: false)
+        defer {
+            try? FileManager.default.removeItem(at: index.dataDirectoryURL)
+        }
+        index.replaceRecordsForTesting(records, buildsSearchStructures: false, phase: .ready)
+
+        let firstResponse = index.search(SearchRequest(
+            query: "",
+            sort: SortSpec(column: .modified, ascending: false),
+            includeHidden: false
+        ), maxResults: 10)
+        let secondResponse = index.search(SearchRequest(
+            query: "",
+            sort: SortSpec(column: .modified, ascending: false),
+            includeHidden: false
+        ), maxResults: 10)
+
+        let expectedNames = (0..<10).map { offset in
+            String(format: "File%06d.txt", recordCount - offset - 1)
+        }
+        #expect(firstResponse.totalMatches == recordCount)
+        #expect(firstResponse.results.map(\.record.name) == expectedNames)
+        #expect(firstResponse.executionProfile.executionPath == .emptyQuerySortedOrder)
+        #expect(firstResponse.executionProfile.scannedRowCount <= 10)
+        #expect(secondResponse.totalMatches == recordCount)
+        #expect(secondResponse.results.map(\.record.name) == expectedNames)
+        #expect(secondResponse.executionProfile.scannedRowCount <= 10)
+    }
+
     @Test("search can hide hidden files")
     func searchCanHideHiddenFiles() async throws {
         let fileManager = FileManager.default
@@ -2230,6 +2268,49 @@ struct FileIndexTests {
         #expect(!previewResponse.results.map(\.record.path).contains(refinedPath))
         #expect(completeResponse.results.map(\.record.path).contains(refinedPath))
         #expect(completeResponse.totalMatches > previewResponse.totalMatches)
+    }
+
+    @Test("interactive preview returns modified sorted text matches without full count")
+    func interactivePreviewReturnsModifiedSortedTextMatchesWithoutFullCount() throws {
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let root = "/tmp/allthethings-modified-preview-\(UUID().uuidString)"
+        let recordCount = 10_000
+        let records = (0..<recordCount).map { index in
+            makeRecord(
+                path: "\(root)/TestFile\(String(format: "%06d", index)).txt",
+                modifiedTime: TimeInterval(index)
+            )
+        }
+
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        defer {
+            try? FileManager.default.removeItem(at: index.dataDirectoryURL)
+        }
+        index.replaceRecordsForTesting(records)
+        index.persistSnapshotForTesting()
+        let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
+        #expect(!reloaded.currentDiagnostics().pathGramIndexEnabled)
+
+        let previewResponse = reloaded.search(SearchRequest(
+            query: "test",
+            sort: SortSpec(column: .modified, ascending: false),
+            includeHidden: false,
+            mode: .interactivePreview
+        ), maxResults: 10)
+        let completeResponse = reloaded.search(SearchRequest(
+            query: "test",
+            sort: SortSpec(column: .modified, ascending: false),
+            includeHidden: false
+        ), maxResults: 10)
+
+        let expectedNames = (0..<10).map { offset in
+            String(format: "TestFile%06d.txt", recordCount - offset - 1)
+        }
+        #expect(previewResponse.results.map(\.record.name) == expectedNames)
+        #expect(previewResponse.totalMatches == 10)
+        #expect(previewResponse.executionProfile.scannedRowCount <= 10)
+        #expect(completeResponse.results.map(\.record.name) == expectedNames)
+        #expect(completeResponse.totalMatches == recordCount)
     }
 
     @Test("overlay allRecords uses base bulk materialization")
