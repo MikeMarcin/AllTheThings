@@ -930,6 +930,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private lazy var watcher = FileSystemWatcher(cursorStore: fseventCursorStore)
     private lazy var fseventReconciler = FSEventReconciliationCoordinator(cursorStore: fseventCursorStore)
     private let searchQueue = DispatchQueue(label: "att.search", qos: .userInitiated)
+    private let searchPreviewQueue = DispatchQueue(label: "att.search.preview", qos: .userInteractive, attributes: .concurrent)
     private let explanationQueue = DispatchQueue(label: "att.search.explain", qos: .utility)
     private let applicationSearchCatalog = ApplicationSearchCatalog()
     private let defaults = UserDefaults.standard
@@ -2590,18 +2591,21 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let appSearchRoots = appSearchQuery == nil ? [] : AppSettings.appSearchRoots(defaults: defaults)
         let applicationSearchCatalog = self.applicationSearchCatalog
 
-        searchQueue.async {
-            guard !token.isCancelled else {
-                DispatchQueue.main.async { [weak self] in
-                    self?.clearSearchTokenIfCurrent(token)
+        if shouldRunPreviewSearch {
+            searchPreviewQueue.async { [weak self] in
+                guard !token.isCancelled else { return }
+                guard let previewResponse = index.search(previewRequest, shouldCancel: { token.isCancelled }) else {
+                    return
                 }
-                return
-            }
 
-            if shouldRunPreviewSearch,
-               let previewResponse = index.search(previewRequest, shouldCancel: { token.isCancelled }) {
                 DispatchQueue.main.async { [weak self] in
-                    guard let self, self.queryGeneration == generation, self.activeSearchToken === token else { return }
+                    guard
+                        let self,
+                        self.queryGeneration == generation,
+                        self.activeSearchToken === token
+                    else {
+                        return
+                    }
                     self.applySearchResponse(
                         previewResponse,
                         signature: signature,
@@ -2611,7 +2615,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                     )
                 }
             }
+        }
 
+        searchQueue.async {
             guard !token.isCancelled else {
                 DispatchQueue.main.async { [weak self] in
                     self?.clearSearchTokenIfCurrent(token)
@@ -2709,11 +2715,35 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         updateActionButtons()
         updateMascotPersistentAnimation()
 
+        let profile = response.executionProfile
         if isFinal {
-            let profile = response.executionProfile
             DiagnosticLogger.shared.log(
                 category: "search",
                 event: "search.displayed",
+                fields: [
+                    "sortColumn": .publicString(signature.sort.column.rawValue),
+                    "sortAscending": .publicBool(signature.sort.ascending),
+                    "includeHidden": .publicBool(signature.includeHidden),
+                    "displayedResultCount": .publicInt(response.results.count),
+                    "totalMatches": .publicInt(response.totalMatches),
+                    "uiLatencySeconds": .publicDouble(elapsed),
+                    "indexLatencySeconds": .publicDouble(response.elapsed),
+                    "usesIndexedCandidates": .publicBool(response.usesIndexedCandidates)
+                ],
+                diagnosticFields: [
+                    "query": .query(signature.query),
+                    "executionPath": .publicString(profile.executionPath.rawValue),
+                    "indexesUsed": .publicStringArray(profile.indexesUsed.map(\.rawValue).sorted()),
+                    "candidateCount": .publicInt(profile.candidateCount),
+                    "scannedRowCount": .publicInt(profile.scannedRowCount),
+                    "fallbackToFullScan": .publicBool(profile.didFallbackToFullScan),
+                    "staleRetry": .publicBool(profile.wasStaleRetry)
+                ]
+            )
+        } else {
+            DiagnosticLogger.shared.log(
+                category: "search",
+                event: "search.previewDisplayed",
                 fields: [
                     "sortColumn": .publicString(signature.sort.column.rawValue),
                     "sortAscending": .publicBool(signature.sort.ascending),
