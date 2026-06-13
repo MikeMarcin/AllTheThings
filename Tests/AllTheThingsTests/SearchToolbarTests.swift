@@ -210,6 +210,63 @@ struct SearchToolbarTests {
         ))
     }
 
+    @Test("search run reconciliation keeps pending previews applyable")
+    func searchRunReconciliationKeepsPendingPreviewsApplyable() {
+        #expect(SearchRunReconciliation.fullCancellationKeepsSearchActive(
+            hasPendingPreview: true,
+            tokenCancelled: false
+        ))
+        #expect(!SearchRunReconciliation.fullCancellationKeepsSearchActive(
+            hasPendingPreview: true,
+            tokenCancelled: true
+        ))
+        #expect(!SearchRunReconciliation.fullCancellationKeepsSearchActive(
+            hasPendingPreview: false,
+            tokenCancelled: false
+        ))
+        #expect(SearchRunReconciliation.previewApplicationCompletesSearch(fullSearchAlreadyFinished: true))
+        #expect(!SearchRunReconciliation.previewApplicationCompletesSearch(fullSearchAlreadyFinished: false))
+    }
+
+    @Test("search run reconciliation rejects stale responses")
+    func searchRunReconciliationRejectsStaleResponses() {
+        #expect(SearchRunReconciliation.canApplyResponse(generationMatches: true, tokenMatches: true))
+        #expect(!SearchRunReconciliation.canApplyResponse(generationMatches: false, tokenMatches: true))
+        #expect(!SearchRunReconciliation.canApplyResponse(generationMatches: true, tokenMatches: false))
+        #expect(SearchRunReconciliation.shouldRejectFinalEmptyResponse(
+            existingResultCount: 25,
+            displayedMatchesResponseSignature: true,
+            responseResultCount: 0,
+            responseTotalMatches: 0,
+            responseSnapshotRevision: 3,
+            currentSnapshotRevision: 4
+        ))
+        #expect(!SearchRunReconciliation.shouldRejectFinalEmptyResponse(
+            existingResultCount: 25,
+            displayedMatchesResponseSignature: true,
+            responseResultCount: 0,
+            responseTotalMatches: 0,
+            responseSnapshotRevision: 4,
+            currentSnapshotRevision: 4
+        ))
+        #expect(!SearchRunReconciliation.shouldRejectFinalEmptyResponse(
+            existingResultCount: 0,
+            displayedMatchesResponseSignature: true,
+            responseResultCount: 0,
+            responseTotalMatches: 0,
+            responseSnapshotRevision: 3,
+            currentSnapshotRevision: 4
+        ))
+        #expect(!SearchRunReconciliation.shouldRejectFinalEmptyResponse(
+            existingResultCount: 25,
+            displayedMatchesResponseSignature: false,
+            responseResultCount: 0,
+            responseTotalMatches: 0,
+            responseSnapshotRevision: 3,
+            currentSnapshotRevision: 4
+        ))
+    }
+
     @Test("foreground reconcile still presents as important reconcile")
     func foregroundReconcileStillPresentsAsImportantReconcile() {
         let now = Date(timeIntervalSince1970: 1_000)

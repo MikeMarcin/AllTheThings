@@ -3476,77 +3476,34 @@ public final class FileIndex: @unchecked Sendable {
         var usedNameGrams = false
         if field != .path {
             guard let nameCandidates = snapshot.candidateNameIndices(containing: Array(pattern.token.utf8)) else {
-                return nil
+                return modifiedPreviewResponseByScanningModifiedOrder(
+                    snapshot: snapshot,
+                    request: request,
+                    orderedRows: orderedRows,
+                    field: field,
+                    token: pattern.token,
+                    mode: mode,
+                    maxResults: maxResults,
+                    started: started,
+                    snapshotRevision: snapshotRevision,
+                    shouldCancel: shouldCancel
+                )
             }
             usedNameGrams = true
             directNameCandidateCount = nameCandidates.count
-            if nameCandidates.isEmpty {
-                if field == .name {
-                    let elapsed = Date().timeIntervalSince(started)
-                    return SearchResponse(
-                        results: [],
-                        totalMatches: 0,
-                        elapsed: elapsed,
-                        snapshotRevision: snapshotRevision,
-                        usesIndexedCandidates: true,
-                        executionProfile: SearchExecutionProfile(
-                            executionPath: .optimizedSortedFastPath,
-                            indexesUsed: [.nameGrams, .modifiedOrder],
-                            candidateCount: 0,
-                            scannedRowCount: 0,
-                            elapsed: elapsed
-                        )
-                    )
-                }
-            } else if field == .name {
-                var nameMatches: [SearchMatch] = []
-                nameMatches.reserveCapacity(min(maxResults, nameCandidates.count))
-                for (offset, candidate) in nameCandidates.enumerated() {
-                    if offset.isMultiple(of: 512), shouldCancel() {
-                        return nil
-                    }
-                    let rowID = Int(candidate)
-                    guard rowID >= 0, rowID < snapshot.count else { continue }
-                    guard snapshot.store.isResultRow(at: rowID) else { continue }
-                    guard request.includeHidden || snapshot.isVisible(at: rowID) else { continue }
-                    guard let explanation = cheapIndexedNameExplanation(
-                        snapshot: snapshot,
-                        rowID: rowID,
-                        token: pattern.token,
-                        mode: mode
-                    ) else {
-                        continue
-                    }
-                    nameMatches.append(SearchMatch(rowID: rowID, score: explanation.score, match: explanation))
-                }
-
-                let total = nameMatches.count
-                nameMatches.sort {
-                    compare($0, $1, snapshot: snapshot, sort: request.sort, queryIsEmpty: false)
-                }
-                if nameMatches.count > maxResults {
-                    nameMatches.removeSubrange(maxResults..<nameMatches.count)
-                }
-
-                guard !shouldCancel() else { return nil }
-                let elapsed = Date().timeIntervalSince(started)
-                var indexesUsed: Set<SearchIndexUse> = [.nameGrams, .modifiedOrder]
-                if !request.includeHidden {
-                    indexesUsed.insert(.visibleBitset)
-                }
-                return SearchResponse(
-                    results: materialize(nameMatches, from: snapshot),
-                    totalMatches: total,
-                    elapsed: elapsed,
+            let pathAccelerationUnavailable = snapshot.gramIndex == nil && snapshot.pathGramShards.isEmpty
+            if field == .name || (field == .any && pathAccelerationUnavailable) {
+                return modifiedPreviewResponseFromNameCandidates(
+                    snapshot: snapshot,
+                    request: request,
+                    orderedRows: orderedRows,
+                    nameCandidates: nameCandidates,
+                    token: pattern.token,
+                    mode: mode,
+                    maxResults: maxResults,
+                    started: started,
                     snapshotRevision: snapshotRevision,
-                    usesIndexedCandidates: true,
-                    executionProfile: SearchExecutionProfile(
-                        executionPath: .optimizedSortedFastPath,
-                        indexesUsed: indexesUsed,
-                        candidateCount: nameCandidates.count,
-                        scannedRowCount: nameCandidates.count,
-                        elapsed: elapsed
-                    )
+                    shouldCancel: shouldCancel
                 )
             } else {
                 var rows = Array(repeating: UInt8(0), count: snapshot.count)
@@ -3628,6 +3585,208 @@ public final class FileIndex: @unchecked Sendable {
                 executionPath: .optimizedSortedFastPath,
                 indexesUsed: indexesUsed,
                 candidateCount: max(matches.count, directNameCandidateCount),
+                scannedRowCount: scannedRows,
+                elapsed: elapsed
+            )
+        )
+    }
+
+    private static func modifiedPreviewResponseByScanningModifiedOrder(
+        snapshot: SearchSnapshot,
+        request: SearchRequest,
+        orderedRows: [Int],
+        field: FuzzyMatcher.QueryField,
+        token: String,
+        mode: FuzzyMatcher.MatchMode,
+        maxResults: Int,
+        started: Date,
+        snapshotRevision: UInt64,
+        shouldCancel: @Sendable () -> Bool
+    ) -> SearchResponse? {
+        guard maxResults > 0, field != .path else {
+            return nil
+        }
+
+        let scanLimit = min(orderedRows.count, max(maxResults * 250, 250_000))
+        var matches: [SearchMatch] = []
+        matches.reserveCapacity(maxResults)
+        var scannedRows = 0
+
+        for (offset, rowID) in orderedRows.prefix(scanLimit).enumerated() {
+            if offset.isMultiple(of: 512), shouldCancel() {
+                return nil
+            }
+            scannedRows += 1
+            guard rowID >= 0, rowID < snapshot.count else { continue }
+            guard snapshot.store.isResultRow(at: rowID) else { continue }
+            guard request.includeHidden || snapshot.isVisible(at: rowID) else { continue }
+            guard let explanation = cheapLiteralNameExplanation(
+                snapshot: snapshot,
+                rowID: rowID,
+                token: token,
+                mode: mode
+            ) else {
+                continue
+            }
+
+            matches.append(SearchMatch(rowID: rowID, score: explanation.score, match: explanation))
+            if matches.count == maxResults {
+                break
+            }
+        }
+
+        guard !shouldCancel() else { return nil }
+        let elapsed = Date().timeIntervalSince(started)
+        var indexesUsed: Set<SearchIndexUse> = [.modifiedOrder]
+        if !request.includeHidden {
+            indexesUsed.insert(.visibleBitset)
+        }
+        return SearchResponse(
+            results: materialize(matches, from: snapshot),
+            totalMatches: matches.count,
+            elapsed: elapsed,
+            snapshotRevision: snapshotRevision,
+            usesIndexedCandidates: true,
+            executionProfile: SearchExecutionProfile(
+                executionPath: .optimizedSortedFastPath,
+                indexesUsed: indexesUsed,
+                candidateCount: matches.count,
+                scannedRowCount: scannedRows,
+                elapsed: elapsed
+            )
+        )
+    }
+
+    private static func modifiedPreviewResponseFromNameCandidates(
+        snapshot: SearchSnapshot,
+        request: SearchRequest,
+        orderedRows: [Int],
+        nameCandidates: [Int32],
+        token: String,
+        mode: FuzzyMatcher.MatchMode,
+        maxResults: Int,
+        started: Date,
+        snapshotRevision: UInt64,
+        shouldCancel: @Sendable () -> Bool
+    ) -> SearchResponse? {
+        var nameRows = Array(repeating: UInt8(0), count: snapshot.count)
+        var visibleNameCandidateRows: [Int] = []
+        visibleNameCandidateRows.reserveCapacity(min(nameCandidates.count, maxResults))
+        for (offset, candidate) in nameCandidates.enumerated() {
+            if offset.isMultiple(of: 512), shouldCancel() {
+                return nil
+            }
+            let rowID = Int(candidate)
+            guard rowID >= 0, rowID < snapshot.count else { continue }
+            guard snapshot.store.isResultRow(at: rowID) else { continue }
+            guard request.includeHidden || snapshot.isVisible(at: rowID) else { continue }
+            visibleNameCandidateRows.append(rowID)
+            nameRows[rowID] = 1
+        }
+
+        guard !visibleNameCandidateRows.isEmpty else {
+            guard !shouldCancel() else { return nil }
+            let elapsed = Date().timeIntervalSince(started)
+            var indexesUsed: Set<SearchIndexUse> = [.nameGrams, .modifiedOrder]
+            if !request.includeHidden {
+                indexesUsed.insert(.visibleBitset)
+            }
+            return SearchResponse(
+                results: [],
+                totalMatches: 0,
+                elapsed: elapsed,
+                snapshotRevision: snapshotRevision,
+                usesIndexedCandidates: true,
+                executionProfile: SearchExecutionProfile(
+                    executionPath: .optimizedSortedFastPath,
+                    indexesUsed: indexesUsed,
+                    candidateCount: nameCandidates.count,
+                    scannedRowCount: 0,
+                    elapsed: elapsed
+                )
+            )
+        }
+
+        if visibleNameCandidateRows.count <= maxResults {
+            var matches: [SearchMatch] = []
+            matches.reserveCapacity(visibleNameCandidateRows.count)
+            for rowID in visibleNameCandidateRows {
+                guard let explanation = cheapIndexedNameExplanation(
+                    snapshot: snapshot,
+                    rowID: rowID,
+                    token: token,
+                    mode: mode
+                ) else {
+                    continue
+                }
+                matches.append(SearchMatch(rowID: rowID, score: explanation.score, match: explanation))
+            }
+            matches.sort {
+                compare($0, $1, snapshot: snapshot, sort: request.sort, queryIsEmpty: false)
+            }
+
+            guard !shouldCancel() else { return nil }
+            let elapsed = Date().timeIntervalSince(started)
+            var indexesUsed: Set<SearchIndexUse> = [.nameGrams, .modifiedOrder]
+            if !request.includeHidden {
+                indexesUsed.insert(.visibleBitset)
+            }
+            return SearchResponse(
+                results: materialize(matches, from: snapshot),
+                totalMatches: matches.count,
+                elapsed: elapsed,
+                snapshotRevision: snapshotRevision,
+                usesIndexedCandidates: true,
+                executionProfile: SearchExecutionProfile(
+                    executionPath: .optimizedSortedFastPath,
+                    indexesUsed: indexesUsed,
+                    candidateCount: nameCandidates.count,
+                    scannedRowCount: visibleNameCandidateRows.count,
+                    elapsed: elapsed
+                )
+            )
+        }
+
+        var matches: [SearchMatch] = []
+        matches.reserveCapacity(maxResults)
+        var scannedRows = 0
+        for (offset, rowID) in orderedRows.enumerated() {
+            if offset.isMultiple(of: 512), shouldCancel() {
+                return nil
+            }
+            scannedRows += 1
+            guard rowID >= 0, rowID < snapshot.count else { continue }
+            guard nameRows[rowID] != 0 else { continue }
+            guard let explanation = cheapIndexedNameExplanation(
+                snapshot: snapshot,
+                rowID: rowID,
+                token: token,
+                mode: mode
+            ) else {
+                continue
+            }
+            matches.append(SearchMatch(rowID: rowID, score: explanation.score, match: explanation))
+            if matches.count == maxResults {
+                break
+            }
+        }
+
+        guard !shouldCancel() else { return nil }
+        let elapsed = Date().timeIntervalSince(started)
+        var indexesUsed: Set<SearchIndexUse> = [.nameGrams, .modifiedOrder]
+        if !request.includeHidden {
+            indexesUsed.insert(.visibleBitset)
+        }
+        return SearchResponse(
+            results: materialize(matches, from: snapshot),
+            totalMatches: matches.count,
+            elapsed: elapsed,
+            snapshotRevision: snapshotRevision,
+            usesIndexedCandidates: true,
+            executionProfile: SearchExecutionProfile(
+                executionPath: .optimizedSortedFastPath,
+                indexesUsed: indexesUsed,
+                candidateCount: nameCandidates.count,
                 scannedRowCount: scannedRows,
                 elapsed: elapsed
             )
@@ -3856,6 +4015,22 @@ public final class FileIndex: @unchecked Sendable {
                 candidateCount: candidateCount,
                 elapsed: elapsed
             )
+        )
+    }
+
+    private static func cheapLiteralNameExplanation(
+        snapshot: SearchSnapshot,
+        rowID: Int,
+        token: String,
+        mode: FuzzyMatcher.MatchMode
+    ) -> MatchExplanation? {
+        guard !token.isEmpty else { return nil }
+        guard snapshot.store.normalizedName(at: rowID).contains(token) else { return nil }
+        return cheapIndexedNameExplanation(
+            snapshot: snapshot,
+            rowID: rowID,
+            token: token,
+            mode: mode
         )
     }
 

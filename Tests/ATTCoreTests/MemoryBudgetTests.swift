@@ -526,6 +526,101 @@ struct MemoryBudgetTests {
         #expect(descending.results.last?.record.name == "File119975.swift")
     }
 
+    @Test("large mapped modified previews use name postings without path postings")
+    func largeMappedModifiedPreviewsUseNamePostingsWithoutPathPostings() {
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let recordCount = 30_000
+        let directoryPadding = String(repeating: "x", count: 900)
+        let records = (0..<recordCount).map { index in
+            makeRecord(
+                path: "/tmp/allthethings-memory/\(directoryPadding)project-\(index % 256)/TestFile\(String(format: "%06d", index)).swift",
+                modifiedTime: TimeInterval(index)
+            )
+        }
+
+        let index = FileIndex(
+            applicationName: applicationName,
+            loadsSnapshotImmediately: false
+        )
+        defer {
+            try? FileManager.default.removeItem(at: index.dataDirectoryURL)
+        }
+        index.replaceRecordsForTesting(records)
+        #expect(!index.currentDiagnostics().pathGramIndexEnabled)
+        index.persistSnapshotForTesting()
+
+        let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
+        let diagnostics = reloaded.currentDiagnostics()
+        #expect(diagnostics.recordStoreKind == .mapped)
+        #expect(!diagnostics.pathGramIndexEnabled)
+        #expect(diagnostics.nameGramPostingCount > 0)
+
+        let response = reloaded.search(SearchRequest(
+            query: "test",
+            sort: SortSpec(column: .modified, ascending: false),
+            includeHidden: false,
+            mode: .interactivePreview
+        ), maxResults: 25)
+
+        let expectedNames = (0..<25).map { offset in
+            String(format: "TestFile%06d.swift", recordCount - offset - 1)
+        }
+        #expect(response.results.map(\.record.name) == expectedNames)
+        #expect(response.totalMatches == 25)
+        #expect(response.usesIndexedCandidates)
+        #expect(response.executionProfile.executionPath == .optimizedSortedFastPath)
+        #expect(response.executionProfile.indexesUsed.contains(.nameGrams))
+        #expect(response.executionProfile.indexesUsed.contains(.modifiedOrder))
+        #expect(!response.executionProfile.indexesUsed.contains(.pathGrams))
+        #expect(!response.executionProfile.didFallbackToFullScan)
+        #expect(response.executionProfile.scannedRowCount <= 25)
+    }
+
+    @Test("large modified previews do not fall back while waiting for name postings")
+    func largeModifiedPreviewsDoNotFallBackWhileWaitingForNamePostings() {
+        let recordCount = 40_000
+        let skippedRecentRows = 12_000
+        let matchingRows = 50
+        let records = (0..<recordCount).map { index in
+            let descendingOffset = recordCount - index - 1
+            let name = (skippedRecentRows..<(skippedRecentRows + matchingRows)).contains(descendingOffset)
+                ? "test-\(String(format: "%06d", index))"
+                : "other-\(String(format: "%06d", index))"
+            return makeRecord(
+                path: "/tmp/allthethings-memory/post-reconcile/\(name).swift",
+                modifiedTime: TimeInterval(index)
+            )
+        }
+        let index = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        index.replaceRecordsForTesting(records, buildsSearchStructures: false)
+
+        let warmup = index.search(SearchRequest(
+            query: "",
+            sort: SortSpec(column: .modified, ascending: false)
+        ), maxResults: 25)
+        #expect(warmup.executionProfile.executionPath == .emptyQuerySortedOrder)
+        #expect(index.currentDiagnostics().nameGramPostingCount == 0)
+
+        let response = index.search(SearchRequest(
+            query: "test",
+            sort: SortSpec(column: .modified, ascending: false),
+            includeHidden: false,
+            mode: .interactivePreview
+        ), maxResults: 25)
+
+        #expect(response.results.count == 25)
+        #expect(response.totalMatches == 25)
+        #expect(response.usesIndexedCandidates)
+        #expect(response.executionProfile.executionPath == .optimizedSortedFastPath)
+        #expect(response.executionProfile.indexesUsed.contains(.modifiedOrder))
+        #expect(!response.executionProfile.indexesUsed.contains(.nameGrams))
+        #expect(!response.executionProfile.didFallbackToFullScan)
+        #expect(response.executionProfile.scannedRowCount < recordCount)
+    }
+
     @Test("primary-only and optimized snapshots return the same matches")
     func primaryOnlyAndOptimizedSnapshotsReturnSameMatches() {
         var records = makeSyntheticRecords(count: 50_000)
