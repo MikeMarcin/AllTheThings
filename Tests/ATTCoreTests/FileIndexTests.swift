@@ -441,8 +441,19 @@ struct FileIndexTests {
             !index.currentStats().isIndexing
         }
 
+        try await waitUntil(timeout: .seconds(10)) {
+            let diagnostics = index.currentDiagnostics()
+            return diagnostics.recordStoreKind == .mapped
+                && diagnostics.optimizedCount == diagnostics.indexedCount
+        }
+
         try fileManager.removeItem(at: removedFile)
         try "added".write(to: addedFile, atomically: true, encoding: .utf8)
+
+        let recorder = StatsRecorder()
+        index.onStatsChanged = { @MainActor @Sendable stats in
+            recorder.append(stats)
+        }
         index.reconcileIndexedRootsInBackground(rootURLs: [sourceDirectory])
 
         try await waitUntil(timeout: .seconds(10)) {
@@ -454,11 +465,27 @@ struct FileIndexTests {
         #expect(paths.contains(retainedFile.path))
         #expect(!paths.contains(removedFile.path))
 
+        let diagnostics = index.currentDiagnostics()
+        #expect(diagnostics.recordStoreKind == .mapped)
+        #expect(diagnostics.optimizedCount == diagnostics.indexedCount)
+        #expect(!recorder.snapshot().contains {
+            $0.phase == .ready && $0.indexedCount > 0 && $0.optimizedCount == 0
+        })
+
+        let reconciledStatus = index.currentStats().status
+        #expect(reconciledStatus.hasPrefix("Reconciled "))
+        #expect(reconciledStatus.contains(" in "))
+
+        let refreshesBeforeNoop = diagnostics.completedRefreshBatches
+        index.update(paths: [
+            root
+                .appendingPathComponent(".git/objects/ab/\(UUID().uuidString)")
+                .path
+        ])
         try await waitUntil(timeout: .seconds(10)) {
-            let diagnostics = index.currentDiagnostics()
-            return diagnostics.recordStoreKind == .mapped
-                && diagnostics.optimizedCount == diagnostics.indexedCount
+            index.currentDiagnostics().completedRefreshBatches > refreshesBeforeNoop
         }
+        #expect(index.currentStats().status == reconciledStatus)
     }
 
     @Test("frontier batch modes match single-directory full rebuild paths")

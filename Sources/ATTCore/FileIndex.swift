@@ -6794,7 +6794,8 @@ public final class FileIndex: @unchecked Sendable {
             recordsByPath: scanResult.records,
             initialStore: scanResult.store,
             generation: currentGeneration,
-            publishesIntermediateSnapshots: publishesIntermediateSnapshots
+            publishesIntermediateSnapshots: publishesIntermediateSnapshots,
+            operationStartedAt: started
         )
         guard isCurrentGeneration(currentGeneration) else { return }
         recordFullRebuild(duration: Date().timeIntervalSince(started))
@@ -6894,7 +6895,8 @@ public final class FileIndex: @unchecked Sendable {
             initialStore: initialStore,
             generation: currentGeneration,
             publishesIntermediateSnapshots: false,
-            completionStatusPrefix: activityPresentation == .backgroundCatchUp ? "Caught up" : "Reconciled"
+            completionStatusPrefix: activityPresentation == .backgroundCatchUp ? "Caught up" : "Reconciled",
+            operationStartedAt: started
         )
         guard isCurrentGeneration(currentGeneration) else { return }
         recordFullRebuild(duration: Date().timeIntervalSince(started))
@@ -7214,7 +7216,8 @@ public final class FileIndex: @unchecked Sendable {
         records: [FileRecord],
         initialStore: HeapPagedRecordStore,
         generation currentGeneration: UInt64,
-        completionStatusPrefix: String
+        completionStatusPrefix: String,
+        operationStartedAt: Date?
     ) {
         let snapshot = SearchSnapshot(store: initialStore, buildsSearchStructures: false)
         let snapshotSettings = lock.withLock {
@@ -7245,7 +7248,11 @@ public final class FileIndex: @unchecked Sendable {
             discoveredCount = snapshot.resultCount
             searchableCount = snapshot.resultCount
             optimizedCount = 0
-            status = "\(completionStatusPrefix) \(snapshot.resultCount.formatted()) files"
+            status = Self.completionStatus(
+                prefix: completionStatusPrefix,
+                recordCount: snapshot.resultCount,
+                startedAt: operationStartedAt
+            )
             lastUpdated = Date()
             activeOperationStartedAt = nil
             resumedFromCheckpoint = false
@@ -7285,11 +7292,30 @@ public final class FileIndex: @unchecked Sendable {
             let jobID = self.beginIndexJob("deferredOptimize")
             defer { self.endIndexJob("deferredOptimize", jobID: jobID) }
 
+            let started = Date()
+            func logCancellation(reason: String) {
+                let generationMatches = self.isCurrentGeneration(currentGeneration)
+                let snapshotRevisionMatches = self.isSnapshotRevisionCurrent(baseSnapshotRevision)
+                DiagnosticLogger.shared.log(
+                    category: "index",
+                    event: "index.deferredOptimizationCancelled",
+                    fields: [
+                        "reason": .publicString(reason),
+                        "recordCount": .publicInt(records.count),
+                        "durationSeconds": .publicDouble(Date().timeIntervalSince(started)),
+                        "generationMatches": .publicBool(generationMatches),
+                        "snapshotRevisionMatches": .publicBool(snapshotRevisionMatches)
+                    ]
+                )
+            }
+
             guard self.isCurrentGeneration(currentGeneration),
                   self.isSnapshotRevisionCurrent(baseSnapshotRevision)
-            else { return }
+            else {
+                logCancellation(reason: "staleBeforeBuild")
+                return
+            }
 
-            let started = Date()
             let packageURL = SnapshotLayout.temporaryPackageURL(in: self.supportDirectory)
             do {
                 try MappedRecordStore.writePackage(
@@ -7312,6 +7338,7 @@ public final class FileIndex: @unchecked Sendable {
                       self.isSnapshotRevisionCurrent(baseSnapshotRevision)
                 else {
                     try? self.fileManager.removeItem(at: packageURL)
+                    logCancellation(reason: "staleAfterBuild")
                     return
                 }
 
@@ -7321,6 +7348,7 @@ public final class FileIndex: @unchecked Sendable {
                       self.isSnapshotRevisionCurrent(baseSnapshotRevision)
                 else {
                     try? self.fileManager.removeItem(at: packageURL)
+                    logCancellation(reason: "staleAfterPersist")
                     return
                 }
 
@@ -7387,18 +7415,20 @@ public final class FileIndex: @unchecked Sendable {
         initialStore: HeapPagedRecordStore,
         generation currentGeneration: UInt64,
         publishesIntermediateSnapshots: Bool = true,
-        completionStatusPrefix: String = "Indexed"
+        completionStatusPrefix: String = "Indexed",
+        operationStartedAt: Date? = nil
     ) {
         let records = Array(recordsByPath.values)
         let deferredOptimizationThreshold = lock.withLock {
             deferredOptimizationRecordThreshold
         }
-        if records.count >= deferredOptimizationThreshold {
+        if records.count >= deferredOptimizationThreshold, publishesIntermediateSnapshots {
             publishReadySnapshotAndOptimizeInBackground(
                 records: records,
                 initialStore: initialStore,
                 generation: currentGeneration,
-                completionStatusPrefix: completionStatusPrefix
+                completionStatusPrefix: completionStatusPrefix,
+                operationStartedAt: operationStartedAt
             )
             return
         }
@@ -7555,7 +7585,11 @@ public final class FileIndex: @unchecked Sendable {
             discoveredCount = records.count
             searchableCount = snapshot.resultCount
             optimizedCount = snapshot.resultCount
-            status = "\(completionStatusPrefix) \(records.count.formatted()) files"
+            status = Self.completionStatus(
+                prefix: completionStatusPrefix,
+                recordCount: records.count,
+                startedAt: operationStartedAt
+            )
             lastUpdated = Date()
             activeOperationStartedAt = nil
             resumedFromCheckpoint = false
@@ -8029,6 +8063,35 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
+    private static func operationElapsed(_ elapsed: TimeInterval) -> String {
+        let totalSeconds = max(Int(elapsed.rounded()), 0)
+        let hours = totalSeconds / 3_600
+        let minutes = (totalSeconds % 3_600) / 60
+        let seconds = totalSeconds % 60
+        if hours > 0 {
+            return "\(hours)h \(String(format: "%02dm", minutes))"
+        }
+        if minutes > 0 {
+            return "\(minutes)m \(String(format: "%02ds", seconds))"
+        }
+        return "\(seconds)s"
+    }
+
+    private static func completionStatus(prefix: String, recordCount: Int, startedAt: Date?) -> String {
+        var status = "\(prefix) \(recordCount.formatted()) files"
+        if let startedAt {
+            status += " in \(operationElapsed(Date().timeIntervalSince(startedAt)))"
+        }
+        return status
+    }
+
+    private static func shouldPreserveReadyStatusDuringNoopUpdate(_ status: String) -> Bool {
+        status.hasPrefix("Indexed ")
+            || status.hasPrefix("Reconciled ")
+            || status.hasPrefix("Caught up ")
+            || status.hasPrefix("Loaded ")
+    }
+
     private static func configuredLargeOverlayPersistRecordLimit() -> Int {
         guard
             let rawValue = ProcessInfo.processInfo.environment["ATT_INDEX_LARGE_OVERLAY_PERSIST_RECORD_LIMIT"],
@@ -8153,8 +8216,11 @@ public final class FileIndex: @unchecked Sendable {
 
     private func updateNow(paths: [String]) {
         let updateStarted = Date()
-        let currentGeneration = lock.withLock { () -> UInt64? in
+        let updateContext = lock.withLock { () -> (generation: UInt64, preservedReadyStatus: String?)? in
             guard !indexing else { return nil }
+            let preservedReadyStatus = phase == .ready && Self.shouldPreserveReadyStatusDuringNoopUpdate(status)
+                ? status
+                : nil
             generation &+= 1
             activePathGramBuildGeneration = nil
             indexing = true
@@ -8167,15 +8233,16 @@ public final class FileIndex: @unchecked Sendable {
             activeOperationStartedAt = updateStarted
             resumedFromCheckpoint = false
             lastUpdated = Date()
-            return generation
+            return (generation, preservedReadyStatus)
         }
-        guard let currentGeneration else {
+        guard let updateContext else {
             lock.withLock {
                 pendingRefreshPaths.formUnion(paths)
             }
             scheduleUpdateDrainIfNeeded(delay: .milliseconds(0))
             return
         }
+        let currentGeneration = updateContext.generation
         recordScanFrontierMetrics(ScanFrontierMetrics(), generation: currentGeneration)
         publishStats()
 
@@ -8307,9 +8374,14 @@ public final class FileIndex: @unchecked Sendable {
                 reconciling = false
                 updating = false
                 phase = .ready
-                status = "No file changes"
+                if let preservedReadyStatus = updateContext.preservedReadyStatus {
+                    status = preservedReadyStatus
+                } else if !Self.shouldPreserveReadyStatusDuringNoopUpdate(status) {
+                    status = "No file changes"
+                }
                 activeOperationStartedAt = nil
                 lastUpdated = Date()
+                completedRefreshBatches &+= 1
                 return true
             }
             if !didApply {
