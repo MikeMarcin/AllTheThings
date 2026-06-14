@@ -1,0 +1,4 @@
+interface:
+  display_name: "Update Promo Assets"
+  short_description: "Regenerate AllTheThings promo screenshots and recordings"
+  default_prompt: "Use $update-promo-assets to rebuild AllTheThings promo PNG/WebP assets from a safe demo index and update the app repo plus gamecoretech.com."
