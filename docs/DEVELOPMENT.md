@@ -130,3 +130,13 @@ ATT_MEMORY_BENCH_RECORDS=250000 swift test --filter optInSyntheticMemoryBenchmar
 
 Use a larger value, such as `5000000`, for local stress testing on a machine with enough memory headroom.
 Initial scan parallelism defaults to `min(8, max(2, activeProcessorCount))`; set `ATT_INDEX_SCAN_WORKERS` to compare filesystem throughput with a fixed worker count.
+
+For real indexed roots and background catch-up memory attribution, run:
+
+```sh
+ATT_PHASE_BENCH_ROOTS="/path/to/indexed/root" \
+ATT_PHASE_BENCH_WAIT_FOR_OPTIMIZED=1 \
+swift test --filter RealRootPhaseTimingTests
+```
+
+The benchmark prints JSON lines for `fullRebuild`, `fullReconcile`, `directFullReconcile`, and, when a child scope exists or `ATT_PHASE_BENCH_SCOPED_ROOTS` is set, `backgroundCatchUpScopedReconcile`. Each line includes `memory_samples` plus a compact `memory_report` with the peak physical footprint, final footprint, classification, and attribution hint. Correlate the `memory_report.peak_label` with `IndexMemory` OS log events such as `reconcile.previousRecords.materialize.*`, `reconcile.merge.*`, `reconcile.heapStore.*`, `optimize.mappedWrite.*`, `optimize.nameGrams.*`, `optimize.extensions.*`, and `optimize.modifiedSort.*` to identify whether a spike comes from scoped whole-index materialization, mapped package construction, postings, sort arrays, or allocator retention.
