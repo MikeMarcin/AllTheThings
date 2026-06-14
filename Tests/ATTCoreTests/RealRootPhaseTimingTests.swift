@@ -7,12 +7,25 @@ import Testing
 struct RealRootPhaseTimingTests {
     @Test("opt-in real-root phase timing")
     func optInRealRootPhaseTiming() async throws {
-        guard let rootValue = ProcessInfo.processInfo.environment["ATT_PHASE_BENCH_ROOTS"],
-              !rootValue.isEmpty
-        else {
+        let liveAppName = ProcessInfo.processInfo.environment["ATT_PHASE_BENCH_LIVE_APP_NAME"]
+        let rootValue = ProcessInfo.processInfo.environment["ATT_PHASE_BENCH_ROOTS"]
+        guard liveAppName?.isEmpty == false || rootValue?.isEmpty == false else {
             return
         }
 
+        let repeatCount = max(1, Int(ProcessInfo.processInfo.environment["ATT_PHASE_BENCH_REPEAT"] ?? "") ?? 1)
+        if let liveAppName, !liveAppName.isEmpty {
+            for repeatIndex in 0..<repeatCount {
+                try await Self.measureCopiedLiveSnapshot(
+                    sourceAppName: liveAppName,
+                    repeatIndex: repeatIndex
+                )
+            }
+        }
+
+        guard let rootValue, !rootValue.isEmpty else {
+            return
+        }
         let roots = Self.readableDirectoryRoots(from: rootValue)
         guard !roots.isEmpty else {
             Issue.record("ATT_PHASE_BENCH_ROOTS did not contain readable absolute directories")
@@ -20,7 +33,6 @@ struct RealRootPhaseTimingTests {
         }
         let scopedCatchUpRoots = Self.scopedCatchUpRoots(inside: roots)
 
-        let repeatCount = max(1, Int(ProcessInfo.processInfo.environment["ATT_PHASE_BENCH_REPEAT"] ?? "") ?? 1)
         for repeatIndex in 0..<repeatCount {
             try await Self.measure(operation: "fullRebuild", roots: roots, repeatIndex: repeatIndex) { index in
                 Self.applyDeferredOptimizationThresholdOverride(to: index)
@@ -64,8 +76,13 @@ struct RealRootPhaseTimingTests {
         let lock = NSLock()
         let started = Date()
         let memoryTimeline = MemoryTimelineRecorder(started: started)
+        let memoryTelemetryRecorder = MemoryTelemetryEventRecorder(started: started)
+        FileIndex.setMemoryTelemetrySinkForTesting { event in
+            memoryTelemetryRecorder.record(event)
+        }
         let memoryTask = memoryTimeline.start()
         defer {
+            FileIndex.setMemoryTelemetrySinkForTesting(nil)
             memoryTask.cancel()
         }
         memoryTimeline.mark("beforeStart")
@@ -104,7 +121,9 @@ struct RealRootPhaseTimingTests {
             )
         }
         memoryTask.cancel()
+        FileIndex.setMemoryTelemetrySinkForTesting(nil)
         let captured = lock.withLock { events }
+        let capturedMemoryTelemetryEvents = memoryTelemetryRecorder.snapshot()
         let stats = index.currentStats()
         let diagnostics = index.currentDiagnostics()
         print(Self.jsonLine(
@@ -117,7 +136,8 @@ struct RealRootPhaseTimingTests {
             stats: stats,
             diagnostics: diagnostics,
             events: captured,
-            memorySamples: memoryTimeline.snapshot()
+            memorySamples: memoryTimeline.snapshot(),
+            memoryTelemetryEvents: capturedMemoryTelemetryEvents
         ))
     }
 
@@ -140,8 +160,13 @@ struct RealRootPhaseTimingTests {
         let lock = NSLock()
         let started = Date()
         let memoryTimeline = MemoryTimelineRecorder(started: started)
+        let memoryTelemetryRecorder = MemoryTelemetryEventRecorder(started: started)
+        FileIndex.setMemoryTelemetrySinkForTesting { event in
+            memoryTelemetryRecorder.record(event)
+        }
         let memoryTask = memoryTimeline.start()
         defer {
+            FileIndex.setMemoryTelemetrySinkForTesting(nil)
             memoryTask.cancel()
         }
         memoryTimeline.mark(
@@ -179,7 +204,9 @@ struct RealRootPhaseTimingTests {
             )
         }
         memoryTask.cancel()
+        FileIndex.setMemoryTelemetrySinkForTesting(nil)
         let captured = lock.withLock { events }
+        let capturedMemoryTelemetryEvents = memoryTelemetryRecorder.snapshot()
         let stats = index.currentStats()
         let diagnostics = index.currentDiagnostics()
         print(Self.jsonLine(
@@ -192,7 +219,8 @@ struct RealRootPhaseTimingTests {
             stats: stats,
             diagnostics: diagnostics,
             events: captured,
-            memorySamples: memoryTimeline.snapshot()
+            memorySamples: memoryTimeline.snapshot(),
+            memoryTelemetryEvents: capturedMemoryTelemetryEvents
         ))
     }
 
@@ -217,8 +245,13 @@ struct RealRootPhaseTimingTests {
         let lock = NSLock()
         let started = Date()
         let memoryTimeline = MemoryTimelineRecorder(started: started)
+        let memoryTelemetryRecorder = MemoryTelemetryEventRecorder(started: started)
+        FileIndex.setMemoryTelemetrySinkForTesting { event in
+            memoryTelemetryRecorder.record(event)
+        }
         let memoryTask = memoryTimeline.start()
         defer {
+            FileIndex.setMemoryTelemetrySinkForTesting(nil)
             memoryTask.cancel()
         }
         memoryTimeline.mark(
@@ -259,7 +292,9 @@ struct RealRootPhaseTimingTests {
             )
         }
         memoryTask.cancel()
+        FileIndex.setMemoryTelemetrySinkForTesting(nil)
         let captured = lock.withLock { events }
+        let capturedMemoryTelemetryEvents = memoryTelemetryRecorder.snapshot()
         let stats = index.currentStats()
         let diagnostics = index.currentDiagnostics()
         print(Self.jsonLine(
@@ -272,7 +307,176 @@ struct RealRootPhaseTimingTests {
             stats: stats,
             diagnostics: diagnostics,
             events: captured,
-            memorySamples: memoryTimeline.snapshot()
+            memorySamples: memoryTimeline.snapshot(),
+            memoryTelemetryEvents: capturedMemoryTelemetryEvents
+        ))
+    }
+
+    private static func measureCopiedLiveSnapshot(sourceAppName: String, repeatIndex: Int) async throws {
+        let copied = try copyLiveSnapshotPackage(sourceAppName: sourceAppName)
+        defer {
+            try? FileManager.default.removeItem(at: copied.supportDirectory)
+        }
+
+        let index = FileIndex(
+            applicationName: copied.applicationName,
+            loadsSnapshotImmediately: false,
+            exclusionPatterns: copied.manifest.exclusionPatterns
+        )
+        index.onBackgroundReconciliationRequested = { _ in }
+
+        var events: [(elapsed: TimeInterval, phase: IndexPhase, status: String, indexed: Int, discovered: Int)] = []
+        let lock = NSLock()
+        let started = Date()
+        let memoryTimeline = MemoryTimelineRecorder(started: started)
+        let memoryTelemetryRecorder = MemoryTelemetryEventRecorder(started: started)
+        FileIndex.setMemoryTelemetrySinkForTesting { event in
+            memoryTelemetryRecorder.record(event)
+        }
+        let memoryTask = memoryTimeline.start()
+        defer {
+            FileIndex.setMemoryTelemetrySinkForTesting(nil)
+            memoryTask.cancel()
+        }
+        memoryTimeline.mark("beforeCopiedLiveSnapshotLoad")
+        index.onStatsChanged = { @MainActor @Sendable stats in
+            lock.lock()
+            events.append((
+                elapsed: Date().timeIntervalSince(started),
+                phase: stats.phase,
+                status: stats.status,
+                indexed: stats.indexedCount,
+                discovered: stats.discoveredCount
+            ))
+            lock.unlock()
+            memoryTimeline.mark("stats.\(stats.phase.rawValue)", stats: stats)
+        }
+
+        _ = index.loadSnapshotInBackground()
+        try await waitUntilSnapshotLoadFinished(index)
+        let readyElapsed = Date().timeIntervalSince(started)
+        memoryTimeline.mark(
+            "ready",
+            stats: index.currentStats(),
+            diagnostics: index.currentDiagnostics()
+        )
+        let optimizationTimings: OptimizationTimings? = nil
+        memoryTask.cancel()
+        FileIndex.setMemoryTelemetrySinkForTesting(nil)
+        let captured = lock.withLock { events }
+        let capturedMemoryTelemetryEvents = memoryTelemetryRecorder.snapshot()
+        let stats = index.currentStats()
+        let diagnostics = index.currentDiagnostics()
+        print(Self.jsonLine(
+            operation: "copiedLiveSnapshotLoad",
+            roots: copied.roots,
+            repeatIndex: repeatIndex,
+            readyElapsed: readyElapsed,
+            optimizationTimings: optimizationTimings,
+            stats: stats,
+            diagnostics: diagnostics,
+            events: captured,
+            memorySamples: memoryTimeline.snapshot(),
+            memoryTelemetryEvents: capturedMemoryTelemetryEvents,
+            extraFields: [
+                "source_app_name": sourceAppName,
+                "source_record_count": copied.manifest.recordCount
+            ]
+        ))
+
+        let scopeRoots = scopedCatchUpRoots(inside: copied.roots)
+        if !scopeRoots.isEmpty {
+            try await measureBackgroundCatchUpOnLoadedIndex(
+                index,
+                roots: copied.roots,
+                scopeRoots: scopeRoots,
+                repeatIndex: repeatIndex,
+                sourceAppName: sourceAppName,
+                sourceRecordCount: copied.manifest.recordCount
+            )
+        }
+    }
+
+    private static func measureBackgroundCatchUpOnLoadedIndex(
+        _ index: FileIndex,
+        roots: [URL],
+        scopeRoots: [URL],
+        repeatIndex: Int,
+        sourceAppName: String,
+        sourceRecordCount: Int
+    ) async throws {
+        var events: [(elapsed: TimeInterval, phase: IndexPhase, status: String, indexed: Int, discovered: Int)] = []
+        let lock = NSLock()
+        let started = Date()
+        let memoryTimeline = MemoryTimelineRecorder(started: started)
+        let memoryTelemetryRecorder = MemoryTelemetryEventRecorder(started: started)
+        FileIndex.setMemoryTelemetrySinkForTesting { event in
+            memoryTelemetryRecorder.record(event)
+        }
+        let memoryTask = memoryTimeline.start()
+        defer {
+            FileIndex.setMemoryTelemetrySinkForTesting(nil)
+            memoryTask.cancel()
+        }
+        memoryTimeline.mark(
+            "beforeCopiedLiveBackgroundCatchUp",
+            stats: index.currentStats(),
+            diagnostics: index.currentDiagnostics()
+        )
+        index.onStatsChanged = { @MainActor @Sendable stats in
+            lock.lock()
+            events.append((
+                elapsed: Date().timeIntervalSince(started),
+                phase: stats.phase,
+                status: stats.status,
+                indexed: stats.indexedCount,
+                discovered: stats.discoveredCount
+            ))
+            lock.unlock()
+            memoryTimeline.mark("stats.\(stats.phase.rawValue)", stats: stats)
+        }
+
+        _ = index.reconcileIndexedRootsInBackground(
+            rootURLs: scopeRoots,
+            activityPresentation: .backgroundCatchUp
+        )
+        try await waitUntilReady(index)
+        let readyElapsed = Date().timeIntervalSince(started)
+        memoryTimeline.mark(
+            "ready",
+            stats: index.currentStats(),
+            diagnostics: index.currentDiagnostics()
+        )
+        let optimizationTimings = try await optimizationTimingsIfRequested(for: index, started: started)
+        if optimizationTimings != nil {
+            memoryTimeline.mark(
+                "optimizedWaitFinished",
+                stats: index.currentStats(),
+                diagnostics: index.currentDiagnostics()
+            )
+        }
+        memoryTask.cancel()
+        FileIndex.setMemoryTelemetrySinkForTesting(nil)
+        let captured = lock.withLock { events }
+        let capturedMemoryTelemetryEvents = memoryTelemetryRecorder.snapshot()
+        let stats = index.currentStats()
+        let diagnostics = index.currentDiagnostics()
+        print(Self.jsonLine(
+            operation: "copiedLiveBackgroundCatchUpScopedReconcile",
+            roots: roots,
+            scopeRoots: scopeRoots,
+            repeatIndex: repeatIndex,
+            readyElapsed: readyElapsed,
+            optimizationTimings: optimizationTimings,
+            stats: stats,
+            diagnostics: diagnostics,
+            events: captured,
+            memorySamples: memoryTimeline.snapshot(),
+            memoryTelemetryEvents: capturedMemoryTelemetryEvents,
+            extraFields: [
+                "source_app_name": sourceAppName,
+                "source_record_count": sourceRecordCount
+            ]
         ))
     }
 
@@ -292,6 +496,16 @@ struct RealRootPhaseTimingTests {
     private static func waitUntilReady(_ index: FileIndex) async throws {
         try await waitUntil(timeoutSeconds: 600) {
             !index.currentStats().isIndexing
+        }
+    }
+
+    private static func waitUntilSnapshotLoadFinished(_ index: FileIndex) async throws {
+        try await waitUntil(timeoutSeconds: 600) {
+            let stats = index.currentStats()
+            let diagnostics = index.currentDiagnostics()
+            return !stats.isLoadingSnapshot
+                && stats.phase != .loading
+                && diagnostics.activeIndexJobs == 0
         }
     }
 
@@ -322,6 +536,11 @@ struct RealRootPhaseTimingTests {
         let mappedByteSize: Int?
         let heapPageCount: Int?
         let overlayCount: Int?
+    }
+
+    private struct TimelineMemoryTelemetryEvent {
+        let elapsed: TimeInterval
+        let event: FileIndexMemoryTelemetryEvent
     }
 
     private final class MemoryTimelineRecorder: @unchecked Sendable {
@@ -394,6 +613,30 @@ struct RealRootPhaseTimingTests {
                 residentBytes: UInt64(info.resident_size),
                 virtualBytes: UInt64(info.virtual_size)
             )
+        }
+    }
+
+    private final class MemoryTelemetryEventRecorder: @unchecked Sendable {
+        private let started: Date
+        private let lock = NSLock()
+        private var events: [TimelineMemoryTelemetryEvent] = []
+
+        init(started: Date) {
+            self.started = started
+        }
+
+        func record(_ event: FileIndexMemoryTelemetryEvent) {
+            let captured = TimelineMemoryTelemetryEvent(
+                elapsed: Date().timeIntervalSince(started),
+                event: event
+            )
+            lock.withLock {
+                events.append(captured)
+            }
+        }
+
+        func snapshot() -> [TimelineMemoryTelemetryEvent] {
+            lock.withLock { events }
         }
     }
 
@@ -471,6 +714,35 @@ struct RealRootPhaseTimingTests {
         return supportRoot.appendingPathComponent(applicationName, isDirectory: true)
     }
 
+    private static func copyLiveSnapshotPackage(
+        sourceAppName: String
+    ) throws -> (applicationName: String, supportDirectory: URL, roots: [URL], manifest: CompactSnapshotManifest) {
+        let sourceSupportDirectory = supportDirectory(applicationName: sourceAppName)
+        let sourceSnapshotURL = SnapshotLayout.packageURL(in: sourceSupportDirectory)
+        let manifestURL = sourceSnapshotURL.appendingPathComponent(
+            SnapshotLayout.FileName.manifest,
+            isDirectory: false
+        )
+        let manifest = try JSONDecoder().decode(
+            CompactSnapshotManifest.self,
+            from: Data(contentsOf: manifestURL)
+        )
+        let applicationName = "AllTheThingsLivePhaseBench-\(UUID().uuidString)"
+        let targetSupportDirectory = supportDirectory(applicationName: applicationName)
+        try? FileManager.default.removeItem(at: targetSupportDirectory)
+        try FileManager.default.createDirectory(at: targetSupportDirectory, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(
+            at: sourceSnapshotURL,
+            to: SnapshotLayout.packageURL(in: targetSupportDirectory)
+        )
+        return (
+            applicationName,
+            targetSupportDirectory,
+            manifest.roots.map { URL(fileURLWithPath: $0, isDirectory: true).standardizedFileURL },
+            manifest
+        )
+    }
+
     private static func readableDirectoryRoots(from value: String) -> [URL] {
         value
             .split(separator: ":", omittingEmptySubsequences: true)
@@ -529,7 +801,9 @@ struct RealRootPhaseTimingTests {
         stats: IndexStats,
         diagnostics: FileIndexDiagnostics,
         events: [(elapsed: TimeInterval, phase: IndexPhase, status: String, indexed: Int, discovered: Int)],
-        memorySamples: [TimelineMemorySample]
+        memorySamples: [TimelineMemorySample],
+        memoryTelemetryEvents: [TimelineMemoryTelemetryEvent],
+        extraFields: [String: Any] = [:]
     ) -> String {
         var payload: [String: Any] = [
             "operation": operation,
@@ -550,10 +824,14 @@ struct RealRootPhaseTimingTests {
             "component_gram_posting_count": diagnostics.componentGramPostingCount,
             "phase_events": phaseEventValues(events),
             "memory_samples": memorySampleValues(memorySamples),
+            "memory_events": memoryTelemetryEventValues(memoryTelemetryEvents),
             "memory_report": memoryReport(operation: operation, samples: memorySamples)
         ]
         if let scopeRoots {
             payload["scope_roots"] = scopeRoots.map(\.path)
+        }
+        for (key, value) in extraFields {
+            payload[key] = value
         }
         if let coreOptimizedElapsed = optimizationTimings?.coreOptimizedElapsed {
             payload["optimized_elapsed_ms"] = Int((coreOptimizedElapsed * 1000).rounded())
@@ -628,6 +906,43 @@ struct RealRootPhaseTimingTests {
         }
     }
 
+    private static func memoryTelemetryEventValues(_ events: [TimelineMemoryTelemetryEvent]) -> [[String: Any]] {
+        events.map { captured in
+            let event = captured.event
+            var value: [String: Any] = [
+                "elapsed_ms": Int((captured.elapsed * 1000).rounded()),
+                "event": event.event,
+                "record_count": event.recordCount,
+                "total_path_bytes": event.totalPathBytes,
+                "max_path_bytes": event.maxPathBytes,
+                "mapped_byte_size": event.mappedByteSize,
+                "heap_page_count": event.heapPageCount,
+                "overlay_count": event.overlayCount,
+                "path_gram_key_count": event.pathGramKeyCount,
+                "path_gram_posting_count": event.pathGramPostingCount,
+                "name_gram_key_count": event.nameGramKeyCount,
+                "name_gram_posting_count": event.nameGramPostingCount,
+                "component_gram_key_count": event.componentGramKeyCount,
+                "component_gram_posting_count": event.componentGramPostingCount,
+                "extension_key_count": event.extensionKeyCount,
+                "extension_posting_count": event.extensionPostingCount,
+                "scope_count": event.scopeCount,
+                "refresh_batch_size": event.refreshBatchSize,
+                "active_index_jobs": event.activeIndexJobs,
+                "physical_footprint_bytes": jsonInt(event.physicalFootprintBytes),
+                "resident_bytes": jsonInt(event.residentBytes),
+                "virtual_bytes": jsonInt(event.virtualBytes)
+            ]
+            if let storeKind = event.storeKind {
+                value["store_kind"] = storeKind.rawValue
+            }
+            if let reconcilesAllRoots = event.reconcilesAllRoots {
+                value["reconciles_all_roots"] = reconcilesAllRoots
+            }
+            return value
+        }
+    }
+
     private static func memoryReport(operation: String, samples: [TimelineMemorySample]) -> [String: Any] {
         guard let peak = samples.max(by: { $0.physicalFootprintBytes < $1.physicalFootprintBytes }) else {
             return [
@@ -648,7 +963,7 @@ struct RealRootPhaseTimingTests {
             : "retained_or_plateau"
         let attribution: String
         if operation == "backgroundCatchUpScopedReconcile" {
-            attribution = "Compare peak_label with IndexMemory OS log events; peaks near previousRecords or merge events indicate whole-index materialization during scoped catch-up."
+            attribution = "Compare peak_label with memory_events; peaks near previousRecords or merge events indicate whole-index materialization during scoped catch-up."
         } else if operation.contains("Reconcile") {
             attribution = "Compare with scoped catch-up output; full-root reconcile should avoid previous snapshot materialization."
         } else {

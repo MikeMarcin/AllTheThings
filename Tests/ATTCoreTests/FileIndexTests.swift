@@ -1845,6 +1845,99 @@ struct FileIndexTests {
         }
     }
 
+    @Test("scoped reconciliation streams merged records into mapped packages")
+    func scopedReconciliationStreamsMergedRecordsIntoMappedPackages() async throws {
+        let fileManager = FileManager.default
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        let changedFolder = root.appendingPathComponent("Project/Sources/Changed", isDirectory: true)
+        let unchangedFolder = root.appendingPathComponent("Project/Docs/Unchanged", isDirectory: true)
+        try fileManager.createDirectory(at: changedFolder, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: unchangedFolder, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+            try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName))
+        }
+
+        let deletedFile = changedFolder.appendingPathComponent("DeletedTarget.swift")
+        let replacedFile = changedFolder.appendingPathComponent("ReplacedTarget.swift")
+        let addedFile = changedFolder.appendingPathComponent("AddedTarget.swift")
+        let retainedFile = unchangedFolder.appendingPathComponent("RetainedTarget.md")
+        try "deleted".write(to: deletedFile, atomically: true, encoding: .utf8)
+        try "old".write(to: replacedFile, atomically: true, encoding: .utf8)
+        try "retained".write(to: retainedFile, atomically: true, encoding: .utf8)
+        let oldDate = Date(timeIntervalSince1970: 1_700_000_000)
+        let newDate = Date(timeIntervalSince1970: 1_700_000_200)
+        try fileManager.setAttributes([.modificationDate: oldDate], ofItemAtPath: replacedFile.path)
+
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil(timeout: .seconds(10)) {
+            let diagnostics = index.currentDiagnostics()
+            return !index.currentStats().isIndexing
+                && diagnostics.recordStoreKind == .mapped
+                && diagnostics.optimizedCount == diagnostics.indexedCount
+        }
+
+        try fileManager.removeItem(at: deletedFile)
+        try "new".write(to: replacedFile, atomically: true, encoding: .utf8)
+        try fileManager.setAttributes([.modificationDate: newDate], ofItemAtPath: replacedFile.path)
+        try "added".write(to: addedFile, atomically: true, encoding: .utf8)
+
+        let memoryEvents = FileIndexMemoryEventRecorder()
+        FileIndex.setMemoryTelemetrySinkForTesting { event in
+            memoryEvents.append(event)
+        }
+        defer {
+            FileIndex.setMemoryTelemetrySinkForTesting(nil)
+        }
+
+        index.reconcileIndexedRootsInBackground(rootURLs: [changedFolder])
+        try await waitUntil(timeout: .seconds(10)) {
+            let diagnostics = index.currentDiagnostics()
+            let replaced = index.search(SearchRequest(
+                query: "ReplacedTarget",
+                sort: SortSpec(column: .relevance, ascending: false)
+            ), maxResults: 10)
+            guard let replacedRecord = replaced.results.first?.record else { return false }
+            let paths = allIndexedPaths(in: index)
+            return !index.currentStats().isIndexing
+                && diagnostics.recordStoreKind == .mapped
+                && diagnostics.optimizedCount == diagnostics.indexedCount
+                && diagnostics.virtualRowCount > 0
+                && paths.contains(addedFile.path)
+                && paths.contains(retainedFile.path)
+                && !paths.contains(deletedFile.path)
+                && abs(replacedRecord.modifiedTime - newDate.timeIntervalSinceReferenceDate) < 1
+        }
+
+        let response = index.search(SearchRequest(
+            query: "Target",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10)
+        #expect(response.usesIndexedCandidates)
+        #expect(response.results.contains { $0.record.path == addedFile.path })
+        #expect(response.results.contains { $0.record.path == replacedFile.path })
+        #expect(response.results.contains { $0.record.path == retainedFile.path })
+        #expect(!response.results.contains { $0.record.path == deletedFile.path })
+
+        let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
+        let reloadedDiagnostics = reloaded.currentDiagnostics()
+        #expect(reloadedDiagnostics.recordStoreKind == .mapped)
+        #expect(reloadedDiagnostics.virtualRowCount > 0)
+        #expect(allIndexedPaths(in: reloaded) == allIndexedPaths(in: index))
+
+        let capturedMemoryEvents = memoryEvents.snapshot()
+        #expect(capturedMemoryEvents.contains {
+            $0.event == "reconcile.scan.finished"
+                && $0.reconcilesAllRoots == false
+                && $0.storeKind == nil
+                && $0.heapPageCount == 0
+        })
+        #expect(!capturedMemoryEvents.contains { $0.event == "reconcile.heapStore.build.end" })
+    }
+
     @Test("directory entry decoding reads only record name bytes")
     func directoryEntryDecodingReadsOnlyRecordNameBytes() throws {
         let pageSize = Int(sysconf(Int32(_SC_PAGESIZE)))
@@ -2528,6 +2621,23 @@ private final class StatsRecorder: @unchecked Sendable {
     func snapshot() -> [IndexStats] {
         lock.withLock {
             stats
+        }
+    }
+}
+
+private final class FileIndexMemoryEventRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [FileIndexMemoryTelemetryEvent] = []
+
+    func append(_ event: FileIndexMemoryTelemetryEvent) {
+        lock.withLock {
+            events.append(event)
+        }
+    }
+
+    func snapshot() -> [FileIndexMemoryTelemetryEvent] {
+        lock.withLock {
+            events
         }
     }
 }
