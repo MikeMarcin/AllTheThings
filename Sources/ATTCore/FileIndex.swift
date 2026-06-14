@@ -604,6 +604,13 @@ public final class FileIndex: @unchecked Sendable {
         let simdTextVerificationEnabled: Bool
     }
 
+    private struct MemoryTelemetryContext {
+        let scopeCount: Int
+        let reconcilesAllRoots: Bool?
+
+        static let none = MemoryTelemetryContext(scopeCount: 0, reconcilesAllRoots: nil)
+    }
+
     private enum MemoryTelemetry {
         private struct MemorySample {
             let virtualBytes: UInt64
@@ -618,23 +625,33 @@ public final class FileIndex: @unchecked Sendable {
             _ event: String,
             records: RecordCollectionMetrics? = nil,
             structures: SearchStructureDiagnostics? = nil,
+            store: RecordStore? = nil,
             refreshBatchSize: Int = 0,
-            activeIndexJobs: Int = 0
+            activeIndexJobs: Int = 0,
+            context: MemoryTelemetryContext = .none
         ) {
             os_signpost(.event, log: signpostLog, name: "IndexMemory")
             let memory = currentMemory()
+            let storeKind = store?.kind.rawValue ?? ""
+            let reconcilesAllRoots = context.reconcilesAllRoots.map { $0 ? "true" : "false" } ?? "unknown"
             logger.info(
                 """
                 event=\(event, privacy: .public) \
                 records=\(records?.recordCount ?? 0, privacy: .public) \
                 totalPathBytes=\(records?.totalPathBytes ?? 0, privacy: .public) \
                 maxPathBytes=\(records?.maxPathBytes ?? 0, privacy: .public) \
+                storeKind=\(storeKind, privacy: .public) \
+                mappedByteSize=\(store?.mappedByteSize ?? 0, privacy: .public) \
+                heapPageCount=\(store?.heapPageCount ?? 0, privacy: .public) \
+                overlayCount=\(store?.overlayCount ?? 0, privacy: .public) \
                 pathGramKeys=\(structures?.pathGramKeyCount ?? 0, privacy: .public) \
                 pathGramPostings=\(structures?.pathGramPostingCount ?? 0, privacy: .public) \
                 nameGramKeys=\(structures?.nameGramKeyCount ?? 0, privacy: .public) \
                 nameGramPostings=\(structures?.nameGramPostingCount ?? 0, privacy: .public) \
                 extensionKeys=\(structures?.extensionKeyCount ?? 0, privacy: .public) \
                 extensionPostings=\(structures?.extensionPostingCount ?? 0, privacy: .public) \
+                scopeCount=\(context.scopeCount, privacy: .public) \
+                reconcilesAllRoots=\(reconcilesAllRoots, privacy: .public) \
                 refreshBatchSize=\(refreshBatchSize, privacy: .public) \
                 activeIndexJobs=\(activeIndexJobs, privacy: .public) \
                 residentBytes=\(memory?.residentBytes ?? 0, privacy: .public) \
@@ -6795,7 +6812,8 @@ public final class FileIndex: @unchecked Sendable {
             initialStore: scanResult.store,
             generation: currentGeneration,
             publishesIntermediateSnapshots: publishesIntermediateSnapshots,
-            operationStartedAt: started
+            operationStartedAt: started,
+            memoryTelemetryContext: MemoryTelemetryContext(scopeCount: rootURLs.count, reconcilesAllRoots: true)
         )
         guard isCurrentGeneration(currentGeneration) else { return }
         recordFullRebuild(duration: Date().timeIntervalSince(started))
@@ -6824,10 +6842,37 @@ public final class FileIndex: @unchecked Sendable {
 
         let scannedRootPaths = rootURLs.map(\.path)
         let reconcilesAllRoots = Set(scannedRootPaths) == Set(allRootPaths)
+        let telemetryContext = MemoryTelemetryContext(
+            scopeCount: rootURLs.count,
+            reconcilesAllRoots: reconcilesAllRoots
+        )
         let previousStore = reconcilesAllRoots ? nil : lock.withLock { searchSnapshot.store }
-        let previousRecords = previousStore?.allRecords() ?? []
+        let previousRecords: [FileRecord]
+        if let previousStore {
+            MemoryTelemetry.log(
+                "reconcile.previousRecords.materialize.begin",
+                records: Self.countOnlyMetrics(for: previousStore),
+                store: previousStore,
+                activeIndexJobs: currentActiveIndexJobCount(),
+                context: telemetryContext
+            )
+            previousRecords = previousStore.allRecords()
+            MemoryTelemetry.log(
+                "reconcile.previousRecords.materialize.end",
+                records: Self.metrics(for: previousRecords),
+                store: previousStore,
+                activeIndexJobs: currentActiveIndexJobCount(),
+                context: telemetryContext
+            )
+        } else {
+            previousRecords = []
+        }
 
-        MemoryTelemetry.log("reconcile.scan.begin", activeIndexJobs: currentActiveIndexJobCount())
+        MemoryTelemetry.log(
+            "reconcile.scan.begin",
+            activeIndexJobs: currentActiveIndexJobCount(),
+            context: telemetryContext
+        )
         DiagnosticLogger.shared.log(
             category: "index",
             event: "index.reconcileBegin",
@@ -6872,22 +6917,87 @@ public final class FileIndex: @unchecked Sendable {
 
         guard isCurrentGeneration(currentGeneration) else { return }
         recordScanFrontierMetrics(scanResult.frontierMetrics, generation: currentGeneration)
+        MemoryTelemetry.log(
+            "reconcile.scan.finished",
+            records: Self.metrics(for: scanResult.store),
+            store: scanResult.store,
+            activeIndexJobs: currentActiveIndexJobCount(),
+            context: telemetryContext
+        )
         let recordsByPath: [String: FileRecord]
         let initialStore: HeapPagedRecordStore
         if reconcilesAllRoots {
             recordsByPath = scanResult.records
             initialStore = scanResult.store
+            MemoryTelemetry.log(
+                "reconcile.fullRoot.recordsReady",
+                records: Self.metrics(for: initialStore),
+                store: initialStore,
+                activeIndexJobs: currentActiveIndexJobCount(),
+                context: telemetryContext
+            )
         } else {
+            MemoryTelemetry.log(
+                "reconcile.merge.begin",
+                records: RecordCollectionMetrics(
+                    recordCount: previousRecords.count + scanResult.records.count,
+                    totalPathBytes: 0,
+                    maxPathBytes: 0
+                ),
+                store: previousStore,
+                activeIndexJobs: currentActiveIndexJobCount(),
+                context: telemetryContext
+            )
             var mergedRecords = Dictionary(
                 uniqueKeysWithValues: previousRecords
                     .filter { !Self.path($0.path, isContainedIn: scannedRootPaths) }
                     .map { ($0.path, $0) }
             )
+            MemoryTelemetry.log(
+                "reconcile.merge.previousFiltered",
+                records: Self.metrics(for: mergedRecords.values),
+                store: previousStore,
+                activeIndexJobs: currentActiveIndexJobCount(),
+                context: telemetryContext
+            )
             for (path, record) in scanResult.records {
                 mergedRecords[path] = record
             }
+            MemoryTelemetry.log(
+                "reconcile.merge.upsertsApplied",
+                records: Self.metrics(for: mergedRecords.values),
+                store: previousStore,
+                activeIndexJobs: currentActiveIndexJobCount(),
+                context: telemetryContext
+            )
             recordsByPath = mergedRecords
-            initialStore = HeapPagedRecordStore(records: Array(mergedRecords.values), roots: allRootPaths)
+            MemoryTelemetry.log(
+                "reconcile.heapStore.recordsArray.begin",
+                records: Self.metrics(for: mergedRecords.values),
+                activeIndexJobs: currentActiveIndexJobCount(),
+                context: telemetryContext
+            )
+            let mergedRecordValues = Array(mergedRecords.values)
+            MemoryTelemetry.log(
+                "reconcile.heapStore.recordsArray.end",
+                records: Self.metrics(for: mergedRecordValues),
+                activeIndexJobs: currentActiveIndexJobCount(),
+                context: telemetryContext
+            )
+            MemoryTelemetry.log(
+                "reconcile.heapStore.build.begin",
+                records: Self.metrics(for: mergedRecordValues),
+                activeIndexJobs: currentActiveIndexJobCount(),
+                context: telemetryContext
+            )
+            initialStore = HeapPagedRecordStore(records: mergedRecordValues, roots: allRootPaths)
+            MemoryTelemetry.log(
+                "reconcile.heapStore.build.end",
+                records: Self.metrics(for: initialStore),
+                store: initialStore,
+                activeIndexJobs: currentActiveIndexJobCount(),
+                context: telemetryContext
+            )
         }
 
         optimizeAndPublish(
@@ -6896,7 +7006,8 @@ public final class FileIndex: @unchecked Sendable {
             generation: currentGeneration,
             publishesIntermediateSnapshots: false,
             completionStatusPrefix: activityPresentation == .backgroundCatchUp ? "Caught up" : "Reconciled",
-            operationStartedAt: started
+            operationStartedAt: started,
+            memoryTelemetryContext: telemetryContext
         )
         guard isCurrentGeneration(currentGeneration) else { return }
         recordFullRebuild(duration: Date().timeIntervalSince(started))
@@ -7217,7 +7328,8 @@ public final class FileIndex: @unchecked Sendable {
         initialStore: HeapPagedRecordStore,
         generation currentGeneration: UInt64,
         completionStatusPrefix: String,
-        operationStartedAt: Date?
+        operationStartedAt: Date?,
+        memoryTelemetryContext: MemoryTelemetryContext
     ) {
         let snapshot = SearchSnapshot(store: initialStore, buildsSearchStructures: false)
         let snapshotSettings = lock.withLock {
@@ -7266,7 +7378,9 @@ public final class FileIndex: @unchecked Sendable {
             "rebuild.primary.ready",
             records: Self.countOnlyMetrics(for: snapshot.store),
             structures: snapshot.diagnostics,
-            activeIndexJobs: currentActiveIndexJobCount()
+            store: snapshot.store,
+            activeIndexJobs: currentActiveIndexJobCount(),
+            context: memoryTelemetryContext
         )
         if snapshotSettings.shouldReconcileAfterFinish {
             requestBackgroundReconciliation()
@@ -7276,7 +7390,8 @@ public final class FileIndex: @unchecked Sendable {
             roots: snapshotSettings.roots,
             exclusionPatterns: snapshotSettings.exclusionPatterns,
             generation: currentGeneration,
-            baseSnapshotRevision: readySnapshotRevision ?? 0
+            baseSnapshotRevision: readySnapshotRevision ?? 0,
+            memoryTelemetryContext: memoryTelemetryContext
         )
     }
 
@@ -7285,7 +7400,8 @@ public final class FileIndex: @unchecked Sendable {
         roots: [String],
         exclusionPatterns: [String],
         generation currentGeneration: UInt64,
-        baseSnapshotRevision: UInt64
+        baseSnapshotRevision: UInt64,
+        memoryTelemetryContext: MemoryTelemetryContext
     ) {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
@@ -7318,6 +7434,12 @@ public final class FileIndex: @unchecked Sendable {
 
             let packageURL = SnapshotLayout.temporaryPackageURL(in: self.supportDirectory)
             do {
+                MemoryTelemetry.log(
+                    "rebuild.deferredOptimize.mappedWrite.begin",
+                    records: Self.metrics(for: records),
+                    activeIndexJobs: self.currentActiveIndexJobCount(),
+                    context: memoryTelemetryContext
+                )
                 try MappedRecordStore.writePackage(
                     records: records,
                     roots: roots,
@@ -7325,14 +7447,82 @@ public final class FileIndex: @unchecked Sendable {
                     packageURL: packageURL,
                     fileManager: self.fileManager
                 )
+                MemoryTelemetry.log(
+                    "rebuild.deferredOptimize.mappedWrite.end",
+                    records: Self.metrics(for: records),
+                    activeIndexJobs: self.currentActiveIndexJobCount(),
+                    context: memoryTelemetryContext
+                )
                 let mappedStore = try MappedRecordStore(
                     packageURL: packageURL,
                     schemaVersion: SnapshotLayout.schemaVersion
                 )
+                MemoryTelemetry.log(
+                    "rebuild.deferredOptimize.mappedStore.loaded",
+                    records: Self.metrics(for: mappedStore),
+                    store: mappedStore,
+                    activeIndexJobs: self.currentActiveIndexJobCount(),
+                    context: memoryTelemetryContext
+                )
                 var optimizedSnapshot = SearchSnapshot(store: mappedStore, buildsSearchStructures: false)
+                MemoryTelemetry.log(
+                    "rebuild.deferredOptimize.snapshot.mapped",
+                    records: Self.countOnlyMetrics(for: optimizedSnapshot.store),
+                    structures: optimizedSnapshot.diagnostics,
+                    store: optimizedSnapshot.store,
+                    activeIndexJobs: self.currentActiveIndexJobCount(),
+                    context: memoryTelemetryContext
+                )
+                MemoryTelemetry.log(
+                    "rebuild.deferredOptimize.nameGrams.begin",
+                    records: Self.countOnlyMetrics(for: optimizedSnapshot.store),
+                    store: optimizedSnapshot.store,
+                    activeIndexJobs: self.currentActiveIndexJobCount(),
+                    context: memoryTelemetryContext
+                )
                 optimizedSnapshot = optimizedSnapshot.addingNameGramIndex()
+                MemoryTelemetry.log(
+                    "rebuild.deferredOptimize.nameGrams.end",
+                    records: Self.countOnlyMetrics(for: optimizedSnapshot.store),
+                    structures: optimizedSnapshot.diagnostics,
+                    store: optimizedSnapshot.store,
+                    activeIndexJobs: self.currentActiveIndexJobCount(),
+                    context: memoryTelemetryContext
+                )
+                MemoryTelemetry.log(
+                    "rebuild.deferredOptimize.extensions.begin",
+                    records: Self.countOnlyMetrics(for: optimizedSnapshot.store),
+                    structures: optimizedSnapshot.diagnostics,
+                    store: optimizedSnapshot.store,
+                    activeIndexJobs: self.currentActiveIndexJobCount(),
+                    context: memoryTelemetryContext
+                )
                 optimizedSnapshot = optimizedSnapshot.addingExtensionIndex()
+                MemoryTelemetry.log(
+                    "rebuild.deferredOptimize.extensions.end",
+                    records: Self.countOnlyMetrics(for: optimizedSnapshot.store),
+                    structures: optimizedSnapshot.diagnostics,
+                    store: optimizedSnapshot.store,
+                    activeIndexJobs: self.currentActiveIndexJobCount(),
+                    context: memoryTelemetryContext
+                )
+                MemoryTelemetry.log(
+                    "rebuild.deferredOptimize.modifiedSort.begin",
+                    records: Self.countOnlyMetrics(for: optimizedSnapshot.store),
+                    structures: optimizedSnapshot.diagnostics,
+                    store: optimizedSnapshot.store,
+                    activeIndexJobs: self.currentActiveIndexJobCount(),
+                    context: memoryTelemetryContext
+                )
                 optimizedSnapshot = optimizedSnapshot.addingModifiedSortOrder()
+                MemoryTelemetry.log(
+                    "rebuild.deferredOptimize.modifiedSort.end",
+                    records: Self.countOnlyMetrics(for: optimizedSnapshot.store),
+                    structures: optimizedSnapshot.diagnostics,
+                    store: optimizedSnapshot.store,
+                    activeIndexJobs: self.currentActiveIndexJobCount(),
+                    context: memoryTelemetryContext
+                )
 
                 guard self.isCurrentGeneration(currentGeneration),
                       self.isSnapshotRevisionCurrent(baseSnapshotRevision)
@@ -7342,7 +7532,23 @@ public final class FileIndex: @unchecked Sendable {
                     return
                 }
 
+                MemoryTelemetry.log(
+                    "rebuild.deferredOptimize.persistSearchStructures.begin",
+                    records: Self.countOnlyMetrics(for: optimizedSnapshot.store),
+                    structures: optimizedSnapshot.diagnostics,
+                    store: optimizedSnapshot.store,
+                    activeIndexJobs: self.currentActiveIndexJobCount(),
+                    context: memoryTelemetryContext
+                )
                 try self.persistSearchStructures(for: optimizedSnapshot, packageURL: packageURL)
+                MemoryTelemetry.log(
+                    "rebuild.deferredOptimize.persistSearchStructures.end",
+                    records: Self.countOnlyMetrics(for: optimizedSnapshot.store),
+                    structures: optimizedSnapshot.diagnostics,
+                    store: optimizedSnapshot.store,
+                    activeIndexJobs: self.currentActiveIndexJobCount(),
+                    context: memoryTelemetryContext
+                )
 
                 guard self.isCurrentGeneration(currentGeneration),
                       self.isSnapshotRevisionCurrent(baseSnapshotRevision)
@@ -7352,7 +7558,23 @@ public final class FileIndex: @unchecked Sendable {
                     return
                 }
 
+                MemoryTelemetry.log(
+                    "rebuild.deferredOptimize.installMappedSnapshot.begin",
+                    records: Self.countOnlyMetrics(for: optimizedSnapshot.store),
+                    structures: optimizedSnapshot.diagnostics,
+                    store: optimizedSnapshot.store,
+                    activeIndexJobs: self.currentActiveIndexJobCount(),
+                    context: memoryTelemetryContext
+                )
                 try self.installMappedSnapshotPackage(packageURL)
+                MemoryTelemetry.log(
+                    "rebuild.deferredOptimize.installMappedSnapshot.end",
+                    records: Self.countOnlyMetrics(for: optimizedSnapshot.store),
+                    structures: optimizedSnapshot.diagnostics,
+                    store: optimizedSnapshot.store,
+                    activeIndexJobs: self.currentActiveIndexJobCount(),
+                    context: memoryTelemetryContext
+                )
 
                 let didApply = self.lock.withLock { () -> Bool in
                     guard self.generation == currentGeneration,
@@ -7380,7 +7602,9 @@ public final class FileIndex: @unchecked Sendable {
                         "rebuild.deferredOptimized.applied",
                         records: Self.countOnlyMetrics(for: optimizedSnapshot.store),
                         structures: optimizedSnapshot.diagnostics,
-                        activeIndexJobs: self.currentActiveIndexJobCount()
+                        store: optimizedSnapshot.store,
+                        activeIndexJobs: self.currentActiveIndexJobCount(),
+                        context: memoryTelemetryContext
                     )
                     DiagnosticLogger.shared.log(
                         category: "index",
@@ -7416,9 +7640,24 @@ public final class FileIndex: @unchecked Sendable {
         generation currentGeneration: UInt64,
         publishesIntermediateSnapshots: Bool = true,
         completionStatusPrefix: String = "Indexed",
-        operationStartedAt: Date? = nil
+        operationStartedAt: Date? = nil,
+        memoryTelemetryContext: MemoryTelemetryContext = .none
     ) {
+        MemoryTelemetry.log(
+            "optimize.records.materialize.begin",
+            records: RecordCollectionMetrics(recordCount: recordsByPath.count, totalPathBytes: 0, maxPathBytes: 0),
+            store: initialStore,
+            activeIndexJobs: currentActiveIndexJobCount(),
+            context: memoryTelemetryContext
+        )
         let records = Array(recordsByPath.values)
+        MemoryTelemetry.log(
+            "optimize.records.materialize.end",
+            records: Self.metrics(for: records),
+            store: initialStore,
+            activeIndexJobs: currentActiveIndexJobCount(),
+            context: memoryTelemetryContext
+        )
         let deferredOptimizationThreshold = lock.withLock {
             deferredOptimizationRecordThreshold
         }
@@ -7428,12 +7667,21 @@ public final class FileIndex: @unchecked Sendable {
                 initialStore: initialStore,
                 generation: currentGeneration,
                 completionStatusPrefix: completionStatusPrefix,
-                operationStartedAt: operationStartedAt
+                operationStartedAt: operationStartedAt,
+                memoryTelemetryContext: memoryTelemetryContext
             )
             return
         }
 
         var snapshot = SearchSnapshot(store: initialStore, buildsSearchStructures: false)
+        MemoryTelemetry.log(
+            "optimize.primarySnapshot.created",
+            records: Self.countOnlyMetrics(for: snapshot.store),
+            structures: snapshot.diagnostics,
+            store: snapshot.store,
+            activeIndexJobs: currentActiveIndexJobCount(),
+            context: memoryTelemetryContext
+        )
         var pendingMappedPackageURL: URL?
 
         guard isCurrentGeneration(currentGeneration) else { return }
@@ -7456,6 +7704,13 @@ public final class FileIndex: @unchecked Sendable {
                     exclusionPatterns: exclusionRules.patterns
                 )
             }
+            MemoryTelemetry.log(
+                "optimize.mappedWrite.begin",
+                records: Self.metrics(for: records),
+                store: snapshot.store,
+                activeIndexJobs: currentActiveIndexJobCount(),
+                context: memoryTelemetryContext
+            )
             try MappedRecordStore.writePackage(
                 records: records,
                 roots: snapshotSettings.roots,
@@ -7463,9 +7718,31 @@ public final class FileIndex: @unchecked Sendable {
                 packageURL: packageURL,
                 fileManager: fileManager
             )
+            MemoryTelemetry.log(
+                "optimize.mappedWrite.end",
+                records: Self.metrics(for: records),
+                store: snapshot.store,
+                activeIndexJobs: currentActiveIndexJobCount(),
+                context: memoryTelemetryContext
+            )
             let mappedStore = try MappedRecordStore(packageURL: packageURL, schemaVersion: SnapshotLayout.schemaVersion)
             pendingMappedPackageURL = packageURL
+            MemoryTelemetry.log(
+                "optimize.mappedStore.loaded",
+                records: Self.metrics(for: mappedStore),
+                store: mappedStore,
+                activeIndexJobs: currentActiveIndexJobCount(),
+                context: memoryTelemetryContext
+            )
             snapshot = SearchSnapshot(store: mappedStore, buildsSearchStructures: false)
+            MemoryTelemetry.log(
+                "optimize.mappedSnapshot.created",
+                records: Self.countOnlyMetrics(for: snapshot.store),
+                structures: snapshot.diagnostics,
+                store: snapshot.store,
+                activeIndexJobs: currentActiveIndexJobCount(),
+                context: memoryTelemetryContext
+            )
             if publishesIntermediateSnapshots {
                 publishOptimizedSnapshot(
                     snapshot,
@@ -7479,7 +7756,22 @@ public final class FileIndex: @unchecked Sendable {
             return
         }
 
+        MemoryTelemetry.log(
+            "optimize.nameGrams.begin",
+            records: Self.countOnlyMetrics(for: snapshot.store),
+            store: snapshot.store,
+            activeIndexJobs: currentActiveIndexJobCount(),
+            context: memoryTelemetryContext
+        )
         snapshot = snapshot.addingNameGramIndex()
+        MemoryTelemetry.log(
+            "optimize.nameGrams.end",
+            records: Self.countOnlyMetrics(for: snapshot.store),
+            structures: snapshot.diagnostics,
+            store: snapshot.store,
+            activeIndexJobs: currentActiveIndexJobCount(),
+            context: memoryTelemetryContext
+        )
         if publishesIntermediateSnapshots {
             publishOptimizedSnapshot(
                 snapshot,
@@ -7500,7 +7792,23 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         guard isCurrentGeneration(currentGeneration) else { return }
+        MemoryTelemetry.log(
+            "optimize.extensions.begin",
+            records: Self.countOnlyMetrics(for: snapshot.store),
+            structures: snapshot.diagnostics,
+            store: snapshot.store,
+            activeIndexJobs: currentActiveIndexJobCount(),
+            context: memoryTelemetryContext
+        )
         snapshot = snapshot.addingExtensionIndex()
+        MemoryTelemetry.log(
+            "optimize.extensions.end",
+            records: Self.countOnlyMetrics(for: snapshot.store),
+            structures: snapshot.diagnostics,
+            store: snapshot.store,
+            activeIndexJobs: currentActiveIndexJobCount(),
+            context: memoryTelemetryContext
+        )
         if publishesIntermediateSnapshots {
             publishOptimizedSnapshot(
                 snapshot,
@@ -7521,7 +7829,23 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         guard isCurrentGeneration(currentGeneration) else { return }
+        MemoryTelemetry.log(
+            "optimize.modifiedSort.begin",
+            records: Self.countOnlyMetrics(for: snapshot.store),
+            structures: snapshot.diagnostics,
+            store: snapshot.store,
+            activeIndexJobs: currentActiveIndexJobCount(),
+            context: memoryTelemetryContext
+        )
         snapshot = snapshot.addingModifiedSortOrder()
+        MemoryTelemetry.log(
+            "optimize.modifiedSort.end",
+            records: Self.countOnlyMetrics(for: snapshot.store),
+            structures: snapshot.diagnostics,
+            store: snapshot.store,
+            activeIndexJobs: currentActiveIndexJobCount(),
+            context: memoryTelemetryContext
+        )
         if publishesIntermediateSnapshots {
             publishOptimizedSnapshot(
                 snapshot,
@@ -7553,13 +7877,45 @@ public final class FileIndex: @unchecked Sendable {
         )
         if let pendingMappedPackageURL {
             do {
+                MemoryTelemetry.log(
+                    "optimize.persistSearchStructures.begin",
+                    records: Self.countOnlyMetrics(for: snapshot.store),
+                    structures: snapshot.diagnostics,
+                    store: snapshot.store,
+                    activeIndexJobs: currentActiveIndexJobCount(),
+                    context: memoryTelemetryContext
+                )
                 try persistSearchStructures(for: snapshot, packageURL: pendingMappedPackageURL)
+                MemoryTelemetry.log(
+                    "optimize.persistSearchStructures.end",
+                    records: Self.countOnlyMetrics(for: snapshot.store),
+                    structures: snapshot.diagnostics,
+                    store: snapshot.store,
+                    activeIndexJobs: currentActiveIndexJobCount(),
+                    context: memoryTelemetryContext
+                )
             } catch {
                 failIndexing("Could not save optimized search index: \(error.localizedDescription)", generation: currentGeneration)
                 return
             }
 
+            MemoryTelemetry.log(
+                "optimize.installMappedSnapshot.begin",
+                records: Self.countOnlyMetrics(for: snapshot.store),
+                structures: snapshot.diagnostics,
+                store: snapshot.store,
+                activeIndexJobs: currentActiveIndexJobCount(),
+                context: memoryTelemetryContext
+            )
             guard installMappedSnapshotPackage(pendingMappedPackageURL, generation: currentGeneration) else { return }
+            MemoryTelemetry.log(
+                "optimize.installMappedSnapshot.end",
+                records: Self.countOnlyMetrics(for: snapshot.store),
+                structures: snapshot.diagnostics,
+                store: snapshot.store,
+                activeIndexJobs: currentActiveIndexJobCount(),
+                context: memoryTelemetryContext
+            )
         } else {
             guard persistSnapshot() else { return }
         }
@@ -7610,7 +7966,9 @@ public final class FileIndex: @unchecked Sendable {
                 "rebuild.optimized.applied",
                 records: Self.countOnlyMetrics(for: snapshot.store),
                 structures: snapshot.diagnostics,
-                activeIndexJobs: currentActiveIndexJobCount()
+                store: snapshot.store,
+                activeIndexJobs: currentActiveIndexJobCount(),
+                context: memoryTelemetryContext
             )
             if shouldReconcileAfterFinish {
                 requestBackgroundReconciliation()
