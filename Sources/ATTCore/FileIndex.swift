@@ -455,6 +455,32 @@ struct FileIndexDiagnostics: Sendable {
     let scanFrontierMetrics: ScanFrontierMetrics
 }
 
+struct FileIndexMemoryTelemetryEvent: Sendable {
+    let event: String
+    let recordCount: Int
+    let totalPathBytes: Int
+    let maxPathBytes: Int
+    let storeKind: RecordStoreKind?
+    let mappedByteSize: Int
+    let heapPageCount: Int
+    let overlayCount: Int
+    let pathGramKeyCount: Int
+    let pathGramPostingCount: Int
+    let nameGramKeyCount: Int
+    let nameGramPostingCount: Int
+    let componentGramKeyCount: Int
+    let componentGramPostingCount: Int
+    let extensionKeyCount: Int
+    let extensionPostingCount: Int
+    let scopeCount: Int
+    let reconcilesAllRoots: Bool?
+    let refreshBatchSize: Int
+    let activeIndexJobs: Int
+    let residentBytes: UInt64
+    let physicalFootprintBytes: UInt64
+    let virtualBytes: UInt64
+}
+
 enum ExclusionEvaluationMode: String, Sendable, CaseIterable {
     case compiledQuery
     case legacyRules
@@ -505,6 +531,31 @@ public final class FileIndex: @unchecked Sendable {
     private static let exactEmptyQuerySortLimit = 100_000
     private static let largeOverlayPersistDefaultDelay: TimeInterval = 30
     public static let maximumIndexedRootCount = RootAttributionTable.maximumRootCount
+    private static let memoryTelemetrySinkForTesting = MemoryTelemetrySinkBox()
+
+    private final class MemoryTelemetrySinkBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var sink: (@Sendable (FileIndexMemoryTelemetryEvent) -> Void)?
+
+        func set(_ sink: (@Sendable (FileIndexMemoryTelemetryEvent) -> Void)?) {
+            lock.withLock {
+                self.sink = sink
+            }
+        }
+
+        func emit(_ event: FileIndexMemoryTelemetryEvent) {
+            let sink = lock.withLock { self.sink }
+            sink?(event)
+        }
+    }
+
+    static func setMemoryTelemetrySinkForTesting(_ sink: (@Sendable (FileIndexMemoryTelemetryEvent) -> Void)?) {
+        memoryTelemetrySinkForTesting.set(sink)
+    }
+
+    private static func emitMemoryTelemetryForTesting(_ event: FileIndexMemoryTelemetryEvent) {
+        memoryTelemetrySinkForTesting.emit(event)
+    }
 
     public var onStatsChanged: (@MainActor @Sendable (IndexStats) -> Void)? {
         get {
@@ -634,6 +685,32 @@ public final class FileIndex: @unchecked Sendable {
             let memory = currentMemory()
             let storeKind = store?.kind.rawValue ?? ""
             let reconcilesAllRoots = context.reconcilesAllRoots.map { $0 ? "true" : "false" } ?? "unknown"
+            let telemetryEvent = FileIndexMemoryTelemetryEvent(
+                event: event,
+                recordCount: records?.recordCount ?? 0,
+                totalPathBytes: records?.totalPathBytes ?? 0,
+                maxPathBytes: records?.maxPathBytes ?? 0,
+                storeKind: store?.kind,
+                mappedByteSize: store?.mappedByteSize ?? 0,
+                heapPageCount: store?.heapPageCount ?? 0,
+                overlayCount: store?.overlayCount ?? 0,
+                pathGramKeyCount: structures?.pathGramKeyCount ?? 0,
+                pathGramPostingCount: structures?.pathGramPostingCount ?? 0,
+                nameGramKeyCount: structures?.nameGramKeyCount ?? 0,
+                nameGramPostingCount: structures?.nameGramPostingCount ?? 0,
+                componentGramKeyCount: structures?.componentGramKeyCount ?? 0,
+                componentGramPostingCount: structures?.componentGramPostingCount ?? 0,
+                extensionKeyCount: structures?.extensionKeyCount ?? 0,
+                extensionPostingCount: structures?.extensionPostingCount ?? 0,
+                scopeCount: context.scopeCount,
+                reconcilesAllRoots: context.reconcilesAllRoots,
+                refreshBatchSize: refreshBatchSize,
+                activeIndexJobs: activeIndexJobs,
+                residentBytes: memory?.residentBytes ?? 0,
+                physicalFootprintBytes: memory?.physicalFootprintBytes ?? 0,
+                virtualBytes: memory?.virtualBytes ?? 0
+            )
+            FileIndex.emitMemoryTelemetryForTesting(telemetryEvent)
             logger.info(
                 """
                 event=\(event, privacy: .public) \
@@ -758,7 +835,7 @@ public final class FileIndex: @unchecked Sendable {
 
     private struct ScanResult {
         let records: [String: FileRecord]
-        let store: HeapPagedRecordStore
+        let store: HeapPagedRecordStore?
         let visited: Int
         let frontierMetrics: ScanFrontierMetrics
     }
@@ -806,7 +883,7 @@ public final class FileIndex: @unchecked Sendable {
         private var completedDirectories: Set<String>
         private var shouldStop = false
         private var records: [String: FileRecord]
-        private let builder: HeapPagedRecordStore.Builder
+        private let builder: HeapPagedRecordStore.Builder?
         private var visited = 0
         private var lastStatusPublishedCount = 0
         private var lastStatusPublishedAt = Date.distantPast
@@ -823,16 +900,17 @@ public final class FileIndex: @unchecked Sendable {
             existingRecords: [FileRecord] = [],
             pendingDirectories: [URL] = [],
             completedDirectories: Set<String> = [],
-            operationStartedAt: Date
+            operationStartedAt: Date,
+            buildsRecordStore: Bool = true
         ) {
             self.completedDirectories = completedDirectories
             self.operationStartedAt = operationStartedAt
             records = [:]
             records.reserveCapacity(max(reservedCapacity, existingRecords.count))
-            builder = HeapPagedRecordStore.Builder(reservedCapacity: reservedCapacity, roots: roots)
+            builder = buildsRecordStore ? HeapPagedRecordStore.Builder(reservedCapacity: reservedCapacity, roots: roots) : nil
             for record in existingRecords {
                 records[record.path] = record
-                builder.append(record)
+                builder?.append(record)
             }
             visited = existingRecords.count
             for directory in pendingDirectories where !completedDirectories.contains(directory.path) {
@@ -872,7 +950,7 @@ public final class FileIndex: @unchecked Sendable {
             condition.lock()
             let isNew = records[record.path] == nil
             records[record.path] = record
-            builder.append(record)
+            builder?.append(record)
             if isNew {
                 visited += 1
             }
@@ -950,7 +1028,7 @@ public final class FileIndex: @unchecked Sendable {
             for record in batch {
                 let isNew = records[record.path] == nil
                 records[record.path] = record
-                builder.append(record)
+                builder?.append(record)
                 if isNew {
                     visited += 1
                 }
@@ -978,6 +1056,7 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         func publishSnapshotIfNeeded(force: Bool) -> ScanProgress? {
+            guard let builder else { return nil }
             condition.lock()
             defer { condition.unlock() }
 
@@ -993,6 +1072,7 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         func checkpointIfNeeded(force: Bool) -> ScanCheckpointProgress? {
+            guard let builder else { return nil }
             condition.lock()
             defer { condition.unlock() }
 
@@ -1023,7 +1103,7 @@ public final class FileIndex: @unchecked Sendable {
             return (
                 ScanResult(
                     records: records,
-                    store: builder.snapshot(includesPathIndex: true),
+                    store: builder?.snapshot(includesPathIndex: true),
                     visited: visited,
                     frontierMetrics: frontierMetrics
                 ),
@@ -6685,7 +6765,7 @@ public final class FileIndex: @unchecked Sendable {
             indexing = false
             reconciling = false
             updating = false
-            discoveredCount = snapshot.resultCount
+            self.discoveredCount = snapshot.resultCount
             searchableCount = snapshot.resultCount
             optimizedCount = loadedOptimized ? snapshot.resultCount : 0
             lastUpdated = persisted.manifest.savedAt
@@ -6803,13 +6883,17 @@ public final class FileIndex: @unchecked Sendable {
 
         guard isCurrentGeneration(currentGeneration) else { return }
         recordScanFrontierMetrics(scanResult.frontierMetrics, generation: currentGeneration)
+        guard let scanStore = scanResult.store else {
+            failIndexing("Could not build scan store.", generation: currentGeneration)
+            return
+        }
         let publishesIntermediateSnapshots = shouldPublishSearchableSnapshotsDuringScan()
         if publishesIntermediateSnapshots {
-            publishPrimary(scanResult.store, scanResult.visited, true)
+            publishPrimary(scanStore, scanResult.visited, true)
         }
         optimizeAndPublish(
             recordsByPath: scanResult.records,
-            initialStore: scanResult.store,
+            initialStore: scanStore,
             generation: currentGeneration,
             publishesIntermediateSnapshots: publishesIntermediateSnapshots,
             operationStartedAt: started,
@@ -6847,25 +6931,14 @@ public final class FileIndex: @unchecked Sendable {
             reconcilesAllRoots: reconcilesAllRoots
         )
         let previousStore = reconcilesAllRoots ? nil : lock.withLock { searchSnapshot.store }
-        let previousRecords: [FileRecord]
         if let previousStore {
             MemoryTelemetry.log(
-                "reconcile.previousRecords.materialize.begin",
+                "reconcile.previousStore.ready",
                 records: Self.countOnlyMetrics(for: previousStore),
                 store: previousStore,
                 activeIndexJobs: currentActiveIndexJobCount(),
                 context: telemetryContext
             )
-            previousRecords = previousStore.allRecords()
-            MemoryTelemetry.log(
-                "reconcile.previousRecords.materialize.end",
-                records: Self.metrics(for: previousRecords),
-                store: previousStore,
-                activeIndexJobs: currentActiveIndexJobCount(),
-                context: telemetryContext
-            )
-        } else {
-            previousRecords = []
         }
 
         MemoryTelemetry.log(
@@ -6895,6 +6968,8 @@ public final class FileIndex: @unchecked Sendable {
             exclusionRootPaths: allRootPaths,
             writesCheckpoints: false,
             publishesScanStatus: true,
+            publishesIntermediateSnapshots: reconcilesAllRoots,
+            buildsRecordStore: reconcilesAllRoots,
             workerCount: Self.refreshScanWorkerCount(),
             workerQoS: .utility,
             progress: { _, _, _ in }
@@ -6917,105 +6992,54 @@ public final class FileIndex: @unchecked Sendable {
 
         guard isCurrentGeneration(currentGeneration) else { return }
         recordScanFrontierMetrics(scanResult.frontierMetrics, generation: currentGeneration)
+        let scanMetrics = scanResult.store.map { Self.metrics(for: $0) } ?? Self.metrics(for: scanResult.records.values)
         MemoryTelemetry.log(
             "reconcile.scan.finished",
-            records: Self.metrics(for: scanResult.store),
+            records: scanMetrics,
             store: scanResult.store,
             activeIndexJobs: currentActiveIndexJobCount(),
             context: telemetryContext
         )
-        let recordsByPath: [String: FileRecord]
-        let initialStore: HeapPagedRecordStore
         if reconcilesAllRoots {
-            recordsByPath = scanResult.records
-            initialStore = scanResult.store
-            MemoryTelemetry.log(
-                "reconcile.fullRoot.recordsReady",
-                records: Self.metrics(for: initialStore),
-                store: initialStore,
-                activeIndexJobs: currentActiveIndexJobCount(),
-                context: telemetryContext
-            )
-        } else {
-            MemoryTelemetry.log(
-                "reconcile.merge.begin",
-                records: RecordCollectionMetrics(
-                    recordCount: previousRecords.count + scanResult.records.count,
-                    totalPathBytes: 0,
-                    maxPathBytes: 0
-                ),
-                store: previousStore,
-                activeIndexJobs: currentActiveIndexJobCount(),
-                context: telemetryContext
-            )
-            var mergedRecords = Dictionary(
-                uniqueKeysWithValues: previousRecords
-                    .filter { !Self.path($0.path, isContainedIn: scannedRootPaths) }
-                    .map { ($0.path, $0) }
-            )
-            MemoryTelemetry.log(
-                "reconcile.merge.previousFiltered",
-                records: Self.metrics(for: mergedRecords.values),
-                store: previousStore,
-                activeIndexJobs: currentActiveIndexJobCount(),
-                context: telemetryContext
-            )
-            for (path, record) in scanResult.records {
-                mergedRecords[path] = record
+            guard let scanStore = scanResult.store else {
+                failIndexing("Could not build reconciliation store.", generation: currentGeneration)
+                return
             }
             MemoryTelemetry.log(
-                "reconcile.merge.upsertsApplied",
-                records: Self.metrics(for: mergedRecords.values),
-                store: previousStore,
+                "reconcile.fullRoot.recordsReady",
+                records: Self.metrics(for: scanStore),
+                store: scanStore,
                 activeIndexJobs: currentActiveIndexJobCount(),
                 context: telemetryContext
             )
-            recordsByPath = mergedRecords
-            MemoryTelemetry.log(
-                "reconcile.heapStore.recordsArray.begin",
-                records: Self.metrics(for: mergedRecords.values),
-                activeIndexJobs: currentActiveIndexJobCount(),
-                context: telemetryContext
+            optimizeAndPublish(
+                recordsByPath: scanResult.records,
+                initialStore: scanStore,
+                generation: currentGeneration,
+                publishesIntermediateSnapshots: false,
+                completionStatusPrefix: activityPresentation == .backgroundCatchUp ? "Caught up" : "Reconciled",
+                operationStartedAt: started,
+                memoryTelemetryContext: telemetryContext
             )
-            let mergedRecordValues = Array(mergedRecords.values)
-            MemoryTelemetry.log(
-                "reconcile.heapStore.recordsArray.end",
-                records: Self.metrics(for: mergedRecordValues),
-                activeIndexJobs: currentActiveIndexJobCount(),
-                context: telemetryContext
-            )
-            MemoryTelemetry.log(
-                "reconcile.heapStore.build.begin",
-                records: Self.metrics(for: mergedRecordValues),
-                activeIndexJobs: currentActiveIndexJobCount(),
-                context: telemetryContext
-            )
-            initialStore = HeapPagedRecordStore(records: mergedRecordValues, roots: allRootPaths)
-            MemoryTelemetry.log(
-                "reconcile.heapStore.build.end",
-                records: Self.metrics(for: initialStore),
-                store: initialStore,
-                activeIndexJobs: currentActiveIndexJobCount(),
-                context: telemetryContext
+        } else if let previousStore {
+            optimizeScopedMergeAndPublish(
+                previousStore: previousStore,
+                scannedRootPaths: scannedRootPaths,
+                scanRecords: scanResult.records,
+                generation: currentGeneration,
+                completionStatusPrefix: activityPresentation == .backgroundCatchUp ? "Caught up" : "Reconciled",
+                operationStartedAt: started,
+                memoryTelemetryContext: telemetryContext
             )
         }
-
-        optimizeAndPublish(
-            recordsByPath: recordsByPath,
-            initialStore: initialStore,
-            generation: currentGeneration,
-            publishesIntermediateSnapshots: false,
-            completionStatusPrefix: activityPresentation == .backgroundCatchUp ? "Caught up" : "Reconciled",
-            operationStartedAt: started,
-            memoryTelemetryContext: telemetryContext
-        )
         guard isCurrentGeneration(currentGeneration) else { return }
         recordFullRebuild(duration: Date().timeIntervalSince(started))
+        let finalRecordCount = lock.withLock { searchSnapshot.resultCount }
         DiagnosticLogger.shared.log(
             category: "index",
             event: "index.reconcileFinished",
             fields: [
-                "recordCount": .publicInt(recordsByPath.count),
+                "recordCount": .publicInt(finalRecordCount),
                 "visitedCount": .publicInt(scanResult.visited),
                 "durationSeconds": .publicDouble(Date().timeIntervalSince(started))
             ]
@@ -7032,6 +7056,7 @@ public final class FileIndex: @unchecked Sendable {
         writesCheckpoints: Bool = true,
         publishesScanStatus: Bool = true,
         publishesIntermediateSnapshots: Bool = true,
+        buildsRecordStore: Bool = true,
         workerCount: Int,
         workerQoS: DispatchQoS.QoSClass,
         progress: @escaping @Sendable (_ store: HeapPagedRecordStore, _ visited: Int, _ force: Bool) -> Void
@@ -7054,7 +7079,7 @@ public final class FileIndex: @unchecked Sendable {
             ? max(scanConfiguration.frontierBatchSize, 1)
             : 1
         let usesBatchedEnqueue = scanConfiguration.frontierMode.usesBatchedEnqueue
-        let currentCount = lock.withLock { searchSnapshot.count }
+        let currentCount = buildsRecordStore ? lock.withLock { searchSnapshot.count } : 0
         let state = ConcurrentScanState(
             reservedCapacity: max(8_192, currentCount, checkpoint?.store.count ?? 0),
             roots: rootPaths,
@@ -7063,7 +7088,8 @@ public final class FileIndex: @unchecked Sendable {
                 .map { URL(fileURLWithPath: $0, isDirectory: true) }
                 .filter { canScanDirectory($0) } ?? [],
             completedDirectories: Set(checkpoint?.state.completedDirectories ?? []),
-            operationStartedAt: operationStartedAt
+            operationStartedAt: operationStartedAt,
+            buildsRecordStore: buildsRecordStore
         )
 
         let publish: @Sendable (_ result: ScanProgress?, _ force: Bool) -> Void = { result, force in
@@ -7357,7 +7383,7 @@ public final class FileIndex: @unchecked Sendable {
             reconciling = false
             updating = false
             phase = .ready
-            discoveredCount = snapshot.resultCount
+            self.discoveredCount = snapshot.resultCount
             searchableCount = snapshot.resultCount
             optimizedCount = 0
             status = Self.completionStatus(
@@ -7459,7 +7485,7 @@ public final class FileIndex: @unchecked Sendable {
                 )
                 MemoryTelemetry.log(
                     "rebuild.deferredOptimize.mappedStore.loaded",
-                    records: Self.metrics(for: mappedStore),
+                    records: Self.countOnlyMetrics(for: mappedStore),
                     store: mappedStore,
                     activeIndexJobs: self.currentActiveIndexJobCount(),
                     context: memoryTelemetryContext
@@ -7634,6 +7660,114 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
+    private static func scopedMergedRecordSource(
+        previousStore: RecordStore,
+        scannedRootPaths: [String],
+        scanRecords: [String: FileRecord]
+    ) -> RecordPackageRecordSource {
+        let retainedEstimate = previousStore.storedResultCount ?? previousStore.count
+        return RecordPackageRecordSource(estimatedRecordCount: retainedEstimate + scanRecords.count) { emit in
+            previousStore.forEachResultRecord { record in
+                guard !Self.path(record.path, isContainedIn: scannedRootPaths) else { return }
+                emit(record)
+            }
+            for record in scanRecords.values {
+                emit(record)
+            }
+        }
+    }
+
+    private func optimizeScopedMergeAndPublish(
+        previousStore: RecordStore,
+        scannedRootPaths: [String],
+        scanRecords: [String: FileRecord],
+        generation currentGeneration: UInt64,
+        completionStatusPrefix: String,
+        operationStartedAt: Date?,
+        memoryTelemetryContext: MemoryTelemetryContext
+    ) {
+        let recordSource = Self.scopedMergedRecordSource(
+            previousStore: previousStore,
+            scannedRootPaths: scannedRootPaths,
+            scanRecords: scanRecords
+        )
+        let estimatedMetrics = RecordCollectionMetrics(
+            recordCount: recordSource.estimatedRecordCount,
+            totalPathBytes: 0,
+            maxPathBytes: 0
+        )
+        MemoryTelemetry.log(
+            "reconcile.merge.streamSource.ready",
+            records: estimatedMetrics,
+            store: previousStore,
+            activeIndexJobs: currentActiveIndexJobCount(),
+            context: memoryTelemetryContext
+        )
+
+        guard isCurrentGeneration(currentGeneration) else { return }
+        publishRebuildStatus(
+            phase: .optimizing,
+            status: "Optimizing compact store",
+            discovered: recordSource.estimatedRecordCount,
+            searchable: lock.withLock { searchSnapshot.resultCount },
+            optimized: 0,
+            isIndexing: true,
+            generation: currentGeneration
+        )
+
+        do {
+            let packageURL = SnapshotLayout.temporaryPackageURL(in: supportDirectory)
+            let snapshotSettings = lock.withLock {
+                (
+                    roots: roots,
+                    exclusionPatterns: exclusionRules.patterns
+                )
+            }
+            MemoryTelemetry.log(
+                "optimize.mappedWrite.begin",
+                records: estimatedMetrics,
+                store: previousStore,
+                activeIndexJobs: currentActiveIndexJobCount(),
+                context: memoryTelemetryContext
+            )
+            try MappedRecordStore.writePackage(
+                recordSource: recordSource,
+                roots: snapshotSettings.roots,
+                exclusionPatterns: snapshotSettings.exclusionPatterns,
+                packageURL: packageURL,
+                fileManager: fileManager
+            )
+            MemoryTelemetry.log(
+                "optimize.mappedWrite.end",
+                records: estimatedMetrics,
+                store: previousStore,
+                activeIndexJobs: currentActiveIndexJobCount(),
+                context: memoryTelemetryContext
+            )
+            let mappedStore = try MappedRecordStore(packageURL: packageURL, schemaVersion: SnapshotLayout.schemaVersion)
+            MemoryTelemetry.log(
+                "optimize.mappedStore.loaded",
+                records: Self.countOnlyMetrics(for: mappedStore),
+                store: mappedStore,
+                activeIndexJobs: currentActiveIndexJobCount(),
+                context: memoryTelemetryContext
+            )
+            optimizeMappedPackageAndPublish(
+                mappedStore: mappedStore,
+                packageURL: packageURL,
+                discoveredCount: recordSource.estimatedRecordCount,
+                generation: currentGeneration,
+                publishesIntermediateSnapshots: false,
+                completionStatusPrefix: completionStatusPrefix,
+                operationStartedAt: operationStartedAt,
+                memoryTelemetryContext: memoryTelemetryContext
+            )
+        } catch {
+            failIndexing("Could not build compact index: \(error.localizedDescription)", generation: currentGeneration)
+            return
+        }
+    }
+
     private func optimizeAndPublish(
         recordsByPath: [String: FileRecord],
         initialStore: HeapPagedRecordStore,
@@ -7673,7 +7807,7 @@ public final class FileIndex: @unchecked Sendable {
             return
         }
 
-        var snapshot = SearchSnapshot(store: initialStore, buildsSearchStructures: false)
+        let snapshot = SearchSnapshot(store: initialStore, buildsSearchStructures: false)
         MemoryTelemetry.log(
             "optimize.primarySnapshot.created",
             records: Self.countOnlyMetrics(for: snapshot.store),
@@ -7682,7 +7816,6 @@ public final class FileIndex: @unchecked Sendable {
             activeIndexJobs: currentActiveIndexJobCount(),
             context: memoryTelemetryContext
         )
-        var pendingMappedPackageURL: URL?
 
         guard isCurrentGeneration(currentGeneration) else { return }
         let searchableBeforeOptimization = lock.withLock { searchSnapshot.resultCount }
@@ -7726,34 +7859,55 @@ public final class FileIndex: @unchecked Sendable {
                 context: memoryTelemetryContext
             )
             let mappedStore = try MappedRecordStore(packageURL: packageURL, schemaVersion: SnapshotLayout.schemaVersion)
-            pendingMappedPackageURL = packageURL
             MemoryTelemetry.log(
                 "optimize.mappedStore.loaded",
-                records: Self.metrics(for: mappedStore),
+                records: Self.countOnlyMetrics(for: mappedStore),
                 store: mappedStore,
                 activeIndexJobs: currentActiveIndexJobCount(),
                 context: memoryTelemetryContext
             )
-            snapshot = SearchSnapshot(store: mappedStore, buildsSearchStructures: false)
-            MemoryTelemetry.log(
-                "optimize.mappedSnapshot.created",
-                records: Self.countOnlyMetrics(for: snapshot.store),
-                structures: snapshot.diagnostics,
-                store: snapshot.store,
-                activeIndexJobs: currentActiveIndexJobCount(),
-                context: memoryTelemetryContext
+            optimizeMappedPackageAndPublish(
+                mappedStore: mappedStore,
+                packageURL: packageURL,
+                discoveredCount: records.count,
+                generation: currentGeneration,
+                publishesIntermediateSnapshots: publishesIntermediateSnapshots,
+                completionStatusPrefix: completionStatusPrefix,
+                operationStartedAt: operationStartedAt,
+                memoryTelemetryContext: memoryTelemetryContext
             )
-            if publishesIntermediateSnapshots {
-                publishOptimizedSnapshot(
-                    snapshot,
-                    status: "Optimizing names",
-                    optimized: 0,
-                    generation: currentGeneration
-                )
-            }
         } catch {
             failIndexing("Could not build compact index: \(error.localizedDescription)", generation: currentGeneration)
             return
+        }
+    }
+
+    private func optimizeMappedPackageAndPublish(
+        mappedStore: MappedRecordStore,
+        packageURL pendingMappedPackageURL: URL,
+        discoveredCount: Int,
+        generation currentGeneration: UInt64,
+        publishesIntermediateSnapshots: Bool,
+        completionStatusPrefix: String,
+        operationStartedAt: Date?,
+        memoryTelemetryContext: MemoryTelemetryContext
+    ) {
+        var snapshot = SearchSnapshot(store: mappedStore, buildsSearchStructures: false)
+        MemoryTelemetry.log(
+            "optimize.mappedSnapshot.created",
+            records: Self.countOnlyMetrics(for: snapshot.store),
+            structures: snapshot.diagnostics,
+            store: snapshot.store,
+            activeIndexJobs: currentActiveIndexJobCount(),
+            context: memoryTelemetryContext
+        )
+        if publishesIntermediateSnapshots {
+            publishOptimizedSnapshot(
+                snapshot,
+                status: "Optimizing names",
+                optimized: 0,
+                generation: currentGeneration
+            )
         }
 
         MemoryTelemetry.log(
@@ -7783,7 +7937,7 @@ public final class FileIndex: @unchecked Sendable {
             publishRebuildStatus(
                 phase: .optimizing,
                 status: "Optimizing extensions",
-                discovered: records.count,
+                discovered: discoveredCount,
                 searchable: lock.withLock { searchSnapshot.resultCount },
                 optimized: 0,
                 isIndexing: true,
@@ -7820,7 +7974,7 @@ public final class FileIndex: @unchecked Sendable {
             publishRebuildStatus(
                 phase: .optimizing,
                 status: "Optimizing modified sort",
-                discovered: records.count,
+                discovered: discoveredCount,
                 searchable: lock.withLock { searchSnapshot.resultCount },
                 optimized: 0,
                 isIndexing: true,
@@ -7857,7 +8011,7 @@ public final class FileIndex: @unchecked Sendable {
             publishRebuildStatus(
                 phase: .optimizing,
                 status: "Saving index",
-                discovered: records.count,
+                discovered: discoveredCount,
                 searchable: lock.withLock { searchSnapshot.resultCount },
                 optimized: snapshot.resultCount,
                 isIndexing: true,
@@ -7869,56 +8023,52 @@ public final class FileIndex: @unchecked Sendable {
         publishRebuildStatus(
             phase: .saving,
             status: "Saving index",
-            discovered: records.count,
+            discovered: discoveredCount,
             searchable: publishesIntermediateSnapshots ? snapshot.resultCount : lock.withLock { searchSnapshot.resultCount },
             optimized: snapshot.resultCount,
             isIndexing: true,
             generation: currentGeneration
         )
-        if let pendingMappedPackageURL {
-            do {
-                MemoryTelemetry.log(
-                    "optimize.persistSearchStructures.begin",
-                    records: Self.countOnlyMetrics(for: snapshot.store),
-                    structures: snapshot.diagnostics,
-                    store: snapshot.store,
-                    activeIndexJobs: currentActiveIndexJobCount(),
-                    context: memoryTelemetryContext
-                )
-                try persistSearchStructures(for: snapshot, packageURL: pendingMappedPackageURL)
-                MemoryTelemetry.log(
-                    "optimize.persistSearchStructures.end",
-                    records: Self.countOnlyMetrics(for: snapshot.store),
-                    structures: snapshot.diagnostics,
-                    store: snapshot.store,
-                    activeIndexJobs: currentActiveIndexJobCount(),
-                    context: memoryTelemetryContext
-                )
-            } catch {
-                failIndexing("Could not save optimized search index: \(error.localizedDescription)", generation: currentGeneration)
-                return
-            }
-
+        do {
             MemoryTelemetry.log(
-                "optimize.installMappedSnapshot.begin",
+                "optimize.persistSearchStructures.begin",
                 records: Self.countOnlyMetrics(for: snapshot.store),
                 structures: snapshot.diagnostics,
                 store: snapshot.store,
                 activeIndexJobs: currentActiveIndexJobCount(),
                 context: memoryTelemetryContext
             )
-            guard installMappedSnapshotPackage(pendingMappedPackageURL, generation: currentGeneration) else { return }
+            try persistSearchStructures(for: snapshot, packageURL: pendingMappedPackageURL)
             MemoryTelemetry.log(
-                "optimize.installMappedSnapshot.end",
+                "optimize.persistSearchStructures.end",
                 records: Self.countOnlyMetrics(for: snapshot.store),
                 structures: snapshot.diagnostics,
                 store: snapshot.store,
                 activeIndexJobs: currentActiveIndexJobCount(),
                 context: memoryTelemetryContext
             )
-        } else {
-            guard persistSnapshot() else { return }
+        } catch {
+            failIndexing("Could not save optimized search index: \(error.localizedDescription)", generation: currentGeneration)
+            return
         }
+
+        MemoryTelemetry.log(
+            "optimize.installMappedSnapshot.begin",
+            records: Self.countOnlyMetrics(for: snapshot.store),
+            structures: snapshot.diagnostics,
+            store: snapshot.store,
+            activeIndexJobs: currentActiveIndexJobCount(),
+            context: memoryTelemetryContext
+        )
+        guard installMappedSnapshotPackage(pendingMappedPackageURL, generation: currentGeneration) else { return }
+        MemoryTelemetry.log(
+            "optimize.installMappedSnapshot.end",
+            records: Self.countOnlyMetrics(for: snapshot.store),
+            structures: snapshot.diagnostics,
+            store: snapshot.store,
+            activeIndexJobs: currentActiveIndexJobCount(),
+            context: memoryTelemetryContext
+        )
 
         let shouldReconcileAfterFinish = lock.withLock {
             resumedFromCheckpoint && completionStatusPrefix == "Indexed"
@@ -7938,12 +8088,12 @@ public final class FileIndex: @unchecked Sendable {
             reconciling = false
             updating = false
             phase = .ready
-            discoveredCount = records.count
+            self.discoveredCount = snapshot.resultCount
             searchableCount = snapshot.resultCount
             optimizedCount = snapshot.resultCount
             status = Self.completionStatus(
                 prefix: completionStatusPrefix,
-                recordCount: records.count,
+                recordCount: snapshot.resultCount,
                 startedAt: operationStartedAt
             )
             lastUpdated = Date()

@@ -233,6 +233,7 @@ protocol RecordStore: AnyObject, Sendable {
     func view(at index: Int) -> RecordSearchView
     func rowID(forPath path: String) -> Int?
     func allRecords() -> [FileRecord]
+    func forEachResultRecord(_ body: (FileRecord) -> Void)
     func recordID(at index: Int) -> UInt64
     func path(at index: Int) -> String
     func name(at index: Int) -> String
@@ -284,6 +285,31 @@ struct RecordSearchView: Sendable {
     }
 }
 
+struct RecordPackageRecordSource {
+    let estimatedRecordCount: Int
+    private let enumerateRecords: (@escaping (FileRecord) -> Void) -> Void
+
+    init(
+        estimatedRecordCount: Int,
+        enumerateRecords: @escaping (@escaping (FileRecord) -> Void) -> Void
+    ) {
+        self.estimatedRecordCount = max(estimatedRecordCount, 0)
+        self.enumerateRecords = enumerateRecords
+    }
+
+    init(records: [FileRecord]) {
+        self.init(estimatedRecordCount: records.count) { emit in
+            for record in records {
+                emit(record)
+            }
+        }
+    }
+
+    func forEachRecord(_ body: @escaping (FileRecord) -> Void) {
+        enumerateRecords(body)
+    }
+}
+
 extension RecordStore {
     var mappedByteSize: Int { 0 }
     var heapPageCount: Int { 0 }
@@ -300,6 +326,12 @@ extension RecordStore {
 
     func allRecords() -> [FileRecord] {
         (0..<count).map { record(at: $0) }
+    }
+
+    func forEachResultRecord(_ body: (FileRecord) -> Void) {
+        for index in 0..<count where isResultRow(at: index) {
+            body(record(at: index))
+        }
     }
 
     func recordID(at index: Int) -> UInt64 { record(at: index).id }
@@ -1196,7 +1228,13 @@ final class MappedRecordStore: RecordStore {
     func allRecords() -> [FileRecord] {
         var records: [FileRecord] = []
         records.reserveCapacity(resultCount)
+        forEachResultRecord { record in
+            records.append(record)
+        }
+        return records
+    }
 
+    func forEachResultRecord(_ body: (FileRecord) -> Void) {
         var materializedPaths = Array<String?>(repeating: nil, count: count)
         var materializedNormalizedPaths = Array<String?>(repeating: nil, count: count)
 
@@ -1229,7 +1267,7 @@ final class MappedRecordStore: RecordStore {
             materializedNormalizedPaths[rowID] = normalizedPath
 
             guard row.flags & UInt32(Self.virtualFlag) == 0 else { continue }
-            records.append(FileRecord(
+            body(FileRecord(
                 id: row.id,
                 path: path,
                 name: name,
@@ -1245,7 +1283,6 @@ final class MappedRecordStore: RecordStore {
                 normalizedPath: normalizedPath
             ))
         }
-        return records
     }
 
     private static func join(directory: String, name: String) -> String {
@@ -1502,12 +1539,24 @@ final class MappedRecordStore: RecordStore {
         let isVirtual: Bool
     }
 
-    private static func preparePackageRows(records: [FileRecord], roots: [String]) -> [PackageRow] {
+    private static func preparePackageRows(recordSource: RecordPackageRecordSource, roots: [String]) -> [PackageRow] {
         var rowsByPath: [String: PackageRow] = [:]
-        rowsByPath.reserveCapacity(records.count)
+        rowsByPath.reserveCapacity(recordSource.estimatedRecordCount)
+        var virtualDirectoryPaths = Set<String>()
+        virtualDirectoryPaths.reserveCapacity(min(max(recordSource.estimatedRecordCount / 4, roots.count), recordSource.estimatedRecordCount))
 
-        for record in records {
+        func addVirtualDirectoryCandidate(_ path: String) {
+            guard path != "/", !path.isEmpty else { return }
+            virtualDirectoryPaths.insert(path)
+        }
+
+        for root in roots {
+            forEachAncestorPath(through: root, addVirtualDirectoryCandidate)
+        }
+
+        recordSource.forEachRecord { record in
             rowsByPath[record.path] = PackageRow(record: record, isVirtual: false)
+            forEachAncestorPath(through: record.directoryPath, addVirtualDirectoryCandidate)
         }
 
         func addVirtualDirectory(_ path: String) {
@@ -1515,16 +1564,8 @@ final class MappedRecordStore: RecordStore {
             rowsByPath[path] = PackageRow(record: virtualDirectoryRecord(path: path), isVirtual: true)
         }
 
-        for root in roots {
-            for ancestor in ancestorPaths(through: root) {
-                addVirtualDirectory(ancestor)
-            }
-        }
-
-        for record in records {
-            for ancestor in ancestorPaths(through: record.directoryPath) {
-                addVirtualDirectory(ancestor)
-            }
+        for path in virtualDirectoryPaths {
+            addVirtualDirectory(path)
         }
 
         var childrenByParent: [String: [String]] = [:]
@@ -1566,18 +1607,23 @@ final class MappedRecordStore: RecordStore {
     }
 
     private static func ancestorPaths(through path: String) -> [String] {
-        guard path != "/", !path.isEmpty else { return [] }
-        let parts = path.split(separator: "/")
-        guard !parts.isEmpty else { return [] }
-
         var ancestors: [String] = []
-        ancestors.reserveCapacity(parts.count)
+        forEachAncestorPath(through: path) { ancestor in
+            ancestors.append(ancestor)
+        }
+        return ancestors
+    }
+
+    private static func forEachAncestorPath(through path: String, _ body: (String) -> Void) {
+        guard path != "/", !path.isEmpty else { return }
+        let parts = path.split(separator: "/")
+        guard !parts.isEmpty else { return }
+
         var current = ""
         for part in parts {
             current += "/" + part
-            ancestors.append(current)
+            body(current)
         }
-        return ancestors
     }
 
     private static func parentPath(for record: FileRecord) -> String? {
@@ -1614,11 +1660,29 @@ final class MappedRecordStore: RecordStore {
         savedAt: Date = Date(),
         fileManager: FileManager = .default
     ) throws {
+        try writePackage(
+            recordSource: RecordPackageRecordSource(records: records),
+            roots: roots,
+            exclusionPatterns: exclusionPatterns,
+            packageURL: packageURL,
+            savedAt: savedAt,
+            fileManager: fileManager
+        )
+    }
+
+    static func writePackage(
+        recordSource: RecordPackageRecordSource,
+        roots: [String],
+        exclusionPatterns: [String],
+        packageURL: URL,
+        savedAt: Date = Date(),
+        fileManager: FileManager = .default
+    ) throws {
         if fileManager.fileExists(atPath: packageURL.path) {
             try fileManager.removeItem(at: packageURL)
         }
         try fileManager.createDirectory(at: packageURL, withIntermediateDirectories: true)
-        let packageRows = preparePackageRows(records: records, roots: roots)
+        let packageRows = preparePackageRows(recordSource: recordSource, roots: roots)
         let resultCount = packageRows.reduce(0) { $0 + ($1.isVirtual ? 0 : 1) }
         let rootAttribution = try RootAttributionTable.build(roots: roots, rowCount: packageRows.count) { index in
             let row = packageRows[index]
