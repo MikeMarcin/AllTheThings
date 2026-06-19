@@ -23,6 +23,44 @@ public enum SearchIndexUse: String, Codable, CaseIterable, Hashable, Sendable {
     case applicationCatalog
 }
 
+public enum SearchMetricPhase: String, Codable, CaseIterable, Sendable {
+    case initialResults
+    case refinedResults
+}
+
+public enum SearchRouteKind: String, Codable, CaseIterable, Hashable, Sendable {
+    case sidecar
+    case fullScan
+    case mappedIndex
+    case applicationCatalog
+    case other
+
+    public static func classify(_ profile: SearchExecutionProfile) -> SearchRouteKind {
+        if profile.didFallbackToFullScan || profile.executionPath == .fullFallbackScan {
+            return .fullScan
+        }
+        if profile.executionPath == .applicationCatalog || profile.indexesUsed.contains(.applicationCatalog) {
+            return .applicationCatalog
+        }
+
+        let mappedUses: Set<SearchIndexUse> = [.nameGrams, .componentGrams, .pathGrams]
+        if !profile.indexesUsed.isDisjoint(with: mappedUses) {
+            return .mappedIndex
+        }
+
+        switch profile.executionPath {
+        case .emptyQuerySortedOrder, .extensionCandidateIntersection, .optimizedSortedFastPath:
+            return .sidecar
+        case .nameComponentIndex, .pathGramIndex, .indexedCandidateIntersection, .unprofiledIndexed:
+            return .mappedIndex
+        case .fullFallbackScan:
+            return .fullScan
+        case .applicationCatalog, .unprofiled:
+            return .other
+        }
+    }
+}
+
 public struct SearchExecutionProfile: Codable, Equatable, Sendable {
     public let executionPath: SearchExecutionPath
     public let indexesUsed: Set<SearchIndexUse>
@@ -169,6 +207,7 @@ public struct SearchUsageCounters: Codable, Equatable, Sendable {
     public var latencyBuckets: [String: UInt64]
     public var executionPathCounts: [SearchExecutionPath: UInt64]
     public var indexUseCounts: [SearchIndexUse: UInt64]
+    public var routeCounts: [SearchRouteKind: UInt64]
 
     public init(
         started: UInt64 = 0,
@@ -183,7 +222,8 @@ public struct SearchUsageCounters: Codable, Equatable, Sendable {
         scannedRowsExamined: UInt64 = 0,
         latencyBuckets: [String: UInt64] = [:],
         executionPathCounts: [SearchExecutionPath: UInt64] = [:],
-        indexUseCounts: [SearchIndexUse: UInt64] = [:]
+        indexUseCounts: [SearchIndexUse: UInt64] = [:],
+        routeCounts: [SearchRouteKind: UInt64] = [:]
     ) {
         self.started = started
         self.completed = completed
@@ -198,10 +238,46 @@ public struct SearchUsageCounters: Codable, Equatable, Sendable {
         self.latencyBuckets = latencyBuckets
         self.executionPathCounts = executionPathCounts
         self.indexUseCounts = indexUseCounts
+        self.routeCounts = routeCounts
     }
 
     public var averageLatency: TimeInterval {
         completed == 0 ? 0 : totalLatency / Double(completed)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case started
+        case completed
+        case cancelled
+        case staleRetries
+        case indexedCandidateSearches
+        case fallbackScans
+        case totalLatency
+        case maxLatency
+        case candidateRowsExamined
+        case scannedRowsExamined
+        case latencyBuckets
+        case executionPathCounts
+        case indexUseCounts
+        case routeCounts
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        started = try container.decodeIfPresent(UInt64.self, forKey: .started) ?? 0
+        completed = try container.decodeIfPresent(UInt64.self, forKey: .completed) ?? 0
+        cancelled = try container.decodeIfPresent(UInt64.self, forKey: .cancelled) ?? 0
+        staleRetries = try container.decodeIfPresent(UInt64.self, forKey: .staleRetries) ?? 0
+        indexedCandidateSearches = try container.decodeIfPresent(UInt64.self, forKey: .indexedCandidateSearches) ?? 0
+        fallbackScans = try container.decodeIfPresent(UInt64.self, forKey: .fallbackScans) ?? 0
+        totalLatency = try container.decodeIfPresent(TimeInterval.self, forKey: .totalLatency) ?? 0
+        maxLatency = try container.decodeIfPresent(TimeInterval.self, forKey: .maxLatency) ?? 0
+        candidateRowsExamined = try container.decodeIfPresent(UInt64.self, forKey: .candidateRowsExamined) ?? 0
+        scannedRowsExamined = try container.decodeIfPresent(UInt64.self, forKey: .scannedRowsExamined) ?? 0
+        latencyBuckets = try container.decodeIfPresent([String: UInt64].self, forKey: .latencyBuckets) ?? [:]
+        executionPathCounts = try container.decodeIfPresent([SearchExecutionPath: UInt64].self, forKey: .executionPathCounts) ?? [:]
+        indexUseCounts = try container.decodeIfPresent([SearchIndexUse: UInt64].self, forKey: .indexUseCounts) ?? [:]
+        routeCounts = try container.decodeIfPresent([SearchRouteKind: UInt64].self, forKey: .routeCounts) ?? [:]
     }
 }
 
@@ -269,6 +345,8 @@ public struct MemoryUsageCounters: Codable, Equatable, Sendable {
 public struct DailyUsageBucket: Codable, Equatable, Sendable, Identifiable {
     public let day: String
     public var searches: SearchUsageCounters
+    public var initialSearches: SearchUsageCounters
+    public var refinedSearches: SearchUsageCounters
     public var fileActions: [FileActionMetric: UInt64]
     public var health: IndexHealthCounters
     public var launches: UInt64
@@ -279,6 +357,8 @@ public struct DailyUsageBucket: Codable, Equatable, Sendable, Identifiable {
     public init(
         day: String,
         searches: SearchUsageCounters = SearchUsageCounters(),
+        initialSearches: SearchUsageCounters = SearchUsageCounters(),
+        refinedSearches: SearchUsageCounters = SearchUsageCounters(),
         fileActions: [FileActionMetric: UInt64] = [:],
         health: IndexHealthCounters = IndexHealthCounters(),
         launches: UInt64 = 0,
@@ -286,10 +366,35 @@ public struct DailyUsageBucket: Codable, Equatable, Sendable, Identifiable {
     ) {
         self.day = day
         self.searches = searches
+        self.initialSearches = initialSearches
+        self.refinedSearches = refinedSearches
         self.fileActions = fileActions
         self.health = health
         self.launches = launches
         self.memory = memory
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case day
+        case searches
+        case initialSearches
+        case refinedSearches
+        case fileActions
+        case health
+        case launches
+        case memory
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        day = try container.decode(String.self, forKey: .day)
+        searches = try container.decodeIfPresent(SearchUsageCounters.self, forKey: .searches) ?? SearchUsageCounters()
+        initialSearches = try container.decodeIfPresent(SearchUsageCounters.self, forKey: .initialSearches) ?? SearchUsageCounters()
+        refinedSearches = try container.decodeIfPresent(SearchUsageCounters.self, forKey: .refinedSearches) ?? SearchUsageCounters()
+        fileActions = try container.decodeIfPresent([FileActionMetric: UInt64].self, forKey: .fileActions) ?? [:]
+        health = try container.decodeIfPresent(IndexHealthCounters.self, forKey: .health) ?? IndexHealthCounters()
+        launches = try container.decodeIfPresent(UInt64.self, forKey: .launches) ?? 0
+        memory = try container.decodeIfPresent(MemoryUsageCounters.self, forKey: .memory) ?? MemoryUsageCounters()
     }
 }
 
@@ -316,14 +421,18 @@ public struct IndexUsageMetrics: Codable, Equatable, Sendable {
     public var schemaVersion: Int
     public var lifetime: AppLifetimeMetrics
     public var allTimeSearches: SearchUsageCounters
+    public var initialSearches: SearchUsageCounters
+    public var refinedSearches: SearchUsageCounters
     public var allTimeFileActions: [FileActionMetric: UInt64]
     public var health: IndexHealthCounters
     public var dailyBuckets: [DailyUsageBucket]
 
     public init(
-        schemaVersion: Int = 1,
+        schemaVersion: Int = 2,
         lifetime: AppLifetimeMetrics = AppLifetimeMetrics(),
         allTimeSearches: SearchUsageCounters = SearchUsageCounters(),
+        initialSearches: SearchUsageCounters = SearchUsageCounters(),
+        refinedSearches: SearchUsageCounters = SearchUsageCounters(),
         allTimeFileActions: [FileActionMetric: UInt64] = [:],
         health: IndexHealthCounters = IndexHealthCounters(),
         dailyBuckets: [DailyUsageBucket] = []
@@ -331,9 +440,34 @@ public struct IndexUsageMetrics: Codable, Equatable, Sendable {
         self.schemaVersion = schemaVersion
         self.lifetime = lifetime
         self.allTimeSearches = allTimeSearches
+        self.initialSearches = initialSearches
+        self.refinedSearches = refinedSearches
         self.allTimeFileActions = allTimeFileActions
         self.health = health
         self.dailyBuckets = dailyBuckets
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion
+        case lifetime
+        case allTimeSearches
+        case initialSearches
+        case refinedSearches
+        case allTimeFileActions
+        case health
+        case dailyBuckets
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
+        lifetime = try container.decodeIfPresent(AppLifetimeMetrics.self, forKey: .lifetime) ?? AppLifetimeMetrics()
+        allTimeSearches = try container.decodeIfPresent(SearchUsageCounters.self, forKey: .allTimeSearches) ?? SearchUsageCounters()
+        initialSearches = try container.decodeIfPresent(SearchUsageCounters.self, forKey: .initialSearches) ?? SearchUsageCounters()
+        refinedSearches = try container.decodeIfPresent(SearchUsageCounters.self, forKey: .refinedSearches) ?? SearchUsageCounters()
+        allTimeFileActions = try container.decodeIfPresent([FileActionMetric: UInt64].self, forKey: .allTimeFileActions) ?? [:]
+        health = try container.decodeIfPresent(IndexHealthCounters.self, forKey: .health) ?? IndexHealthCounters()
+        dailyBuckets = try container.decodeIfPresent([DailyUsageBucket].self, forKey: .dailyBuckets) ?? []
     }
 }
 
@@ -448,7 +582,7 @@ public struct IndexInsightsSnapshot: Codable, Equatable, Sendable {
 }
 
 extension IndexUsageMetrics {
-    static let currentSchemaVersion = 1
+    static let currentSchemaVersion = 2
     static let retainedDailyBucketCount = 365
 
     mutating func recordAppLaunch(appVersion: String?, at date: Date = Date()) {
@@ -468,32 +602,38 @@ extension IndexUsageMetrics {
         pruneDailyBuckets()
     }
 
-    mutating func recordSearchStarted(at date: Date = Date()) {
+    mutating func recordSearchStarted(phase: SearchMetricPhase, at date: Date = Date()) {
         allTimeSearches.started &+= 1
+        incrementSearchStarted(phase: phase)
         mutateDailyBucket(for: date) { bucket in
             bucket.searches.started &+= 1
+            bucket.incrementSearchStarted(phase: phase)
         }
         pruneDailyBuckets()
     }
 
-    mutating func recordSearchCompleted(_ profile: SearchExecutionProfile, at date: Date = Date()) {
+    mutating func recordSearchCompleted(_ profile: SearchExecutionProfile, phase: SearchMetricPhase, at date: Date = Date()) {
         Self.applyCompletedSearch(profile, to: &allTimeSearches)
+        applyCompletedSearch(profile, phase: phase)
         mutateDailyBucket(for: date) { bucket in
             Self.applyCompletedSearch(profile, to: &bucket.searches)
+            bucket.applyCompletedSearch(profile, phase: phase)
         }
         pruneDailyBuckets()
     }
 
-    mutating func recordSearchCancelled(elapsed: TimeInterval, at date: Date = Date()) {
+    mutating func recordSearchCancelled(phase: SearchMetricPhase, elapsed: TimeInterval, at date: Date = Date()) {
         let profile = SearchExecutionProfile(
             executionPath: .unprofiled,
             wasCancelled: true,
             elapsed: elapsed
         )
         allTimeSearches.cancelled &+= 1
+        incrementSearchCancelled(phase: phase, elapsed: profile.elapsed)
         mutateDailyBucket(for: date) { bucket in
             bucket.searches.cancelled &+= 1
             Self.applyLatency(profile.elapsed, to: &bucket.searches)
+            bucket.incrementSearchCancelled(phase: phase, elapsed: profile.elapsed)
         }
         Self.applyLatency(profile.elapsed, to: &allTimeSearches)
         pruneDailyBuckets()
@@ -639,7 +779,36 @@ extension IndexUsageMetrics {
         replaceDailyBucket(bucket)
     }
 
-    private static func applyCompletedSearch(_ profile: SearchExecutionProfile, to counters: inout SearchUsageCounters) {
+    private mutating func incrementSearchStarted(phase: SearchMetricPhase) {
+        switch phase {
+        case .initialResults:
+            initialSearches.started &+= 1
+        case .refinedResults:
+            refinedSearches.started &+= 1
+        }
+    }
+
+    private mutating func applyCompletedSearch(_ profile: SearchExecutionProfile, phase: SearchMetricPhase) {
+        switch phase {
+        case .initialResults:
+            Self.applyCompletedSearch(profile, to: &initialSearches)
+        case .refinedResults:
+            Self.applyCompletedSearch(profile, to: &refinedSearches)
+        }
+    }
+
+    private mutating func incrementSearchCancelled(phase: SearchMetricPhase, elapsed: TimeInterval) {
+        switch phase {
+        case .initialResults:
+            initialSearches.cancelled &+= 1
+            Self.applyLatency(elapsed, to: &initialSearches)
+        case .refinedResults:
+            refinedSearches.cancelled &+= 1
+            Self.applyLatency(elapsed, to: &refinedSearches)
+        }
+    }
+
+    fileprivate static func applyCompletedSearch(_ profile: SearchExecutionProfile, to counters: inout SearchUsageCounters) {
         counters.completed &+= 1
         if profile.wasCancelled {
             counters.cancelled &+= 1
@@ -657,6 +826,7 @@ extension IndexUsageMetrics {
         counters.candidateRowsExamined &+= UInt64(max(profile.candidateCount, 0))
         counters.scannedRowsExamined &+= UInt64(max(profile.scannedRowCount, 0))
         counters.executionPathCounts[profile.executionPath, default: 0] &+= 1
+        counters.routeCounts[SearchRouteKind.classify(profile), default: 0] &+= 1
 
         for indexUse in profile.indexesUsed {
             counters.indexUseCounts[indexUse, default: 0] &+= 1
@@ -665,7 +835,7 @@ extension IndexUsageMetrics {
         applyLatency(profile.elapsed, to: &counters)
     }
 
-    private static func applyLatency(_ elapsed: TimeInterval, to counters: inout SearchUsageCounters) {
+    fileprivate static func applyLatency(_ elapsed: TimeInterval, to counters: inout SearchUsageCounters) {
         let boundedElapsed = max(elapsed, 0)
         counters.totalLatency += boundedElapsed
         counters.maxLatency = max(counters.maxLatency, boundedElapsed)
@@ -680,6 +850,37 @@ extension IndexUsageMetrics {
         case ..<0.25: "100-250ms"
         case ..<1.0: "250ms-1s"
         default: ">1s"
+        }
+    }
+}
+
+extension DailyUsageBucket {
+    fileprivate mutating func incrementSearchStarted(phase: SearchMetricPhase) {
+        switch phase {
+        case .initialResults:
+            initialSearches.started &+= 1
+        case .refinedResults:
+            refinedSearches.started &+= 1
+        }
+    }
+
+    fileprivate mutating func applyCompletedSearch(_ profile: SearchExecutionProfile, phase: SearchMetricPhase) {
+        switch phase {
+        case .initialResults:
+            IndexUsageMetrics.applyCompletedSearch(profile, to: &initialSearches)
+        case .refinedResults:
+            IndexUsageMetrics.applyCompletedSearch(profile, to: &refinedSearches)
+        }
+    }
+
+    fileprivate mutating func incrementSearchCancelled(phase: SearchMetricPhase, elapsed: TimeInterval) {
+        switch phase {
+        case .initialResults:
+            initialSearches.cancelled &+= 1
+            IndexUsageMetrics.applyLatency(elapsed, to: &initialSearches)
+        case .refinedResults:
+            refinedSearches.cancelled &+= 1
+            IndexUsageMetrics.applyLatency(elapsed, to: &refinedSearches)
         }
     }
 }

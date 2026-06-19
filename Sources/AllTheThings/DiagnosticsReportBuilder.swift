@@ -72,7 +72,12 @@ enum DiagnosticsReportBuilder {
         lines.append("")
 
         lines.append("## Search Performance")
+        lines.append("Aggregate:")
         appendSearchCounters(snapshot.usage.allTimeSearches, to: &lines)
+        lines.append("Initial Results:")
+        appendSearchCounters(snapshot.usage.initialSearches, to: &lines)
+        lines.append("Refined Results:")
+        appendSearchCounters(snapshot.usage.refinedSearches, to: &lines)
         lines.append("")
 
         lines.append("## Health Counters")
@@ -118,7 +123,7 @@ enum DiagnosticsReportBuilder {
             lines.append("- none")
         } else {
             for bucket in recentBuckets {
-                lines.append("- \(bucket.day): searches=\(bucket.searches.completed), fallbacks=\(bucket.searches.fallbackScans), refreshes=\(bucket.health.incrementalRefreshBatches), rebuilds=\(bucket.health.fullRebuilds), launches=\(bucket.launches), memoryLatest=\(byteString(bucket.memory.latestBytes))")
+                lines.append("- \(bucket.day): searches=\(bucket.searches.completed), initial=\(bucket.initialSearches.completed), refined=\(bucket.refinedSearches.completed), fallbacks=\(bucket.searches.fallbackScans), refreshes=\(bucket.health.incrementalRefreshBatches), rebuilds=\(bucket.health.fullRebuilds), launches=\(bucket.launches), memoryLatest=\(byteString(bucket.memory.latestBytes))")
             }
         }
 
@@ -151,6 +156,15 @@ enum DiagnosticsReportBuilder {
             for indexUse in SearchIndexUse.allCases {
                 if let count = counters.indexUseCounts[indexUse], count > 0 {
                     lines.append("  - \(indexUse.rawValue): \(count)")
+                }
+            }
+        }
+
+        if !counters.routeCounts.isEmpty {
+            lines.append("- Routes:")
+            for route in SearchRouteKind.allCases {
+                if let count = counters.routeCounts[route], count > 0 {
+                    lines.append("  - \(route.rawValue): \(count)")
                 }
             }
         }

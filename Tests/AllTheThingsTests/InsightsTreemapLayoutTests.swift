@@ -151,6 +151,33 @@ struct InsightsTreemapLayoutTests {
         #expect(InsightsRootDisplay.activePlaceholderLabel(for: makeStats(isIndexing: true, phase: .saving)) == "Saving")
     }
 
+    @Test("query route summary handles zero cancellation and mixed routes")
+    func queryRouteSummaryHandlesZeroCancellationAndMixedRoutes() {
+        #expect(InsightsQueryRouteSummary.compactRouteSummary(SearchUsageCounters()) == "none")
+        #expect(InsightsQueryRouteSummary.percentString(numerator: 0, denominator: 0) == "0%")
+
+        var cancelledOnly = SearchUsageCounters(started: 3, cancelled: 3)
+        #expect(InsightsQueryRouteSummary.compactRouteSummary(cancelledOnly) == "none")
+        #expect(InsightsQueryRouteSummary.percentString(numerator: cancelledOnly.cancelled, denominator: cancelledOnly.started) == "100%")
+
+        cancelledOnly.routeCounts[.sidecar] = 2
+        #expect(InsightsQueryRouteSummary.compactRouteSummary(cancelledOnly) == "none")
+
+        let mixed = SearchUsageCounters(
+            completed: 7,
+            routeCounts: [
+                .sidecar: 2,
+                .fullScan: 3,
+                .mappedIndex: 1,
+                .applicationCatalog: 1,
+                .other: 4
+            ]
+        )
+        #expect(InsightsQueryRouteSummary.routeCountString(mixed, .sidecar) == "2")
+        #expect(InsightsQueryRouteSummary.applicationOtherRouteString(mixed) == "1 / 4")
+        #expect(InsightsQueryRouteSummary.compactRouteSummary(mixed).contains("scan 3"))
+    }
+
     @Test("default Insights layout fits the initial viewport")
     @MainActor
     func defaultInsightsLayoutFitsInitialViewport() throws {
@@ -178,13 +205,101 @@ struct InsightsTreemapLayoutTests {
         window.setContentSize(InsightsWindowController.defaultContentSize)
         window.contentView?.layoutSubtreeIfNeeded()
 
-        let scrollView = try #require(findScrollView(in: window.contentView))
-        scrollView.layoutSubtreeIfNeeded()
-        let documentView = try #require(scrollView.documentView)
-        documentView.layoutSubtreeIfNeeded()
+        let contentRoot = try #require(findView(accessibilityIdentifier: "Insights.ContentView", in: window.contentView))
+        contentRoot.layoutSubtreeIfNeeded()
 
-        #expect(documentView.fittingSize.height <= scrollView.contentView.bounds.height + 1)
-        #expect(documentView.fittingSize.width <= scrollView.contentView.bounds.width + 1)
+        let tabControl = try #require(findTitlebarTabControl(in: window))
+        let titlebarActions = try #require(findView(accessibilityIdentifier: "Insights.TitlebarActions", in: window.contentView))
+        let summaryPage = try #require(findView(accessibilityIdentifier: "Insights.SummaryPage", in: contentRoot))
+        let summaryTiles = try #require(findView(accessibilityIdentifier: "Insights.SummaryTiles", in: contentRoot))
+        let healthTiles = try #require(findView(accessibilityIdentifier: "Insights.HealthTiles", in: summaryPage))
+        let healthFactsTable = try #require(findView(accessibilityIdentifier: "Insights.HealthFactsTable", in: summaryPage))
+
+        #expect(window.contentView?.subviews.contains { $0 is NSScrollView } == false)
+        #expect(contentRoot.fittingSize.height <= contentRoot.bounds.height + 1)
+        #expect(contentRoot.fittingSize.width <= contentRoot.bounds.width + 1)
+        #expect(tabControl.segmentCount == 3)
+        #expect(tabControl.selectedSegment == 0)
+        #expect(tabControl.segmentStyle == .separated)
+        #expect(window.titleVisibility == .hidden)
+        #expect(window.titlebarAppearsTransparent)
+        #expect(window.styleMask.contains(.fullSizeContentView))
+        #expect(window.titlebarAccessoryViewControllers.isEmpty)
+        #expect(findView(accessibilityIdentifier: "Insights.TabControl", in: contentRoot) == nil)
+        #expect(findView(accessibilityIdentifier: "Insights.TitlebarActions", in: contentRoot) == nil)
+        if let windowContentView = window.contentView {
+            #expect(abs(tabControl.frame.midX - windowContentView.bounds.midX) <= 1)
+        }
+        #expect(abs(titlebarActions.frame.midY - tabControl.frame.midY) <= 1)
+        #expect(titlebarActions.frame.minX >= tabControl.frame.maxX + 20)
+        #expect(summaryPage.frame.maxY <= contentRoot.bounds.maxY - 17)
+        #expect(summaryTiles.frame.minY >= summaryPage.bounds.minY)
+        #expect(summaryTiles.frame.height >= 185)
+        #expect(healthTiles.frame.maxX <= healthFactsTable.frame.minX - 12)
+        #expect(abs(healthTiles.frame.width - healthFactsTable.frame.width) <= 1)
+        #expect(healthFactsTable.frame.width <= summaryPage.frame.width * 0.55)
+    }
+
+    @Test("Insights tab pages fit the initial viewport")
+    @MainActor
+    func insightsTabPagesFitInitialViewport() throws {
+        let suiteName = "AllTheThingsTests-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        let index = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        defer {
+            try? FileManager.default.removeItem(at: index.dataDirectoryURL)
+        }
+
+        let controller = InsightsWindowController(
+            index: index,
+            defaults: defaults,
+            clearCachedIndexHandler: {}
+        )
+        let window = try #require(controller.window)
+        window.setContentSize(InsightsWindowController.defaultContentSize)
+        window.contentView?.layoutSubtreeIfNeeded()
+
+        let contentRoot = try #require(findView(accessibilityIdentifier: "Insights.ContentView", in: window.contentView))
+        let tabControl = try #require(findTitlebarTabControl(in: window))
+        let pageIdentifiers = [
+            "Insights.SummaryPage",
+            "Insights.IndexPage",
+            "Insights.ActivityPage"
+        ]
+        let expectedTables = [
+            "Insights.SummaryPage": "Insights.HealthFactsTable",
+            "Insights.IndexPage": "Insights.StorageFactsTable",
+            "Insights.ActivityPage": "Insights.ActivityFactsTable"
+        ]
+        let expectedNestedViews = [
+            "Insights.ActivityPage": "Insights.QueryPanel"
+        ]
+
+        for (index, identifier) in pageIdentifiers.enumerated() {
+            tabControl.selectedSegment = index
+            _ = tabControl.sendAction(tabControl.action, to: tabControl.target)
+            window.contentView?.layoutSubtreeIfNeeded()
+            contentRoot.layoutSubtreeIfNeeded()
+
+            let page = try #require(findView(accessibilityIdentifier: identifier, in: contentRoot))
+            #expect(contentRoot.fittingSize.height <= contentRoot.bounds.height + 1)
+            #expect(contentRoot.fittingSize.width <= contentRoot.bounds.width + 1)
+            #expect(page.frame.maxY <= contentRoot.bounds.maxY - 17)
+            if let tableIdentifier = expectedTables[identifier] {
+                #expect(findView(accessibilityIdentifier: tableIdentifier, in: page) != nil)
+            }
+            if let nestedIdentifier = expectedNestedViews[identifier] {
+                #expect(findView(accessibilityIdentifier: nestedIdentifier, in: page) != nil)
+            }
+        }
     }
 
     @Test("Insights opening placement centers in the visible screen")
@@ -336,17 +451,22 @@ struct InsightsTreemapLayoutTests {
     }
 
     @MainActor
-    private func findScrollView(in view: NSView?) -> NSScrollView? {
+    private func findView(accessibilityIdentifier identifier: String, in view: NSView?) -> NSView? {
         guard let view else { return nil }
-        if let scrollView = view as? NSScrollView {
-            return scrollView
+        if view.accessibilityIdentifier() == identifier {
+            return view
         }
         for subview in view.subviews {
-            if let scrollView = findScrollView(in: subview) {
-                return scrollView
+            if let match = findView(accessibilityIdentifier: identifier, in: subview) {
+                return match
             }
         }
         return nil
+    }
+
+    @MainActor
+    private func findTitlebarTabControl(in window: NSWindow) -> NSSegmentedControl? {
+        findView(accessibilityIdentifier: "Insights.TabControl", in: window.contentView) as? NSSegmentedControl
     }
 
     @MainActor

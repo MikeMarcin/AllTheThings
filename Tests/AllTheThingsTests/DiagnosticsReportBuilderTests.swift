@@ -24,6 +24,10 @@ struct DiagnosticsReportBuilderTests {
         #expect(report.contains("Root 1"))
         #expect(report.contains("source=persistedExact"))
         #expect(report.contains("Measurement: measured"))
+        #expect(report.contains("Initial Results:"))
+        #expect(report.contains("Refined Results:"))
+        #expect(report.contains("mappedIndex: 1"))
+        #expect(report.contains("sidecar: 1"))
         #expect(!report.contains(rootPath))
         #expect(!report.contains("SecretProject"))
         #expect(!report.lowercased().contains("query text:"))
@@ -57,11 +61,21 @@ struct DiagnosticsReportBuilderTests {
         usage.allTimeSearches.fallbackScans = 1
         usage.allTimeSearches.executionPathCounts[.nameComponentIndex] = 2
         usage.allTimeSearches.indexUseCounts[.nameGrams] = 2
+        usage.allTimeSearches.routeCounts[.mappedIndex] = 2
         usage.allTimeSearches.latencyBuckets["10-50ms"] = 3
+        usage.initialSearches.started = 2
+        usage.initialSearches.completed = 1
+        usage.initialSearches.cancelled = 1
+        usage.initialSearches.routeCounts[.mappedIndex] = 1
+        usage.refinedSearches.started = 1
+        usage.refinedSearches.completed = 1
+        usage.refinedSearches.routeCounts[.sidecar] = 1
         usage.dailyBuckets = [
             DailyUsageBucket(
                 day: "2026-05-30",
                 searches: usage.allTimeSearches,
+                initialSearches: usage.initialSearches,
+                refinedSearches: usage.refinedSearches,
                 fileActions: [.open: 2],
                 health: IndexHealthCounters(incrementalRefreshBatches: 1),
                 launches: 1,
