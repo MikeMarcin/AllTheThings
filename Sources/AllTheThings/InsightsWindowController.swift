@@ -5,8 +5,8 @@ import Darwin
 
 @MainActor
 final class InsightsWindowController: NSWindowController {
-    static let defaultContentSize = NSSize(width: 900, height: 720)
-    static let minimumContentSize = NSSize(width: 720, height: 560)
+    static let defaultContentSize = NSSize(width: 900, height: 600)
+    static let minimumContentSize = NSSize(width: 720, height: 500)
     private static let screenMargin: CGFloat = 18
 
     init(
@@ -28,11 +28,13 @@ final class InsightsWindowController: NSWindowController {
 
         let window = InsightsWindow(
             contentRect: NSRect(origin: .zero, size: contentSize),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
         window.title = "Insights"
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
         window.canHide = true
         window.isRestorable = false
         window.contentMinSize = Self.clampedContentSize(
@@ -44,6 +46,7 @@ final class InsightsWindowController: NSWindowController {
         Self.placeWindowForOpening(window)
 
         super.init(window: window)
+        viewController.installTitlebarTabs(in: window)
     }
 
     override func showWindow(_ sender: Any?) {
@@ -175,28 +178,78 @@ private final class InsightsWindow: NSWindow {
     }
 }
 
+private enum InsightsTab: Int, CaseIterable {
+    case summary
+    case index
+    case activity
+
+    var title: String {
+        switch self {
+        case .summary:
+            "Summary"
+        case .index:
+            "Index"
+        case .activity:
+            "Activity"
+        }
+    }
+
+    var accessibilityIdentifier: String {
+        switch self {
+        case .summary:
+            "Insights.SummaryPage"
+        case .index:
+            "Insights.IndexPage"
+        case .activity:
+            "Insights.ActivityPage"
+        }
+    }
+}
+
+private struct InsightsFact {
+    let title: String
+    let value: String
+    let tooltip: String?
+
+    init(_ title: String, _ value: String, tooltip: String? = nil) {
+        self.title = title
+        self.value = value
+        self.tooltip = tooltip
+    }
+}
+
 @MainActor
 private final class InsightsViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate {
     private let index: FileIndex
     private let defaults: UserDefaults
     private let clearCachedIndexHandler: () throws -> Void
 
-    private let scrollView = NSScrollView()
     private let contentView = FlippedView()
     private let overviewTilesContainer = NSView()
+    private let tabControl = NSSegmentedControl(
+        labels: InsightsTab.allCases.map(\.title),
+        trackingMode: .selectOne,
+        target: nil,
+        action: nil
+    )
+    private let tabContentView = NSView()
+    private let queryRouteView = InsightsRouteMixView()
+    private let queryRowsStack = NSStackView()
+    private let refinedRowsStack = NSStackView()
     private let storageTitleLabel = NSTextField(labelWithString: "")
+    private let storageFactsStack = NSStackView()
     private let treemapView = InsightsTreemapView()
     private let activityChartView = InsightsBarChartView()
+    private let activityFactsStack = NSStackView()
     private let rootsTableView = NSTableView()
     private let statusLabel = NSTextField(labelWithString: "Loading insights...")
     private let revealDataFolderButton = NSButton()
     private let clearCachedIndexButton = NSButton()
     private let copyReportButton = NSButton()
     private let saveReportButton = NSButton()
-    private let storageSummaryLabel = NSTextField(wrappingLabelWithString: "")
-    private let performanceSummaryLabel = NSTextField(wrappingLabelWithString: "")
+    private let titlebarActionStack = NSStackView()
     private let healthTilesContainer = NSView()
-    private let lifetimeSummaryLabel = NSTextField(wrappingLabelWithString: "")
+    private let lifetimeFactsStack = NSStackView()
 
     private var refreshTimer: Timer?
     private var latestSnapshot: IndexInsightsSnapshot?
@@ -207,6 +260,11 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
     private var isViewVisible = false
     private var overviewTileConstraints: [NSLayoutConstraint] = []
     private var healthTileConstraints: [NSLayoutConstraint] = []
+    private var tabPages: [InsightsTab: NSView] = [:]
+    private var selectedTab: InsightsTab = .summary
+    private var activeTabPage: NSView?
+    private var activeTabPageConstraints: [NSLayoutConstraint] = []
+    private var titlebarTabsInstalled = false
 
     init(
         index: FileIndex,
@@ -264,14 +322,8 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
     }
 
     private func buildInterface() {
-        scrollView.translatesAutoresizingMaskIntoConstraints = false
-        scrollView.hasVerticalScroller = true
-        scrollView.hasHorizontalScroller = false
-        scrollView.borderType = .noBorder
-        scrollView.drawsBackground = false
-
         contentView.translatesAutoresizingMaskIntoConstraints = false
-        scrollView.documentView = contentView
+        contentView.setAccessibilityIdentifier("Insights.ContentView")
 
         let titleLabel = NSTextField(labelWithString: "Insights")
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -288,36 +340,87 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         configureIconButton(copyReportButton, title: "Copy Diagnostics Report", symbol: "doc.on.doc", action: #selector(copyDiagnosticsReport(_:)))
         configureIconButton(saveReportButton, title: "Save Diagnostics Report...", symbol: "square.and.arrow.down", action: #selector(saveDiagnosticsReport(_:)))
 
-        let buttonStack = NSStackView(views: [
-            revealDataFolderButton,
-            clearCachedIndexButton,
-            copyReportButton,
-            saveReportButton
-        ])
-        buttonStack.translatesAutoresizingMaskIntoConstraints = false
-        buttonStack.orientation = .horizontal
-        buttonStack.alignment = .centerY
-        buttonStack.spacing = 8
+        titlebarActionStack.translatesAutoresizingMaskIntoConstraints = false
+        titlebarActionStack.orientation = .horizontal
+        titlebarActionStack.alignment = .centerY
+        titlebarActionStack.spacing = 8
+        titlebarActionStack.setAccessibilityIdentifier("Insights.TitlebarActions")
+        if titlebarActionStack.arrangedSubviews.isEmpty {
+            for button in [
+                revealDataFolderButton,
+                clearCachedIndexButton,
+                copyReportButton,
+                saveReportButton
+            ] {
+                titlebarActionStack.addArrangedSubview(button)
+            }
+        }
+
+        tabControl.translatesAutoresizingMaskIntoConstraints = false
+        tabControl.segmentStyle = .separated
+        tabControl.controlSize = .regular
+        tabControl.font = .systemFont(ofSize: 13, weight: .medium)
+        for segment in 0..<tabControl.segmentCount {
+            tabControl.setWidth(96, forSegment: segment)
+        }
+        tabControl.target = self
+        tabControl.action = #selector(tabSelectionDidChange(_:))
+        tabControl.selectedSegment = selectedTab.rawValue
+        tabControl.setAccessibilityIdentifier("Insights.TabControl")
+
+        tabContentView.translatesAutoresizingMaskIntoConstraints = false
+
+        configureFactsStack(storageFactsStack)
+        configureFactsStack(activityFactsStack)
+        configureFactsStack(lifetimeFactsStack)
 
         overviewTilesContainer.translatesAutoresizingMaskIntoConstraints = false
+        overviewTilesContainer.setAccessibilityIdentifier("Insights.SummaryTiles")
 
-        let overviewCard = makeCard(containing: overviewTilesContainer)
+        configureRowsStack(queryRowsStack)
+        configureRowsStack(refinedRowsStack)
+        queryRouteView.translatesAutoresizingMaskIntoConstraints = false
+        let queryTitleLabel = makePanelTitleLabel("Search Routing")
+        let queryPanelStack = verticalStack([
+            queryTitleLabel,
+            queryRouteView,
+            queryRowsStack,
+            makeDivider(),
+            refinedRowsStack
+        ], spacing: 5)
+        let queryPanel = makeOutlinedPanel(containing: queryPanelStack)
+        queryPanel.setAccessibilityIdentifier("Insights.QueryPanel")
 
-        let storageLabel = makeSectionLabel("Storage")
         storageTitleLabel.translatesAutoresizingMaskIntoConstraints = false
         storageTitleLabel.font = .systemFont(ofSize: 12, weight: .semibold)
         storageTitleLabel.textColor = .labelColor
         storageTitleLabel.lineBreakMode = .byTruncatingTail
         allowHorizontalCompression(storageTitleLabel)
         treemapView.translatesAutoresizingMaskIntoConstraints = false
-        storageSummaryLabel.translatesAutoresizingMaskIntoConstraints = false
-        storageSummaryLabel.font = .systemFont(ofSize: 12)
-        storageSummaryLabel.textColor = .secondaryLabelColor
-        storageSummaryLabel.lineBreakMode = .byWordWrapping
-        storageSummaryLabel.maximumNumberOfLines = 2
-        allowHorizontalCompression(storageSummaryLabel)
-        let storageStack = verticalStack([storageTitleLabel, treemapView, storageSummaryLabel], spacing: 6)
-        let storageCard = makeCard(containing: storageStack)
+        let storageFactsTable = makeFactTable(
+            containing: storageFactsStack,
+            accessibilityIdentifier: "Insights.StorageFactsTable"
+        )
+        let storageChartStack = verticalStack([storageTitleLabel, treemapView], spacing: 8)
+        let storageBody = NSView()
+        storageBody.translatesAutoresizingMaskIntoConstraints = false
+        storageBody.addSubview(storageChartStack)
+        storageBody.addSubview(storageFactsTable)
+        NSLayoutConstraint.activate([
+            storageChartStack.centerYAnchor.constraint(equalTo: storageBody.centerYAnchor),
+            storageChartStack.topAnchor.constraint(greaterThanOrEqualTo: storageBody.topAnchor),
+            storageChartStack.leadingAnchor.constraint(equalTo: storageBody.leadingAnchor),
+            storageChartStack.bottomAnchor.constraint(lessThanOrEqualTo: storageBody.bottomAnchor),
+            storageChartStack.trailingAnchor.constraint(equalTo: storageFactsTable.leadingAnchor, constant: -14),
+            storageChartStack.widthAnchor.constraint(greaterThanOrEqualToConstant: 360),
+
+            storageFactsTable.topAnchor.constraint(equalTo: storageBody.topAnchor),
+            storageFactsTable.trailingAnchor.constraint(equalTo: storageBody.trailingAnchor),
+            storageFactsTable.bottomAnchor.constraint(equalTo: storageBody.bottomAnchor),
+            storageFactsTable.widthAnchor.constraint(equalToConstant: 292)
+        ])
+        let storageCard = makeOutlinedPanel(containing: storageBody)
+        storageCard.setAccessibilityIdentifier("Insights.StorageCard")
 
         let rootsLabel = makeSectionLabel("Indexed Roots")
         configureRootsTable()
@@ -328,122 +431,199 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         rootsScrollView.borderType = .noBorder
         rootsScrollView.documentView = rootsTableView
         let rootsCard = makeCard(containing: rootsScrollView)
+        rootsCard.setAccessibilityIdentifier("Insights.RootsCard")
 
-        let activityLabel = makeSectionLabel("Activity")
         activityChartView.translatesAutoresizingMaskIntoConstraints = false
-        performanceSummaryLabel.translatesAutoresizingMaskIntoConstraints = false
-        performanceSummaryLabel.font = .systemFont(ofSize: 12)
-        performanceSummaryLabel.textColor = .secondaryLabelColor
-        performanceSummaryLabel.lineBreakMode = .byWordWrapping
-        performanceSummaryLabel.maximumNumberOfLines = 2
-        allowHorizontalCompression(performanceSummaryLabel)
-        let activityCard = makeCard(containing: verticalStack([activityChartView, performanceSummaryLabel], spacing: 8))
+        let activityFactsTable = makeFactTable(
+            containing: activityFactsStack,
+            accessibilityIdentifier: "Insights.ActivityFactsTable"
+        )
+        let activityBody = NSView()
+        activityBody.translatesAutoresizingMaskIntoConstraints = false
+        activityBody.addSubview(activityChartView)
+        activityBody.addSubview(activityFactsTable)
+        NSLayoutConstraint.activate([
+            activityChartView.topAnchor.constraint(equalTo: activityBody.topAnchor),
+            activityChartView.leadingAnchor.constraint(equalTo: activityBody.leadingAnchor),
+            activityChartView.bottomAnchor.constraint(equalTo: activityBody.bottomAnchor),
+            activityChartView.trailingAnchor.constraint(equalTo: activityFactsTable.leadingAnchor, constant: -14),
 
-        let healthLabel = makeSectionLabel("Performance & Health")
+            activityFactsTable.centerYAnchor.constraint(equalTo: activityBody.centerYAnchor),
+            activityFactsTable.topAnchor.constraint(greaterThanOrEqualTo: activityBody.topAnchor),
+            activityFactsTable.trailingAnchor.constraint(equalTo: activityBody.trailingAnchor),
+            activityFactsTable.bottomAnchor.constraint(lessThanOrEqualTo: activityBody.bottomAnchor),
+            activityFactsTable.widthAnchor.constraint(equalToConstant: 292)
+        ])
+        let activityCard = makeCard(containing: activityBody)
+        activityCard.setAccessibilityIdentifier("Insights.ActivityCard")
+
         healthTilesContainer.translatesAutoresizingMaskIntoConstraints = false
-        lifetimeSummaryLabel.translatesAutoresizingMaskIntoConstraints = false
-        lifetimeSummaryLabel.font = .systemFont(ofSize: 12)
-        lifetimeSummaryLabel.textColor = .secondaryLabelColor
-        lifetimeSummaryLabel.lineBreakMode = .byWordWrapping
-        lifetimeSummaryLabel.maximumNumberOfLines = 2
-        allowHorizontalCompression(lifetimeSummaryLabel)
+        healthTilesContainer.setAccessibilityIdentifier("Insights.HealthTiles")
         let healthContentView = NSView()
         healthContentView.translatesAutoresizingMaskIntoConstraints = false
+        let lifetimeFactsTable = makeFactTable(
+            containing: lifetimeFactsStack,
+            accessibilityIdentifier: "Insights.HealthFactsTable"
+        )
         healthContentView.addSubview(healthTilesContainer)
-        healthContentView.addSubview(lifetimeSummaryLabel)
+        healthContentView.addSubview(lifetimeFactsTable)
         NSLayoutConstraint.activate([
             healthTilesContainer.topAnchor.constraint(equalTo: healthContentView.topAnchor),
             healthTilesContainer.leadingAnchor.constraint(equalTo: healthContentView.leadingAnchor),
-            healthTilesContainer.trailingAnchor.constraint(equalTo: healthContentView.trailingAnchor),
-            healthTilesContainer.heightAnchor.constraint(equalToConstant: 128),
+            healthTilesContainer.bottomAnchor.constraint(equalTo: healthContentView.bottomAnchor),
 
-            lifetimeSummaryLabel.topAnchor.constraint(equalTo: healthTilesContainer.bottomAnchor, constant: 8),
-            lifetimeSummaryLabel.leadingAnchor.constraint(equalTo: healthContentView.leadingAnchor),
-            lifetimeSummaryLabel.trailingAnchor.constraint(equalTo: healthContentView.trailingAnchor),
-            lifetimeSummaryLabel.bottomAnchor.constraint(equalTo: healthContentView.bottomAnchor)
+            lifetimeFactsTable.topAnchor.constraint(equalTo: healthContentView.topAnchor),
+            lifetimeFactsTable.leadingAnchor.constraint(equalTo: healthTilesContainer.trailingAnchor, constant: 14),
+            lifetimeFactsTable.trailingAnchor.constraint(equalTo: healthContentView.trailingAnchor),
+            lifetimeFactsTable.bottomAnchor.constraint(equalTo: healthContentView.bottomAnchor),
+            lifetimeFactsTable.widthAnchor.constraint(equalTo: healthTilesContainer.widthAnchor)
         ])
         let healthCard = makeCard(containing: healthContentView)
+        healthCard.setAccessibilityIdentifier("Insights.HealthCard")
+
+        let summaryPage = makePage(accessibilityIdentifier: InsightsTab.summary.accessibilityIdentifier)
+        summaryPage.addSubview(overviewTilesContainer)
+        summaryPage.addSubview(healthCard)
+
+        let indexPage = makePage(accessibilityIdentifier: InsightsTab.index.accessibilityIdentifier)
+        indexPage.addSubview(storageCard)
+        indexPage.addSubview(rootsLabel)
+        indexPage.addSubview(rootsCard)
+
+        let activityPage = makePage(accessibilityIdentifier: InsightsTab.activity.accessibilityIdentifier)
+        activityPage.addSubview(queryPanel)
+        activityPage.addSubview(activityCard)
+
+        tabPages = [
+            .summary: summaryPage,
+            .index: indexPage,
+            .activity: activityPage
+        ]
 
         for item in [
             titleLabel,
             statusLabel,
-            buttonStack,
-            overviewCard,
-            storageLabel,
-            storageCard,
-            rootsLabel,
-            rootsCard,
-            activityLabel,
-            activityCard,
-            healthLabel,
-            healthCard
+            tabContentView
         ] {
             contentView.addSubview(item)
         }
-        view.addSubview(scrollView)
+        view.addSubview(contentView)
 
         NSLayoutConstraint.activate([
-            scrollView.topAnchor.constraint(equalTo: view.topAnchor),
-            scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            contentView.topAnchor.constraint(equalTo: view.topAnchor),
+            contentView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            contentView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            contentView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
 
-            contentView.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
-            contentView.leadingAnchor.constraint(equalTo: scrollView.contentView.leadingAnchor),
-            contentView.trailingAnchor.constraint(equalTo: scrollView.contentView.trailingAnchor),
-            contentView.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
-            contentView.heightAnchor.constraint(greaterThanOrEqualTo: scrollView.contentView.heightAnchor),
-
-            titleLabel.topAnchor.constraint(equalTo: contentView.safeAreaLayoutGuide.topAnchor, constant: 18),
+            titleLabel.topAnchor.constraint(equalTo: contentView.safeAreaLayoutGuide.topAnchor, constant: 14),
             titleLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 26),
 
-            statusLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 4),
+            statusLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 2),
             statusLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
             statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: contentView.trailingAnchor, constant: -26),
 
-            buttonStack.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
-            buttonStack.leadingAnchor.constraint(greaterThanOrEqualTo: titleLabel.trailingAnchor, constant: 16),
-            buttonStack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -26),
+            tabContentView.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 14),
+            tabContentView.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            tabContentView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -26),
+            tabContentView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -14),
 
-            overviewCard.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 12),
-            overviewCard.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
-            overviewCard.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -26),
-            overviewTilesContainer.heightAnchor.constraint(equalToConstant: 132),
+            overviewTilesContainer.topAnchor.constraint(equalTo: summaryPage.topAnchor),
+            overviewTilesContainer.leadingAnchor.constraint(equalTo: summaryPage.leadingAnchor),
+            overviewTilesContainer.trailingAnchor.constraint(equalTo: summaryPage.trailingAnchor),
+            overviewTilesContainer.heightAnchor.constraint(equalToConstant: 190),
 
-            storageLabel.topAnchor.constraint(equalTo: overviewCard.bottomAnchor, constant: 16),
-            storageLabel.leadingAnchor.constraint(equalTo: overviewCard.leadingAnchor),
+            healthCard.topAnchor.constraint(equalTo: overviewTilesContainer.bottomAnchor, constant: 12),
+            healthCard.leadingAnchor.constraint(equalTo: summaryPage.leadingAnchor),
+            healthCard.trailingAnchor.constraint(equalTo: summaryPage.trailingAnchor),
+            healthCard.bottomAnchor.constraint(lessThanOrEqualTo: summaryPage.bottomAnchor),
 
-            storageCard.topAnchor.constraint(equalTo: storageLabel.bottomAnchor, constant: 8),
-            storageCard.leadingAnchor.constraint(equalTo: overviewCard.leadingAnchor),
-            storageCard.widthAnchor.constraint(equalTo: overviewCard.widthAnchor, multiplier: 0.48),
-            treemapView.heightAnchor.constraint(equalToConstant: 124),
+            storageCard.topAnchor.constraint(equalTo: indexPage.topAnchor),
+            storageCard.leadingAnchor.constraint(equalTo: indexPage.leadingAnchor),
+            storageCard.trailingAnchor.constraint(equalTo: indexPage.trailingAnchor),
+            treemapView.heightAnchor.constraint(equalToConstant: 114),
 
-            rootsLabel.topAnchor.constraint(equalTo: storageLabel.topAnchor),
-            rootsLabel.leadingAnchor.constraint(equalTo: storageCard.trailingAnchor, constant: 18),
+            rootsLabel.topAnchor.constraint(equalTo: storageCard.bottomAnchor, constant: 12),
+            rootsLabel.leadingAnchor.constraint(equalTo: indexPage.leadingAnchor),
 
             rootsCard.topAnchor.constraint(equalTo: rootsLabel.bottomAnchor, constant: 8),
-            rootsCard.leadingAnchor.constraint(equalTo: rootsLabel.leadingAnchor),
-            rootsCard.trailingAnchor.constraint(equalTo: overviewCard.trailingAnchor),
-            rootsCard.heightAnchor.constraint(equalTo: storageCard.heightAnchor),
-            rootsScrollView.heightAnchor.constraint(equalToConstant: 178),
+            rootsCard.leadingAnchor.constraint(equalTo: indexPage.leadingAnchor),
+            rootsCard.trailingAnchor.constraint(equalTo: indexPage.trailingAnchor),
+            rootsCard.bottomAnchor.constraint(equalTo: indexPage.bottomAnchor),
+            rootsScrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 210),
 
-            activityLabel.topAnchor.constraint(equalTo: storageCard.bottomAnchor, constant: 16),
-            activityLabel.leadingAnchor.constraint(equalTo: overviewCard.leadingAnchor),
+            queryPanel.topAnchor.constraint(equalTo: activityPage.topAnchor),
+            queryPanel.leadingAnchor.constraint(equalTo: activityPage.leadingAnchor),
+            queryPanel.trailingAnchor.constraint(equalTo: activityPage.trailingAnchor),
+            queryPanel.heightAnchor.constraint(equalToConstant: 208),
+            queryRouteView.heightAnchor.constraint(equalToConstant: 58),
 
-            activityCard.topAnchor.constraint(equalTo: activityLabel.bottomAnchor, constant: 8),
-            activityCard.leadingAnchor.constraint(equalTo: overviewCard.leadingAnchor),
-            activityCard.widthAnchor.constraint(equalTo: storageCard.widthAnchor),
-            activityChartView.heightAnchor.constraint(equalToConstant: 104),
-
-            healthLabel.topAnchor.constraint(equalTo: activityLabel.topAnchor),
-            healthLabel.leadingAnchor.constraint(equalTo: activityCard.trailingAnchor, constant: 18),
-
-            healthCard.topAnchor.constraint(equalTo: healthLabel.bottomAnchor, constant: 8),
-            healthCard.leadingAnchor.constraint(equalTo: healthLabel.leadingAnchor),
-            healthCard.trailingAnchor.constraint(equalTo: overviewCard.trailingAnchor),
-            healthCard.heightAnchor.constraint(equalTo: activityCard.heightAnchor),
-            healthCard.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -18)
+            activityCard.topAnchor.constraint(equalTo: queryPanel.bottomAnchor, constant: 12),
+            activityCard.leadingAnchor.constraint(equalTo: activityPage.leadingAnchor),
+            activityCard.trailingAnchor.constraint(equalTo: activityPage.trailingAnchor),
+            activityCard.bottomAnchor.constraint(lessThanOrEqualTo: activityPage.bottomAnchor),
+            activityChartView.heightAnchor.constraint(equalToConstant: 216)
         ])
+
+        showTab(selectedTab)
+    }
+
+    func installTitlebarTabs(in window: NSWindow) {
+        _ = view
+        guard !titlebarTabsInstalled else { return }
+
+        window.titleVisibility = .hidden
+
+        let titlebarGuide = NSLayoutGuide()
+        view.addLayoutGuide(titlebarGuide)
+        view.addSubview(tabControl)
+        view.addSubview(titlebarActionStack)
+        NSLayoutConstraint.activate([
+            titlebarGuide.topAnchor.constraint(equalTo: view.topAnchor),
+            titlebarGuide.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            titlebarGuide.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            titlebarGuide.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+
+            tabControl.centerXAnchor.constraint(equalTo: titlebarGuide.centerXAnchor),
+            tabControl.centerYAnchor.constraint(equalTo: titlebarGuide.centerYAnchor),
+            tabControl.leadingAnchor.constraint(greaterThanOrEqualTo: titlebarGuide.leadingAnchor, constant: 140),
+            tabControl.trailingAnchor.constraint(lessThanOrEqualTo: titlebarGuide.trailingAnchor, constant: -140),
+            tabControl.widthAnchor.constraint(equalToConstant: 288),
+            tabControl.heightAnchor.constraint(equalToConstant: 26),
+
+            titlebarActionStack.centerYAnchor.constraint(equalTo: titlebarGuide.centerYAnchor),
+            titlebarActionStack.leadingAnchor.constraint(greaterThanOrEqualTo: tabControl.trailingAnchor, constant: 24),
+            titlebarActionStack.trailingAnchor.constraint(equalTo: titlebarGuide.trailingAnchor, constant: -26),
+            titlebarActionStack.topAnchor.constraint(greaterThanOrEqualTo: titlebarGuide.topAnchor),
+            titlebarActionStack.bottomAnchor.constraint(lessThanOrEqualTo: titlebarGuide.bottomAnchor)
+        ])
+        titlebarTabsInstalled = true
+    }
+
+    @objc private func tabSelectionDidChange(_ sender: NSSegmentedControl) {
+        guard let tab = InsightsTab(rawValue: sender.selectedSegment) else { return }
+        showTab(tab)
+    }
+
+    private func showTab(_ tab: InsightsTab) {
+        guard let page = tabPages[tab] else { return }
+        selectedTab = tab
+        tabControl.selectedSegment = tab.rawValue
+        guard activeTabPage !== page else { return }
+
+        NSLayoutConstraint.deactivate(activeTabPageConstraints)
+        activeTabPageConstraints.removeAll()
+        activeTabPage?.removeFromSuperview()
+
+        page.translatesAutoresizingMaskIntoConstraints = false
+        tabContentView.addSubview(page)
+        activeTabPageConstraints = [
+            page.topAnchor.constraint(equalTo: tabContentView.topAnchor),
+            page.leadingAnchor.constraint(equalTo: tabContentView.leadingAnchor),
+            page.trailingAnchor.constraint(equalTo: tabContentView.trailingAnchor),
+            page.bottomAnchor.constraint(equalTo: tabContentView.bottomAnchor)
+        ]
+        NSLayoutConstraint.activate(activeTabPageConstraints)
+        activeTabPage = page
     }
 
     private func startPolling() {
@@ -507,20 +687,21 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         clearCachedIndexButton.isEnabled = snapshot.health.canClearCachedIndex
 
         rebuildOverviewGrid(snapshot, displayedRootCount: displayedRoots.count)
+        rebuildQueryPathPanel(snapshot)
         treemapView.roots = displayedRoots
         activityChartView.buckets = Array(snapshot.usage.dailyBuckets.suffix(30))
         rootsTableView.reloadData()
 
         storageTitleLabel.stringValue = storageTitleText(roots: displayedRoots)
-        storageSummaryLabel.stringValue = storageSummaryText(
+        rebuildStorageFacts(
             snapshot,
             displayedRoots: displayedRoots,
             accessStatuses: rootAccessStatuses,
             activePlaceholder: InsightsRootDisplay.activePlaceholderLabel(for: snapshot.stats)
         )
-        performanceSummaryLabel.stringValue = "Searches: \(snapshot.usage.allTimeSearches.completed.formatted()) completed, \(snapshot.usage.allTimeSearches.fallbackScans.formatted()) full fallback scans, average latency \(durationString(snapshot.usage.allTimeSearches.averageLatency))."
+        rebuildActivityFacts(snapshot)
         rebuildHealthGrid(snapshot)
-        lifetimeSummaryLabel.stringValue = lifetimeText(snapshot)
+        rebuildLifetimeFacts(snapshot)
     }
 
     private func rebuildOverviewGrid(_ snapshot: IndexInsightsSnapshot, displayedRootCount: Int) {
@@ -531,13 +712,29 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         let tiles = [
             makeMetricTile(title: "Tracked Files", value: snapshot.stats.indexedCount.formatted(), detail: "\(displayedRootCount) roots"),
             makeMetricTile(title: "ATT Data", value: byteString(snapshot.storage.totalATTDataBytes), detail: "Index \(byteString(snapshot.storage.indexPackageBytes))"),
-            makeMetricTile(title: "Searches", value: snapshot.usage.allTimeSearches.completed.formatted(), detail: "\(snapshot.usage.allTimeSearches.fallbackScans.formatted()) fallbacks"),
+            makeMetricTile(title: "Initial Results", value: snapshot.usage.initialSearches.completed.formatted(), detail: "\(snapshot.usage.initialSearches.cancelled.formatted()) cancelled"),
             makeMetricTile(title: "Index Updates", value: snapshot.usage.health.incrementalRefreshBatches.formatted(), detail: "\(snapshot.usage.health.fullRebuilds.formatted()) rebuilds"),
             makeMetricTile(title: "Memory", value: byteString(snapshot.usage.dailyBuckets.last?.memory.latestBytes ?? 0), detail: "latest sample"),
             makeMetricTile(title: "Launches", value: snapshot.lifetime.launchCount.formatted(), detail: dateOnlyString(snapshot.lifetime.firstLaunchDate))
         ]
 
-        overviewTileConstraints = layoutTileGrid(tiles, in: overviewTilesContainer, columns: 3, rowGap: 8, columnGap: 8)
+        overviewTileConstraints = layoutTileGrid(tiles, in: overviewTilesContainer, columns: 2, rowGap: 8, columnGap: 10)
+    }
+
+    private func rebuildQueryPathPanel(_ snapshot: IndexInsightsSnapshot) {
+        let initial = snapshot.usage.initialSearches
+        let refined = snapshot.usage.refinedSearches
+        queryRouteView.counters = initial
+
+        replaceRows(in: queryRowsStack, with: [
+            makeRouteCountRow(title: "Initial", value: compactRouteSummary(initial), color: InsightsRouteMixView.color(for: .mappedIndex)),
+            makeRouteCountRow(title: "Done / Cancelled / Avg", value: "\(initial.completed.formatted()) / \(initial.cancelled.formatted()) / \(durationString(initial.averageLatency))", color: .secondaryLabelColor)
+        ])
+
+        replaceRows(in: refinedRowsStack, with: [
+            makeRouteCountRow(title: "Refined", value: compactRouteSummary(refined), color: .secondaryLabelColor),
+            makeRouteCountRow(title: "Done / Cancelled / Avg", value: "\(refined.completed.formatted()) / \(refined.cancelled.formatted()) / \(durationString(refined.averageLatency))", color: .secondaryLabelColor)
+        ])
     }
 
     private func rebuildHealthGrid(_ snapshot: IndexInsightsSnapshot) {
@@ -574,6 +771,57 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         ]
 
         healthTileConstraints = layoutTileGrid(tiles, in: healthTilesContainer, columns: 2, rowGap: 8, columnGap: 8)
+    }
+
+    private func rebuildStorageFacts(
+        _ snapshot: IndexInsightsSnapshot,
+        displayedRoots: [IndexRootInsight],
+        accessStatuses: [String: InsightsRootAccessStatus],
+        activePlaceholder: String?
+    ) {
+        let rootsWithData = displayedRoots.filter { root in
+            root.trackedFileCount > 0 || root.directoryCount > 0 || root.pathByteWeight > 0
+        }.count
+        let rootValue = displayedRoots.isEmpty
+            ? "none"
+            : "\(rootsWithData.formatted()) / \(displayedRoots.count.formatted()) active"
+        let storageDetails = storageSummaryText(
+            snapshot,
+            displayedRoots: displayedRoots,
+            accessStatuses: accessStatuses,
+            activePlaceholder: activePlaceholder
+        )
+        replaceFacts(in: storageFactsStack, with: [
+            InsightsFact("ATT Data", byteString(snapshot.storage.totalATTDataBytes)),
+            InsightsFact("Index Package", byteString(snapshot.storage.indexPackageBytes)),
+            InsightsFact("Cache", byteString(snapshot.storage.cacheBytes)),
+            InsightsFact("Measurement", storageMeasurementValue(snapshot.storage), tooltip: storageMeasurementText(snapshot.storage)),
+            InsightsFact("Roots", rootValue, tooltip: storageDetails)
+        ])
+    }
+
+    private func rebuildActivityFacts(_ snapshot: IndexInsightsSnapshot) {
+        let searches = snapshot.usage.allTimeSearches
+        let health = snapshot.usage.health
+        replaceFacts(in: activityFactsStack, with: [
+            InsightsFact("Completed", searches.completed.formatted()),
+            InsightsFact("Fallbacks", searches.fallbackScans.formatted()),
+            InsightsFact("Avg Latency", durationString(searches.averageLatency)),
+            InsightsFact("Max Latency", durationString(searches.maxLatency)),
+            InsightsFact("File Actions", totalFileActionString(snapshot.usage.allTimeFileActions)),
+            InsightsFact("Index Updates", health.incrementalRefreshBatches.formatted()),
+            InsightsFact("Full Rebuilds", health.fullRebuilds.formatted()),
+            InsightsFact("Last Refresh", optionalDurationString(health.lastRefreshDuration))
+        ])
+    }
+
+    private func rebuildLifetimeFacts(_ snapshot: IndexInsightsSnapshot) {
+        replaceFacts(in: lifetimeFactsStack, with: [
+            InsightsFact("First Launch", dateOnlyString(snapshot.lifetime.firstLaunchDate)),
+            InsightsFact("Launches", snapshot.lifetime.launchCount.formatted()),
+            InsightsFact("Version Seen", dateOnlyString(snapshot.lifetime.currentAppVersionFirstSeenDate)),
+            InsightsFact("Memory Today", memoryTodayString(snapshot.usage.dailyBuckets.last?.memory))
+        ])
     }
 
     private func layoutTileGrid(
@@ -658,9 +906,9 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
             root.trackedFileCount > 0 || root.directoryCount > 0 || root.pathByteWeight > 0
         }.count
         if roots.isEmpty {
-            return "Estimated index package share by root"
+            return "Index package by root"
         }
-        return "Estimated index package share by root (\(rootsWithData) of \(roots.count) with indexed data)"
+        return "Index package by root (\(rootsWithData)/\(roots.count) active)"
     }
 
     private func storageSummaryText(
@@ -926,14 +1174,6 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         }
     }
 
-    private func lifetimeText(_ snapshot: IndexInsightsSnapshot) -> String {
-        let firstLaunch = dateOnlyString(snapshot.lifetime.firstLaunchDate)
-        let versionSeen = dateOnlyString(snapshot.lifetime.currentAppVersionFirstSeenDate)
-        let daily = snapshot.usage.dailyBuckets.last
-        let memory = daily.map { "Memory today \(byteString($0.memory.dailyMinimumBytes)) - \(byteString($0.memory.dailyMaximumBytes))" } ?? "No memory samples yet"
-        return "First launch \(firstLaunch) · launches \(snapshot.lifetime.launchCount.formatted()) · version seen \(versionSeen) · \(memory)"
-    }
-
     private func configureIconButton(_ button: NSButton, title: String, symbol: String, action: Selector) {
         button.translatesAutoresizingMaskIntoConstraints = false
         button.title = ""
@@ -961,6 +1201,175 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         return label
     }
 
+    private func makePage(accessibilityIdentifier: String) -> NSView {
+        let page = NSView()
+        page.translatesAutoresizingMaskIntoConstraints = false
+        page.setAccessibilityIdentifier(accessibilityIdentifier)
+        return page
+    }
+
+    private func makePanelTitleLabel(_ text: String) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.font = .systemFont(ofSize: 12, weight: .semibold)
+        label.textColor = .labelColor
+        allowHorizontalCompression(label)
+        return label
+    }
+
+    private func configureFactsStack(_ stack: NSStackView) {
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.orientation = .vertical
+        stack.alignment = .width
+        stack.spacing = 0
+    }
+
+    private func configureRowsStack(_ stack: NSStackView) {
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.orientation = .vertical
+        stack.alignment = .width
+        stack.spacing = 0
+    }
+
+    private func replaceRows(in stack: NSStackView, with rows: [NSView]) {
+        for view in stack.arrangedSubviews {
+            stack.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+        for (index, row) in rows.enumerated() {
+            stack.addArrangedSubview(row)
+            if index < rows.count - 1 {
+                stack.addArrangedSubview(makeTableSeparator())
+            }
+        }
+    }
+
+    private func replaceFacts(in stack: NSStackView, with facts: [InsightsFact]) {
+        for view in stack.arrangedSubviews {
+            stack.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+        for (index, fact) in facts.enumerated() {
+            stack.addArrangedSubview(makeFactRow(fact))
+            if index < facts.count - 1 {
+                stack.addArrangedSubview(makeTableSeparator())
+            }
+        }
+    }
+
+    private func makeDivider() -> NSView {
+        let view = InsightsTableSeparatorView()
+        NSLayoutConstraint.activate([
+            view.heightAnchor.constraint(equalToConstant: 2)
+        ])
+        return view
+    }
+
+    private func makeTableSeparator() -> NSView {
+        let view = InsightsTableSeparatorView()
+        NSLayoutConstraint.activate([
+            view.heightAnchor.constraint(equalToConstant: 2)
+        ])
+        return view
+    }
+
+    private func makeFactTable(containing content: NSView, accessibilityIdentifier: String) -> NSView {
+        let table = InsightsFactTableView()
+        table.setAccessibilityIdentifier(accessibilityIdentifier)
+        content.translatesAutoresizingMaskIntoConstraints = false
+        table.addSubview(content)
+        NSLayoutConstraint.activate([
+            content.topAnchor.constraint(equalTo: table.topAnchor),
+            content.leadingAnchor.constraint(equalTo: table.leadingAnchor),
+            content.trailingAnchor.constraint(equalTo: table.trailingAnchor),
+            content.bottomAnchor.constraint(equalTo: table.bottomAnchor)
+        ])
+        return table
+    }
+
+    private func makeFactRow(_ fact: InsightsFact) -> NSView {
+        let row = NSView()
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.toolTip = fact.tooltip
+
+        let titleLabel = NSTextField(labelWithString: fact.title)
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        titleLabel.font = .systemFont(ofSize: 11, weight: .medium)
+        titleLabel.textColor = .secondaryLabelColor
+        titleLabel.lineBreakMode = .byTruncatingTail
+        titleLabel.toolTip = fact.tooltip
+
+        let valueLabel = NSTextField(labelWithString: fact.value)
+        valueLabel.translatesAutoresizingMaskIntoConstraints = false
+        valueLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
+        valueLabel.textColor = .labelColor
+        valueLabel.alignment = .right
+        valueLabel.lineBreakMode = .byTruncatingTail
+        valueLabel.toolTip = fact.tooltip
+        valueLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        row.addSubview(titleLabel)
+        row.addSubview(valueLabel)
+        titleLabel.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        NSLayoutConstraint.activate([
+            row.heightAnchor.constraint(equalToConstant: 26),
+            titleLabel.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 12),
+            titleLabel.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            titleLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 120),
+
+            valueLabel.leadingAnchor.constraint(greaterThanOrEqualTo: titleLabel.trailingAnchor, constant: 12),
+            valueLabel.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -12),
+            valueLabel.centerYAnchor.constraint(equalTo: row.centerYAnchor)
+        ])
+        return row
+    }
+
+    private func makeRouteCountRow(title: String, value: String, color: NSColor) -> NSView {
+        let row = NSView()
+        row.translatesAutoresizingMaskIntoConstraints = false
+
+        let marker = NSView()
+        marker.translatesAutoresizingMaskIntoConstraints = false
+        marker.wantsLayer = true
+        marker.layer?.cornerRadius = 2
+        marker.layer?.backgroundColor = AppTheme.resolvedCGColor(color, for: view)
+
+        let titleLabel = NSTextField(labelWithString: title)
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        titleLabel.font = .systemFont(ofSize: 10.5, weight: .medium)
+        titleLabel.textColor = .secondaryLabelColor
+        titleLabel.lineBreakMode = .byTruncatingTail
+        allowHorizontalCompression(titleLabel)
+
+        let valueLabel = NSTextField(labelWithString: value)
+        valueLabel.translatesAutoresizingMaskIntoConstraints = false
+        valueLabel.font = .monospacedDigitSystemFont(ofSize: 10.5, weight: .semibold)
+        valueLabel.textColor = .labelColor
+        valueLabel.alignment = .right
+        valueLabel.lineBreakMode = .byTruncatingTail
+        valueLabel.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        valueLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        row.addSubview(marker)
+        row.addSubview(titleLabel)
+        row.addSubview(valueLabel)
+        NSLayoutConstraint.activate([
+            row.heightAnchor.constraint(equalToConstant: 24),
+            marker.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 12),
+            marker.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            marker.widthAnchor.constraint(equalToConstant: 7),
+            marker.heightAnchor.constraint(equalToConstant: 7),
+
+            titleLabel.leadingAnchor.constraint(equalTo: marker.trailingAnchor, constant: 8),
+            titleLabel.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+
+            valueLabel.leadingAnchor.constraint(greaterThanOrEqualTo: titleLabel.trailingAnchor, constant: 12),
+            valueLabel.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -12),
+            valueLabel.centerYAnchor.constraint(equalTo: row.centerYAnchor)
+        ])
+        return row
+    }
+
     private func makeMetricTile(title: String, value: String, detail: String) -> NSView {
         let titleLabel = NSTextField(labelWithString: title)
         titleLabel.font = .systemFont(ofSize: 10, weight: .medium)
@@ -969,7 +1378,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         allowHorizontalCompression(titleLabel)
 
         let valueLabel = NSTextField(labelWithString: value)
-        valueLabel.font = .monospacedDigitSystemFont(ofSize: 18, weight: .semibold)
+        valueLabel.font = .monospacedDigitSystemFont(ofSize: 17, weight: .semibold)
         valueLabel.textColor = .labelColor
         valueLabel.alignment = .left
         valueLabel.lineBreakMode = .byTruncatingTail
@@ -977,7 +1386,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         allowHorizontalCompression(valueLabel)
 
         let detailLabel = NSTextField(labelWithString: detail)
-        detailLabel.font = .systemFont(ofSize: 11, weight: .medium)
+        detailLabel.font = .systemFont(ofSize: 10.5, weight: .medium)
         detailLabel.textColor = .secondaryLabelColor
         detailLabel.alignment = .left
         detailLabel.lineBreakMode = .byTruncatingTail
@@ -986,23 +1395,23 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         let stack = InsightsTileView(views: [titleLabel, valueLabel, detailLabel], style: .metric)
         stack.spacing = 2
         stack.alignment = .leading
-        stack.edgeInsets = NSEdgeInsets(top: 5, left: 10, bottom: 5, right: 10)
+        stack.edgeInsets = NSEdgeInsets(top: 5, left: 9, bottom: 5, right: 9)
         NSLayoutConstraint.activate([
-            stack.heightAnchor.constraint(greaterThanOrEqualToConstant: 62)
+            stack.heightAnchor.constraint(greaterThanOrEqualToConstant: 58)
         ])
         return stack
     }
 
     private func makeHealthTile(title: String, value: String, detail: String, isWarning: Bool = false) -> NSView {
         let titleLabel = NSTextField(labelWithString: title)
-        titleLabel.font = .systemFont(ofSize: 10, weight: .medium)
+        titleLabel.font = .systemFont(ofSize: 9.5, weight: .medium)
         titleLabel.textColor = .secondaryLabelColor
         titleLabel.alignment = .left
         titleLabel.lineBreakMode = .byTruncatingTail
         allowHorizontalCompression(titleLabel)
 
         let valueLabel = NSTextField(labelWithString: value)
-        valueLabel.font = .monospacedDigitSystemFont(ofSize: 15, weight: .semibold)
+        valueLabel.font = .monospacedDigitSystemFont(ofSize: 14, weight: .semibold)
         valueLabel.textColor = isWarning ? .systemOrange : .labelColor
         valueLabel.alignment = .left
         valueLabel.lineBreakMode = .byTruncatingTail
@@ -1010,7 +1419,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         allowHorizontalCompression(valueLabel)
 
         let detailLabel = NSTextField(labelWithString: detail)
-        detailLabel.font = .systemFont(ofSize: 10, weight: .medium)
+        detailLabel.font = .systemFont(ofSize: 9.5, weight: .medium)
         detailLabel.textColor = .secondaryLabelColor
         detailLabel.alignment = .left
         detailLabel.lineBreakMode = .byTruncatingTail
@@ -1020,9 +1429,9 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         let stack = InsightsTileView(views: [titleLabel, valueLabel, detailLabel], style: .health)
         stack.spacing = 2
         stack.alignment = .leading
-        stack.edgeInsets = NSEdgeInsets(top: 7, left: 9, bottom: 7, right: 9)
+        stack.edgeInsets = NSEdgeInsets(top: 5, left: 8, bottom: 5, right: 8)
         NSLayoutConstraint.activate([
-            stack.heightAnchor.constraint(greaterThanOrEqualToConstant: 54)
+            stack.heightAnchor.constraint(greaterThanOrEqualToConstant: 48)
         ])
         return stack
     }
@@ -1039,6 +1448,24 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
             content.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -10)
         ])
         return card
+    }
+
+    private func makeOutlinedPanel(containing content: NSView) -> NSView {
+        let panel = InsightsOutlinePanelView()
+
+        content.translatesAutoresizingMaskIntoConstraints = false
+        panel.addSubview(content)
+        NSLayoutConstraint.activate([
+            content.topAnchor.constraint(equalTo: panel.topAnchor, constant: 10),
+            content.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 10),
+            content.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -10),
+            content.bottomAnchor.constraint(equalTo: panel.bottomAnchor, constant: -10)
+        ])
+        return panel
+    }
+
+    private func compactRouteSummary(_ counters: SearchUsageCounters) -> String {
+        InsightsQueryRouteSummary.compactRouteSummary(counters)
     }
 
     private func verticalStack(_ views: [NSView], spacing: CGFloat) -> NSStackView {
@@ -1078,6 +1505,30 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         formatter.dateStyle = .medium
         formatter.timeStyle = .none
         return formatter.string(from: date)
+    }
+
+    private func storageMeasurementValue(_ storage: IndexStorageInsights) -> String {
+        if storage.isMeasuring {
+            return "measuring"
+        }
+        guard let measuredAt = storage.measuredAt else {
+            return "pending"
+        }
+        return relativeDateString(measuredAt)
+    }
+
+    private func optionalDurationString(_ duration: TimeInterval?) -> String {
+        guard let duration else { return "none" }
+        return durationString(duration)
+    }
+
+    private func totalFileActionString(_ actions: [FileActionMetric: UInt64]) -> String {
+        actions.values.reduce(UInt64(0), +).formatted()
+    }
+
+    private func memoryTodayString(_ memory: MemoryUsageCounters?) -> String {
+        guard let memory else { return "no samples" }
+        return "\(byteString(memory.dailyMinimumBytes)) - \(byteString(memory.dailyMaximumBytes))"
     }
 
     private func relativeDateString(_ date: Date) -> String {
@@ -1163,6 +1614,40 @@ enum InsightsRootDisplay {
         }
 
         return roots
+    }
+}
+
+enum InsightsQueryRouteSummary {
+    static func routeCountString(_ counters: SearchUsageCounters, _ route: SearchRouteKind) -> String {
+        counters.routeCounts[route, default: 0].formatted()
+    }
+
+    static func applicationOtherRouteString(_ counters: SearchUsageCounters) -> String {
+        let application = counters.routeCounts[.applicationCatalog, default: 0]
+        let other = counters.routeCounts[.other, default: 0]
+        guard other > 0 else { return application.formatted() }
+        return "\(application.formatted()) / \(other.formatted())"
+    }
+
+    static func compactRouteSummary(_ counters: SearchUsageCounters) -> String {
+        let sidecars = counters.routeCounts[.sidecar, default: 0]
+        let fullScans = counters.routeCounts[.fullScan, default: 0]
+        let mapped = counters.routeCounts[.mappedIndex, default: 0]
+        let application = counters.routeCounts[.applicationCatalog, default: 0]
+        let other = counters.routeCounts[.other, default: 0]
+        if counters.completed == 0 {
+            return "none"
+        }
+        return "side \(sidecars.formatted()) · map \(mapped.formatted()) · scan \(fullScans.formatted()) · app \(application.formatted()) · other \(other.formatted())"
+    }
+
+    static func percentString(numerator: UInt64, denominator: UInt64) -> String {
+        guard denominator > 0 else { return "0%" }
+        let percent = Double(numerator) / Double(denominator) * 100
+        if percent > 0, percent < 1 {
+            return "<1%"
+        }
+        return "\(Int(percent.rounded()))%"
     }
 }
 
@@ -1255,6 +1740,12 @@ enum InsightsPanelPalette {
             : NSColor(calibratedWhite: 0.54, alpha: 0.34)
     }
 
+    static func tableRuleColor(isDark: Bool) -> NSColor {
+        isDark
+            ? NSColor(calibratedWhite: 0.78, alpha: 0.50)
+            : NSColor(calibratedWhite: 0.36, alpha: 0.44)
+    }
+
     static func tileBackgroundColor(style: InsightsPanelTileStyle, isDark: Bool) -> NSColor {
         switch (style, isDark) {
         case (.metric, true):
@@ -1292,7 +1783,7 @@ private final class InsightsCardView: NSView {
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
         layer?.cornerRadius = 8
-        layer?.borderWidth = 1
+        layer?.borderWidth = 0
         updateThemeColors()
     }
 
@@ -1319,6 +1810,114 @@ private final class InsightsCardView: NSView {
         )
         layer?.borderColor = AppTheme.resolvedCGColor(
             InsightsPanelPalette.cardBorderColor(isDark: isDark),
+            for: self
+        )
+    }
+}
+
+private final class InsightsOutlinePanelView: NSView {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        layer?.cornerRadius = 7
+        layer?.borderWidth = 1.5
+        updateThemeColors()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateThemeColors()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        updateThemeColors()
+    }
+
+    private func updateThemeColors() {
+        let isDark = InsightsPanelPalette.isDarkAppearance(effectiveAppearance)
+        layer?.backgroundColor = AppTheme.resolvedCGColor(
+            InsightsPanelPalette.cardBackgroundColor(isDark: isDark),
+            for: self
+        )
+        layer?.borderColor = AppTheme.resolvedCGColor(
+            InsightsPanelPalette.cardBorderColor(isDark: isDark),
+            for: self
+        )
+    }
+}
+
+private final class InsightsFactTableView: NSView {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        layer?.cornerRadius = 6
+        layer?.borderWidth = 1.5
+        updateThemeColors()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateThemeColors()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        updateThemeColors()
+    }
+
+    private func updateThemeColors() {
+        let isDark = InsightsPanelPalette.isDarkAppearance(effectiveAppearance)
+        layer?.backgroundColor = AppTheme.resolvedCGColor(
+            InsightsPanelPalette.cardBackgroundColor(isDark: isDark).withAlphaComponent(isDark ? 0.30 : 0.58),
+            for: self
+        )
+        layer?.borderColor = AppTheme.resolvedCGColor(
+            InsightsPanelPalette.cardBorderColor(isDark: isDark),
+            for: self
+        )
+    }
+}
+
+private final class InsightsTableSeparatorView: NSView {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        updateThemeColors()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateThemeColors()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        updateThemeColors()
+    }
+
+    private func updateThemeColors() {
+        let isDark = InsightsPanelPalette.isDarkAppearance(effectiveAppearance)
+        layer?.backgroundColor = AppTheme.resolvedCGColor(
+            InsightsPanelPalette.tableRuleColor(isDark: isDark),
             for: self
         )
     }
@@ -1361,6 +1960,100 @@ private final class InsightsTileView: NSStackView {
         layer?.backgroundColor = AppTheme.resolvedCGColor(
             InsightsPanelPalette.tileBackgroundColor(style: style, isDark: isDark),
             for: self
+        )
+    }
+}
+
+private final class InsightsRouteMixView: NSView {
+    var counters = SearchUsageCounters() {
+        didSet { needsDisplay = true }
+    }
+
+    override var isFlipped: Bool { true }
+
+    static func color(for route: SearchRouteKind) -> NSColor {
+        switch route {
+        case .sidecar:
+            return .systemGreen
+        case .fullScan:
+            return .systemOrange
+        case .mappedIndex:
+            return .systemPurple
+        case .applicationCatalog:
+            return .systemBlue
+        case .other:
+            return .systemGray
+        }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        let isDark = InsightsPanelPalette.isDarkAppearance(effectiveAppearance)
+        let background = InsightsPanelPalette.chartBackgroundColor(isDark: isDark)
+        let border = InsightsPanelPalette.treemapStrokeColor(isDark: isDark)
+        let rect = bounds.insetBy(dx: 0.5, dy: 0.5)
+        background.setFill()
+        NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5).fill()
+
+        let routes: [SearchRouteKind] = [.sidecar, .mappedIndex, .fullScan, .applicationCatalog, .other]
+        let counts = routes.map { counters.routeCounts[$0, default: 0] }
+        let total = counts.reduce(UInt64(0), +)
+        guard total > 0 else {
+            drawEmpty("No initial route data")
+            border.setStroke()
+            NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5).stroke()
+            return
+        }
+
+        var x = rect.minX
+        let lastPositiveIndex = counts.indices.last { counts[$0] > 0 }
+        for (index, route) in routes.enumerated() {
+            let count = counts[index]
+            guard count > 0 else { continue }
+            let isLast = index == lastPositiveIndex
+            let width = isLast
+                ? rect.maxX - x
+                : max(2, floor(rect.width * CGFloat(Double(count) / Double(total))))
+            let segment = NSRect(x: x, y: rect.minY, width: min(width, rect.maxX - x), height: rect.height)
+            Self.color(for: route).withAlphaComponent(0.82).setFill()
+            segment.fill()
+            if segment.width > 56 {
+                drawCount(count, in: segment)
+            }
+            x += segment.width
+        }
+
+        border.setStroke()
+        NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5).stroke()
+    }
+
+    private func drawEmpty(_ text: String) {
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+            .foregroundColor: NSColor.secondaryLabelColor
+        ]
+        let size = text.size(withAttributes: attributes)
+        text.draw(
+            at: NSPoint(x: bounds.midX - size.width / 2, y: bounds.midY - size.height / 2),
+            withAttributes: attributes
+        )
+    }
+
+    private func drawCount(_ count: UInt64, in rect: NSRect) {
+        let text = count.formatted()
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .bold),
+            .foregroundColor: NSColor.white
+        ]
+        let size = text.size(withAttributes: attributes)
+        text.draw(
+            at: NSPoint(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2),
+            withAttributes: attributes
         )
     }
 }

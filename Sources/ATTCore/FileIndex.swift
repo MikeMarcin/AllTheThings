@@ -49,6 +49,17 @@ public enum SearchMode: Sendable {
     case interactivePreview
 }
 
+extension SearchMode {
+    var metricPhase: SearchMetricPhase {
+        switch self {
+        case .interactivePreview:
+            return .initialResults
+        case .complete:
+            return .refinedResults
+        }
+    }
+}
+
 public enum MatchClass: Int, Codable, CaseIterable, Sendable {
     case metadata = 0
     case weakPath = 1
@@ -3210,18 +3221,19 @@ public final class FileIndex: @unchecked Sendable {
         shouldCancel: @Sendable () -> Bool
     ) -> SearchResponse? {
         let started = Date()
-        recordSearchStarted()
+        let metricPhase = request.mode.metricPhase
+        recordSearchStarted(phase: metricPhase)
         var didCompleteSearch = false
 
         func finish(_ response: SearchResponse) -> SearchResponse {
             didCompleteSearch = true
-            recordSearchCompleted(response.executionProfile)
+            recordSearchCompleted(response.executionProfile, phase: metricPhase)
             return response
         }
 
         defer {
             if !didCompleteSearch {
-                recordSearchCancelled(elapsed: Date().timeIntervalSince(started))
+                recordSearchCancelled(phase: metricPhase, elapsed: Date().timeIntervalSince(started))
             }
         }
 
@@ -10318,21 +10330,21 @@ public final class FileIndex: @unchecked Sendable {
         )
     }
 
-    private func recordSearchStarted() {
+    private func recordSearchStarted(phase: SearchMetricPhase) {
         updateUsageMetrics { metrics in
-            metrics.recordSearchStarted()
+            metrics.recordSearchStarted(phase: phase)
         }
     }
 
-    private func recordSearchCompleted(_ profile: SearchExecutionProfile) {
+    private func recordSearchCompleted(_ profile: SearchExecutionProfile, phase: SearchMetricPhase) {
         updateUsageMetrics { metrics in
-            metrics.recordSearchCompleted(profile)
+            metrics.recordSearchCompleted(profile, phase: phase)
         }
     }
 
-    private func recordSearchCancelled(elapsed: TimeInterval) {
+    private func recordSearchCancelled(phase: SearchMetricPhase, elapsed: TimeInterval) {
         updateUsageMetrics { metrics in
-            metrics.recordSearchCancelled(elapsed: elapsed)
+            metrics.recordSearchCancelled(phase: phase, elapsed: elapsed)
         }
     }
 
@@ -10390,9 +10402,23 @@ public final class FileIndex: @unchecked Sendable {
         guard
             fileManager.fileExists(atPath: url.path),
             let data = try? Data(contentsOf: url),
-            var metrics = try? JSONDecoder().decode(IndexUsageMetrics.self, from: data),
-            metrics.schemaVersion == IndexUsageMetrics.currentSchemaVersion
+            var metrics = try? JSONDecoder().decode(IndexUsageMetrics.self, from: data)
         else {
+            return IndexUsageMetrics(schemaVersion: IndexUsageMetrics.currentSchemaVersion)
+        }
+
+        switch metrics.schemaVersion {
+        case IndexUsageMetrics.currentSchemaVersion:
+            break
+        case 1:
+            metrics.schemaVersion = IndexUsageMetrics.currentSchemaVersion
+            metrics.initialSearches = SearchUsageCounters()
+            metrics.refinedSearches = SearchUsageCounters()
+            for index in metrics.dailyBuckets.indices {
+                metrics.dailyBuckets[index].initialSearches = SearchUsageCounters()
+                metrics.dailyBuckets[index].refinedSearches = SearchUsageCounters()
+            }
+        default:
             return IndexUsageMetrics(schemaVersion: IndexUsageMetrics.currentSchemaVersion)
         }
 

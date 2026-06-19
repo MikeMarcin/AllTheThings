@@ -165,8 +165,8 @@ struct FileIndexInsightsTests {
         #expect(index.currentInsightsSnapshot().usage.health.indexingFailures == 0)
     }
 
-    @Test("search profiles and metrics stay aggregate only")
-    func searchProfilesAndMetricsStayAggregateOnly() throws {
+    @Test("search profiles and metrics stay aggregate and phase separated")
+    func searchProfilesAndMetricsStayAggregateAndPhaseSeparated() throws {
         let fileManager = FileManager.default
         let applicationName = "AllTheThingsInsights-\(UUID().uuidString)"
         let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
@@ -180,24 +180,161 @@ struct FileIndexInsightsTests {
             makeRecord(path: "/tmp/AllTheThingsPrivate/Beta.txt", size: 8)
         ])
 
+        let previewResponse = index.search(SearchRequest(
+            query: "AlphaSecret",
+            sort: SortSpec(column: .name, ascending: true),
+            mode: .interactivePreview
+        ))
         let response = index.search(SearchRequest(
             query: "AlphaSecret",
             sort: SortSpec(column: .name, ascending: true)
         ))
 
+        #expect(previewResponse.executionProfile.elapsed >= 0)
         #expect(response.executionProfile.elapsed >= 0)
         #expect(response.executionProfile.executionPath != .unprofiled)
 
         let usage = index.currentInsightsSnapshot().usage
-        #expect(usage.allTimeSearches.started == 1)
-        #expect(usage.allTimeSearches.completed == 1)
+        #expect(usage.allTimeSearches.started == 2)
+        #expect(usage.allTimeSearches.completed == 2)
+        #expect(usage.initialSearches.started == 1)
+        #expect(usage.initialSearches.completed == 1)
+        #expect(usage.refinedSearches.started == 1)
+        #expect(usage.refinedSearches.completed == 1)
         #expect(!usage.allTimeSearches.executionPathCounts.isEmpty)
+        #expect(!usage.initialSearches.routeCounts.isEmpty)
+        #expect(!usage.refinedSearches.routeCounts.isEmpty)
 
         let data = try JSONEncoder().encode(usage)
         let json = String(decoding: data, as: UTF8.self).lowercased()
         #expect(!json.contains("alphasecret"))
         #expect(!json.contains("allthethingsprivate"))
         #expect(!json.contains(privatePath.lowercased()))
+    }
+
+    @Test("search metrics classify mapped sidecar and full scan routes")
+    func searchMetricsClassifyRoutes() {
+        var metrics = IndexUsageMetrics()
+        for profile in [
+            SearchExecutionProfile(
+                executionPath: .indexedCandidateIntersection,
+                indexesUsed: [.nameGrams, .visibleBitset]
+            ),
+            SearchExecutionProfile(
+                executionPath: .extensionCandidateIntersection,
+                indexesUsed: [.extensionPostings, .visibleBitset]
+            ),
+            SearchExecutionProfile(
+                executionPath: .fullFallbackScan,
+                indexesUsed: [.visibleBitset],
+                didFallbackToFullScan: true
+            )
+        ] {
+            metrics.recordSearchStarted(phase: .refinedResults)
+            metrics.recordSearchCompleted(profile, phase: .refinedResults)
+        }
+
+        let refined = metrics.refinedSearches
+        #expect(refined.completed == 3)
+        #expect(refined.routeCounts[.mappedIndex] == 1)
+        #expect(refined.routeCounts[.sidecar] == 1)
+        #expect(refined.routeCounts[.fullScan] == 1)
+    }
+
+    @Test("cancelled searches stay phase specific without route counts")
+    func cancelledSearchesStayPhaseSpecificWithoutRouteCounts() throws {
+        let fileManager = FileManager.default
+        let applicationName = "AllTheThingsInsights-\(UUID().uuidString)"
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        defer {
+            try? fileManager.removeItem(at: index.dataDirectoryURL)
+        }
+
+        index.replaceRecordsForTesting([
+            makeRecord(path: "/tmp/AllTheThingsPrivate/AlphaSecret.swift", size: 12)
+        ])
+
+        let preview = index.search(
+            SearchRequest(
+                query: "AlphaSecret",
+                sort: SortSpec(column: .name, ascending: true),
+                mode: .interactivePreview
+            ),
+            shouldCancel: { true }
+        )
+        let refined = index.search(
+            SearchRequest(
+                query: "AlphaSecret",
+                sort: SortSpec(column: .name, ascending: true)
+            ),
+            shouldCancel: { true }
+        )
+
+        #expect(preview == nil)
+        #expect(refined == nil)
+
+        let usage = index.currentInsightsSnapshot().usage
+        #expect(usage.initialSearches.started == 1)
+        #expect(usage.initialSearches.cancelled == 1)
+        #expect(usage.initialSearches.completed == 0)
+        #expect(usage.initialSearches.routeCounts.isEmpty)
+        #expect(!usage.initialSearches.latencyBuckets.isEmpty)
+        #expect(usage.refinedSearches.started == 1)
+        #expect(usage.refinedSearches.cancelled == 1)
+        #expect(usage.refinedSearches.completed == 0)
+        #expect(usage.refinedSearches.routeCounts.isEmpty)
+        #expect(!usage.refinedSearches.latencyBuckets.isEmpty)
+        #expect(usage.allTimeSearches.started == 2)
+        #expect(usage.allTimeSearches.cancelled == 2)
+    }
+
+    @Test("legacy v1 metrics migrate without backfilling phase counters")
+    func legacyV1MetricsMigrateWithoutBackfillingPhaseCounters() throws {
+        let fileManager = FileManager.default
+        let applicationName = "AllTheThingsInsights-\(UUID().uuidString)"
+        let supportDirectory = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent(applicationName, isDirectory: true)
+        try? fileManager.removeItem(at: supportDirectory)
+        try fileManager.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: supportDirectory)
+        }
+
+        let metricsURL = supportDirectory.appendingPathComponent("index-metrics.json", isDirectory: false)
+        let legacyJSON = """
+        {
+          "schemaVersion": 1,
+          "allTimeSearches": {
+            "started": 7,
+            "completed": 5,
+            "cancelled": 2,
+            "fallbackScans": 1
+          },
+          "dailyBuckets": [
+            {
+              "day": "2026-06-14",
+              "searches": {
+                "started": 7,
+                "completed": 5,
+                "cancelled": 2
+              }
+            }
+          ]
+        }
+        """
+        try Data(legacyJSON.utf8).write(to: metricsURL)
+
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        let usage = index.currentInsightsSnapshot().usage
+        #expect(usage.schemaVersion == IndexUsageMetrics.currentSchemaVersion)
+        #expect(usage.allTimeSearches.started == 7)
+        #expect(usage.allTimeSearches.completed == 5)
+        #expect(usage.allTimeSearches.cancelled == 2)
+        #expect(usage.initialSearches.started == 0)
+        #expect(usage.refinedSearches.started == 0)
+        #expect(usage.dailyBuckets.first?.searches.completed == 5)
+        #expect(usage.dailyBuckets.first?.initialSearches.completed == 0)
+        #expect(usage.dailyBuckets.first?.refinedSearches.completed == 0)
     }
 
     @Test("first launch date is write once and clear keeps metrics sidecars")
