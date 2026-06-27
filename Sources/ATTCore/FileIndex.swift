@@ -4263,6 +4263,36 @@ public final class FileIndex: @unchecked Sendable {
             }
         }
 
+        if heap.count < maxResults, field != .name {
+            let existingRows = Set(heap.map(\.rowID))
+            if let appended = appendWeakPathPreviewCandidates(
+                snapshot: snapshot,
+                token: pattern.token,
+                mode: mode,
+                request: request,
+                maxResults: maxResults,
+                existingRows: existingRows,
+                heapCount: { heap.count },
+                appendCandidate: { appendToHeap($0) },
+                makeCandidate: makeCandidate,
+                shouldCancel: shouldCancel
+            ) {
+                scannedRows += appended.scannedRows
+                if appended.candidateCount > 0 {
+                    var previewIndexesUsed: Set<SearchIndexUse> = []
+                    if nameCandidates != nil {
+                        previewIndexesUsed.insert(.nameGrams)
+                    }
+                    previewIndexesUsed.insert(.componentGrams)
+                    guard !shouldCancel() else { return nil }
+                    return response(
+                        candidateCount: (nameCandidates?.count ?? 0) + appended.candidateCount,
+                        indexesUsed: previewIndexesUsed
+                    )
+                }
+            }
+        }
+
         guard !heap.isEmpty else {
             return nil
         }
@@ -4273,6 +4303,87 @@ public final class FileIndex: @unchecked Sendable {
             indexesUsed.insert(.nameGrams)
         }
         return response(candidateCount: nameCandidates?.count ?? snapshot.count, indexesUsed: indexesUsed)
+    }
+
+    private struct WeakPathPreviewAppendResult {
+        let candidateCount: Int
+        let scannedRows: Int
+    }
+
+    private static func appendWeakPathPreviewCandidates(
+        snapshot: SearchSnapshot,
+        token: String,
+        mode: FuzzyMatcher.MatchMode,
+        request: SearchRequest,
+        maxResults: Int,
+        existingRows: Set<Int>,
+        heapCount: () -> Int,
+        appendCandidate: (RelevancePreviewCandidate) -> Void,
+        makeCandidate: (Int, MatchExplanation) -> RelevancePreviewCandidate,
+        shouldCancel: @Sendable () -> Bool
+    ) -> WeakPathPreviewAppendResult? {
+        guard let componentCandidates = snapshot.candidateComponentIndices(containing: Array(token.utf8)) else {
+            return nil
+        }
+
+        var selectedRows = existingRows
+        var scannedRows = 0
+
+        func appendSubtree(startingAt directRow: Int) -> Bool? {
+            let intervalEnd = min(snapshot.store.subtreeEnd(at: directRow), snapshot.count)
+            guard directRow < intervalEnd else { return true }
+
+            for rowID in directRow..<intervalEnd {
+                if rowID.isMultiple(of: 512), shouldCancel() {
+                    return nil
+                }
+
+                scannedRows += 1
+                guard snapshot.store.isResultRow(at: rowID) else { continue }
+                guard request.includeHidden || snapshot.isVisible(at: rowID) else { continue }
+                guard selectedRows.insert(rowID).inserted else { continue }
+
+                let explanation = cheapIndexedPathExplanation(
+                    snapshot: snapshot,
+                    rowID: rowID,
+                    token: token,
+                    mode: mode
+                )
+                appendCandidate(makeCandidate(rowID, explanation))
+                if heapCount() == maxResults {
+                    return false
+                }
+            }
+
+            return true
+        }
+
+        var foundDirectRow = false
+        for (offset, candidate) in componentCandidates.enumerated() {
+            if offset.isMultiple(of: 512), shouldCancel() {
+                return nil
+            }
+
+            let rowID = Int(candidate)
+            guard rowID >= 0, rowID < snapshot.count else { continue }
+            guard snapshot.store.normalizedName(at: rowID, contains: token) else { continue }
+            foundDirectRow = true
+            guard let shouldContinue = appendSubtree(startingAt: rowID) else {
+                return nil
+            }
+            if !shouldContinue {
+                return WeakPathPreviewAppendResult(
+                    candidateCount: componentCandidates.count,
+                    scannedRows: scannedRows
+                )
+            }
+        }
+
+        guard foundDirectRow else {
+            return WeakPathPreviewAppendResult(candidateCount: componentCandidates.count, scannedRows: scannedRows)
+        }
+
+        return WeakPathPreviewAppendResult(candidateCount: componentCandidates.count, scannedRows: scannedRows)
     }
 
     private static func fastNameCandidateInteractivePreviewSearch(
@@ -4636,6 +4747,7 @@ public final class FileIndex: @unchecked Sendable {
 
         var intervals: [RowInterval] = []
         var directNameRows = Array(repeating: UInt8(0), count: snapshot.count)
+        var directNameRowIDs: [Int] = []
         if field != .name {
             let usesShortFuzzyPathExpansion = shortFuzzy && (!isPreview || field == .path)
             guard let pathIntervals = snapshot.componentPathIntervalSet(
@@ -4679,7 +4791,10 @@ public final class FileIndex: @unchecked Sendable {
                         continue
                     }
                 }
-                directNameRows[rowID] = 1
+                if directNameRows[rowID] == 0 {
+                    directNameRows[rowID] = 1
+                    directNameRowIDs.append(rowID)
+                }
                 intervals.append(RowInterval(start: rowID, end: rowID + 1))
             }
         }
@@ -4697,6 +4812,36 @@ public final class FileIndex: @unchecked Sendable {
                     executionPath: .optimizedSortedFastPath,
                     indexesUsed: [.nameGrams, .componentGrams],
                     candidateCount: 0,
+                    elapsed: elapsed
+                )
+            )
+        }
+
+        if let selected = nameSortedComponentPathIntervalMatches(
+            snapshot: snapshot,
+            rowSet: rowSet,
+            directNameRows: directNameRows,
+            directNameRowIDs: directNameRowIDs,
+            token: pattern.token,
+            mode: mode,
+            field: field,
+            request: request,
+            maxResults: maxResults,
+            shouldCancel: shouldCancel
+        ) {
+            let elapsed = Date().timeIntervalSince(started)
+            let candidateCount = rowSet.intervals.reduce(0) { $0 + max($1.end - $1.start, 0) }
+            return SearchResponse(
+                results: materialize(selected.matches, from: snapshot),
+                totalMatches: selected.total,
+                elapsed: elapsed,
+                snapshotRevision: snapshotRevision,
+                usesIndexedCandidates: true,
+                executionProfile: SearchExecutionProfile(
+                    executionPath: .optimizedSortedFastPath,
+                    indexesUsed: [.nameGrams, .componentGrams],
+                    candidateCount: candidateCount,
+                    scannedRowCount: selected.scannedRowCount,
                     elapsed: elapsed
                 )
             )
@@ -5065,7 +5210,6 @@ public final class FileIndex: @unchecked Sendable {
         shouldCancel: @Sendable () -> Bool
     ) -> SearchResponse? {
         guard
-            request.sort.column != .relevance,
             request.sort.column != .path,
             snapshot.nameGramIndex != nil,
             parsedQuery.negative.isEmpty,
@@ -5084,6 +5228,10 @@ public final class FileIndex: @unchecked Sendable {
         let tokenBytes = Array(pattern.token.utf8)
         let exactNameCandidates = snapshot.candidateNameIndices(containing: tokenBytes) ?? []
         let exactPathCandidates: [Int32]
+        var indexesUsed = Set<SearchIndexUse>()
+        if field != .path {
+            indexesUsed.insert(.nameGrams)
+        }
         switch field {
         case .name:
             exactPathCandidates = exactNameCandidates
@@ -5091,11 +5239,15 @@ public final class FileIndex: @unchecked Sendable {
             let pathCandidates: [Int32]?
             if let gramCandidates = snapshot.candidatePathIndices(containing: tokenBytes) {
                 pathCandidates = gramCandidates
+                indexesUsed.insert(.pathGrams)
             } else {
                 pathCandidates = snapshot.candidatePathIndicesByComponentExpansion(
                     containing: pattern.token,
                     shouldCancel: shouldCancel
                 )
+                if pathCandidates != nil {
+                    indexesUsed.insert(.componentGrams)
+                }
             }
             guard let pathCandidates else { return nil }
             exactPathCandidates = field == .any ? unionPostingLists(pathCandidates, exactNameCandidates) : pathCandidates
@@ -5105,27 +5257,62 @@ public final class FileIndex: @unchecked Sendable {
             return nil
         }
 
-        if request.sort.column == .modified, snapshot.hasModifiedSortOrder {
-            let candidateMask: UInt8 = 1
-            let directNameMask: UInt8 = 2
-            var rowMarkers = Array(repeating: UInt8(0), count: snapshot.count)
-            for candidate in exactNameCandidates {
-                let rowID = Int(candidate)
-                guard rowID >= 0, rowID < snapshot.count else { continue }
-                rowMarkers[rowID] |= directNameMask
-            }
-            var total = 0
-            for candidate in exactPathCandidates {
-                let rowID = Int(candidate)
-                guard rowID >= 0, rowID < snapshot.count else { continue }
-                guard snapshot.store.isResultRow(at: rowID) else { continue }
-                guard request.includeHidden || snapshot.isVisible(at: rowID) else { continue }
-                if rowMarkers[rowID] & candidateMask == 0 {
-                    rowMarkers[rowID] |= candidateMask
-                    total += 1
-                }
+        if !request.includeHidden {
+            indexesUsed.insert(.visibleBitset)
+        }
+
+        let candidateMask: UInt8 = 1
+        let directNameMask: UInt8 = 2
+        let directNameListedMask: UInt8 = 4
+        var rowMarkers = Array(repeating: UInt8(0), count: snapshot.count)
+        for (offset, candidate) in exactNameCandidates.enumerated() {
+            if offset.isMultiple(of: 512), shouldCancel() {
+                return nil
             }
 
+            let rowID = Int(candidate)
+            guard rowID >= 0, rowID < snapshot.count else { continue }
+            rowMarkers[rowID] |= directNameMask
+        }
+
+        var candidateRows: [Int] = []
+        candidateRows.reserveCapacity(min(exactPathCandidates.count, snapshot.resultCount))
+        for (offset, candidate) in exactPathCandidates.enumerated() {
+            if offset.isMultiple(of: 512), shouldCancel() {
+                return nil
+            }
+
+            let rowID = Int(candidate)
+            guard rowID >= 0, rowID < snapshot.count else { continue }
+            guard snapshot.store.isResultRow(at: rowID) else { continue }
+            guard request.includeHidden || snapshot.isVisible(at: rowID) else { continue }
+            guard rowMarkers[rowID] & candidateMask == 0 else { continue }
+            rowMarkers[rowID] |= candidateMask
+            candidateRows.append(rowID)
+        }
+
+        guard candidateRows.count >= max(maxResults, 1) || candidateRows.count > 1_000 else {
+            return nil
+        }
+
+        var directNameRows: [Int] = []
+        if field != .path {
+            directNameRows.reserveCapacity(min(exactNameCandidates.count, candidateRows.count))
+            for (offset, candidate) in exactNameCandidates.enumerated() {
+                if offset.isMultiple(of: 512), shouldCancel() {
+                    return nil
+                }
+
+                let rowID = Int(candidate)
+                guard rowID >= 0, rowID < snapshot.count else { continue }
+                guard rowMarkers[rowID] & candidateMask != 0 else { continue }
+                guard rowMarkers[rowID] & directNameListedMask == 0 else { continue }
+                rowMarkers[rowID] |= directNameListedMask
+                directNameRows.append(rowID)
+            }
+        }
+
+        if request.sort.column == .modified, snapshot.hasModifiedSortOrder {
             let orderedRows: [Int]
             if request.includeHidden {
                 orderedRows = request.sort.ascending ? snapshot.modifiedAscending : snapshot.modifiedDescending
@@ -5133,6 +5320,7 @@ public final class FileIndex: @unchecked Sendable {
                 orderedRows = request.sort.ascending ? snapshot.visibleModifiedAscending : snapshot.visibleModifiedDescending
             }
             var matches: [SearchMatch] = []
+            let total = candidateRows.count
             let targetResultCount = maxResults > 0 ? min(maxResults, total) : 0
             matches.reserveCapacity(targetResultCount)
             var scannedRows = 0
@@ -5145,24 +5333,15 @@ public final class FileIndex: @unchecked Sendable {
                     scannedRows += 1
                     guard rowMarkers[rowID] & candidateMask != 0 else { continue }
 
-                    let explanation: MatchExplanation
-                    if rowMarkers[rowID] & directNameMask != 0,
-                       field != .path,
-                       let nameExplanation = cheapIndexedNameExplanation(
+                    guard let explanation = cheapExactPathSubstringExplanation(
                         snapshot: snapshot,
                         rowID: rowID,
                         token: pattern.token,
-                        mode: mode
-                    ) {
-                        explanation = nameExplanation
-                    } else if field != .name {
-                        explanation = cheapIndexedPathExplanation(
-                            snapshot: snapshot,
-                            rowID: rowID,
-                            token: pattern.token,
-                            mode: mode
-                        )
-                    } else {
+                        mode: mode,
+                        field: field,
+                        rowMarkers: rowMarkers,
+                        directNameMask: directNameMask
+                    ) else {
                         continue
                     }
 
@@ -5173,12 +5352,10 @@ public final class FileIndex: @unchecked Sendable {
                 }
             }
 
-            guard total >= max(maxResults, 1) || total > 1_000 else {
-                return nil
-            }
-
             guard !shouldCancel() else { return nil }
             let elapsed = Date().timeIntervalSince(started)
+            var modifiedIndexesUsed = indexesUsed
+            modifiedIndexesUsed.insert(.modifiedOrder)
             return SearchResponse(
                 results: materialize(matches, from: snapshot),
                 totalMatches: total,
@@ -5187,7 +5364,7 @@ public final class FileIndex: @unchecked Sendable {
                 usesIndexedCandidates: true,
                 executionProfile: SearchExecutionProfile(
                     executionPath: .pathGramIndex,
-                    indexesUsed: [.nameGrams, .pathGrams, .modifiedOrder],
+                    indexesUsed: modifiedIndexesUsed,
                     candidateCount: exactPathCandidates.count,
                     scannedRowCount: scannedRows,
                     elapsed: elapsed
@@ -5195,19 +5372,21 @@ public final class FileIndex: @unchecked Sendable {
             )
         }
 
-        if request.sort.column == .name, maxResults > 0 {
-            guard let selected = nameSortedPathSubstringMatches(
+        if request.sort.column == .relevance {
+            guard let selected = relevanceExactPathSubstringMatches(
                 snapshot: snapshot,
-                candidates: exactPathCandidates,
-                parsedQuery: parsedQuery,
+                candidateRows: candidateRows,
+                rowMarkers: rowMarkers,
+                candidateMask: candidateMask,
+                directNameMask: directNameMask,
+                directNameRows: directNameRows,
+                token: pattern.token,
+                mode: mode,
+                field: field,
                 request: request,
                 maxResults: maxResults,
                 shouldCancel: shouldCancel
             ) else {
-                return nil
-            }
-
-            guard selected.total >= max(maxResults, 1) || selected.total > 1_000 else {
                 return nil
             }
 
@@ -5220,68 +5399,70 @@ public final class FileIndex: @unchecked Sendable {
                 usesIndexedCandidates: true,
                 executionProfile: SearchExecutionProfile(
                     executionPath: .pathGramIndex,
-                    indexesUsed: [.nameGrams, .pathGrams],
+                    indexesUsed: indexesUsed,
                     candidateCount: exactPathCandidates.count,
                     elapsed: elapsed
                 )
             )
         }
 
-        var matches: [SearchMatch] = []
-        matches.reserveCapacity(min(exactPathCandidates.count, maxResults))
-        let trimThreshold = maxResults > 0 ? maxResults * 5 : 0
-        var total = 0
-
-        func sortAndLimitMatches() {
-            guard maxResults > 0 else { return }
-            matches.sort {
-                compare($0, $1, snapshot: snapshot, sort: request.sort, queryIsEmpty: false)
-            }
-            if matches.count > maxResults {
-                matches.removeSubrange(maxResults..<matches.count)
-            }
-        }
-
-        for (offset, candidate) in exactPathCandidates.enumerated() {
-            if offset.isMultiple(of: 512), shouldCancel() {
+        if request.sort.column == .name, maxResults > 0 {
+            guard let selected = nameSortedExactPathSubstringMatches(
+                snapshot: snapshot,
+                candidateRows: candidateRows,
+                rowMarkers: rowMarkers,
+                directNameMask: directNameMask,
+                token: pattern.token,
+                mode: mode,
+                field: field,
+                request: request,
+                maxResults: maxResults,
+                shouldCancel: shouldCancel
+            ) else {
                 return nil
             }
 
-            let rowID = Int(candidate)
-            guard rowID >= 0, rowID < snapshot.count else { continue }
-            guard snapshot.store.isResultRow(at: rowID) else { continue }
-            guard request.includeHidden || snapshot.isVisible(at: rowID) else { continue }
-            guard let explanation = FuzzyMatcher.explain(record: snapshot.view(at: rowID), parsedQuery: parsedQuery) else {
-                continue
-            }
-
-            total += 1
-            guard maxResults > 0 else { continue }
-
-            matches.append(SearchMatch(rowID: rowID, score: explanation.score, match: explanation))
-            if matches.count > trimThreshold {
-                sortAndLimitMatches()
-            }
+            let elapsed = Date().timeIntervalSince(started)
+            return SearchResponse(
+                results: materialize(selected.matches, from: snapshot),
+                totalMatches: selected.total,
+                elapsed: elapsed,
+                snapshotRevision: snapshotRevision,
+                usesIndexedCandidates: true,
+                executionProfile: SearchExecutionProfile(
+                    executionPath: .pathGramIndex,
+                    indexesUsed: indexesUsed,
+                    candidateCount: exactPathCandidates.count,
+                    elapsed: elapsed
+                )
+            )
         }
 
-        guard total >= max(maxResults, 1) || total > 1_000 else {
+        guard let selected = exactPathSubstringMatches(
+            snapshot: snapshot,
+            candidateRows: candidateRows,
+            rowMarkers: rowMarkers,
+            directNameMask: directNameMask,
+            token: pattern.token,
+            mode: mode,
+            field: field,
+            request: request,
+            maxResults: maxResults,
+            shouldCancel: shouldCancel
+        ) else {
             return nil
         }
 
-        guard !shouldCancel() else { return nil }
-        sortAndLimitMatches()
-
-        guard !shouldCancel() else { return nil }
         let elapsed = Date().timeIntervalSince(started)
         return SearchResponse(
-            results: materialize(matches, from: snapshot),
-            totalMatches: total,
+            results: materialize(selected.matches, from: snapshot),
+            totalMatches: selected.total,
             elapsed: elapsed,
             snapshotRevision: snapshotRevision,
             usesIndexedCandidates: true,
             executionProfile: SearchExecutionProfile(
                 executionPath: .pathGramIndex,
-                indexesUsed: [.nameGrams, .pathGrams],
+                indexesUsed: indexesUsed,
                 candidateCount: exactPathCandidates.count,
                 elapsed: elapsed
             )
@@ -5375,6 +5556,317 @@ public final class FileIndex: @unchecked Sendable {
     private struct NameSortedSelection {
         let matches: [SearchMatch]
         let total: Int
+        let scannedRowCount: Int
+
+        init(matches: [SearchMatch], total: Int, scannedRowCount: Int = 0) {
+            self.matches = matches
+            self.total = total
+            self.scannedRowCount = scannedRowCount
+        }
+    }
+
+    private static func countResultRows(
+        in rowSet: RowIntervalSet,
+        snapshot: SearchSnapshot,
+        includeHidden: Bool,
+        shouldCancel: @Sendable () -> Bool
+    ) -> Int? {
+        let prefixCounts = includeHidden ? snapshot.resultPrefixCounts : snapshot.visibleResultPrefixCounts
+        if prefixCounts.count == snapshot.count + 1 {
+            return rowSet.count(using: prefixCounts)
+        }
+
+        var total = 0
+        for interval in rowSet.intervals {
+            for rowID in interval.start..<interval.end {
+                if rowID & 511 == 0, shouldCancel() {
+                    return nil
+                }
+                guard rowID >= 0, rowID < snapshot.count else { continue }
+                guard snapshot.store.isResultRow(at: rowID) else { continue }
+                guard includeHidden || snapshot.isVisible(at: rowID) else { continue }
+                total += 1
+            }
+        }
+        return total
+    }
+
+    private static func nameSortedComponentPathIntervalMatches(
+        snapshot: SearchSnapshot,
+        rowSet: RowIntervalSet,
+        directNameRows: [UInt8],
+        directNameRowIDs: [Int],
+        token: String,
+        mode: FuzzyMatcher.MatchMode,
+        field: FuzzyMatcher.QueryField,
+        request: SearchRequest,
+        maxResults: Int,
+        shouldCancel: @Sendable () -> Bool
+    ) -> NameSortedSelection? {
+        guard snapshot.hasSortedOrder, !snapshot.nameAscending.isEmpty else {
+            return nil
+        }
+
+        guard let total = countResultRows(
+            in: rowSet,
+            snapshot: snapshot,
+            includeHidden: request.includeHidden,
+            shouldCancel: shouldCancel
+        ) else {
+            return nil
+        }
+
+        guard maxResults > 0, total > 0 else {
+            return NameSortedSelection(matches: [], total: total)
+        }
+
+        var matches: [SearchMatch] = []
+        matches.reserveCapacity(min(maxResults, total))
+        let trimThreshold = maxResults * 5
+        var scannedRows = 0
+
+        func sortAndLimitMatches() {
+            matches.sort {
+                compare($0, $1, snapshot: snapshot, sort: request.sort, queryIsEmpty: false)
+            }
+            if matches.count > maxResults {
+                matches.removeSubrange(maxResults..<matches.count)
+            }
+        }
+
+        for (offset, rowID) in directNameRowIDs.enumerated() {
+            if offset.isMultiple(of: 512), shouldCancel() {
+                return nil
+            }
+            scannedRows += 1
+            guard rowID >= 0, rowID < snapshot.count else { continue }
+            guard snapshot.store.isResultRow(at: rowID) else { continue }
+            guard request.includeHidden || snapshot.isVisible(at: rowID) else { continue }
+            guard let explanation = cheapIndexedNameExplanation(
+                snapshot: snapshot,
+                rowID: rowID,
+                token: token,
+                mode: mode
+            ) else {
+                continue
+            }
+
+            matches.append(SearchMatch(rowID: rowID, score: explanation.score, match: explanation))
+            if matches.count > trimThreshold {
+                sortAndLimitMatches()
+            }
+        }
+
+        sortAndLimitMatches()
+        guard matches.count < maxResults, field != .name else {
+            return NameSortedSelection(matches: matches, total: total, scannedRowCount: scannedRows)
+        }
+
+        let order = request.sort.ascending ? snapshot.nameAscending : snapshot.nameDescending
+        for (offset, rowID) in order.enumerated() {
+            if offset.isMultiple(of: 512), shouldCancel() {
+                return nil
+            }
+            scannedRows += 1
+            guard rowID >= 0, rowID < snapshot.count else { continue }
+            guard directNameRows[rowID] == 0 else { continue }
+            guard rowSet.contains(rowID) else { continue }
+            guard snapshot.store.isResultRow(at: rowID) else { continue }
+            guard request.includeHidden || snapshot.isVisible(at: rowID) else { continue }
+
+            let explanation = cheapIndexedPathExplanation(
+                snapshot: snapshot,
+                rowID: rowID,
+                token: token,
+                mode: mode
+            )
+            matches.append(SearchMatch(rowID: rowID, score: explanation.score, match: explanation))
+            if matches.count == maxResults {
+                break
+            }
+        }
+
+        return NameSortedSelection(matches: matches, total: total, scannedRowCount: scannedRows)
+    }
+
+    private static func cheapExactPathSubstringExplanation(
+        snapshot: SearchSnapshot,
+        rowID: Int,
+        token: String,
+        mode: FuzzyMatcher.MatchMode,
+        field: FuzzyMatcher.QueryField,
+        rowMarkers: [UInt8],
+        directNameMask: UInt8
+    ) -> MatchExplanation? {
+        if rowMarkers[rowID] & directNameMask != 0,
+           field != .path,
+           let nameExplanation = cheapIndexedNameExplanation(
+            snapshot: snapshot,
+            rowID: rowID,
+            token: token,
+            mode: mode
+        ) {
+            return nameExplanation
+        }
+
+        guard field != .name else { return nil }
+        return cheapIndexedPathExplanation(
+            snapshot: snapshot,
+            rowID: rowID,
+            token: token,
+            mode: mode
+        )
+    }
+
+    private static func exactPathSubstringMatches(
+        snapshot: SearchSnapshot,
+        candidateRows: [Int],
+        rowMarkers: [UInt8],
+        directNameMask: UInt8,
+        token: String,
+        mode: FuzzyMatcher.MatchMode,
+        field: FuzzyMatcher.QueryField,
+        request: SearchRequest,
+        maxResults: Int,
+        shouldCancel: @Sendable () -> Bool
+    ) -> NameSortedSelection? {
+        let total = candidateRows.count
+        guard maxResults > 0, total > 0 else {
+            return NameSortedSelection(matches: [], total: total)
+        }
+
+        var matches: [SearchMatch] = []
+        matches.reserveCapacity(min(total, maxResults))
+        let trimThreshold = maxResults * 5
+
+        func sortAndLimitMatches() {
+            matches.sort {
+                compare($0, $1, snapshot: snapshot, sort: request.sort, queryIsEmpty: false)
+            }
+            if matches.count > maxResults {
+                matches.removeSubrange(maxResults..<matches.count)
+            }
+        }
+
+        for (offset, rowID) in candidateRows.enumerated() {
+            if offset.isMultiple(of: 512), shouldCancel() {
+                return nil
+            }
+            guard let explanation = cheapExactPathSubstringExplanation(
+                snapshot: snapshot,
+                rowID: rowID,
+                token: token,
+                mode: mode,
+                field: field,
+                rowMarkers: rowMarkers,
+                directNameMask: directNameMask
+            ) else {
+                continue
+            }
+
+            matches.append(SearchMatch(rowID: rowID, score: explanation.score, match: explanation))
+            if matches.count > trimThreshold {
+                sortAndLimitMatches()
+            }
+        }
+
+        guard !shouldCancel() else { return nil }
+        sortAndLimitMatches()
+        return NameSortedSelection(matches: matches, total: total)
+    }
+
+    private static func relevanceExactPathSubstringMatches(
+        snapshot: SearchSnapshot,
+        candidateRows: [Int],
+        rowMarkers: [UInt8],
+        candidateMask: UInt8,
+        directNameMask: UInt8,
+        directNameRows: [Int],
+        token: String,
+        mode: FuzzyMatcher.MatchMode,
+        field: FuzzyMatcher.QueryField,
+        request: SearchRequest,
+        maxResults: Int,
+        shouldCancel: @Sendable () -> Bool
+    ) -> NameSortedSelection? {
+        let total = candidateRows.count
+        guard maxResults > 0, total > 0 else {
+            return NameSortedSelection(matches: [], total: total)
+        }
+
+        guard snapshot.hasSortedOrder, !snapshot.nameAscending.isEmpty else {
+            return exactPathSubstringMatches(
+                snapshot: snapshot,
+                candidateRows: candidateRows,
+                rowMarkers: rowMarkers,
+                directNameMask: directNameMask,
+                token: token,
+                mode: mode,
+                field: field,
+                request: request,
+                maxResults: maxResults,
+                shouldCancel: shouldCancel
+            )
+        }
+
+        var matches: [SearchMatch] = []
+        matches.reserveCapacity(min(total, maxResults))
+        let trimThreshold = maxResults * 5
+
+        func sortAndLimitMatches() {
+            matches.sort {
+                compare($0, $1, snapshot: snapshot, sort: request.sort, queryIsEmpty: false)
+            }
+            if matches.count > maxResults {
+                matches.removeSubrange(maxResults..<matches.count)
+            }
+        }
+
+        for (offset, rowID) in directNameRows.enumerated() {
+            if offset.isMultiple(of: 512), shouldCancel() {
+                return nil
+            }
+            guard let explanation = cheapIndexedNameExplanation(
+                snapshot: snapshot,
+                rowID: rowID,
+                token: token,
+                mode: mode
+            ) else {
+                continue
+            }
+
+            matches.append(SearchMatch(rowID: rowID, score: explanation.score, match: explanation))
+            if matches.count > trimThreshold {
+                sortAndLimitMatches()
+            }
+        }
+
+        guard !shouldCancel() else { return nil }
+        sortAndLimitMatches()
+        guard matches.count < maxResults, field != .name else {
+            return NameSortedSelection(matches: matches, total: total)
+        }
+
+        for (offset, rowID) in snapshot.nameAscending.enumerated() {
+            if offset.isMultiple(of: 512), shouldCancel() {
+                return nil
+            }
+            guard rowMarkers[rowID] & candidateMask != 0 else { continue }
+            guard rowMarkers[rowID] & directNameMask == 0 else { continue }
+
+            let explanation = cheapIndexedPathExplanation(
+                snapshot: snapshot,
+                rowID: rowID,
+                token: token,
+                mode: mode
+            )
+            matches.append(SearchMatch(rowID: rowID, score: explanation.score, match: explanation))
+            if matches.count == maxResults {
+                break
+            }
+        }
+
+        return NameSortedSelection(matches: matches, total: total)
     }
 
     private static func nameSortedExactExtensionMatches(
@@ -5427,6 +5919,57 @@ public final class FileIndex: @unchecked Sendable {
             }
             guard included[rowID] != 0 else { continue }
             guard let explanation = FuzzyMatcher.explain(record: snapshot.view(at: rowID), parsedQuery: parsedQuery) else {
+                continue
+            }
+            matches.append(SearchMatch(rowID: rowID, score: explanation.score, match: explanation))
+            if matches.count == maxResults {
+                break
+            }
+        }
+
+        return NameSortedSelection(matches: matches, total: total)
+    }
+
+    private static func nameSortedExactPathSubstringMatches(
+        snapshot: SearchSnapshot,
+        candidateRows: [Int],
+        rowMarkers: [UInt8],
+        directNameMask: UInt8,
+        token: String,
+        mode: FuzzyMatcher.MatchMode,
+        field: FuzzyMatcher.QueryField,
+        request: SearchRequest,
+        maxResults: Int,
+        shouldCancel: @Sendable () -> Bool
+    ) -> NameSortedSelection? {
+        guard snapshot.hasSortedOrder, !snapshot.nameAscending.isEmpty || candidateRows.isEmpty else {
+            return nil
+        }
+
+        let total = candidateRows.count
+        guard maxResults > 0, total > 0 else {
+            return NameSortedSelection(matches: [], total: total)
+        }
+
+        let candidateMask: UInt8 = 1
+        let order = request.sort.ascending ? snapshot.nameAscending : snapshot.nameDescending
+        var matches: [SearchMatch] = []
+        matches.reserveCapacity(min(maxResults, total))
+
+        for (offset, rowID) in order.enumerated() {
+            if offset.isMultiple(of: 512), shouldCancel() {
+                return nil
+            }
+            guard rowMarkers[rowID] & candidateMask != 0 else { continue }
+            guard let explanation = cheapExactPathSubstringExplanation(
+                snapshot: snapshot,
+                rowID: rowID,
+                token: token,
+                mode: mode,
+                field: field,
+                rowMarkers: rowMarkers,
+                directNameMask: directNameMask
+            ) else {
                 continue
             }
             matches.append(SearchMatch(rowID: rowID, score: explanation.score, match: explanation))
@@ -10328,6 +10871,18 @@ public final class FileIndex: @unchecked Sendable {
             resumedFromCheckpoint: resumedFromCheckpoint,
             activityPresentation: activityPresentation
         )
+    }
+
+    public func recordExternalSearchStarted(phase: SearchMetricPhase) {
+        recordSearchStarted(phase: phase)
+    }
+
+    public func recordExternalSearchCompleted(_ profile: SearchExecutionProfile, phase: SearchMetricPhase) {
+        recordSearchCompleted(profile, phase: phase)
+    }
+
+    public func recordExternalSearchCancelled(phase: SearchMetricPhase, elapsed: TimeInterval) {
+        recordSearchCancelled(phase: phase, elapsed: elapsed)
     }
 
     private func recordSearchStarted(phase: SearchMetricPhase) {

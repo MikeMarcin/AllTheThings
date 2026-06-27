@@ -208,6 +208,7 @@ public struct SearchUsageCounters: Codable, Equatable, Sendable {
     public var executionPathCounts: [SearchExecutionPath: UInt64]
     public var indexUseCounts: [SearchIndexUse: UInt64]
     public var routeCounts: [SearchRouteKind: UInt64]
+    public var routeLatencyTotals: [SearchRouteKind: TimeInterval]
 
     public init(
         started: UInt64 = 0,
@@ -223,7 +224,8 @@ public struct SearchUsageCounters: Codable, Equatable, Sendable {
         latencyBuckets: [String: UInt64] = [:],
         executionPathCounts: [SearchExecutionPath: UInt64] = [:],
         indexUseCounts: [SearchIndexUse: UInt64] = [:],
-        routeCounts: [SearchRouteKind: UInt64] = [:]
+        routeCounts: [SearchRouteKind: UInt64] = [:],
+        routeLatencyTotals: [SearchRouteKind: TimeInterval] = [:]
     ) {
         self.started = started
         self.completed = completed
@@ -239,10 +241,22 @@ public struct SearchUsageCounters: Codable, Equatable, Sendable {
         self.executionPathCounts = executionPathCounts
         self.indexUseCounts = indexUseCounts
         self.routeCounts = routeCounts
+        self.routeLatencyTotals = routeLatencyTotals
     }
 
     public var averageLatency: TimeInterval {
-        completed == 0 ? 0 : totalLatency / Double(completed)
+        let measuredSearches = completed + cancelled
+        return measuredSearches == 0 ? 0 : totalLatency / Double(measuredSearches)
+    }
+
+    public func averageLatency(for route: SearchRouteKind) -> TimeInterval {
+        guard let count = routeCounts[route], count > 0 else { return 0 }
+        return routeLatencyTotals[route, default: 0] / Double(count)
+    }
+
+    public func hasAverageLatency(for route: SearchRouteKind) -> Bool {
+        guard routeCounts[route, default: 0] > 0 else { return false }
+        return routeLatencyTotals[route] != nil
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -260,6 +274,7 @@ public struct SearchUsageCounters: Codable, Equatable, Sendable {
         case executionPathCounts
         case indexUseCounts
         case routeCounts
+        case routeLatencyTotals
     }
 
     public init(from decoder: Decoder) throws {
@@ -278,6 +293,7 @@ public struct SearchUsageCounters: Codable, Equatable, Sendable {
         executionPathCounts = try container.decodeIfPresent([SearchExecutionPath: UInt64].self, forKey: .executionPathCounts) ?? [:]
         indexUseCounts = try container.decodeIfPresent([SearchIndexUse: UInt64].self, forKey: .indexUseCounts) ?? [:]
         routeCounts = try container.decodeIfPresent([SearchRouteKind: UInt64].self, forKey: .routeCounts) ?? [:]
+        routeLatencyTotals = try container.decodeIfPresent([SearchRouteKind: TimeInterval].self, forKey: .routeLatencyTotals) ?? [:]
     }
 }
 
@@ -826,18 +842,26 @@ extension IndexUsageMetrics {
         counters.candidateRowsExamined &+= UInt64(max(profile.candidateCount, 0))
         counters.scannedRowsExamined &+= UInt64(max(profile.scannedRowCount, 0))
         counters.executionPathCounts[profile.executionPath, default: 0] &+= 1
-        counters.routeCounts[SearchRouteKind.classify(profile), default: 0] &+= 1
+        let route = SearchRouteKind.classify(profile)
+        counters.routeCounts[route, default: 0] &+= 1
 
         for indexUse in profile.indexesUsed {
             counters.indexUseCounts[indexUse, default: 0] &+= 1
         }
 
-        applyLatency(profile.elapsed, to: &counters)
+        applyLatency(profile.elapsed, route: route, to: &counters)
     }
 
-    fileprivate static func applyLatency(_ elapsed: TimeInterval, to counters: inout SearchUsageCounters) {
+    fileprivate static func applyLatency(
+        _ elapsed: TimeInterval,
+        route: SearchRouteKind? = nil,
+        to counters: inout SearchUsageCounters
+    ) {
         let boundedElapsed = max(elapsed, 0)
         counters.totalLatency += boundedElapsed
+        if let route {
+            counters.routeLatencyTotals[route, default: 0] += boundedElapsed
+        }
         counters.maxLatency = max(counters.maxLatency, boundedElapsed)
         counters.latencyBuckets[Self.latencyBucket(for: boundedElapsed), default: 0] &+= 1
     }

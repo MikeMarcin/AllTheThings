@@ -164,7 +164,10 @@ enum DiagnosticsReportBuilder {
             lines.append("- Routes:")
             for route in SearchRouteKind.allCases {
                 if let count = counters.routeCounts[route], count > 0 {
-                    lines.append("  - \(route.rawValue): \(count)")
+                    let latency = counters.hasAverageLatency(for: route)
+                        ? durationString(counters.averageLatency(for: route))
+                        : "unknown"
+                    lines.append("  - \(route.rawValue): \(count), avg \(latency)")
                 }
             }
         }

@@ -1,4 +1,5 @@
 @testable import AllTheThings
+import ATTCore
 import CoreServices
 import Foundation
 import Testing
@@ -201,9 +202,19 @@ struct FileSystemWatcherTests {
                     eventID: 42
                 ),
                 FileSystemEvent(
+                    path: root.appendingPathComponent("build/debug/_deps/package/CMakeLists.txt").path,
+                    flags: 0,
+                    eventID: 43
+                ),
+                FileSystemEvent(
+                    path: root.appendingPathComponent("build/debug/CMakeCache.txt.tmp123").path,
+                    flags: 0,
+                    eventID: 44
+                ),
+                FileSystemEvent(
                     path: root.path,
                     flags: FSEventStreamEventFlags(kFSEventStreamEventFlagHistoryDone),
-                    eventID: 43
+                    eventID: 45
                 )
             ],
             completion: .completed
@@ -211,11 +222,11 @@ struct FileSystemWatcherTests {
         let coordinator = FSEventReconciliationCoordinator(
             cursorStore: store,
             replaySource: source,
-            currentEventID: { 43 }
+            currentEventID: { 45 }
         )
 
         let action = await actionFromCoordinator(coordinator, roots: [root])
-        #expect(action == .upToDate(baselineEventID: 43))
+        #expect(action == .upToDate(baselineEventID: 45))
     }
 
     @Test("FSEvent reconciliation keeps allowed git paths after filtering")
@@ -247,6 +258,61 @@ struct FileSystemWatcherTests {
 
         let action = await actionFromCoordinator(coordinator, roots: [root])
         #expect(action == .reconcile(paths: [gitDirectory.path], baselineEventID: 42))
+    }
+
+    @Test("live FSEvents drop excluded paths before update queuing")
+    func liveFSEventsDropExcludedPathsBeforeUpdateQueuing() {
+        let root = URL(fileURLWithPath: "/tmp/allthethings/root-a", isDirectory: true)
+        let sourcePath = root.appendingPathComponent("Sources/App.swift").path
+        let allowedGitPath = root.appendingPathComponent(".git/config").path
+        let events = [
+            FileSystemEvent(
+                path: root.appendingPathComponent(".git/objects/ab/cdef").path,
+                flags: 0,
+                eventID: 41
+            ),
+            FileSystemEvent(
+                path: root.appendingPathComponent(".git/FETCH_HEAD").path,
+                flags: 0,
+                eventID: 42
+            ),
+            FileSystemEvent(
+                path: root.appendingPathComponent("build/module.o").path,
+                flags: 0,
+                eventID: 43
+            ),
+            FileSystemEvent(
+                path: root.appendingPathComponent("build/CMakeFiles").path,
+                flags: FSEventStreamEventFlags(kFSEventStreamEventFlagItemIsDir),
+                eventID: 44
+            ),
+            FileSystemEvent(
+                path: root.appendingPathComponent("build/debug/_deps/package/CMakeLists.txt").path,
+                flags: 0,
+                eventID: 45
+            ),
+            FileSystemEvent(
+                path: root.appendingPathComponent("build/debug/CMakeCache.txt.tmp123").path,
+                flags: 0,
+                eventID: 46
+            ),
+            FileSystemEvent(path: allowedGitPath, flags: 0, eventID: 47),
+            FileSystemEvent(
+                path: sourcePath,
+                flags: FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs),
+                eventID: 48
+            )
+        ]
+
+        let filtered = FSEventIndexFilter.indexableEvents(
+            events,
+            rootPaths: [root.path],
+            exclusionPatterns: FileExclusionRules.defaultPatterns
+        )
+
+        #expect(filtered.map(\.path) == [allowedGitPath, sourcePath])
+        #expect(filtered.map(\.eventID) == [47, 48])
+        #expect(filtered.last?.requiresRecursiveRescan == true)
     }
 
     @Test("FSEvent reconciliation falls back when a cursor is missing")

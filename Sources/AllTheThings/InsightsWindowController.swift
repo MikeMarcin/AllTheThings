@@ -218,6 +218,15 @@ private struct InsightsFact {
     }
 }
 
+private enum InsightsRoutePresentation {
+    static func previewDisplayCounters(_ counters: SearchUsageCounters) -> SearchUsageCounters {
+        var displayCounters = counters
+        displayCounters.routeCounts[.applicationCatalog] = nil
+        displayCounters.routeLatencyTotals[.applicationCatalog] = nil
+        return displayCounters
+    }
+}
+
 @MainActor
 private final class InsightsViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate {
     private let index: FileIndex
@@ -234,8 +243,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
     )
     private let tabContentView = NSView()
     private let queryRouteView = InsightsRouteMixView()
-    private let queryRowsStack = NSStackView()
-    private let refinedRowsStack = NSStackView()
+    private let queryRouteGroupsStack = NSStackView()
     private let storageTitleLabel = NSTextField(labelWithString: "")
     private let storageFactsStack = NSStackView()
     private let treemapView = InsightsTreemapView()
@@ -377,17 +385,28 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         overviewTilesContainer.translatesAutoresizingMaskIntoConstraints = false
         overviewTilesContainer.setAccessibilityIdentifier("Insights.SummaryTiles")
 
-        configureRowsStack(queryRowsStack)
-        configureRowsStack(refinedRowsStack)
+        configureRowsStack(queryRouteGroupsStack)
         queryRouteView.translatesAutoresizingMaskIntoConstraints = false
+        queryRouteView.setAccessibilityIdentifier("Insights.QueryRouteChart")
         let queryTitleLabel = makePanelTitleLabel("Search Routing")
+        queryTitleLabel.setAccessibilityIdentifier("Insights.QueryTitleLabel")
+        queryTitleLabel.alignment = .center
+        let queryFactsTable = makeFactTable(
+            containing: queryRouteGroupsStack,
+            accessibilityIdentifier: "Insights.QueryRouteFactsTable"
+        )
+        replaceQueryRouteGroups(initial: SearchUsageCounters(), refined: SearchUsageCounters())
         let queryPanelStack = verticalStack([
             queryTitleLabel,
             queryRouteView,
-            queryRowsStack,
-            makeDivider(),
-            refinedRowsStack
-        ], spacing: 5)
+            queryFactsTable
+        ], spacing: 8)
+        queryPanelStack.alignment = .centerX
+        NSLayoutConstraint.activate([
+            queryTitleLabel.widthAnchor.constraint(equalTo: queryPanelStack.widthAnchor),
+            queryRouteView.widthAnchor.constraint(equalToConstant: RouteMatrixLayout.tableWidth),
+            queryFactsTable.widthAnchor.constraint(equalToConstant: RouteMatrixLayout.tableWidth)
+        ])
         let queryPanel = makeOutlinedPanel(containing: queryPanelStack)
         queryPanel.setAccessibilityIdentifier("Insights.QueryPanel")
 
@@ -397,6 +416,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         storageTitleLabel.lineBreakMode = .byTruncatingTail
         allowHorizontalCompression(storageTitleLabel)
         treemapView.translatesAutoresizingMaskIntoConstraints = false
+        treemapView.setAccessibilityIdentifier("Insights.StorageTreemap")
         let storageFactsTable = makeFactTable(
             containing: storageFactsStack,
             accessibilityIdentifier: "Insights.StorageFactsTable"
@@ -416,7 +436,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
 
             storageFactsTable.topAnchor.constraint(equalTo: storageBody.topAnchor),
             storageFactsTable.trailingAnchor.constraint(equalTo: storageBody.trailingAnchor),
-            storageFactsTable.bottomAnchor.constraint(equalTo: storageBody.bottomAnchor),
+            storageFactsTable.bottomAnchor.constraint(lessThanOrEqualTo: storageBody.bottomAnchor),
             storageFactsTable.widthAnchor.constraint(equalToConstant: 292)
         ])
         let storageCard = makeOutlinedPanel(containing: storageBody)
@@ -475,7 +495,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
             lifetimeFactsTable.topAnchor.constraint(equalTo: healthContentView.topAnchor),
             lifetimeFactsTable.leadingAnchor.constraint(equalTo: healthTilesContainer.trailingAnchor, constant: 14),
             lifetimeFactsTable.trailingAnchor.constraint(equalTo: healthContentView.trailingAnchor),
-            lifetimeFactsTable.bottomAnchor.constraint(equalTo: healthContentView.bottomAnchor),
+            lifetimeFactsTable.bottomAnchor.constraint(lessThanOrEqualTo: healthContentView.bottomAnchor),
             lifetimeFactsTable.widthAnchor.constraint(equalTo: healthTilesContainer.widthAnchor)
         ])
         let healthCard = makeCard(containing: healthContentView)
@@ -535,12 +555,12 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
             healthCard.topAnchor.constraint(equalTo: overviewTilesContainer.bottomAnchor, constant: 12),
             healthCard.leadingAnchor.constraint(equalTo: summaryPage.leadingAnchor),
             healthCard.trailingAnchor.constraint(equalTo: summaryPage.trailingAnchor),
-            healthCard.bottomAnchor.constraint(lessThanOrEqualTo: summaryPage.bottomAnchor),
+            healthCard.bottomAnchor.constraint(equalTo: summaryPage.bottomAnchor),
 
             storageCard.topAnchor.constraint(equalTo: indexPage.topAnchor),
             storageCard.leadingAnchor.constraint(equalTo: indexPage.leadingAnchor),
             storageCard.trailingAnchor.constraint(equalTo: indexPage.trailingAnchor),
-            treemapView.heightAnchor.constraint(equalToConstant: 114),
+            treemapView.heightAnchor.constraint(equalToConstant: 210),
 
             rootsLabel.topAnchor.constraint(equalTo: storageCard.bottomAnchor, constant: 12),
             rootsLabel.leadingAnchor.constraint(equalTo: indexPage.leadingAnchor),
@@ -549,13 +569,13 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
             rootsCard.leadingAnchor.constraint(equalTo: indexPage.leadingAnchor),
             rootsCard.trailingAnchor.constraint(equalTo: indexPage.trailingAnchor),
             rootsCard.bottomAnchor.constraint(equalTo: indexPage.bottomAnchor),
-            rootsScrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 210),
+            rootsScrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 160),
 
             queryPanel.topAnchor.constraint(equalTo: activityPage.topAnchor),
             queryPanel.leadingAnchor.constraint(equalTo: activityPage.leadingAnchor),
             queryPanel.trailingAnchor.constraint(equalTo: activityPage.trailingAnchor),
-            queryPanel.heightAnchor.constraint(equalToConstant: 208),
-            queryRouteView.heightAnchor.constraint(equalToConstant: 58),
+            queryPanel.heightAnchor.constraint(equalToConstant: 238),
+            queryRouteView.heightAnchor.constraint(equalToConstant: 46),
 
             activityCard.topAnchor.constraint(equalTo: queryPanel.bottomAnchor, constant: 12),
             activityCard.leadingAnchor.constraint(equalTo: activityPage.leadingAnchor),
@@ -712,7 +732,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         let tiles = [
             makeMetricTile(title: "Tracked Files", value: snapshot.stats.indexedCount.formatted(), detail: "\(displayedRootCount) roots"),
             makeMetricTile(title: "ATT Data", value: byteString(snapshot.storage.totalATTDataBytes), detail: "Index \(byteString(snapshot.storage.indexPackageBytes))"),
-            makeMetricTile(title: "Initial Results", value: snapshot.usage.initialSearches.completed.formatted(), detail: "\(snapshot.usage.initialSearches.cancelled.formatted()) cancelled"),
+            makeMetricTile(title: "Preview Results", value: snapshot.usage.initialSearches.completed.formatted(), detail: "\(snapshot.usage.initialSearches.cancelled.formatted()) cancelled"),
             makeMetricTile(title: "Index Updates", value: snapshot.usage.health.incrementalRefreshBatches.formatted(), detail: "\(snapshot.usage.health.fullRebuilds.formatted()) rebuilds"),
             makeMetricTile(title: "Memory", value: byteString(snapshot.usage.dailyBuckets.last?.memory.latestBytes ?? 0), detail: "latest sample"),
             makeMetricTile(title: "Launches", value: snapshot.lifetime.launchCount.formatted(), detail: dateOnlyString(snapshot.lifetime.firstLaunchDate))
@@ -724,16 +744,23 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
     private func rebuildQueryPathPanel(_ snapshot: IndexInsightsSnapshot) {
         let initial = snapshot.usage.initialSearches
         let refined = snapshot.usage.refinedSearches
-        queryRouteView.counters = initial
+        queryRouteView.setCounters(preview: initial, final: refined)
+        replaceQueryRouteGroups(initial: initial, refined: refined)
+    }
 
-        replaceRows(in: queryRowsStack, with: [
-            makeRouteCountRow(title: "Initial", value: compactRouteSummary(initial), color: InsightsRouteMixView.color(for: .mappedIndex)),
-            makeRouteCountRow(title: "Done / Cancelled / Avg", value: "\(initial.completed.formatted()) / \(initial.cancelled.formatted()) / \(durationString(initial.averageLatency))", color: .secondaryLabelColor)
-        ])
-
-        replaceRows(in: refinedRowsStack, with: [
-            makeRouteCountRow(title: "Refined", value: compactRouteSummary(refined), color: .secondaryLabelColor),
-            makeRouteCountRow(title: "Done / Cancelled / Avg", value: "\(refined.completed.formatted()) / \(refined.cancelled.formatted()) / \(durationString(refined.averageLatency))", color: .secondaryLabelColor)
+    private func replaceQueryRouteGroups(initial: SearchUsageCounters, refined: SearchUsageCounters) {
+        replaceRows(in: queryRouteGroupsStack, with: [
+            makeRouteMatrixHeaderRow(),
+            makeRouteMatrixPhaseGroup(
+                title: "Preview",
+                counters: previewDisplayCounters(initial),
+                accessibilityIdentifier: "Insights.PreviewRouteGroup"
+            ),
+            makeRouteMatrixPhaseGroup(
+                title: "Final",
+                counters: refined,
+                accessibilityIdentifier: "Insights.FinalRouteGroup"
+            )
         ])
     }
 
@@ -1324,50 +1351,220 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         return row
     }
 
-    private func makeRouteCountRow(title: String, value: String, color: NSColor) -> NSView {
+    private enum RouteMatrixLayout {
+        static let tableWidth: CGFloat = 620
+        static let phaseWidth: CGFloat = 76
+        static let metricWidth: CGFloat = 54
+        static let routeCountWidth: CGFloat = 50
+        static let doneWidth: CGFloat = 54
+        static let cancelWidth: CGFloat = 60
+        static let averageWidth: CGFloat = 72
+        static let spacing: CGFloat = 6
+    }
+
+    private func makeRouteMatrixHeaderRow() -> NSView {
         let row = NSView()
         row.translatesAutoresizingMaskIntoConstraints = false
+        row.setAccessibilityIdentifier("Insights.RouteMatrixHeader")
+
+        let phaseLabel = makeRouteMatrixHeaderCell("Phase", alignment: .left)
+        let labels = [
+            makeRouteMatrixHeaderCell("Metric", alignment: .left),
+            makeRouteMatrixRouteHeaderCell("Side", route: .sidecar),
+            makeRouteMatrixRouteHeaderCell("Map", route: .mappedIndex),
+            makeRouteMatrixRouteHeaderCell("Scan", route: .fullScan),
+            makeRouteMatrixRouteHeaderCell("App", route: .applicationCatalog),
+            makeRouteMatrixRouteHeaderCell("Other", route: .other),
+            makeRouteMatrixHeaderCell("Done"),
+            makeRouteMatrixHeaderCell("Cancel"),
+            makeRouteMatrixHeaderCell("Avg")
+        ]
+        let grid = makeRouteMetricGrid(labels)
+        row.addSubview(phaseLabel)
+        row.addSubview(grid)
+        NSLayoutConstraint.activate([
+            row.heightAnchor.constraint(equalToConstant: 26),
+            phaseLabel.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 12),
+            phaseLabel.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            phaseLabel.widthAnchor.constraint(equalToConstant: RouteMatrixLayout.phaseWidth),
+
+            grid.topAnchor.constraint(equalTo: row.topAnchor, constant: 5),
+            grid.leadingAnchor.constraint(equalTo: phaseLabel.trailingAnchor, constant: RouteMatrixLayout.spacing),
+            grid.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -12),
+            grid.bottomAnchor.constraint(equalTo: row.bottomAnchor, constant: -3)
+        ])
+        return row
+    }
+
+    private func makeRouteMatrixPhaseGroup(
+        title: String,
+        counters: SearchUsageCounters,
+        accessibilityIdentifier: String
+    ) -> NSView {
+        let group = NSView()
+        group.translatesAutoresizingMaskIntoConstraints = false
+        group.setAccessibilityIdentifier(accessibilityIdentifier)
+
+        let titleLabel = NSTextField(labelWithString: title)
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        titleLabel.font = .systemFont(ofSize: 10.5, weight: .semibold)
+        titleLabel.textColor = .labelColor
+        titleLabel.lineBreakMode = .byTruncatingTail
+        allowHorizontalCompression(titleLabel)
+
+        let countGrid = makeRouteMetricGrid([
+            makeRouteMetricLabelCell("Count"),
+            makeRouteMatrixValueCell(routeCountString(counters, .sidecar)),
+            makeRouteMatrixValueCell(routeCountString(counters, .mappedIndex)),
+            makeRouteMatrixValueCell(routeCountString(counters, .fullScan)),
+            makeRouteMatrixValueCell(routeCountString(counters, .applicationCatalog)),
+            makeRouteMatrixValueCell(routeCountString(counters, .other)),
+            makeRouteMatrixValueCell(counters.completed.formatted()),
+            makeRouteMatrixValueCell(counters.cancelled.formatted()),
+            makeRouteMatrixValueCell("")
+        ])
+        let averageGrid = makeRouteMetricGrid([
+            makeRouteMetricLabelCell("Avg", isSecondary: true),
+            makeRouteMatrixValueCell(routeAverageString(counters, .sidecar), isSecondary: true),
+            makeRouteMatrixValueCell(routeAverageString(counters, .mappedIndex), isSecondary: true),
+            makeRouteMatrixValueCell(routeAverageString(counters, .fullScan), isSecondary: true),
+            makeRouteMatrixValueCell(routeAverageString(counters, .applicationCatalog), isSecondary: true),
+            makeRouteMatrixValueCell(routeAverageString(counters, .other), isSecondary: true),
+            makeRouteMatrixValueCell("", isSecondary: true),
+            makeRouteMatrixValueCell("", isSecondary: true),
+            makeRouteMatrixValueCell(durationString(counters.averageLatency), isSecondary: true)
+        ])
+        let separator = makeTableSeparator()
+
+        group.addSubview(titleLabel)
+        group.addSubview(countGrid)
+        group.addSubview(separator)
+        group.addSubview(averageGrid)
+        NSLayoutConstraint.activate([
+            group.heightAnchor.constraint(equalToConstant: 54),
+
+            titleLabel.leadingAnchor.constraint(equalTo: group.leadingAnchor, constant: 12),
+            titleLabel.centerYAnchor.constraint(equalTo: group.centerYAnchor),
+            titleLabel.widthAnchor.constraint(equalToConstant: RouteMatrixLayout.phaseWidth),
+
+            countGrid.topAnchor.constraint(equalTo: group.topAnchor, constant: 4),
+            countGrid.leadingAnchor.constraint(equalTo: titleLabel.trailingAnchor, constant: RouteMatrixLayout.spacing),
+            countGrid.trailingAnchor.constraint(equalTo: group.trailingAnchor, constant: -12),
+            countGrid.heightAnchor.constraint(equalToConstant: 21),
+
+            separator.leadingAnchor.constraint(equalTo: countGrid.leadingAnchor),
+            separator.trailingAnchor.constraint(equalTo: countGrid.trailingAnchor),
+            separator.topAnchor.constraint(equalTo: countGrid.bottomAnchor),
+
+            averageGrid.topAnchor.constraint(equalTo: separator.bottomAnchor),
+            averageGrid.leadingAnchor.constraint(equalTo: countGrid.leadingAnchor),
+            averageGrid.trailingAnchor.constraint(equalTo: countGrid.trailingAnchor),
+            averageGrid.bottomAnchor.constraint(equalTo: group.bottomAnchor, constant: -4)
+        ])
+        return group
+    }
+
+    private func previewDisplayCounters(_ counters: SearchUsageCounters) -> SearchUsageCounters {
+        InsightsRoutePresentation.previewDisplayCounters(counters)
+    }
+
+    private func routeCountString(_ counters: SearchUsageCounters, _ route: SearchRouteKind) -> String {
+        guard let count = counters.routeCounts[route], count > 0 else { return "" }
+        return count.formatted()
+    }
+
+    private func routeAverageString(_ counters: SearchUsageCounters, _ route: SearchRouteKind) -> String {
+        guard counters.hasAverageLatency(for: route) else { return "" }
+        return durationString(counters.averageLatency(for: route))
+    }
+
+    private func makeRouteMetricGrid(_ cells: [NSView]) -> NSStackView {
+        let grid = NSStackView(views: cells)
+        grid.translatesAutoresizingMaskIntoConstraints = false
+        grid.orientation = .horizontal
+        grid.alignment = .centerY
+        grid.distribution = .fill
+        grid.spacing = RouteMatrixLayout.spacing
+
+        for (index, cell) in cells.enumerated() {
+            if index == 0 {
+                cell.widthAnchor.constraint(equalToConstant: RouteMatrixLayout.metricWidth).isActive = true
+            } else if index == cells.count - 1 {
+                cell.widthAnchor.constraint(equalToConstant: RouteMatrixLayout.averageWidth).isActive = true
+            } else if index == cells.count - 2 {
+                cell.widthAnchor.constraint(equalToConstant: RouteMatrixLayout.cancelWidth).isActive = true
+            } else if index == cells.count - 3 {
+                cell.widthAnchor.constraint(equalToConstant: RouteMatrixLayout.doneWidth).isActive = true
+            } else {
+                cell.widthAnchor.constraint(equalToConstant: RouteMatrixLayout.routeCountWidth).isActive = true
+            }
+        }
+        return grid
+    }
+
+    private func makeRouteMatrixHeaderCell(_ title: String, alignment: NSTextAlignment = .right) -> NSTextField {
+        let label = NSTextField(labelWithString: title)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.font = .systemFont(ofSize: 9.5, weight: .medium)
+        label.textColor = .secondaryLabelColor
+        label.alignment = alignment
+        label.lineBreakMode = .byTruncatingTail
+        allowHorizontalCompression(label)
+        return label
+    }
+
+    private func makeRouteMatrixRouteHeaderCell(_ title: String, route: SearchRouteKind) -> NSView {
+        let cell = NSView()
+        cell.translatesAutoresizingMaskIntoConstraints = false
 
         let marker = NSView()
         marker.translatesAutoresizingMaskIntoConstraints = false
         marker.wantsLayer = true
         marker.layer?.cornerRadius = 2
-        marker.layer?.backgroundColor = AppTheme.resolvedCGColor(color, for: view)
+        marker.layer?.backgroundColor = AppTheme.resolvedCGColor(InsightsRouteMixView.color(for: route), for: view)
 
-        let titleLabel = NSTextField(labelWithString: title)
-        titleLabel.translatesAutoresizingMaskIntoConstraints = false
-        titleLabel.font = .systemFont(ofSize: 10.5, weight: .medium)
-        titleLabel.textColor = .secondaryLabelColor
-        titleLabel.lineBreakMode = .byTruncatingTail
-        allowHorizontalCompression(titleLabel)
+        let label = makeRouteMatrixHeaderCell(title, alignment: .left)
+        let cluster = NSStackView(views: [marker, label])
+        cluster.translatesAutoresizingMaskIntoConstraints = false
+        cluster.orientation = .horizontal
+        cluster.alignment = .centerY
+        cluster.distribution = .fill
+        cluster.spacing = 4
 
+        cell.addSubview(cluster)
+        NSLayoutConstraint.activate([
+            marker.widthAnchor.constraint(equalToConstant: 6),
+            marker.heightAnchor.constraint(equalToConstant: 6),
+
+            cluster.leadingAnchor.constraint(greaterThanOrEqualTo: cell.leadingAnchor),
+            cluster.trailingAnchor.constraint(equalTo: cell.trailingAnchor),
+            cluster.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
+        ])
+        return cell
+    }
+
+    private func makeRouteMetricLabelCell(_ value: String, isSecondary: Bool = false) -> NSTextField {
         let valueLabel = NSTextField(labelWithString: value)
         valueLabel.translatesAutoresizingMaskIntoConstraints = false
-        valueLabel.font = .monospacedDigitSystemFont(ofSize: 10.5, weight: .semibold)
-        valueLabel.textColor = .labelColor
+        valueLabel.font = .systemFont(ofSize: 10.5, weight: isSecondary ? .medium : .semibold)
+        valueLabel.textColor = isSecondary ? .secondaryLabelColor : .labelColor
+        valueLabel.alignment = .left
+        valueLabel.lineBreakMode = .byTruncatingTail
+        valueLabel.maximumNumberOfLines = 1
+        allowHorizontalCompression(valueLabel)
+        return valueLabel
+    }
+
+    private func makeRouteMatrixValueCell(_ value: String, isSecondary: Bool = false) -> NSTextField {
+        let valueLabel = NSTextField(labelWithString: value)
+        valueLabel.translatesAutoresizingMaskIntoConstraints = false
+        valueLabel.font = .monospacedDigitSystemFont(ofSize: 10.5, weight: isSecondary ? .medium : .semibold)
+        valueLabel.textColor = value.isEmpty ? .clear : (isSecondary ? .secondaryLabelColor : .labelColor)
         valueLabel.alignment = .right
         valueLabel.lineBreakMode = .byTruncatingTail
-        valueLabel.setContentHuggingPriority(.defaultHigh, for: .horizontal)
-        valueLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-
-        row.addSubview(marker)
-        row.addSubview(titleLabel)
-        row.addSubview(valueLabel)
-        NSLayoutConstraint.activate([
-            row.heightAnchor.constraint(equalToConstant: 24),
-            marker.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 12),
-            marker.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-            marker.widthAnchor.constraint(equalToConstant: 7),
-            marker.heightAnchor.constraint(equalToConstant: 7),
-
-            titleLabel.leadingAnchor.constraint(equalTo: marker.trailingAnchor, constant: 8),
-            titleLabel.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-
-            valueLabel.leadingAnchor.constraint(greaterThanOrEqualTo: titleLabel.trailingAnchor, constant: 12),
-            valueLabel.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -12),
-            valueLabel.centerYAnchor.constraint(equalTo: row.centerYAnchor)
-        ])
-        return row
+        valueLabel.maximumNumberOfLines = 1
+        allowHorizontalCompression(valueLabel)
+        return valueLabel
     }
 
     private func makeMetricTile(title: String, value: String, detail: String) -> NSView {
@@ -1404,14 +1601,14 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
 
     private func makeHealthTile(title: String, value: String, detail: String, isWarning: Bool = false) -> NSView {
         let titleLabel = NSTextField(labelWithString: title)
-        titleLabel.font = .systemFont(ofSize: 9.5, weight: .medium)
+        titleLabel.font = .systemFont(ofSize: 10.5, weight: .medium)
         titleLabel.textColor = .secondaryLabelColor
         titleLabel.alignment = .left
         titleLabel.lineBreakMode = .byTruncatingTail
         allowHorizontalCompression(titleLabel)
 
         let valueLabel = NSTextField(labelWithString: value)
-        valueLabel.font = .monospacedDigitSystemFont(ofSize: 14, weight: .semibold)
+        valueLabel.font = .monospacedDigitSystemFont(ofSize: 18, weight: .semibold)
         valueLabel.textColor = isWarning ? .systemOrange : .labelColor
         valueLabel.alignment = .left
         valueLabel.lineBreakMode = .byTruncatingTail
@@ -1419,7 +1616,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         allowHorizontalCompression(valueLabel)
 
         let detailLabel = NSTextField(labelWithString: detail)
-        detailLabel.font = .systemFont(ofSize: 9.5, weight: .medium)
+        detailLabel.font = .systemFont(ofSize: 10.5, weight: .medium)
         detailLabel.textColor = .secondaryLabelColor
         detailLabel.alignment = .left
         detailLabel.lineBreakMode = .byTruncatingTail
@@ -1427,11 +1624,11 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         allowHorizontalCompression(detailLabel)
 
         let stack = InsightsTileView(views: [titleLabel, valueLabel, detailLabel], style: .health)
-        stack.spacing = 2
+        stack.spacing = 4
         stack.alignment = .leading
-        stack.edgeInsets = NSEdgeInsets(top: 5, left: 8, bottom: 5, right: 8)
+        stack.edgeInsets = NSEdgeInsets(top: 10, left: 12, bottom: 10, right: 12)
         NSLayoutConstraint.activate([
-            stack.heightAnchor.constraint(greaterThanOrEqualToConstant: 48)
+            stack.heightAnchor.constraint(greaterThanOrEqualToConstant: 74)
         ])
         return stack
     }
@@ -1964,12 +2161,141 @@ private final class InsightsTileView: NSStackView {
     }
 }
 
-private final class InsightsRouteMixView: NSView {
-    var counters = SearchUsageCounters() {
-        didSet { needsDisplay = true }
+enum InsightsHoverCardLayout {
+    static let lineHeight: CGFloat = 16
+
+    static var titleAttributes: [NSAttributedString.Key: Any] {
+        [
+            .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
+            .foregroundColor: NSColor.labelColor
+        ]
     }
 
+    static var detailAttributes: [NSAttributedString.Key: Any] {
+        [
+            .font: NSFont.systemFont(ofSize: 11, weight: .regular),
+            .foregroundColor: NSColor.secondaryLabelColor
+        ]
+    }
+
+    static func placardRect(lines: [String], near point: NSPoint, in bounds: NSRect) -> NSRect {
+        guard !lines.isEmpty, bounds.width > 0, bounds.height > 0 else { return .zero }
+        let measured = lines.enumerated().map { index, line in
+            line.size(withAttributes: index == 0 ? Self.titleAttributes : Self.detailAttributes)
+        }
+        let maximumWidth = max(120, bounds.width - 20)
+        let width = min(max(measured.map(\.width).max() ?? 0, 160) + 20, maximumWidth)
+        let height = CGFloat(lines.count) * Self.lineHeight + 18
+        var origin = NSPoint(x: point.x + 12, y: point.y + 12)
+        if origin.x + width > bounds.maxX - 8 {
+            origin.x = point.x - width - 12
+        }
+        if origin.y + height > bounds.maxY - 8 {
+            origin.y = point.y - height - 12
+        }
+        origin.x = min(max(origin.x, bounds.minX + 8), max(bounds.minX + 8, bounds.maxX - width - 8))
+        origin.y = min(max(origin.y, bounds.minY + 8), max(bounds.minY + 8, bounds.maxY - height - 8))
+        return NSRect(origin: origin, size: NSSize(width: width, height: height))
+    }
+}
+
+private final class InsightsHoverCardView: NSView {
+    private var lines: [String] = []
+    private var anchorPoint: NSPoint = .zero
+
     override var isFlipped: Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
+
+    func show(lines: [String], near point: NSPoint) {
+        self.lines = lines
+        anchorPoint = point
+        isHidden = false
+        needsDisplay = true
+    }
+
+    func hide() {
+        lines = []
+        isHidden = true
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard !lines.isEmpty else { return }
+
+        let rect = InsightsHoverCardLayout.placardRect(lines: lines, near: anchorPoint, in: bounds)
+        guard !rect.isEmpty else { return }
+        NSColor.windowBackgroundColor.setFill()
+        NSBezierPath(roundedRect: rect, xRadius: 7, yRadius: 7).fill()
+        NSColor.separatorColor.withAlphaComponent(0.85).setStroke()
+        NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), xRadius: 7, yRadius: 7).stroke()
+
+        var y = rect.minY + 9
+        for (index, line) in lines.enumerated() {
+            let attributes = index == 0
+                ? InsightsHoverCardLayout.titleAttributes
+                : InsightsHoverCardLayout.detailAttributes
+            line.draw(
+                in: NSRect(x: rect.minX + 10, y: y, width: rect.width - 20, height: InsightsHoverCardLayout.lineHeight),
+                withAttributes: attributes
+            )
+            y += InsightsHoverCardLayout.lineHeight
+        }
+    }
+}
+
+private enum InsightsHoverCard {
+    @MainActor
+    static func show(lines: [String], near point: NSPoint, from sourceView: NSView) {
+        guard !lines.isEmpty, let contentView = sourceView.window?.contentView else { return }
+        let cardView = hoverCardView(in: contentView)
+        if cardView.superview == nil {
+            contentView.addSubview(cardView, positioned: .above, relativeTo: nil)
+        }
+        cardView.frame = contentView.bounds
+        cardView.autoresizingMask = [.width, .height]
+        cardView.show(lines: lines, near: cardView.convert(point, from: sourceView))
+    }
+
+    @MainActor
+    static func hide(from sourceView: NSView) {
+        guard let contentView = sourceView.window?.contentView else { return }
+        contentView.subviews
+            .compactMap { $0 as? InsightsHoverCardView }
+            .first?
+            .hide()
+    }
+
+    @MainActor
+    private static func hoverCardView(in contentView: NSView) -> InsightsHoverCardView {
+        if let existing = contentView.subviews.compactMap({ $0 as? InsightsHoverCardView }).first {
+            return existing
+        }
+        let view = InsightsHoverCardView(frame: contentView.bounds)
+        view.autoresizingMask = [.width, .height]
+        view.isHidden = true
+        return view
+    }
+}
+
+private final class InsightsRouteMixView: NSView {
+    private var previewCounters = SearchUsageCounters()
+    private var finalCounters = SearchUsageCounters()
+
+    override var isFlipped: Bool { true }
+
+    private var trackingArea: NSTrackingArea?
+    private var hoveredTarget: InsightsRouteMixHoverTarget?
+    private var hoverPoint: NSPoint?
+
+    func setCounters(preview: SearchUsageCounters, final: SearchUsageCounters) {
+        previewCounters = InsightsRoutePresentation.previewDisplayCounters(preview)
+        finalCounters = final
+        refreshHoverAfterContentUpdate()
+        needsDisplay = true
+    }
 
     static func color(for route: SearchRouteKind) -> NSColor {
         switch route {
@@ -1986,9 +2312,95 @@ private final class InsightsRouteMixView: NSView {
         }
     }
 
+    override func updateTrackingAreas() {
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.activeAlways, .inVisibleRect, .mouseEnteredAndExited, .mouseMoved],
+            owner: self,
+            userInfo: nil
+        )
+        trackingArea = area
+        addTrackingArea(area)
+        super.updateTrackingAreas()
+    }
+
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         needsDisplay = true
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        updateHover(at: point)
+        updateHoverCard()
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hoveredTarget = nil
+        hoverPoint = nil
+        InsightsHoverCard.hide(from: self)
+        needsDisplay = true
+    }
+
+    private func refreshHoverAfterContentUpdate() {
+        guard
+            let hoverPoint,
+            bounds.contains(hoverPoint),
+            window?.isKeyWindow != false
+        else {
+            hoveredTarget = nil
+            self.hoverPoint = nil
+            InsightsHoverCard.hide(from: self)
+            return
+        }
+
+        updateHover(at: hoverPoint)
+        updateHoverCard()
+    }
+
+    private func updateHover(at point: NSPoint) {
+        hoverPoint = point
+        hoveredTarget = InsightsRouteMixLayout.hitTarget(
+            at: point,
+            preview: previewCounters,
+            final: finalCounters,
+            in: bounds.insetBy(dx: 0.5, dy: 0.5)
+        )
+    }
+
+    private func updateHoverCard() {
+        guard let hoveredTarget, let hoverPoint else {
+            InsightsHoverCard.hide(from: self)
+            return
+        }
+
+        let segments = InsightsRouteMixLayout.segments(
+            preview: previewCounters,
+            final: finalCounters,
+            in: bounds.insetBy(dx: 0.5, dy: 0.5)
+        )
+        let phaseSegments = segments.filter { $0.phase == hoveredTarget.phase }
+        let total = segments.reduce(UInt64(0)) { $0 &+ $1.count }
+        let phaseTotal = phaseSegments.reduce(UInt64(0)) { $0 &+ $1.count }
+        guard let segment = phaseSegments.first(where: { $0.route == hoveredTarget.route }) else {
+            InsightsHoverCard.hide(from: self)
+            return
+        }
+
+        InsightsHoverCard.show(
+            lines: routeHoverLines(
+                target: hoveredTarget,
+                count: segment.count,
+                phaseTotal: phaseTotal,
+                total: total
+            ),
+            near: hoverPoint,
+            from: self
+        )
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -2000,36 +2412,55 @@ private final class InsightsRouteMixView: NSView {
         background.setFill()
         NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5).fill()
 
-        let routes: [SearchRouteKind] = [.sidecar, .mappedIndex, .fullScan, .applicationCatalog, .other]
-        let counts = routes.map { counters.routeCounts[$0, default: 0] }
-        let total = counts.reduce(UInt64(0), +)
-        guard total > 0 else {
-            drawEmpty("No initial route data")
+        let rows = InsightsRouteMixLayout.barRows(in: rect)
+        let segments = InsightsRouteMixLayout.segments(
+            preview: previewCounters,
+            final: finalCounters,
+            in: rect
+        )
+        guard !segments.isEmpty else {
+            drawEmpty("No route data")
             border.setStroke()
             NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5).stroke()
             return
         }
 
-        var x = rect.minX
-        let lastPositiveIndex = counts.indices.last { counts[$0] > 0 }
-        for (index, route) in routes.enumerated() {
-            let count = counts[index]
-            guard count > 0 else { continue }
-            let isLast = index == lastPositiveIndex
-            let width = isLast
-                ? rect.maxX - x
-                : max(2, floor(rect.width * CGFloat(Double(count) / Double(total))))
-            let segment = NSRect(x: x, y: rect.minY, width: min(width, rect.maxX - x), height: rect.height)
-            Self.color(for: route).withAlphaComponent(0.82).setFill()
-            segment.fill()
-            if segment.width > 56 {
-                drawCount(count, in: segment)
+        for row in rows {
+            drawPhaseLabel(row.phase.rawValue, in: row.labelRect)
+        }
+
+        for segment in segments {
+            let isHovered = hoveredTarget?.phase == segment.phase && hoveredTarget?.route == segment.route
+            let alpha: CGFloat = hoveredTarget == nil || isHovered ? 0.82 : 0.54
+            Self.color(for: segment.route).withAlphaComponent(alpha).setFill()
+            segment.rect.fill()
+            if isHovered {
+                NSColor.white.withAlphaComponent(0.55).setStroke()
+                NSBezierPath(roundedRect: segment.rect.insetBy(dx: 1, dy: 1), xRadius: 4, yRadius: 4).stroke()
             }
-            x += segment.width
+            if segment.rect.width > 56 {
+                drawCount(segment.count, in: segment.rect)
+            }
         }
 
         border.setStroke()
         NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5).stroke()
+    }
+
+    private func routeHoverLines(
+        target: InsightsRouteMixHoverTarget,
+        count: UInt64,
+        phaseTotal: UInt64,
+        total: UInt64
+    ) -> [String] {
+        let phasePercent = InsightsRouteMixLayout.percentString(count: count, total: phaseTotal)
+        let totalPercent = InsightsRouteMixLayout.percentString(count: count, total: total)
+        return [
+            "\(target.phase.rawValue) \(InsightsRouteMixLayout.title(for: target.route))",
+            "\(count.formatted()) searches",
+            "\(phasePercent) of \(target.phase.rawValue.lowercased())",
+            "\(totalPercent) of routed queries"
+        ]
     }
 
     private func drawEmpty(_ text: String) {
@@ -2040,6 +2471,26 @@ private final class InsightsRouteMixView: NSView {
         let size = text.size(withAttributes: attributes)
         text.draw(
             at: NSPoint(x: bounds.midX - size.width / 2, y: bounds.midY - size.height / 2),
+            withAttributes: attributes
+        )
+    }
+
+    private func drawPhaseLabel(_ text: String, in rect: NSRect) {
+        let paragraphStyle = NSMutableParagraphStyle()
+        paragraphStyle.alignment = .right
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 10.5, weight: .semibold),
+            .foregroundColor: NSColor.secondaryLabelColor,
+            .paragraphStyle: paragraphStyle
+        ]
+        let size = text.size(withAttributes: attributes)
+        text.draw(
+            in: NSRect(
+                x: rect.minX,
+                y: rect.midY - size.height / 2,
+                width: rect.width,
+                height: size.height
+            ),
             withAttributes: attributes
         )
     }
@@ -2055,6 +2506,165 @@ private final class InsightsRouteMixView: NSView {
             at: NSPoint(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2),
             withAttributes: attributes
         )
+    }
+}
+
+enum InsightsRouteMixPhase: String, CaseIterable {
+    case preview = "Preview"
+    case final = "Final"
+}
+
+struct InsightsRouteMixHoverTarget: Equatable {
+    let phase: InsightsRouteMixPhase
+    let route: SearchRouteKind
+}
+
+struct InsightsRouteMixBarRow: Equatable {
+    let phase: InsightsRouteMixPhase
+    let labelRect: NSRect
+    let barRect: NSRect
+}
+
+struct InsightsRouteMixSegment: Equatable {
+    let phase: InsightsRouteMixPhase
+    let route: SearchRouteKind
+    let count: UInt64
+    let rect: NSRect
+}
+
+enum InsightsRouteMixLayout {
+    static let routes: [SearchRouteKind] = [.sidecar, .mappedIndex, .fullScan, .applicationCatalog, .other]
+    private static let labelWidth: CGFloat = 54
+    private static let labelGap: CGFloat = 8
+    private static let rowGap: CGFloat = 6
+    private static let horizontalInset: CGFloat = 8
+    private static let verticalInset: CGFloat = 7
+
+    static func barRows(in rect: NSRect) -> [InsightsRouteMixBarRow] {
+        let content = rect.insetBy(dx: horizontalInset, dy: verticalInset)
+        guard content.width > labelWidth + labelGap, content.height > rowGap else { return [] }
+
+        let rowHeight = max(4, floor((content.height - rowGap) / 2))
+        let barX = content.minX + labelWidth + labelGap
+        let barWidth = content.maxX - barX
+        guard barWidth > 0 else { return [] }
+
+        return [
+            InsightsRouteMixBarRow(
+                phase: .preview,
+                labelRect: NSRect(x: content.minX, y: content.minY, width: labelWidth, height: rowHeight),
+                barRect: NSRect(x: barX, y: content.minY, width: barWidth, height: rowHeight)
+            ),
+            InsightsRouteMixBarRow(
+                phase: .final,
+                labelRect: NSRect(
+                    x: content.minX,
+                    y: content.minY + rowHeight + rowGap,
+                    width: labelWidth,
+                    height: rowHeight
+                ),
+                barRect: NSRect(
+                    x: barX,
+                    y: content.minY + rowHeight + rowGap,
+                    width: barWidth,
+                    height: rowHeight
+                )
+            )
+        ]
+    }
+
+    static func segments(
+        preview: SearchUsageCounters,
+        final: SearchUsageCounters,
+        in rect: NSRect
+    ) -> [InsightsRouteMixSegment] {
+        let preview = InsightsRoutePresentation.previewDisplayCounters(preview)
+        let countersByPhase: [InsightsRouteMixPhase: SearchUsageCounters] = [
+            .preview: preview,
+            .final: final
+        ]
+        return barRows(in: rect).flatMap { row in
+            segments(
+                phase: row.phase,
+                counters: countersByPhase[row.phase] ?? SearchUsageCounters(),
+                in: row.barRect
+            )
+        }
+    }
+
+    private static func segments(
+        phase: InsightsRouteMixPhase,
+        counters: SearchUsageCounters,
+        in rect: NSRect
+    ) -> [InsightsRouteMixSegment] {
+        guard rect.width > 0, rect.height > 0 else { return [] }
+        let counts = routes.map { counters.routeCounts[$0, default: 0] }
+        let total = counts.reduce(UInt64(0), +)
+        guard total > 0 else { return [] }
+
+        var x = rect.minX
+        let lastPositiveIndex = counts.indices.last { counts[$0] > 0 }
+        var segments: [InsightsRouteMixSegment] = []
+        segments.reserveCapacity(routes.count)
+
+        for (index, route) in routes.enumerated() {
+            let count = counts[index]
+            guard count > 0 else { continue }
+            let isLast = index == lastPositiveIndex
+            let width = isLast
+                ? rect.maxX - x
+                : max(2, floor(rect.width * CGFloat(Double(count) / Double(total))))
+            let segmentRect = NSRect(
+                x: x,
+                y: rect.minY,
+                width: min(width, rect.maxX - x),
+                height: rect.height
+            )
+            guard segmentRect.width > 0 else { continue }
+            segments.append(InsightsRouteMixSegment(phase: phase, route: route, count: count, rect: segmentRect))
+            x += segmentRect.width
+        }
+
+        return segments
+    }
+
+    static func hitTarget(
+        at point: NSPoint,
+        preview: SearchUsageCounters,
+        final: SearchUsageCounters,
+        in rect: NSRect
+    ) -> InsightsRouteMixHoverTarget? {
+        guard let segment = segments(preview: preview, final: final, in: rect).first(where: { $0.rect.contains(point) }) else {
+            return nil
+        }
+        return InsightsRouteMixHoverTarget(phase: segment.phase, route: segment.route)
+    }
+
+    static func title(for route: SearchRouteKind) -> String {
+        switch route {
+        case .sidecar:
+            return "Sidecar"
+        case .mappedIndex:
+            return "Mapped index"
+        case .fullScan:
+            return "Full scan"
+        case .applicationCatalog:
+            return "App catalog"
+        case .other:
+            return "Other"
+        }
+    }
+
+    static func percentString(count: UInt64, total: UInt64) -> String {
+        guard total > 0 else { return "0%" }
+        let percent = Double(count) / Double(total) * 100
+        if percent > 0, percent < 0.1 {
+            return "<0.1%"
+        }
+        if percent < 10 {
+            return String(format: "%.1f%%", percent)
+        }
+        return "\(Int(percent.rounded()))%"
     }
 }
 
@@ -2103,12 +2713,14 @@ private final class InsightsTreemapView: NSView {
     override func mouseMoved(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         updateHover(at: point)
+        updateHoverCard()
         needsDisplay = true
     }
 
     override func mouseExited(with event: NSEvent) {
         hoveredRootIndex = nil
         hoverPoint = nil
+        InsightsHoverCard.hide(from: self)
         needsDisplay = true
     }
 
@@ -2120,10 +2732,12 @@ private final class InsightsTreemapView: NSView {
         else {
             hoveredRootIndex = nil
             self.hoverPoint = nil
+            InsightsHoverCard.hide(from: self)
             return
         }
 
         updateHover(at: hoverPoint)
+        updateHoverCard()
     }
 
     private func updateHover(at point: NSPoint) {
@@ -2132,6 +2746,27 @@ private final class InsightsTreemapView: NSView {
             at: point,
             roots: roots,
             bounds: bounds
+        )
+    }
+
+    private func updateHoverCard() {
+        guard let hoveredRootIndex, let hoverPoint, hoveredRootIndex < roots.count else {
+            InsightsHoverCard.hide(from: self)
+            return
+        }
+
+        let weights = roots.map(Self.layoutWeight(for:))
+        let total = weights.reduce(UInt64(0)) { $0 &+ $1 }
+        let labels = Self.compactLabels(for: roots.map(\.path))
+        InsightsHoverCard.show(
+            lines: Self.placardLines(
+                for: roots[hoveredRootIndex],
+                label: labels[hoveredRootIndex],
+                weight: weights[hoveredRootIndex],
+                totalWeight: total
+            ),
+            near: hoverPoint,
+            from: self
         )
     }
 
@@ -2191,16 +2826,6 @@ private final class InsightsTreemapView: NSView {
                 )
             }
         }
-
-        if let hoveredRootIndex, let hoverPoint, hoveredRootIndex < roots.count {
-            drawPlacard(
-                for: roots[hoveredRootIndex],
-                label: labels[hoveredRootIndex],
-                weight: weights[hoveredRootIndex],
-                totalWeight: total,
-                near: hoverPoint
-            )
-        }
     }
 
     nonisolated private static func rootIndex(at point: NSPoint, roots: [IndexRootInsight], bounds: NSRect) -> Int? {
@@ -2240,62 +2865,20 @@ private final class InsightsTreemapView: NSView {
         return paths
     }
 
-    private func drawPlacard(
+    private static func placardLines(
         for root: IndexRootInsight,
         label: String,
         weight: UInt64,
-        totalWeight: UInt64,
-        near point: NSPoint
-    ) {
+        totalWeight: UInt64
+    ) -> [String] {
         let percent = Self.percentString(weight: weight, total: totalWeight)
-        let lines = [
+        return [
             label,
             "\(percent) of estimated index package",
             "\(root.trackedFileCount.formatted()) files",
             "\(Self.byteString(root.indexedContentBytes)) content",
             "\(Self.byteString(root.estimatedIndexBytes)) index estimate"
         ]
-
-        let titleAttributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
-            .foregroundColor: NSColor.labelColor
-        ]
-        let detailAttributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 11, weight: .regular),
-            .foregroundColor: NSColor.secondaryLabelColor
-        ]
-
-        let measured = lines.enumerated().map { index, line in
-            line.size(withAttributes: index == 0 ? titleAttributes : detailAttributes)
-        }
-        let width = min(max(measured.map(\.width).max() ?? 0, 160) + 20, bounds.width - 20)
-        let lineHeight: CGFloat = 16
-        let height = CGFloat(lines.count) * lineHeight + 18
-        var origin = NSPoint(x: point.x + 12, y: point.y + 12)
-        if origin.x + width > bounds.maxX - 8 {
-            origin.x = point.x - width - 12
-        }
-        if origin.y + height > bounds.maxY - 8 {
-            origin.y = point.y - height - 12
-        }
-        origin.x = min(max(origin.x, bounds.minX + 8), bounds.maxX - width - 8)
-        origin.y = min(max(origin.y, bounds.minY + 8), bounds.maxY - height - 8)
-
-        let rect = NSRect(origin: origin, size: NSSize(width: width, height: height))
-        NSColor.windowBackgroundColor.withAlphaComponent(0.96).setFill()
-        NSBezierPath(roundedRect: rect, xRadius: 7, yRadius: 7).fill()
-        NSColor.separatorColor.withAlphaComponent(0.85).setStroke()
-        NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), xRadius: 7, yRadius: 7).stroke()
-
-        var y = rect.minY + 9
-        for (index, line) in lines.enumerated() {
-            let attributes = index == 0 ? titleAttributes : detailAttributes
-            line.draw(
-                in: NSRect(x: rect.minX + 10, y: y, width: rect.width - 20, height: lineHeight),
-                withAttributes: attributes
-            )
-            y += lineHeight
-        }
     }
 
     nonisolated private static func percentString(weight: UInt64, total: UInt64) -> String {
@@ -2448,21 +3031,94 @@ enum InsightsTreemapLayout {
 
 private final class InsightsBarChartView: NSView {
     var buckets: [DailyUsageBucket] = [] {
-        didSet { needsDisplay = true }
+        didSet {
+            refreshHoverAfterContentUpdate()
+            needsDisplay = true
+        }
     }
 
     override var isFlipped: Bool { true }
+
+    private var trackingArea: NSTrackingArea?
+    private var hoveredBucketIndex: Int?
+    private var hoverPoint: NSPoint?
+
+    override func updateTrackingAreas() {
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.activeAlways, .inVisibleRect, .mouseEnteredAndExited, .mouseMoved],
+            owner: self,
+            userInfo: nil
+        )
+        trackingArea = area
+        addTrackingArea(area)
+        super.updateTrackingAreas()
+    }
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         needsDisplay = true
     }
 
+    override func mouseMoved(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        updateHover(at: point)
+        updateHoverCard()
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hoveredBucketIndex = nil
+        hoverPoint = nil
+        InsightsHoverCard.hide(from: self)
+        needsDisplay = true
+    }
+
+    private func refreshHoverAfterContentUpdate() {
+        guard
+            let hoverPoint,
+            bounds.contains(hoverPoint),
+            window?.isKeyWindow != false
+        else {
+            hoveredBucketIndex = nil
+            self.hoverPoint = nil
+            InsightsHoverCard.hide(from: self)
+            return
+        }
+
+        updateHover(at: hoverPoint)
+        updateHoverCard()
+    }
+
+    private func updateHover(at point: NSPoint) {
+        hoverPoint = point
+        hoveredBucketIndex = InsightsActivityChartLayout.bucketIndex(
+            at: point,
+            bucketCount: buckets.count,
+            in: bounds
+        )
+    }
+
+    private func updateHoverCard() {
+        guard let hoveredBucketIndex, let hoverPoint, hoveredBucketIndex < buckets.count else {
+            InsightsHoverCard.hide(from: self)
+            return
+        }
+
+        InsightsHoverCard.show(
+            lines: placardLines(for: buckets[hoveredBucketIndex]),
+            near: hoverPoint,
+            from: self
+        )
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        InsightsPanelPalette.chartBackgroundColor(
-            isDark: InsightsPanelPalette.isDarkAppearance(effectiveAppearance)
-        ).setFill()
+        let isDark = InsightsPanelPalette.isDarkAppearance(effectiveAppearance)
+        InsightsPanelPalette.chartBackgroundColor(isDark: isDark).setFill()
         bounds.fill()
 
         guard !buckets.isEmpty else {
@@ -2473,19 +3129,24 @@ private final class InsightsBarChartView: NSView {
         let values = buckets.map { max($0.searches.completed, $0.fileActions.values.reduce(UInt64(0), +), $0.health.incrementalRefreshBatches + $0.health.fullRebuilds) }
         let maxValue = max(values.max() ?? 0, 1)
         let plot = InsightsActivityChartLayout.plotRect(in: bounds)
-        let gap: CGFloat = 3
-        let barWidth = max(3, (plot.width - CGFloat(max(buckets.count - 1, 0)) * gap) / CGFloat(max(buckets.count, 1)))
+        let bucketRects = InsightsActivityChartLayout.bucketRects(bucketCount: buckets.count, in: bounds)
+
+        if let hoveredBucketIndex, hoveredBucketIndex < bucketRects.count {
+            let highlightRect = bucketRects[hoveredBucketIndex].insetBy(dx: -1, dy: 0)
+            NSColor.labelColor.withAlphaComponent(isDark ? 0.10 : 0.06).setFill()
+            NSBezierPath(roundedRect: highlightRect, xRadius: 3, yRadius: 3).fill()
+        }
 
         for (index, bucket) in buckets.enumerated() {
-            let x = plot.minX + CGFloat(index) * (barWidth + gap)
+            let bucketRect = bucketRects[index]
             let searchHeight = CGFloat(Double(bucket.searches.completed) / Double(maxValue)) * plot.height
             let actionCount = bucket.fileActions.values.reduce(UInt64(0), +)
             let actionHeight = CGFloat(Double(actionCount) / Double(maxValue)) * plot.height
             let updateHeight = CGFloat(Double(bucket.health.incrementalRefreshBatches + bucket.health.fullRebuilds) / Double(maxValue)) * plot.height
 
-            drawBar(x: x, width: barWidth, height: searchHeight, color: .systemBlue, plot: plot)
-            drawBar(x: x, width: barWidth, height: actionHeight, color: .systemGreen.withAlphaComponent(0.75), plot: plot.insetBy(dx: barWidth * 0.25, dy: 0))
-            drawBar(x: x, width: barWidth, height: updateHeight, color: .systemOrange.withAlphaComponent(0.8), plot: plot.insetBy(dx: barWidth * 0.42, dy: 0))
+            drawBar(x: bucketRect.minX, width: bucketRect.width, height: searchHeight, color: .systemBlue, plot: plot)
+            drawBar(x: bucketRect.minX, width: bucketRect.width, height: actionHeight, color: .systemGreen.withAlphaComponent(0.75), plot: plot.insetBy(dx: bucketRect.width * 0.25, dy: 0))
+            drawBar(x: bucketRect.minX, width: bucketRect.width, height: updateHeight, color: .systemOrange.withAlphaComponent(0.8), plot: plot.insetBy(dx: bucketRect.width * 0.42, dy: 0))
         }
 
         drawLegend(in: InsightsActivityChartLayout.legendRect(in: bounds))
@@ -2517,6 +3178,17 @@ private final class InsightsBarChartView: NSView {
         }
     }
 
+    private func placardLines(for bucket: DailyUsageBucket) -> [String] {
+        let actionCount = bucket.fileActions.values.reduce(UInt64(0), +)
+        let updateCount = bucket.health.incrementalRefreshBatches + bucket.health.fullRebuilds
+        return [
+            bucket.day,
+            "\(bucket.searches.completed.formatted()) searches completed",
+            "\(actionCount.formatted()) file actions",
+            "\(updateCount.formatted()) index updates"
+        ]
+    }
+
     private func drawEmpty(_ text: String) {
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 13, weight: .medium),
@@ -2534,6 +3206,7 @@ enum InsightsActivityChartLayout {
     static let inset = NSEdgeInsets(top: 10, left: 8, bottom: 10, right: 8)
     static let legendHeight: CGFloat = 14
     static let legendGap: CGFloat = 8
+    static let bucketGap: CGFloat = 3
     static let legendItems: [(title: String, color: NSColor)] = [
         ("Searches", .systemBlue),
         ("File actions", .systemGreen.withAlphaComponent(0.75)),
@@ -2560,5 +3233,28 @@ enum InsightsActivityChartLayout {
             width: plot.width,
             height: legendHeight
         )
+    }
+
+    static func bucketRects(bucketCount: Int, in bounds: NSRect) -> [NSRect] {
+        guard bucketCount > 0 else { return [] }
+        let plot = plotRect(in: bounds)
+        guard plot.width > 0, plot.height > 0 else { return [] }
+        let barWidth = max(
+            3,
+            (plot.width - CGFloat(max(bucketCount - 1, 0)) * bucketGap) / CGFloat(bucketCount)
+        )
+        return (0..<bucketCount).map { index in
+            NSRect(
+                x: plot.minX + CGFloat(index) * (barWidth + bucketGap),
+                y: plot.minY,
+                width: barWidth,
+                height: plot.height
+            )
+        }
+    }
+
+    static func bucketIndex(at point: NSPoint, bucketCount: Int, in bounds: NSRect) -> Int? {
+        bucketRects(bucketCount: bucketCount, in: bounds)
+            .firstIndex { $0.contains(point) }
     }
 }

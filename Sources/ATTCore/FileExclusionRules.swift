@@ -25,9 +25,21 @@ public struct FileExclusionRules: @unchecked Sendable {
         "Engine/DerivedDataCache/",
         "Engine/Intermediate/",
         "Engine/Saved/",
+        "CMakeFiles/",
+        "Testing/Temporary/",
         ".build/**/index/store/",
         "build/.cmake/api/",
         "build/_deps/",
+        "build/**/_deps/",
+        "build/**/*.tmp*",
+        "*.o",
+        "*.pyc",
+        "*.pyo",
+        "*.dSYM/",
+        "*.gcda",
+        "*.gcno",
+        "*.profraw",
+        "*.profdata",
         ".venv/",
         "venv/",
         ".tox/",
@@ -222,9 +234,25 @@ public struct FileExclusionRules: @unchecked Sendable {
                 let components = Self.components(for: relativePath)
                 guard components.count > 1 else { return false }
 
-                for count in 1..<components.count {
-                    let ancestor = components.prefix(count).joined(separator: "/")
-                    if matches(relativePath: ancestor, isDirectory: true) {
+                if !containsSlash {
+                    let ancestorComponents = components.dropLast()
+                    if isAnchored {
+                        guard let firstAncestor = ancestorComponents.first else { return false }
+                        return matchesWholeString(String(firstAncestor))
+                    }
+
+                    return ancestorComponents.contains { matchesWholeString(String($0)) }
+                }
+
+                var ancestor = ""
+                for component in components.dropLast() {
+                    if ancestor.isEmpty {
+                        ancestor = String(component)
+                    } else {
+                        ancestor += "/"
+                        ancestor += String(component)
+                    }
+                    if matchesPathCandidate(ancestor) {
                         return true
                     }
                 }

@@ -2455,6 +2455,106 @@ struct FileIndexTests {
         #expect(completeResponse.executionProfile.scannedRowCount <= 10)
     }
 
+    @Test("broad relevance path substring uses exact component fast path")
+    func broadRelevancePathSubstringUsesExactComponentFastPath() throws {
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let root = "/tmp/allthethings-broad-fast-path-\(UUID().uuidString)"
+        let documents = "\(root)/Documents"
+        let recordCount = 5_000
+        var records = [
+            makeRecord(path: root, isDirectory: true),
+            makeRecord(path: documents, isDirectory: true)
+        ]
+        records.reserveCapacity(recordCount + records.count)
+        for index in 0..<recordCount {
+            records.append(makeRecord(
+                path: "\(documents)/File\(String(format: "%06d", index)).swift",
+                modifiedTime: TimeInterval(index)
+            ))
+        }
+
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        defer {
+            try? FileManager.default.removeItem(at: index.dataDirectoryURL)
+        }
+        index.replaceRecordsForTesting(records)
+        index.persistSnapshotForTesting()
+
+        let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
+        #expect(!reloaded.currentDiagnostics().pathGramIndexEnabled)
+
+        let previewResponse = reloaded.search(SearchRequest(
+            query: "documents",
+            sort: SortSpec(column: .relevance, ascending: false),
+            includeHidden: false,
+            mode: .interactivePreview
+        ), maxResults: 25)
+        let response = reloaded.search(SearchRequest(
+            query: "documents",
+            sort: SortSpec(column: .relevance, ascending: false),
+            includeHidden: false
+        ), maxResults: 25)
+
+        #expect(previewResponse.usesIndexedCandidates)
+        #expect(previewResponse.executionProfile.executionPath != .fullFallbackScan)
+        #expect(!previewResponse.executionProfile.didFallbackToFullScan)
+        #expect(previewResponse.executionProfile.indexesUsed.contains(.componentGrams))
+        #expect(previewResponse.totalMatches == 25)
+        #expect(previewResponse.results.count == 25)
+        #expect(previewResponse.results.contains { $0.match?.field == .ancestorPath })
+
+        #expect(response.usesIndexedCandidates)
+        #expect(response.executionProfile.executionPath != .fullFallbackScan)
+        #expect(!response.executionProfile.didFallbackToFullScan)
+        #expect(response.executionProfile.indexesUsed.contains(.componentGrams))
+        #expect(response.totalMatches == recordCount + 1)
+        #expect(response.results.count == 25)
+    }
+
+    @Test("broad name path substring returns exact total without scoring every descendant")
+    func broadNamePathSubstringReturnsExactTotalWithoutScoringEveryDescendant() throws {
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let root = "/tmp/allthethings-broad-name-fast-path-\(UUID().uuidString)"
+        let documents = "\(root)/Documents"
+        let recordCount = 5_000
+        var records = [
+            makeRecord(path: root, isDirectory: true),
+            makeRecord(path: documents, isDirectory: true)
+        ]
+        records.reserveCapacity(recordCount + records.count)
+        for index in 0..<recordCount {
+            records.append(makeRecord(
+                path: "\(documents)/File\(String(format: "%06d", index)).swift",
+                modifiedTime: TimeInterval(index)
+            ))
+        }
+
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        defer {
+            try? FileManager.default.removeItem(at: index.dataDirectoryURL)
+        }
+        index.replaceRecordsForTesting(records)
+        index.persistSnapshotForTesting()
+
+        let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
+        #expect(!reloaded.currentDiagnostics().pathGramIndexEnabled)
+
+        let response = reloaded.search(SearchRequest(
+            query: "documents",
+            sort: SortSpec(column: .name, ascending: true),
+            includeHidden: false
+        ), maxResults: 25)
+
+        #expect(response.usesIndexedCandidates)
+        #expect(response.executionProfile.executionPath == .optimizedSortedFastPath)
+        #expect(!response.executionProfile.didFallbackToFullScan)
+        #expect(response.executionProfile.indexesUsed.contains(.componentGrams))
+        #expect(response.totalMatches == recordCount + 1)
+        #expect(response.results.count == 25)
+        #expect(response.results.first?.record.name == "Documents")
+        #expect(response.executionProfile.scannedRowCount <= 75)
+    }
+
     @Test("overlay allRecords uses base bulk materialization")
     func overlayAllRecordsUsesBaseBulkMaterialization() throws {
         let alpha = makeRecord(path: "/tmp/allthethings-store/Alpha.txt")

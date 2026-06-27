@@ -26,11 +26,23 @@ struct FileExclusionRulesTests {
             "/tmp/project/Engine/DerivedDataCache/Boot.ddc",
             "/tmp/project/Engine/Intermediate/Build/Target.make",
             "/tmp/project/Engine/Saved/Logs/Editor.log",
+            "/tmp/project/build/CMakeFiles/Progress/1",
+            "/tmp/project/build/module/CMakeFiles/target.dir/compiler_depend.make",
+            "/tmp/project/build/Testing/Temporary/LastTest.log",
             "/tmp/project/build/.cmake/api/v1/reply/index-123.json",
             "/tmp/project/build/_deps/llvm_project-src/clang/test/Sema/File.cpp",
+            "/tmp/project/build/debug/_deps/package-src/include/package.hpp",
+            "/tmp/project/build/debug/CMakeCache.txt.tmp4b189",
+            "/tmp/project/build/App.o",
+            "/tmp/project/build/App.dSYM/Contents/Resources/DWARF/App",
+            "/tmp/project/build/coverage.gcda",
+            "/tmp/project/build/coverage.gcno",
+            "/tmp/project/build/default.profraw",
+            "/tmp/project/build/default.profdata",
             "/tmp/project/.venv/lib/python3.14/site-packages/babel/locale-data/en.dat",
             "/tmp/project/.build/arm64-apple-macosx/debug/index/store/v5/records/2W/unit",
             "/tmp/project/__pycache__/module.pyc",
+            "/tmp/project/Sources/__pycache__/module.pyc",
             "/tmp/project/Library/Caches/com.example/cache.db"
         ]
 
@@ -48,7 +60,7 @@ struct FileExclusionRulesTests {
             isDirectory: false
         ))
         #expect(!rules.excludes(
-            url: URL(fileURLWithPath: "/tmp/project/build/App.o"),
+            url: URL(fileURLWithPath: "/tmp/project/build/App"),
             roots: [root],
             isDirectory: false
         ))
