@@ -68,7 +68,7 @@ enum AppSettings {
     static let appSearchRootsDidChangeNotification = Notification.Name("com.allthethings.settings.appSearchRootsDidChange")
     static let exclusionPatternsDidChangeNotification = Notification.Name("com.allthethings.settings.exclusionPatternsDidChange")
 
-    private static let currentExclusionDefaultsVersion = 10
+    private static let currentExclusionDefaultsVersion = 12
     private static let currentIndexedRootDefaultsVersion = 2
     private static let versionOneDefaultExclusionPatterns = [
         "node_modules/",
@@ -616,6 +616,22 @@ enum AppSettings {
             additions.append("!.git/description")
             additions.append("!.git/hooks/**")
             additions.append("!.git/info/**")
+        }
+        if version < 11 {
+            additions.append("CMakeFiles/")
+            additions.append("Testing/Temporary/")
+            additions.append("*.o")
+            additions.append("*.pyc")
+            additions.append("*.pyo")
+            additions.append("*.dSYM/")
+            additions.append("*.gcda")
+            additions.append("*.gcno")
+            additions.append("*.profraw")
+            additions.append("*.profdata")
+        }
+        if version < 12 {
+            additions.append("build/**/_deps/")
+            additions.append("build/**/*.tmp*")
         }
         return additions
     }

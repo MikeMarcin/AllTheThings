@@ -218,16 +218,24 @@ struct FileIndexInsightsTests {
         for profile in [
             SearchExecutionProfile(
                 executionPath: .indexedCandidateIntersection,
-                indexesUsed: [.nameGrams, .visibleBitset]
+                indexesUsed: [.nameGrams, .visibleBitset],
+                elapsed: 1
             ),
             SearchExecutionProfile(
                 executionPath: .extensionCandidateIntersection,
-                indexesUsed: [.extensionPostings, .visibleBitset]
+                indexesUsed: [.extensionPostings, .visibleBitset],
+                elapsed: 2
             ),
             SearchExecutionProfile(
                 executionPath: .fullFallbackScan,
                 indexesUsed: [.visibleBitset],
-                didFallbackToFullScan: true
+                didFallbackToFullScan: true,
+                elapsed: 3
+            ),
+            SearchExecutionProfile(
+                executionPath: .applicationCatalog,
+                indexesUsed: [.applicationCatalog],
+                elapsed: 4
             )
         ] {
             metrics.recordSearchStarted(phase: .refinedResults)
@@ -235,10 +243,47 @@ struct FileIndexInsightsTests {
         }
 
         let refined = metrics.refinedSearches
-        #expect(refined.completed == 3)
+        #expect(refined.completed == 4)
         #expect(refined.routeCounts[.mappedIndex] == 1)
         #expect(refined.routeCounts[.sidecar] == 1)
         #expect(refined.routeCounts[.fullScan] == 1)
+        #expect(refined.routeCounts[.applicationCatalog] == 1)
+        #expect(refined.averageLatency(for: .mappedIndex) == 1)
+        #expect(refined.averageLatency(for: .sidecar) == 2)
+        #expect(refined.averageLatency(for: .fullScan) == 3)
+        #expect(refined.averageLatency(for: .applicationCatalog) == 4)
+    }
+
+    @Test("external searches contribute application route metrics")
+    func externalSearchesContributeApplicationRouteMetrics() throws {
+        let fileManager = FileManager.default
+        let applicationName = "AllTheThingsInsights-\(UUID().uuidString)"
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        defer {
+            try? fileManager.removeItem(at: index.dataDirectoryURL)
+        }
+
+        index.recordExternalSearchStarted(phase: .refinedResults)
+        index.recordExternalSearchCompleted(
+            SearchExecutionProfile(
+                executionPath: .applicationCatalog,
+                indexesUsed: [.applicationCatalog],
+                candidateCount: 12,
+                scannedRowCount: 12,
+                elapsed: 0.25
+            ),
+            phase: .refinedResults
+        )
+
+        let usage = index.currentInsightsSnapshot().usage
+        #expect(usage.allTimeSearches.started == 1)
+        #expect(usage.allTimeSearches.completed == 1)
+        #expect(usage.allTimeSearches.routeCounts[.applicationCatalog] == 1)
+        #expect(usage.allTimeSearches.averageLatency(for: .applicationCatalog) == 0.25)
+        #expect(usage.refinedSearches.started == 1)
+        #expect(usage.refinedSearches.completed == 1)
+        #expect(usage.refinedSearches.routeCounts[.applicationCatalog] == 1)
+        #expect(usage.refinedSearches.averageLatency(for: .applicationCatalog) == 0.25)
     }
 
     @Test("cancelled searches stay phase specific without route counts")
@@ -286,6 +331,34 @@ struct FileIndexInsightsTests {
         #expect(!usage.refinedSearches.latencyBuckets.isEmpty)
         #expect(usage.allTimeSearches.started == 2)
         #expect(usage.allTimeSearches.cancelled == 2)
+    }
+
+    @Test("average latency uses all measured searches")
+    func averageLatencyUsesAllMeasuredSearches() {
+        var counters = SearchUsageCounters(
+            completed: 2,
+            cancelled: 1,
+            totalLatency: 9
+        )
+
+        #expect(counters.averageLatency == 3)
+
+        counters.completed = 0
+        counters.cancelled = 1
+        counters.totalLatency = 4
+        #expect(counters.averageLatency == 4)
+
+        counters.cancelled = 0
+        counters.totalLatency = 4
+        #expect(counters.averageLatency == 0)
+
+        counters.routeCounts[.mappedIndex] = 2
+        #expect(!counters.hasAverageLatency(for: .mappedIndex))
+        counters.routeLatencyTotals[.mappedIndex] = 7
+        #expect(counters.hasAverageLatency(for: .mappedIndex))
+        #expect(counters.averageLatency(for: .mappedIndex) == 3.5)
+        #expect(!counters.hasAverageLatency(for: .applicationCatalog))
+        #expect(counters.averageLatency(for: .applicationCatalog) == 0)
     }
 
     @Test("legacy v1 metrics migrate without backfilling phase counters")

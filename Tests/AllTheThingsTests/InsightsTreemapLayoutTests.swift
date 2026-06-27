@@ -212,6 +212,7 @@ struct InsightsTreemapLayoutTests {
         let titlebarActions = try #require(findView(accessibilityIdentifier: "Insights.TitlebarActions", in: window.contentView))
         let summaryPage = try #require(findView(accessibilityIdentifier: "Insights.SummaryPage", in: contentRoot))
         let summaryTiles = try #require(findView(accessibilityIdentifier: "Insights.SummaryTiles", in: contentRoot))
+        let healthCard = try #require(findView(accessibilityIdentifier: "Insights.HealthCard", in: summaryPage))
         let healthTiles = try #require(findView(accessibilityIdentifier: "Insights.HealthTiles", in: summaryPage))
         let healthFactsTable = try #require(findView(accessibilityIdentifier: "Insights.HealthFactsTable", in: summaryPage))
 
@@ -235,9 +236,12 @@ struct InsightsTreemapLayoutTests {
         #expect(summaryPage.frame.maxY <= contentRoot.bounds.maxY - 17)
         #expect(summaryTiles.frame.minY >= summaryPage.bounds.minY)
         #expect(summaryTiles.frame.height >= 185)
+        #expect(healthCard.frame.minY <= summaryPage.bounds.minY + 1)
         #expect(healthTiles.frame.maxX <= healthFactsTable.frame.minX - 12)
         #expect(abs(healthTiles.frame.width - healthFactsTable.frame.width) <= 1)
         #expect(healthFactsTable.frame.width <= summaryPage.frame.width * 0.55)
+        #expect(healthFactsTable.frame.height <= 120)
+        #expect(healthTiles.frame.height > healthFactsTable.frame.height)
     }
 
     @Test("Insights tab pages fit the initial viewport")
@@ -298,6 +302,54 @@ struct InsightsTreemapLayoutTests {
             }
             if let nestedIdentifier = expectedNestedViews[identifier] {
                 #expect(findView(accessibilityIdentifier: nestedIdentifier, in: page) != nil)
+            }
+
+            if identifier == "Insights.IndexPage" {
+                let storageCard = try #require(findView(accessibilityIdentifier: "Insights.StorageCard", in: page))
+                let storageTreemap = try #require(findView(accessibilityIdentifier: "Insights.StorageTreemap", in: page))
+                let storageFactsTable = try #require(findView(accessibilityIdentifier: "Insights.StorageFactsTable", in: page))
+                let rootsCard = try #require(findView(accessibilityIdentifier: "Insights.RootsCard", in: page))
+                #expect(storageTreemap.frame.height >= 205)
+                #expect(storageFactsTable.frame.height <= 150)
+                #expect(storageCard.frame.height >= rootsCard.frame.height)
+            }
+
+            if identifier == "Insights.ActivityPage" {
+                let queryPanel = try #require(findView(accessibilityIdentifier: "Insights.QueryPanel", in: page))
+                let queryTitleLabel = try #require(findView(accessibilityIdentifier: "Insights.QueryTitleLabel", in: page))
+                let queryRouteChart = try #require(findView(accessibilityIdentifier: "Insights.QueryRouteChart", in: page))
+                let queryFactsTable = try #require(findView(accessibilityIdentifier: "Insights.QueryRouteFactsTable", in: page))
+                let routeMatrixHeader = try #require(findView(accessibilityIdentifier: "Insights.RouteMatrixHeader", in: page))
+                let previewRouteGroup = try #require(findView(accessibilityIdentifier: "Insights.PreviewRouteGroup", in: page))
+                let finalRouteGroup = try #require(findView(accessibilityIdentifier: "Insights.FinalRouteGroup", in: page))
+                let panelFrame = queryPanel.convert(queryPanel.bounds, to: page)
+                let titleFrame = queryTitleLabel.convert(queryTitleLabel.bounds, to: page)
+                let chartFrame = queryRouteChart.convert(queryRouteChart.bounds, to: page)
+                let factsFrame = queryFactsTable.convert(queryFactsTable.bounds, to: page)
+                let headerFrame = routeMatrixHeader.convert(routeMatrixHeader.bounds, to: page)
+                let previewFrame = previewRouteGroup.convert(previewRouteGroup.bounds, to: page)
+                let finalFrame = finalRouteGroup.convert(finalRouteGroup.bounds, to: page)
+
+                #expect(queryFactsTable.frame.width >= 600)
+                #expect(queryFactsTable.frame.width <= page.bounds.width * 0.75)
+                #expect(queryFactsTable.frame.height <= 150)
+                #expect(chartFrame.width >= 600)
+                #expect(chartFrame.width <= page.bounds.width * 0.75)
+                #expect(abs(chartFrame.width - factsFrame.width) <= 1)
+                #expect(queryRouteChart.frame.height <= 50)
+                #expect(abs(chartFrame.midX - panelFrame.midX) <= 1)
+                #expect(abs(factsFrame.midX - panelFrame.midX) <= 1)
+                #expect(factsFrame.minX >= panelFrame.minX + 90)
+                #expect(factsFrame.maxX <= panelFrame.maxX - 90)
+                #expect(titleFrame.minY > chartFrame.maxY)
+                #expect(chartFrame.minY > factsFrame.maxY)
+                #expect(titleFrame.maxY <= panelFrame.maxY - 8)
+                #expect(titleFrame.minY >= panelFrame.minY + 8)
+                #expect(headerFrame.minY > previewFrame.maxY)
+                #expect(previewFrame.minY > finalFrame.maxY)
+                #expect(routeMatrixHeader.frame.height <= 32)
+                #expect(previewRouteGroup.frame.height <= 58)
+                #expect(finalRouteGroup.frame.height <= 58)
             }
         }
     }
@@ -382,6 +434,66 @@ struct InsightsTreemapLayoutTests {
         #expect(plot.height > legend.height)
     }
 
+    @Test("activity chart bucket hit testing follows plotted bars")
+    func activityChartBucketHitTestingFollowsPlottedBars() {
+        let bounds = NSRect(x: 0, y: 0, width: 420, height: 104)
+
+        let buckets = InsightsActivityChartLayout.bucketRects(bucketCount: 4, in: bounds)
+
+        #expect(buckets.count == 4)
+        #expect(InsightsActivityChartLayout.bucketIndex(at: center(of: buckets[0]), bucketCount: 4, in: bounds) == 0)
+        #expect(InsightsActivityChartLayout.bucketIndex(at: center(of: buckets[3]), bucketCount: 4, in: bounds) == 3)
+        #expect(InsightsActivityChartLayout.bucketIndex(at: NSPoint(x: 1, y: bounds.maxY - 1), bucketCount: 4, in: bounds) == nil)
+    }
+
+    @Test("route mix layout hit testing follows visible route segments")
+    func routeMixLayoutHitTestingFollowsVisibleRouteSegments() {
+        let bounds = NSRect(x: 0, y: 0, width: 620, height: 76)
+        let preview = SearchUsageCounters(routeCounts: [
+            .sidecar: 4,
+            .mappedIndex: 34,
+            .applicationCatalog: 2
+        ])
+        let final = SearchUsageCounters(routeCounts: [
+            .sidecar: 3,
+            .mappedIndex: 12,
+            .applicationCatalog: 5
+        ])
+
+        let rows = InsightsRouteMixLayout.barRows(in: bounds)
+        let segments = InsightsRouteMixLayout.segments(preview: preview, final: final, in: bounds)
+        let previewSegments = segments.filter { $0.phase == .preview }
+        let finalSegments = segments.filter { $0.phase == .final }
+
+        #expect(rows.map(\.phase) == [.preview, .final])
+        #expect(previewSegments.map(\.route) == [.sidecar, .mappedIndex])
+        #expect(finalSegments.map(\.route) == [.sidecar, .mappedIndex, .applicationCatalog])
+        #expect(InsightsRouteMixLayout.hitTarget(at: center(of: previewSegments[0].rect), preview: preview, final: final, in: bounds) == InsightsRouteMixHoverTarget(phase: .preview, route: .sidecar))
+        #expect(InsightsRouteMixLayout.hitTarget(at: center(of: previewSegments[1].rect), preview: preview, final: final, in: bounds) == InsightsRouteMixHoverTarget(phase: .preview, route: .mappedIndex))
+        #expect(InsightsRouteMixLayout.hitTarget(at: center(of: finalSegments[2].rect), preview: preview, final: final, in: bounds) == InsightsRouteMixHoverTarget(phase: .final, route: .applicationCatalog))
+        #expect(InsightsRouteMixLayout.hitTarget(at: NSPoint(x: bounds.maxX + 1, y: bounds.midY), preview: preview, final: final, in: bounds) == nil)
+    }
+
+    @Test("hover placards can escape a source section while fitting window content")
+    func hoverPlacardsCanEscapeSourceSectionWhileFittingWindowContent() {
+        let sourceSection = NSRect(x: 0, y: 0, width: 120, height: 50)
+        let contentBounds = NSRect(x: 0, y: 0, width: 800, height: 600)
+
+        let rect = InsightsHoverCardLayout.placardRect(
+            lines: [
+                "Documents",
+                "100% of estimated index package",
+                "900,000 files"
+            ],
+            near: NSPoint(x: sourceSection.maxX - 6, y: sourceSection.midY),
+            in: contentBounds
+        )
+
+        #expect(rect.maxX > sourceSection.maxX)
+        #expect(rect.maxX <= contentBounds.maxX - 8)
+        #expect(rect.minY >= contentBounds.minY + 8)
+    }
+
     @Test("Insights panel palette keeps light panels lighter than dark panels")
     @MainActor
     func insightsPanelPaletteKeepsLightPanelsLighterThanDarkPanels() throws {
@@ -416,6 +528,10 @@ struct InsightsTreemapLayoutTests {
         #expect(lightCard > darkCard + 0.3)
         #expect(lightMetric > darkMetric + 0.3)
         #expect(lightChart > darkChart + 0.3)
+    }
+
+    private func center(of rect: NSRect) -> NSPoint {
+        NSPoint(x: rect.midX, y: rect.midY)
     }
 
     private func makeRoot(path: String, trackedFileCount: Int) -> IndexRootInsight {

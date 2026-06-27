@@ -27,6 +27,7 @@ struct DiagnosticsReportBuilderTests {
         #expect(report.contains("Initial Results:"))
         #expect(report.contains("Refined Results:"))
         #expect(report.contains("mappedIndex: 1"))
+        #expect(report.contains("mappedIndex: 1, avg"))
         #expect(report.contains("sidecar: 1"))
         #expect(!report.contains(rootPath))
         #expect(!report.contains("SecretProject"))
@@ -67,9 +68,11 @@ struct DiagnosticsReportBuilderTests {
         usage.initialSearches.completed = 1
         usage.initialSearches.cancelled = 1
         usage.initialSearches.routeCounts[.mappedIndex] = 1
+        usage.initialSearches.routeLatencyTotals[.mappedIndex] = 0.02
         usage.refinedSearches.started = 1
         usage.refinedSearches.completed = 1
         usage.refinedSearches.routeCounts[.sidecar] = 1
+        usage.refinedSearches.routeLatencyTotals[.sidecar] = 0.01
         usage.dailyBuckets = [
             DailyUsageBucket(
                 day: "2026-05-30",

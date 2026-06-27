@@ -182,29 +182,29 @@ struct SearchToolbarTests {
             initialQueryElapsed: nil,
             isRefiningSearchResults: false,
             hasFinalSearchTiming: true
-        ) == "42 ms")
+        ) == "42ms")
         #expect(SearchWindowPresentation.searchElapsedText(
             queryElapsed: 1.2,
             initialQueryElapsed: 0.08,
             isRefiningSearchResults: true,
             hasFinalSearchTiming: false
-        ) == "80 ms (refining)")
+        ) == "80ms (1.20s refining)")
         #expect(SearchWindowPresentation.searchElapsedText(
             queryElapsed: 1.2,
             initialQueryElapsed: 0.08,
             isRefiningSearchResults: false,
             hasFinalSearchTiming: true
-        ) == "80 ms (1200 ms)")
+        ) == "80ms (1.20s)")
         let footerText = SearchWindowPresentation.detailedFooterText(
             shownText: "2,000 shown / 955,841 matches",
             operationText: "Ready",
             detailText: "Caught up 974,301 files",
             appSearchScopeText: nil,
             memoryStatusText: "Memory 215.8 MB",
-            searchElapsedText: "80 ms (1200 ms)"
+            searchElapsedText: "80ms (1.20s)"
         )
         #expect(footerText.centerText == "2,000 shown / 955,841 matches")
-        #expect(footerText.operationText == "Ready • 80 ms (1200 ms)")
+        #expect(footerText.operationText == "Ready • 80ms (1.20s)")
         #expect(footerText.rightText == "Caught up 974,301 files • Memory 215.8 MB")
         #expect(!SearchWindowPresentation.shouldShowSearchElapsedText(
             displayedSearchSignatureIsSet: false,
@@ -297,6 +297,42 @@ struct SearchToolbarTests {
             responseTotalMatches: 0,
             responseSnapshotRevision: 3,
             currentSnapshotRevision: 4
+        ))
+        #expect(!SearchRunReconciliation.shouldRetryStaleFinalResponse(
+            usesIndexedCandidates: true,
+            responseSnapshotRevision: 3,
+            currentSnapshotRevision: 4,
+            signatureStillScheduled: true,
+            responseResultCount: 25,
+            responseTotalMatches: 1_000,
+            isIndexing: true
+        ))
+        #expect(SearchRunReconciliation.shouldRetryStaleFinalResponse(
+            usesIndexedCandidates: true,
+            responseSnapshotRevision: 3,
+            currentSnapshotRevision: 4,
+            signatureStillScheduled: true,
+            responseResultCount: 25,
+            responseTotalMatches: 1_000,
+            isIndexing: false
+        ))
+        #expect(SearchRunReconciliation.shouldRetryStaleFinalResponse(
+            usesIndexedCandidates: true,
+            responseSnapshotRevision: 3,
+            currentSnapshotRevision: 4,
+            signatureStillScheduled: true,
+            responseResultCount: 0,
+            responseTotalMatches: 0,
+            isIndexing: true
+        ))
+        #expect(!SearchRunReconciliation.shouldRetryStaleFinalResponse(
+            usesIndexedCandidates: false,
+            responseSnapshotRevision: 3,
+            currentSnapshotRevision: 4,
+            signatureStillScheduled: true,
+            responseResultCount: 25,
+            responseTotalMatches: 1_000,
+            isIndexing: false
         ))
     }
 

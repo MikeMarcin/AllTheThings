@@ -28,6 +28,112 @@ struct FileSystemEvent {
     }
 }
 
+enum FSEventIndexFilter {
+    static func indexableEvents(
+        _ events: [FileSystemEvent],
+        rootPaths: [String],
+        exclusionPatterns: [String]
+    ) -> [FileSystemEvent] {
+        guard !events.isEmpty else { return [] }
+        let activePatterns = Set(exclusionPatterns)
+        let exclusions = FileExclusionRules(patterns: exclusionPatterns)
+        return events.filter { event in
+            if isKnownExcludedEventPath(event.path, activePatterns: activePatterns) {
+                return false
+            }
+            return shouldQueue(event, rootPaths: rootPaths, exclusions: exclusions)
+        }
+    }
+
+    static func isKnownExcludedEventPath(_ path: String, activePatterns: Set<String>) -> Bool {
+        let lowerPath = path.lowercased()
+        let lastComponent = URL(fileURLWithPath: path).lastPathComponent.lowercased()
+
+        if activePatterns.contains("node_modules/"), containsComponent("node_modules", in: lowerPath) {
+            return true
+        }
+        if activePatterns.contains("DerivedData/"), containsComponent("deriveddata", in: lowerPath) {
+            return true
+        }
+        if activePatterns.contains("CMakeFiles/"), containsComponent("cmakefiles", in: lowerPath) {
+            return true
+        }
+        if activePatterns.contains("Testing/Temporary/"), containsPathFragment("/testing/temporary", in: lowerPath) {
+            return true
+        }
+        if activePatterns.contains("build/.cmake/api/"), containsPathFragment("/build/.cmake/api", in: lowerPath) {
+            return true
+        }
+        if
+            (activePatterns.contains("build/_deps/") || activePatterns.contains("build/**/_deps/")),
+            lowerPath.contains("/build/"),
+            containsComponent("_deps", in: lowerPath)
+        {
+            return true
+        }
+        if
+            activePatterns.contains("build/**/*.tmp*"),
+            lowerPath.contains("/build/"),
+            lastComponent.contains(".tmp")
+        {
+            return true
+        }
+        if activePatterns.contains("*.o"), lastComponent.hasSuffix(".o") {
+            return true
+        }
+        if activePatterns.contains("*.pyc"), lastComponent.hasSuffix(".pyc") {
+            return true
+        }
+        if activePatterns.contains("*.pyo"), lastComponent.hasSuffix(".pyo") {
+            return true
+        }
+        if activePatterns.contains("*.gcda"), lastComponent.hasSuffix(".gcda") {
+            return true
+        }
+        if activePatterns.contains("*.gcno"), lastComponent.hasSuffix(".gcno") {
+            return true
+        }
+        if activePatterns.contains("*.profraw"), lastComponent.hasSuffix(".profraw") {
+            return true
+        }
+        if activePatterns.contains("*.profdata"), lastComponent.hasSuffix(".profdata") {
+            return true
+        }
+        if activePatterns.contains("*.dSYM/"), lowerPath.contains(".dsym/") || lowerPath.hasSuffix(".dsym") {
+            return true
+        }
+
+        return false
+    }
+
+    private static func containsComponent(_ component: String, in lowerPath: String) -> Bool {
+        lowerPath.hasSuffix("/" + component) || lowerPath.contains("/" + component + "/")
+    }
+
+    private static func containsPathFragment(_ fragment: String, in lowerPath: String) -> Bool {
+        lowerPath.contains(fragment + "/") || lowerPath.hasSuffix(fragment)
+    }
+
+    private static func shouldQueue(
+        _ event: FileSystemEvent,
+        rootPaths: [String],
+        exclusions: FileExclusionRules
+    ) -> Bool {
+        let url = URL(fileURLWithPath: event.path)
+        if event.itemIsDirectory {
+            return exclusions.decision(url: url, roots: rootPaths, isDirectory: true) != .prune
+        }
+
+        let fileDecision = exclusions.decision(url: url, roots: rootPaths, isDirectory: false)
+        if fileDecision != .prune {
+            return true
+        }
+
+        let directoryDecision = exclusions.decision(url: url, roots: rootPaths, isDirectory: true)
+        return directoryDecision != .prune
+    }
+}
+
 final class FileSystemWatcher {
     struct StreamConfiguration: Equatable, Sendable {
         static let interactive = StreamConfiguration(latency: 0.05, usesNoDefer: true)
@@ -261,6 +367,7 @@ private final class FSEventHistoryReplayCollector: @unchecked Sendable {
 
     private let rootPaths: [String]
     private let exclusions: FileExclusionRules
+    private let activeExclusionPatterns: Set<String>
     private let lock = NSLock()
     private var reconciliationPaths = Set<String>()
     private var fallbackRootPaths = Set<String>()
@@ -272,6 +379,7 @@ private final class FSEventHistoryReplayCollector: @unchecked Sendable {
     init(rootPaths: [String], exclusions: FileExclusionRules) {
         self.rootPaths = rootPaths.sorted { $0.count > $1.count }
         self.exclusions = exclusions
+        activeExclusionPatterns = Set(exclusions.patterns)
     }
 
     func ingest(_ events: [FileSystemEvent]) {
@@ -288,6 +396,11 @@ private final class FSEventHistoryReplayCollector: @unchecked Sendable {
 
             guard let rootPath = matchingRoot(for: event.path) else {
                 requiresGlobalFallback = true
+                continue
+            }
+
+            if FSEventIndexFilter.isKnownExcludedEventPath(event.path, activePatterns: activeExclusionPatterns) {
+                droppedExcludedEventCount += 1
                 continue
             }
 

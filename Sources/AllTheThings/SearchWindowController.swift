@@ -266,21 +266,31 @@ enum SearchWindowPresentation {
         isRefiningSearchResults: Bool,
         hasFinalSearchTiming: Bool
     ) -> String {
-        let finalMilliseconds = Int((queryElapsed * 1_000).rounded())
+        let finalText = searchDurationText(queryElapsed)
         guard let initialQueryElapsed else {
-            return "\(finalMilliseconds) ms"
+            return finalText
         }
 
-        let initialMilliseconds = Int((initialQueryElapsed * 1_000).rounded())
+        let initialText = searchDurationText(initialQueryElapsed)
         if isRefiningSearchResults {
-            return "\(initialMilliseconds) ms (refining)"
+            return "\(initialText) (\(finalText) refining)"
         }
 
         guard hasFinalSearchTiming else {
-            return "\(initialMilliseconds) ms"
+            return initialText
         }
 
-        return "\(initialMilliseconds) ms (\(finalMilliseconds) ms)"
+        return "\(initialText) (\(finalText))"
+    }
+
+    nonisolated private static func searchDurationText(_ elapsed: TimeInterval) -> String {
+        let milliseconds = max(Int((elapsed * 1_000).rounded()), 0)
+        guard milliseconds >= 1_000 else {
+            return "\(milliseconds)ms"
+        }
+
+        let seconds = Double(milliseconds) / 1_000
+        return String(format: "%.2fs", seconds)
     }
 
     nonisolated static func operationStatusText(operationText: String, searchElapsedText: String?) -> String {
@@ -342,6 +352,31 @@ enum SearchRunReconciliation {
             let responseSnapshotRevision,
             responseSnapshotRevision < currentSnapshotRevision
         else {
+            return false
+        }
+
+        return true
+    }
+
+    nonisolated static func shouldRetryStaleFinalResponse(
+        usesIndexedCandidates: Bool,
+        responseSnapshotRevision: UInt64?,
+        currentSnapshotRevision: UInt64,
+        signatureStillScheduled: Bool,
+        responseResultCount: Int,
+        responseTotalMatches: Int,
+        isIndexing: Bool
+    ) -> Bool {
+        guard
+            usesIndexedCandidates,
+            let responseSnapshotRevision,
+            responseSnapshotRevision < currentSnapshotRevision,
+            signatureStillScheduled
+        else {
+            return false
+        }
+
+        if isIndexing, responseResultCount > 0, responseTotalMatches > 0 {
             return false
         }
 
@@ -2612,10 +2647,11 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let token = SearchCancellationToken()
         activeSearchToken = token
         let searchStartedAt: Date
-        if redisplaysCurrentSignature, initialQueryElapsed != nil, !hasFinalSearchTiming {
-            searchStartedAt = activeSearchStartedAt ?? Date()
+        if redisplaysCurrentSignature, initialQueryElapsed != nil {
+            searchStartedAt = Date()
             activeSearchStartedAt = searchStartedAt
             isRefiningSearchResults = true
+            hasFinalSearchTiming = false
         } else {
             searchStartedAt = pendingSearchInputStartedAt ?? Date()
             activeSearchStartedAt = searchStartedAt
@@ -2744,14 +2780,28 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                 }
                 return false
             }
-            let response = appSearchQuery.map { appQuery in
-                applicationSearchCatalog.search(
+            let response: SearchResponse?
+            if let appQuery = appSearchQuery {
+                let appSearchStartedAt = Date()
+                let metricPhase = Self.metricPhase(for: request.mode)
+                index.recordExternalSearchStarted(phase: metricPhase)
+                response = applicationSearchCatalog.search(
                     queryText: appQuery.searchText,
                     roots: appSearchRoots,
                     sort: request.sort,
                     shouldCancel: shouldCancelSearch
                 )
-            } ?? index.search(request, shouldCancel: shouldCancelSearch)
+                if let response {
+                    index.recordExternalSearchCompleted(response.executionProfile, phase: metricPhase)
+                } else {
+                    index.recordExternalSearchCancelled(
+                        phase: metricPhase,
+                        elapsed: Date().timeIntervalSince(appSearchStartedAt)
+                    )
+                }
+            } else {
+                response = index.search(request, shouldCancel: shouldCancelSearch)
+            }
 
             guard let response else {
                 DispatchQueue.main.async { [weak self] in
@@ -2796,15 +2846,27 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                     searchStartedAt: searchStartedAt,
                     isFinal: true
                 )
-                if
-                    response.usesIndexedCandidates,
-                    let responseRevision = response.snapshotRevision,
-                    responseRevision < self.indexStats.snapshotRevision,
-                    signature == self.scheduledSearchSignature
-                {
+                if SearchRunReconciliation.shouldRetryStaleFinalResponse(
+                    usesIndexedCandidates: response.usesIndexedCandidates,
+                    responseSnapshotRevision: response.snapshotRevision,
+                    currentSnapshotRevision: self.indexStats.snapshotRevision,
+                    signatureStillScheduled: signature == self.scheduledSearchSignature,
+                    responseResultCount: response.results.count,
+                    responseTotalMatches: response.totalMatches,
+                    isIndexing: self.indexStats.isIndexing
+                ) {
                     self.scheduleSearch(force: true)
                 }
             }
+        }
+    }
+
+    nonisolated private static func metricPhase(for mode: SearchMode) -> SearchMetricPhase {
+        switch mode {
+        case .interactivePreview:
+            return .initialResults
+        case .complete:
+            return .refinedResults
         }
     }
 
@@ -3231,11 +3293,28 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         refreshZeroRowRootRecoveryCandidatesIfNeeded(stats: stats)
         scheduleZeroRowRootRecoveryIfNeeded()
 
-        if stats.snapshotRevision != previousStats.snapshotRevision {
+        if shouldForceSearchRefreshForSnapshotChange(previous: previousStats, current: stats) {
             scheduleSearch(force: true)
         } else {
             scheduleSearch()
         }
+    }
+
+    private func shouldForceSearchRefreshForSnapshotChange(previous: IndexStats, current: IndexStats) -> Bool {
+        guard current.snapshotRevision != previous.snapshotRevision else {
+            return false
+        }
+
+        if
+            current.isIndexing,
+            !results.isEmpty,
+            !currentSearchText().trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            displayedSearchSignature == scheduledSearchSignature
+        {
+            return false
+        }
+
+        return true
     }
 
     private func shouldSuppressEmptySearchDuringIndexing(request: SearchRequest, stats: IndexStats? = nil) -> Bool {
@@ -4145,17 +4224,38 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func coalesceFSEvents(_ events: [FileSystemEvent]) {
-        pendingEventPaths.formUnion(events.map(\.path))
-        pendingRecursiveEventPaths.formUnion(events.filter(\.requiresRecursiveRescan).map(\.path))
+        let filteredEvents = FSEventIndexFilter.indexableEvents(
+            events,
+            rootPaths: rootPaths(indexedRoots),
+            exclusionPatterns: index.allExclusionPatterns()
+        )
+        guard !filteredEvents.isEmpty else {
+            DiagnosticLogger.shared.log(
+                category: "fsevents",
+                event: "fsevents.eventsReceived",
+                fields: [
+                    "eventCount": .publicInt(events.count),
+                    "filteredEventCount": .publicInt(0),
+                    "droppedExcludedEventCount": .publicInt(events.count),
+                    "recursiveEventCount": .publicInt(0)
+                ]
+            )
+            return
+        }
+
+        pendingEventPaths.formUnion(filteredEvents.map(\.path))
+        pendingRecursiveEventPaths.formUnion(filteredEvents.filter(\.requiresRecursiveRescan).map(\.path))
         DiagnosticLogger.shared.log(
             category: "fsevents",
             event: "fsevents.eventsReceived",
             fields: [
                 "eventCount": .publicInt(events.count),
-                "recursiveEventCount": .publicInt(events.filter(\.requiresRecursiveRescan).count)
+                "filteredEventCount": .publicInt(filteredEvents.count),
+                "droppedExcludedEventCount": .publicInt(events.count - filteredEvents.count),
+                "recursiveEventCount": .publicInt(filteredEvents.filter(\.requiresRecursiveRescan).count)
             ],
             diagnosticFields: [
-                "paths": .pathArray(events.map(\.path))
+                "paths": .pathArray(filteredEvents.map(\.path))
             ]
         )
         scheduleCoalescedFSEventFlush()
