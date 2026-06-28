@@ -96,8 +96,8 @@ struct FileSystemWatcherTests {
         #expect(background.flags & UInt32(kFSEventStreamCreateFlagFileEvents) != 0)
     }
 
-    @Test("FSEvent reconciliation scopes normal historical file paths to parent folders")
-    func fseventReconciliationScopesNormalHistoricalFilePathsToParentFolders() async {
+    @Test("FSEvent reconciliation scopes normal historical file paths exactly")
+    func fseventReconciliationScopesNormalHistoricalFilePathsExactly() async {
         let root = URL(fileURLWithPath: "/tmp/allthethings/root-a", isDirectory: true)
         let folder = root.appendingPathComponent("Project", isDirectory: true)
         let changedPath = folder.appendingPathComponent("log.txt").path
@@ -122,6 +122,38 @@ struct FileSystemWatcherTests {
 
         let action = await actionFromCoordinator(coordinator, roots: [root])
         #expect(source.requestedSinceEventID == 40)
+        #expect(action == .reconcile(paths: [changedPath], baselineEventID: 42))
+    }
+
+    @Test("FSEvent reconciliation scopes removed files to parent folders")
+    func fseventReconciliationScopesRemovedFilesToParentFolders() async {
+        let root = URL(fileURLWithPath: "/tmp/allthethings/root-a", isDirectory: true)
+        let folder = root.appendingPathComponent("Project", isDirectory: true)
+        let changedPath = folder.appendingPathComponent("deleted.txt").path
+        let store = memoryCursorStore()
+        store.markBaseline(for: [root.path], eventID: 40)
+        let source = FakeHistoryReplaySource(
+            events: [
+                FileSystemEvent(
+                    path: changedPath,
+                    flags: FSEventStreamEventFlags(kFSEventStreamEventFlagItemRemoved),
+                    eventID: 41
+                ),
+                FileSystemEvent(
+                    path: root.path,
+                    flags: FSEventStreamEventFlags(kFSEventStreamEventFlagHistoryDone),
+                    eventID: 42
+                )
+            ],
+            completion: .completed
+        )
+        let coordinator = FSEventReconciliationCoordinator(
+            cursorStore: store,
+            replaySource: source,
+            currentEventID: { 42 }
+        )
+
+        let action = await actionFromCoordinator(coordinator, roots: [root])
         #expect(action == .reconcile(paths: [folder.path], baselineEventID: 42))
     }
 
@@ -257,7 +289,7 @@ struct FileSystemWatcherTests {
         )
 
         let action = await actionFromCoordinator(coordinator, roots: [root])
-        #expect(action == .reconcile(paths: [gitDirectory.path], baselineEventID: 42))
+        #expect(action == .reconcile(paths: [gitDirectory.appendingPathComponent("config").path], baselineEventID: 42))
     }
 
     @Test("live FSEvents drop excluded paths before update queuing")
