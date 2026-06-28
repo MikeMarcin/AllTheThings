@@ -907,6 +907,54 @@ struct FileIndexTests {
         }
     }
 
+    @Test("large directory reconciliation publishes unoptimized overlay before compaction")
+    func largeDirectoryReconciliationPublishesUnoptimizedOverlayBeforeCompaction() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        let folder = root.appendingPathComponent("Folder", isDirectory: true)
+        try fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        let index = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false,
+            largeOverlayPersistRecordLimit: 0,
+            largeOverlayPersistDelay: 0.2
+        )
+        index.replaceRootsAndRebuild([root])
+        try await waitUntil {
+            let diagnostics = index.currentDiagnostics()
+            return !index.currentStats().isIndexing
+                && diagnostics.recordStoreKind == .mapped
+                && diagnostics.optimizedCount == diagnostics.indexedCount
+        }
+
+        let before = index.currentDiagnostics()
+        let createdFile = folder.appendingPathComponent("CreatedDuringCatchup.swift")
+        try "created".write(to: createdFile, atomically: true, encoding: .utf8)
+        index.update(paths: [folder.path])
+
+        try await waitUntil(timeout: .seconds(5)) {
+            let diagnostics = index.currentDiagnostics()
+            return diagnostics.completedRefreshBatches > before.completedRefreshBatches
+                && diagnostics.recordStoreKind == .overlay
+                && diagnostics.overlayCount > 0
+                && diagnostics.optimizedCount == 0
+        }
+        let overlayRevision = index.currentDiagnostics().snapshotRevision
+
+        try await waitUntil(timeout: .seconds(10)) {
+            let diagnostics = index.currentDiagnostics()
+            return diagnostics.snapshotRevision > overlayRevision
+                && diagnostics.recordStoreKind == .mapped
+                && diagnostics.overlayCount == 0
+                && diagnostics.optimizedCount == diagnostics.indexedCount
+        }
+    }
+
     @Test("queued refreshes continue draining after the maximum batch")
     func queuedRefreshesContinueDrainingAfterMaximumBatch() async throws {
         let fileManager = FileManager.default
@@ -943,6 +991,25 @@ struct FileIndexTests {
             return diagnostics.completedRefreshBatches >= beforeDiagnostics.completedRefreshBatches + 2
                 && response.totalMatches == fileCount
         }
+    }
+
+    @Test("large overlay drain pruning removes children under reconciled prefixes")
+    func largeOverlayDrainPruningRemovesChildrenUnderReconciledPrefixes() {
+        let folder = "/tmp/allthethings/Root/Folder"
+        let pending: Set<String> = [
+            folder,
+            "\(folder)/Child.swift",
+            "\(folder)/Nested/Grandchild.swift",
+            "/tmp/allthethings/Root/Folderish/Child.swift",
+            "/tmp/allthethings/Root/Sibling.swift"
+        ]
+
+        let pruned = FileIndex.prunedPendingRefreshPathsForTesting(pending, coveredBy: [folder])
+
+        #expect(pruned == [
+            "/tmp/allthethings/Root/Folderish/Child.swift",
+            "/tmp/allthethings/Root/Sibling.swift"
+        ])
     }
 
     @Test("update applies optimized overlay so log and log.rb searches stay indexed")
@@ -1211,6 +1278,52 @@ struct FileIndexTests {
         #expect(secondResponse.totalMatches == recordCount)
         #expect(secondResponse.results.map(\.record.name) == expectedNames)
         #expect(secondResponse.executionProfile.scannedRowCount <= 10)
+    }
+
+    @Test("degraded active search scans bounded rows and optimized search returns rich totals")
+    func degradedActiveSearchScansBoundedRowsAndOptimizedSearchReturnsRichTotals() {
+        let recordCount = 30_000
+        var records = (0..<recordCount).map { index in
+            makeRecord(path: String(format: "/tmp/att-degraded-search/File%06d.txt", index))
+        }
+        let earlyNeedle = "/tmp/att-degraded-search/NeedleEarly.swift"
+        let lateNeedle = "/tmp/att-degraded-search/NeedleLate.swift"
+        records[100] = makeRecord(path: earlyNeedle)
+        records[26_000] = makeRecord(path: lateNeedle)
+
+        let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)", loadsSnapshotImmediately: false)
+        defer {
+            try? FileManager.default.removeItem(at: index.dataDirectoryURL)
+        }
+        index.replaceRecordsForTesting(
+            records,
+            buildsSearchStructures: false,
+            phase: .ready,
+            prefersDegradedSearch: true
+        )
+
+        let degraded = index.search(SearchRequest(
+            query: "Needle",
+            sort: SortSpec(column: .relevance, ascending: false),
+            mode: .interactivePreview
+        ), maxResults: 10)
+
+        #expect(degraded.results.map(\.record.path) == [earlyNeedle])
+        #expect(degraded.totalMatches == 1)
+        #expect(degraded.executionProfile.scannedRowCount == 25_000)
+        #expect(degraded.executionProfile.scannedRowCount < recordCount)
+        #expect(!degraded.executionProfile.didFallbackToFullScan)
+
+        index.replaceRecordsForTesting(records, buildsSearchStructures: true, phase: .ready)
+        let optimized = index.search(SearchRequest(
+            query: ".swift",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10)
+
+        #expect(optimized.totalMatches == 2)
+        #expect(Set(optimized.results.map(\.record.path)) == [earlyNeedle, lateNeedle])
+        #expect(!optimized.executionProfile.didFallbackToFullScan)
+        #expect(optimized.executionProfile.scannedRowCount < recordCount)
     }
 
     @Test("search can hide hidden files")

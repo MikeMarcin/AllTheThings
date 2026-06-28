@@ -119,6 +119,32 @@ struct FileIndexInsightsTests {
         #expect(childInsight.indexedContentBytes >= 5)
     }
 
+    @Test("root attribution matcher preserves nested roots and persisted schema")
+    func rootAttributionMatcherPreservesNestedRootsAndPersistedSchema() throws {
+        let root = "/tmp/allthethings-root-attribution"
+        let childRoot = "\(root)/App"
+        let records = [
+            RootAttributionInput(path: "\(root)/ParentOnly.txt", isResultRow: true, isDirectory: false, isHidden: false, sizeBytes: 12),
+            RootAttributionInput(path: "\(childRoot)/ChildOnly.txt", isResultRow: true, isDirectory: false, isHidden: false, sizeBytes: 34)
+        ]
+
+        let result = try RootAttributionTable.build(roots: [root, childRoot], rowCount: records.count) { index in
+            records[index]
+        }
+
+        #expect(result.rootIDs == [0, 1])
+        #expect(result.table.rootID(forNormalizedPath: "\(root)/ParentOnly.txt") == 0)
+        #expect(result.table.rootID(forNormalizedPath: "\(childRoot)/Nested/ChildOnly.txt") == 1)
+        #expect(result.table.rootID(forNormalizedPath: "\(root)-sibling/Other.txt") == nil)
+
+        let data = try JSONEncoder().encode(result.table)
+        let json = try #require(String(data: data, encoding: .utf8))
+        #expect(json.contains("\"schemaVersion\""))
+        #expect(json.contains("\"roots\""))
+        #expect(!json.contains("matcher"))
+        #expect(try JSONDecoder().decode(RootAttributionTable.self, from: data) == result.table)
+    }
+
     @Test("root attribution rejects more roots than fit in UInt16")
     func rootAttributionRejectsMoreRootsThanFitInUInt16() throws {
         let roots = (0...FileIndex.maximumIndexedRootCount).map { "/tmp/allthethings-root-\($0)" }
@@ -461,7 +487,7 @@ struct FileIndexInsightsTests {
     }
 
     private func waitUntil(
-        timeout: Duration = .seconds(5),
+        timeout: Duration = .seconds(30),
         pollInterval: Duration = .milliseconds(25),
         _ condition: () -> Bool
     ) async throws {

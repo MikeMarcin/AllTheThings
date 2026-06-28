@@ -88,8 +88,25 @@ struct RootAttributionTable: Codable, Equatable, Sendable {
     }
 
     func rootID(for path: String) -> UInt16? {
-        let normalizedPath = Self.normalizedPath(path)
-        return Self.ownerID(for: normalizedPath, matchers: rootsBySpecificity())
+        rootID(forNormalizedPath: Self.normalizedPath(path))
+    }
+
+    func rootID(forNormalizedPath path: String) -> UInt16? {
+        var selected: RootAttributionSummary?
+        for summary in roots where RootAttributionMatcher.matches(path: path, rootPath: summary.path) {
+            guard let current = selected else {
+                selected = summary
+                continue
+            }
+            if summary.path.count > current.path.count || (summary.path.count == current.path.count && summary.id < current.id) {
+                selected = summary
+            }
+        }
+        return selected?.id
+    }
+
+    func makeMatcher() -> RootAttributionMatcher {
+        RootAttributionMatcher(summaries: roots)
     }
 
     mutating func add(_ input: RootAttributionInput, to rootID: UInt16) {
@@ -145,17 +162,14 @@ struct RootAttributionTable: Codable, Equatable, Sendable {
         var summaries = normalizedRoots.enumerated().map { index, path in
             RootAttributionSummary(id: UInt16(index), path: path)
         }
-        let matchers = summaries.sorted {
-            if $0.path.count != $1.path.count { return $0.path.count > $1.path.count }
-            return $0.id < $1.id
-        }
+        let matcher = RootAttributionMatcher(summaries: summaries)
 
         var rowRootIDs: [UInt16] = []
         rowRootIDs.reserveCapacity(rowCount)
 
         for rowID in 0..<rowCount {
             let input = inputAt(rowID)
-            let ownerID = ownerID(for: input.path, matchers: matchers) ?? unassignedRootID
+            let ownerID = matcher.rootID(forNormalizedPath: input.path) ?? unassignedRootID
             rowRootIDs.append(ownerID)
             guard ownerID != unassignedRootID, input.isResultRow else { continue }
             summaries[Int(ownerID)].apply(input)
@@ -181,24 +195,33 @@ struct RootAttributionTable: Codable, Equatable, Sendable {
         return result
     }
 
-    private func rootsBySpecificity() -> [RootAttributionSummary] {
-        roots.sorted {
+    private static func normalizedPath(_ path: String) -> String {
+        let standardized = (path as NSString).standardizingPath
+        guard !standardized.isEmpty, standardized != "." else { return "" }
+        guard standardized.hasPrefix("/") else { return "/" + standardized }
+        return standardized
+    }
+}
+
+struct RootAttributionMatcher: Sendable {
+    private let matchers: [RootAttributionSummary]
+
+    init(summaries: [RootAttributionSummary]) {
+        self.matchers = summaries.sorted {
             if $0.path.count != $1.path.count { return $0.path.count > $1.path.count }
             return $0.id < $1.id
         }
     }
 
-    private static func ownerID(for path: String, matchers: [RootAttributionSummary]) -> UInt16? {
-        matchers.first { summary in
-            if summary.path == "/" {
-                return path == "/" || path.hasPrefix("/")
-            }
-            return path == summary.path || path.hasPrefix(summary.path + "/")
-        }?.id
+    func rootID(forNormalizedPath path: String) -> UInt16? {
+        matchers.first { Self.matches(path: path, rootPath: $0.path) }?.id
     }
 
-    private static func normalizedPath(_ path: String) -> String {
-        URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL.path
+    static func matches(path: String, rootPath: String) -> Bool {
+        if rootPath == "/" {
+            return path == "/" || path.hasPrefix("/")
+        }
+        return path == rootPath || path.hasPrefix(rootPath + "/")
     }
 }
 
@@ -592,6 +615,7 @@ final class OverlayRecordStore: RecordStore {
     private let pathToOverlay: [String: Int]
     private let resultCount: Int
     private let rootAttribution: RootAttributionTable?
+    private let rootAttributionMatcher: RootAttributionMatcher?
 
     var count: Int { visibleBaseRows.count + upserts.count }
     var mappedByteSize: Int { base.mappedByteSize }
@@ -611,7 +635,9 @@ final class OverlayRecordStore: RecordStore {
         let baseResultCount = base.storedResultCount ?? (0..<base.count).filter { base.isResultRow(at: $0) }.count
         let deletedResultCount = deletedRows.filter { base.isResultRow(at: $0) }.count
         self.resultCount = max(0, baseResultCount - deletedResultCount) + upserts.count
-        self.rootAttribution = Self.adjustedRootAttribution(base: base, upserts: upserts, deletedRows: deletedRows)
+        let rootAttribution = Self.adjustedRootAttribution(base: base, upserts: upserts, deletedRows: deletedRows)
+        self.rootAttribution = rootAttribution
+        self.rootAttributionMatcher = rootAttribution?.makeMatcher()
     }
 
     func record(at index: Int) -> FileRecord {
@@ -742,8 +768,8 @@ final class OverlayRecordStore: RecordStore {
         if index < visibleBaseRows.count {
             return base.rootID(at: visibleBaseRows[index])
         }
-        guard let rootAttribution else { return nil }
-        return rootAttribution.rootID(for: upserts[index - visibleBaseRows.count].path)
+        guard let rootAttributionMatcher else { return nil }
+        return rootAttributionMatcher.rootID(forNormalizedPath: upserts[index - visibleBaseRows.count].path)
     }
 
     func rootPath(at index: Int) -> String? {
@@ -806,8 +832,9 @@ final class OverlayRecordStore: RecordStore {
             )
         }
 
+        let matcher = table.makeMatcher()
         for record in upserts {
-            guard let rootID = table.rootID(for: record.path) else { continue }
+            guard let rootID = matcher.rootID(forNormalizedPath: record.path) else { continue }
             table.add(
                 RootAttributionInput(
                     path: record.path,

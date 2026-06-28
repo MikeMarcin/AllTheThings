@@ -541,6 +541,9 @@ public final class FileIndex: @unchecked Sendable {
     private static let defaultDeferredOptimizationRecordThreshold = 10_000
     private static let exactEmptyQuerySortLimit = 100_000
     private static let largeOverlayPersistDefaultDelay: TimeInterval = 30
+    private static let largeOverlayChangedPathDefaultThreshold = 10_000
+    private static let largeOverlayDrainBackoffDefaultDelay: TimeInterval = 5
+    private static let degradedSearchMaximumScanLimit = 25_000
     public static let maximumIndexedRootCount = RootAttributionTable.maximumRootCount
     private static let memoryTelemetrySinkForTesting = MemoryTelemetrySinkBox()
 
@@ -777,6 +780,22 @@ public final class FileIndex: @unchecked Sendable {
             self.score = score
             self.match = match
         }
+    }
+
+    private struct RefreshUpdateResult {
+        let applied: Bool
+        let largeOverlay: Bool
+        let batchPathCount: Int
+        let changedPathCount: Int
+        let reconciledDirectoryPrefixes: [String]
+
+        static let none = RefreshUpdateResult(
+            applied: false,
+            largeOverlay: false,
+            batchPathCount: 0,
+            changedPathCount: 0,
+            reconciledDirectoryPrefixes: []
+        )
     }
 
     private struct RowInterval {
@@ -1144,6 +1163,7 @@ public final class FileIndex: @unchecked Sendable {
         private let childLinks: ChildLinks?
         let visibleCount: Int?
         let hasSortedOrder: Bool
+        let prefersDegradedSearch: Bool
         let diagnostics: SearchStructureDiagnostics
 
         private struct ChildLinks {
@@ -1192,9 +1212,11 @@ public final class FileIndex: @unchecked Sendable {
             records: [FileRecord],
             roots: [String] = [],
             buildsSearchStructures: Bool = true,
-            buildsPathGramIndex: Bool = true
+            buildsPathGramIndex: Bool = true,
+            prefersDegradedSearch: Bool = false
         ) {
             self.store = HeapPagedRecordStore(records: records, roots: roots)
+            self.prefersDegradedSearch = prefersDegradedSearch
             if buildsSearchStructures {
                 let buildsPathGramIndex = buildsPathGramIndex && FileIndex.shouldBuildPathGramIndex(records: records)
                 self.gramIndex = buildsPathGramIndex ? Self.makePathGramIndex(store: store) : nil
@@ -1260,8 +1282,14 @@ public final class FileIndex: @unchecked Sendable {
             }
         }
 
-        init(store: RecordStore, buildsSearchStructures: Bool = true, buildsPathGramIndex: Bool = true) {
+        init(
+            store: RecordStore,
+            buildsSearchStructures: Bool = true,
+            buildsPathGramIndex: Bool = true,
+            prefersDegradedSearch: Bool = false
+        ) {
             self.store = store
+            self.prefersDegradedSearch = prefersDegradedSearch
             if buildsSearchStructures {
                 let buildsPathGramIndex = buildsPathGramIndex && FileIndex.shouldBuildPathGramIndex(store: store)
                 self.gramIndex = buildsPathGramIndex ? Self.makePathGramIndex(store: store) : nil
@@ -1329,6 +1357,7 @@ public final class FileIndex: @unchecked Sendable {
 
         init(store: RecordStore, persistedStructures: PersistedSearchStructures) {
             self.store = store
+            self.prefersDegradedSearch = false
             self.gramIndex = persistedStructures.pathGramIndex
             self.pathGramShards = []
             self.pathGramExpectedRowCount = persistedStructures.pathGramIndex == nil ? 0 : store.count
@@ -1393,9 +1422,11 @@ public final class FileIndex: @unchecked Sendable {
             nameAscending: [Int]? = nil,
             nameDescending: [Int]? = nil,
             visibleCount: Int?,
-            hasSortedOrder: Bool
+            hasSortedOrder: Bool,
+            prefersDegradedSearch: Bool = false
         ) {
             self.store = store
+            self.prefersDegradedSearch = prefersDegradedSearch
             self.modifiedDescending = modifiedDescending
             self.modifiedAscending = Array(modifiedDescending.reversed())
             let expectedNameOrderCount = store.storedResultCount ?? store.count
@@ -1483,7 +1514,8 @@ public final class FileIndex: @unchecked Sendable {
                 nameAscending: nameAscending,
                 nameDescending: nameDescending,
                 visibleCount: Self.makeVisibleCount(store: updatedStore),
-                hasSortedOrder: true
+                hasSortedOrder: true,
+                prefersDegradedSearch: prefersDegradedSearch
             )
         }
 
@@ -1512,7 +1544,8 @@ public final class FileIndex: @unchecked Sendable {
                 nameAscending: nameAscending,
                 nameDescending: nameDescending,
                 visibleCount: visibleCount,
-                hasSortedOrder: hasSortedOrder
+                hasSortedOrder: hasSortedOrder,
+                prefersDegradedSearch: prefersDegradedSearch
             )
         }
 
@@ -1532,7 +1565,8 @@ public final class FileIndex: @unchecked Sendable {
                 nameAscending: nameAscending,
                 nameDescending: nameDescending,
                 visibleCount: visibleCount ?? extensionData.visibleCount,
-                hasSortedOrder: hasSortedOrder
+                hasSortedOrder: hasSortedOrder,
+                prefersDegradedSearch: prefersDegradedSearch
             )
         }
 
@@ -1551,7 +1585,8 @@ public final class FileIndex: @unchecked Sendable {
                 nameAscending: nameAscending,
                 nameDescending: nameDescending,
                 visibleCount: visibleCount,
-                hasSortedOrder: true
+                hasSortedOrder: true,
+                prefersDegradedSearch: prefersDegradedSearch
             )
         }
 
@@ -1568,7 +1603,8 @@ public final class FileIndex: @unchecked Sendable {
                 extensionIndex: extensionIndex,
                 childLinks: childLinks,
                 visibleCount: visibleCount,
-                hasSortedOrder: hasSortedOrder
+                hasSortedOrder: hasSortedOrder,
+                prefersDegradedSearch: prefersDegradedSearch
             )
         }
 
@@ -1590,7 +1626,8 @@ public final class FileIndex: @unchecked Sendable {
                 nameAscending: nameAscending,
                 nameDescending: nameDescending,
                 visibleCount: visibleCount,
-                hasSortedOrder: hasSortedOrder
+                hasSortedOrder: hasSortedOrder,
+                prefersDegradedSearch: prefersDegradedSearch
             )
         }
 
@@ -1632,7 +1669,8 @@ public final class FileIndex: @unchecked Sendable {
                 nameAscending: nameAscending,
                 nameDescending: nameDescending,
                 visibleCount: visibleCount,
-                hasSortedOrder: hasSortedOrder
+                hasSortedOrder: hasSortedOrder,
+                prefersDegradedSearch: prefersDegradedSearch
             )
         }
 
@@ -1651,7 +1689,8 @@ public final class FileIndex: @unchecked Sendable {
                 nameAscending: nameAscending,
                 nameDescending: nameDescending,
                 visibleCount: visibleCount,
-                hasSortedOrder: hasSortedOrder
+                hasSortedOrder: hasSortedOrder,
+                prefersDegradedSearch: prefersDegradedSearch
             )
         }
 
@@ -1670,7 +1709,8 @@ public final class FileIndex: @unchecked Sendable {
                 nameAscending: nameAscending,
                 nameDescending: nameDescending,
                 visibleCount: visibleCount,
-                hasSortedOrder: hasSortedOrder
+                hasSortedOrder: hasSortedOrder,
+                prefersDegradedSearch: prefersDegradedSearch
             )
         }
 
@@ -1689,7 +1729,8 @@ public final class FileIndex: @unchecked Sendable {
                 nameAscending: nameAscending,
                 nameDescending: nameDescending,
                 visibleCount: visibleCount,
-                hasSortedOrder: hasSortedOrder
+                hasSortedOrder: hasSortedOrder,
+                prefersDegradedSearch: prefersDegradedSearch
             )
         }
 
@@ -2631,6 +2672,8 @@ public final class FileIndex: @unchecked Sendable {
     private let storageInsightsLock = NSLock()
     private var largeOverlayPersistRecordLimitOverride: Int?
     private var largeOverlayPersistDelayOverride: TimeInterval?
+    private var largeOverlayChangedPathThresholdOverride: Int?
+    private var largeOverlayDrainBackoffDelayOverride: TimeInterval?
     private var checkpointWriteInFlight = false
     private var cachedStorageInsights: IndexStorageInsights?
     private var storageInsightsRefreshInFlight = false
@@ -2690,6 +2733,8 @@ public final class FileIndex: @unchecked Sendable {
         self.exclusionRules = FileExclusionRules(patterns: exclusionPatterns)
         self.largeOverlayPersistRecordLimitOverride = nil
         self.largeOverlayPersistDelayOverride = nil
+        self.largeOverlayChangedPathThresholdOverride = nil
+        self.largeOverlayDrainBackoffDelayOverride = nil
 
         let supportRoot = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
@@ -2722,7 +2767,9 @@ public final class FileIndex: @unchecked Sendable {
         loadsSnapshotImmediately: Bool = false,
         exclusionPatterns: [String] = FileExclusionRules.defaultPatterns,
         largeOverlayPersistRecordLimit: Int?,
-        largeOverlayPersistDelay: TimeInterval?
+        largeOverlayPersistDelay: TimeInterval?,
+        largeOverlayChangedPathThreshold: Int? = nil,
+        largeOverlayDrainBackoffDelay: TimeInterval? = nil
     ) {
         precondition(!loadsSnapshotImmediately, "Large overlay persist overrides are only for deferred-load test indexes.")
         self.init(
@@ -2733,6 +2780,8 @@ public final class FileIndex: @unchecked Sendable {
         )
         self.largeOverlayPersistRecordLimitOverride = largeOverlayPersistRecordLimit.map { max(0, $0) }
         self.largeOverlayPersistDelayOverride = largeOverlayPersistDelay.map { max(0, $0) }
+        self.largeOverlayChangedPathThresholdOverride = largeOverlayChangedPathThreshold.map { max(0, $0) }
+        self.largeOverlayDrainBackoffDelayOverride = largeOverlayDrainBackoffDelay.map { max(0, $0) }
     }
 
     public func currentStats() -> IndexStats {
@@ -3215,6 +3264,10 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
+    private static func shouldUseDegradedSearch(snapshot: SearchSnapshot, isRefreshActive: Bool) -> Bool {
+        snapshot.prefersDegradedSearch || isRefreshActive
+    }
+
     public func search(
         _ request: SearchRequest,
         maxResults: Int = 2_000,
@@ -3241,7 +3294,8 @@ public final class FileIndex: @unchecked Sendable {
             (
                 snapshot: searchSnapshot,
                 revision: searchSnapshotRevision,
-                canPromoteSortedOrder: !indexing && !reconciling && !updating
+                canPromoteSortedOrder: !indexing && !reconciling && !updating && !isRefreshDrainScheduled && pendingRefreshPaths.isEmpty,
+                isRefreshActive: reconciling || updating || isRefreshDrainScheduled || !pendingRefreshPaths.isEmpty
             )
         }
         var snapshot = snapshotData.snapshot
@@ -3252,13 +3306,17 @@ public final class FileIndex: @unchecked Sendable {
         let trimmedQuery = request.query.trimmingCharacters(in: .whitespacesAndNewlines)
         let parsedQuery = FuzzyMatcher.parse(trimmedQuery)
         let boundedMaxResults = max(maxResults, 0)
+        let usesDegradedSearch = Self.shouldUseDegradedSearch(
+            snapshot: snapshot,
+            isRefreshActive: snapshotData.isRefreshActive
+        )
 
         if Self.shouldPromoteSortedOrderForEmptyQuery(
             snapshot: snapshot,
             request: request,
             parsedQuery: parsedQuery,
             maxResults: boundedMaxResults,
-            canPromoteSortedOrder: snapshotData.canPromoteSortedOrder
+            canPromoteSortedOrder: snapshotData.canPromoteSortedOrder && !usesDegradedSearch
         ) {
             let promotedSnapshot = request.sort.column == .name
                 ? snapshot.addingModifiedSortOrder()
@@ -3407,6 +3465,32 @@ public final class FileIndex: @unchecked Sendable {
                 }
             }
         } else {
+            if usesDegradedSearch, !snapshot.isOptimizedForSearch {
+                if let indexedResponse = Self.indexedCandidateSearch(
+                    snapshot: snapshot,
+                    request: request,
+                    parsedQuery: parsedQuery,
+                    maxResults: boundedMaxResults,
+                    started: started,
+                    snapshotRevision: snapshotRevision,
+                    shouldCancel: shouldCancel
+                ) {
+                    return finish(indexedResponse)
+                }
+
+                if let degradedResponse = Self.degradedSearch(
+                    snapshot: snapshot,
+                    request: request,
+                    parsedQuery: parsedQuery,
+                    maxResults: boundedMaxResults,
+                    started: started,
+                    snapshotRevision: snapshotRevision,
+                    shouldCancel: shouldCancel
+                ) {
+                    return finish(degradedResponse)
+                }
+            }
+
             if let fastResponse = Self.fastModifiedInteractivePreviewSearch(
                 snapshot: snapshot,
                 request: request,
@@ -3527,6 +3611,18 @@ public final class FileIndex: @unchecked Sendable {
                 return finish(indexedResponse)
             }
 
+            if usesDegradedSearch, let degradedResponse = Self.degradedSearch(
+                snapshot: snapshot,
+                request: request,
+                parsedQuery: parsedQuery,
+                maxResults: boundedMaxResults,
+                started: started,
+                snapshotRevision: snapshotRevision,
+                shouldCancel: shouldCancel
+            ) {
+                return finish(degradedResponse)
+            }
+
             lock.withLock {
                 fallbackScanCount &+= 1
                 scannedRowCount &+= UInt64(snapshot.count)
@@ -3578,6 +3674,213 @@ public final class FileIndex: @unchecked Sendable {
             usesIndexedCandidates: parsedQuery.isEmpty,
             executionProfile: profile
         ))
+    }
+
+    private static func degradedSearch(
+        snapshot: SearchSnapshot,
+        request: SearchRequest,
+        parsedQuery: FuzzyMatcher.ParsedQuery,
+        maxResults: Int,
+        started: Date,
+        snapshotRevision: UInt64,
+        shouldCancel: @Sendable () -> Bool
+    ) -> SearchResponse? {
+        let scanLimit = min(snapshot.count, Self.degradedSearchMaximumScanLimit)
+        var matches: [SearchMatch] = []
+        matches.reserveCapacity(min(scanLimit, maxResults))
+        let trimThreshold = maxResults > 0 ? maxResults * 5 : 0
+        var total = 0
+        var scannedRows = 0
+        var pathContainsCache: [Int: Bool] = [:]
+
+        func sortAndLimitMatches() {
+            guard maxResults > 0 else { return }
+            matches.sort {
+                Self.compare($0, $1, snapshot: snapshot, sort: request.sort, queryIsEmpty: false)
+            }
+            if matches.count > maxResults {
+                matches.removeSubrange(maxResults..<matches.count)
+            }
+        }
+
+        for rowID in 0..<scanLimit {
+            if rowID.isMultiple(of: 64), shouldCancel() {
+                return nil
+            }
+
+            scannedRows += 1
+            guard snapshot.store.isResultRow(at: rowID) else { continue }
+            guard request.includeHidden || snapshot.isVisible(at: rowID) else { continue }
+            guard let explanation = cheapDegradedExplanation(
+                snapshot: snapshot,
+                rowID: rowID,
+                parsedQuery: parsedQuery,
+                pathContainsCache: &pathContainsCache
+            ) else {
+                continue
+            }
+
+            total += 1
+            guard maxResults > 0 else { continue }
+            matches.append(SearchMatch(rowID: rowID, score: explanation.score, match: explanation))
+            if matches.count > trimThreshold {
+                sortAndLimitMatches()
+            }
+        }
+
+        guard !shouldCancel() else { return nil }
+        sortAndLimitMatches()
+
+        let elapsed = Date().timeIntervalSince(started)
+        return SearchResponse(
+            results: materialize(matches, from: snapshot),
+            totalMatches: total,
+            elapsed: elapsed,
+            snapshotRevision: snapshotRevision,
+            usesIndexedCandidates: false,
+            executionProfile: SearchExecutionProfile(
+                executionPath: .fullFallbackScan,
+                candidateCount: scanLimit,
+                scannedRowCount: scannedRows,
+                didFallbackToFullScan: false,
+                elapsed: elapsed
+            )
+        )
+    }
+
+    private static func cheapDegradedExplanation(
+        snapshot: SearchSnapshot,
+        rowID: Int,
+        parsedQuery: FuzzyMatcher.ParsedQuery,
+        pathContainsCache: inout [Int: Bool]
+    ) -> MatchExplanation? {
+        guard !parsedQuery.isEmpty else { return nil }
+
+        for negative in parsedQuery.negative {
+            if cheapDegradedExplanation(
+                snapshot: snapshot,
+                rowID: rowID,
+                clause: negative,
+                pathContainsCache: &pathContainsCache
+            ) != nil {
+                return nil
+            }
+        }
+
+        var totalScore = 0
+        var spans: [MatchSpan] = []
+        var best: MatchExplanation?
+        for clause in parsedQuery.positive {
+            guard let explanation = cheapDegradedExplanation(
+                snapshot: snapshot,
+                rowID: rowID,
+                clause: clause,
+                pathContainsCache: &pathContainsCache
+            ) else {
+                return nil
+            }
+            totalScore += explanation.score
+            spans.append(contentsOf: explanation.spans)
+            if best == nil
+                || explanation.quality > best!.quality
+                || (explanation.quality == best!.quality && explanation.score > best!.score) {
+                best = explanation
+            }
+        }
+
+        guard let best else { return nil }
+        let depthPenalty = min(snapshot.store.path(at: rowID).filter { $0 == "/" }.count * 4, 120)
+        let hiddenPenalty = snapshot.store.isHidden(at: rowID) ? 35 : 0
+        let finalScore = totalScore - depthPenalty - hiddenPenalty
+        return MatchExplanation(
+            matchClass: best.matchClass,
+            score: finalScore,
+            field: best.field,
+            reason: parsedQuery.positive.count == 1 ? best.reason : "Matched all query terms",
+            spans: spans
+        )
+    }
+
+    private static func cheapDegradedExplanation(
+        snapshot: SearchSnapshot,
+        rowID: Int,
+        clause: FuzzyMatcher.QueryClause,
+        pathContainsCache: inout [Int: Bool]
+    ) -> MatchExplanation? {
+        var best: MatchExplanation?
+        for alternative in clause.alternatives {
+            guard let explanation = cheapDegradedExplanation(
+                snapshot: snapshot,
+                rowID: rowID,
+                part: alternative,
+                pathContainsCache: &pathContainsCache
+            ) else {
+                continue
+            }
+            if best == nil
+                || explanation.quality > best!.quality
+                || (explanation.quality == best!.quality && explanation.score > best!.score) {
+                best = explanation
+            }
+        }
+        return best
+    }
+
+    private static func cheapDegradedExplanation(
+        snapshot: SearchSnapshot,
+        rowID: Int,
+        part: FuzzyMatcher.QueryPart,
+        pathContainsCache: inout [Int: Bool]
+    ) -> MatchExplanation? {
+        switch part {
+        case .text(let field, let pattern, let mode):
+            let token = mode == .wildcard ? cheapWildcardLiteralToken(pattern.token) : pattern.token
+            guard !token.isEmpty else { return nil }
+            if field != .path,
+               let nameExplanation = cheapLiteralNameExplanation(
+                   snapshot: snapshot,
+                   rowID: rowID,
+                   token: token,
+                   mode: mode
+               ) {
+                return nameExplanation
+            }
+            if field != .name,
+               snapshot.store.normalizedPath(at: rowID, contains: token, cache: &pathContainsCache) {
+                return cheapIndexedPathExplanation(
+                    snapshot: snapshot,
+                    rowID: rowID,
+                    token: token,
+                    mode: mode
+                )
+            }
+            return nil
+        case .fileExtension(let pattern, let mode):
+            return FuzzyMatcher.extensionExplanation(
+                snapshot.store.fileExtension(at: rowID),
+                pattern: pattern,
+                mode: mode
+            )
+        case .kind(let token):
+            guard !token.isEmpty else { return nil }
+            let values: [String]
+            if snapshot.store.isDirectory(at: rowID), snapshot.store.fileExtension(at: rowID) == "app" {
+                values = ["app", "application", "folder", "directory", "dir"]
+            } else {
+                values = snapshot.store.isDirectory(at: rowID) ? ["folder", "directory", "dir"] : ["file"]
+            }
+            guard values.contains(where: { $0.hasPrefix(token) }) else { return nil }
+            return MatchExplanation(
+                matchClass: .metadata,
+                score: 4_400,
+                field: .kind,
+                reason: "Kind matched \"\(token)\""
+            )
+        }
+    }
+
+    private static func cheapWildcardLiteralToken(_ token: String) -> String {
+        token.filter { $0 != "*" && $0 != "?" && $0 != "[" && $0 != "]" && $0 != "!" && $0 != "^" }
     }
 
     private static func materialize(_ matches: [SearchMatch], from snapshot: SearchSnapshot) -> [SearchResult] {
@@ -4263,7 +4566,8 @@ public final class FileIndex: @unchecked Sendable {
             }
         }
 
-        if heap.count < maxResults, field != .name {
+        let shouldAppendWeakPathMatches = heap.isEmpty || heap.contains { snapshot.store.isDirectory(at: $0.rowID) }
+        if heap.count < maxResults, field != .name, shouldAppendWeakPathMatches {
             let existingRows = Set(heap.map(\.rowID))
             if let appended = appendWeakPathPreviewCandidates(
                 snapshot: snapshot,
@@ -9183,8 +9487,19 @@ public final class FileIndex: @unchecked Sendable {
         largeOverlayPersistRecordLimitOverride ?? Self.configuredLargeOverlayPersistRecordLimit()
     }
 
-    private func largeOverlayPersistDelay() -> TimeInterval {
-        largeOverlayPersistDelayOverride ?? Self.configuredLargeOverlayPersistDelay()
+    private func largeOverlayPersistDelay(immediateLargeOverlay: Bool = false) -> TimeInterval {
+        if let largeOverlayPersistDelayOverride {
+            return largeOverlayPersistDelayOverride
+        }
+        return immediateLargeOverlay ? 0 : Self.configuredLargeOverlayPersistDelay()
+    }
+
+    private func largeOverlayChangedPathThreshold() -> Int {
+        largeOverlayChangedPathThresholdOverride ?? Self.largeOverlayChangedPathDefaultThreshold
+    }
+
+    private func largeOverlayDrainBackoffDelay() -> TimeInterval {
+        largeOverlayDrainBackoffDelayOverride ?? Self.largeOverlayDrainBackoffDefaultDelay
     }
 
     private func scheduleUpdateDrainIfNeeded(delay: DispatchTimeInterval) {
@@ -9256,6 +9571,7 @@ public final class FileIndex: @unchecked Sendable {
             return
         }
 
+        var updateResult = RefreshUpdateResult.none
         if !drain.paths.isEmpty {
             if drain.pendingPathCountAfterBatch > 0 {
                 DiagnosticLogger.shared.log(
@@ -9268,16 +9584,65 @@ public final class FileIndex: @unchecked Sendable {
                     ]
                 )
             }
-            updateNow(paths: drain.paths)
+            updateResult = updateNow(paths: drain.paths)
         }
 
-        let shouldContinue = lock.withLock { !pendingRefreshPaths.isEmpty }
-        if shouldContinue {
-            scheduleUpdateDrainIfNeeded(delay: .milliseconds(0))
+        if updateResult.largeOverlay, !updateResult.reconciledDirectoryPrefixes.isEmpty {
+            _ = prunePendingRefreshPaths(coveredBy: updateResult.reconciledDirectoryPrefixes)
+        }
+
+        let remainingPathCount = lock.withLock { pendingRefreshPaths.count }
+        if remainingPathCount > 0 {
+            let delay: DispatchTimeInterval
+            if updateResult.largeOverlay {
+                let backoff = largeOverlayDrainBackoffDelay()
+                DiagnosticLogger.shared.log(
+                    category: "index",
+                    event: "index.updateDrainBackoff",
+                    fields: [
+                        "batchPathCount": .publicInt(updateResult.batchPathCount),
+                        "remainingPathCount": .publicInt(remainingPathCount),
+                        "changedPathCount": .publicInt(updateResult.changedPathCount),
+                        "delaySeconds": .publicDouble(backoff)
+                    ]
+                )
+                delay = .milliseconds(Int((backoff * 1_000).rounded(.up)))
+            } else {
+                delay = .milliseconds(0)
+            }
+            scheduleUpdateDrainIfNeeded(delay: delay)
         }
     }
 
-    private func updateNow(paths: [String]) {
+    private func prunePendingRefreshPaths(coveredBy directoryPrefixes: [String]) -> Int {
+        return lock.withLock {
+            let before = pendingRefreshPaths.count
+            pendingRefreshPaths = Self.prunedPendingRefreshPaths(pendingRefreshPaths, coveredBy: directoryPrefixes)
+            if pendingRefreshPaths.isEmpty {
+                pendingRefreshPaths.removeAll(keepingCapacity: false)
+            }
+            return before - pendingRefreshPaths.count
+        }
+    }
+
+    static func prunedPendingRefreshPathsForTesting(_ paths: Set<String>, coveredBy directoryPrefixes: [String]) -> Set<String> {
+        prunedPendingRefreshPaths(paths, coveredBy: directoryPrefixes)
+    }
+
+    private static func prunedPendingRefreshPaths(_ paths: Set<String>, coveredBy directoryPrefixes: [String]) -> Set<String> {
+        let prefixes = directoryPrefixes
+            .filter { !$0.isEmpty }
+            .sorted { $0.count > $1.count }
+        guard !prefixes.isEmpty else { return paths }
+
+        return Set(paths.filter { path in
+            !prefixes.contains { prefix in
+                path == prefix || path.hasPrefix(prefix + "/")
+            }
+        })
+    }
+
+    private func updateNow(paths: [String]) -> RefreshUpdateResult {
         let updateStarted = Date()
         let updateContext = lock.withLock { () -> (generation: UInt64, preservedReadyStatus: String?)? in
             guard !indexing else { return nil }
@@ -9303,7 +9668,7 @@ public final class FileIndex: @unchecked Sendable {
                 pendingRefreshPaths.formUnion(paths)
             }
             scheduleUpdateDrainIfNeeded(delay: .milliseconds(0))
-            return
+            return .none
         }
         let currentGeneration = updateContext.generation
         recordScanFrontierMetrics(ScanFrontierMetrics(), generation: currentGeneration)
@@ -9429,7 +9794,7 @@ public final class FileIndex: @unchecked Sendable {
             }
         }
 
-        guard isCurrentGeneration(currentGeneration) else { return }
+        guard isCurrentGeneration(currentGeneration) else { return .none }
         guard !upserts.isEmpty || !deletedPrefixes.isEmpty else {
             let didApply = lock.withLock { () -> Bool in
                 guard generation == currentGeneration else { return false }
@@ -9448,7 +9813,7 @@ public final class FileIndex: @unchecked Sendable {
                 return true
             }
             if !didApply {
-                return
+                return .none
             }
             publishStats()
             MemoryTelemetry.log(
@@ -9465,7 +9830,13 @@ public final class FileIndex: @unchecked Sendable {
                     "durationSeconds": .publicDouble(Date().timeIntervalSince(updateStarted))
                 ]
             )
-            return
+            return RefreshUpdateResult(
+                applied: true,
+                largeOverlay: false,
+                batchPathCount: paths.count,
+                changedPathCount: 0,
+                reconciledDirectoryPrefixes: []
+            )
         }
 
         let previousSnapshot = lock.withLock { searchSnapshot }
@@ -9496,7 +9867,7 @@ public final class FileIndex: @unchecked Sendable {
                 return true
             }
             if !didApply {
-                return
+                return .none
             }
 
             publishStats()
@@ -9519,7 +9890,13 @@ public final class FileIndex: @unchecked Sendable {
                     "durationSeconds": .publicDouble(Date().timeIntervalSince(updateStarted))
                 ]
             )
-            return
+            return RefreshUpdateResult(
+                applied: true,
+                largeOverlay: false,
+                batchPathCount: paths.count,
+                changedPathCount: changedPathCount,
+                reconciledDirectoryPrefixes: reconciledDirectoryPrefixes
+            )
         }
 
         for prefix in reconciledDirectoryPrefixes {
@@ -9569,18 +9946,21 @@ public final class FileIndex: @unchecked Sendable {
             }
         }
 
+        let changedPathCount = upserts.count + deletedPrefixes.count
+        let isLargeOverlayUpdate = requiresDirectoryReconciliation
+            || changedPathCount > largeOverlayChangedPathThreshold()
         let overlayStore = OverlayRecordStore(
             base: previousSnapshot.store,
             upserts: Array(upserts.values),
             deletedRows: deletedRows
         )
-        let shouldOptimizeOverlay = previousSnapshot.isOptimizedForSearch
+        let shouldOptimizeOverlay = previousSnapshot.isOptimizedForSearch && !isLargeOverlayUpdate
         let snapshot = SearchSnapshot(
             store: overlayStore,
             buildsSearchStructures: shouldOptimizeOverlay,
-            buildsPathGramIndex: false
+            buildsPathGramIndex: false,
+            prefersDegradedSearch: isLargeOverlayUpdate && !shouldOptimizeOverlay
         )
-        let changedPathCount = upserts.count + deletedPrefixes.count
 
         let didApply = lock.withLock { () -> Bool in
             guard generation == currentGeneration else { return false }
@@ -9601,11 +9981,11 @@ public final class FileIndex: @unchecked Sendable {
             return true
         }
         if !didApply {
-            return
+            return .none
         }
 
         publishStats()
-        scheduleRefreshPersistIfReasonable(snapshot)
+        scheduleRefreshPersistIfReasonable(snapshot, immediateLargeOverlay: isLargeOverlayUpdate)
         MemoryTelemetry.log(
             "update.overlayApplied",
             records: RecordCollectionMetrics(recordCount: snapshot.count, totalPathBytes: 0, maxPathBytes: 0),
@@ -9624,8 +10004,17 @@ public final class FileIndex: @unchecked Sendable {
                 "changedPathCount": .publicInt(changedPathCount),
                 "recordCount": .publicInt(snapshot.resultCount),
                 "requiresDirectoryReconciliation": .publicBool(requiresDirectoryReconciliation),
+                "largeOverlay": .publicBool(isLargeOverlayUpdate),
+                "optimizedOverlay": .publicBool(snapshot.isOptimizedForSearch),
                 "durationSeconds": .publicDouble(Date().timeIntervalSince(updateStarted))
             ]
+        )
+        return RefreshUpdateResult(
+            applied: true,
+            largeOverlay: isLargeOverlayUpdate,
+            batchPathCount: paths.count,
+            changedPathCount: changedPathCount,
+            reconciledDirectoryPrefixes: reconciledDirectoryPrefixes
         )
     }
 
@@ -9821,9 +10210,9 @@ public final class FileIndex: @unchecked Sendable {
         )
     }
 
-    private func scheduleRefreshPersistIfReasonable(_ snapshot: SearchSnapshot) {
+    private func scheduleRefreshPersistIfReasonable(_ snapshot: SearchSnapshot, immediateLargeOverlay: Bool = false) {
         if snapshot.store.kind == .overlay, snapshot.count > largeOverlayPersistRecordLimit() {
-            let delay = largeOverlayPersistDelay()
+            let delay = largeOverlayPersistDelay(immediateLargeOverlay: immediateLargeOverlay)
             MemoryTelemetry.log(
                 "refresh.persist.scheduledLargeOverlay",
                 records: Self.countOnlyMetrics(for: snapshot.store),
@@ -10621,12 +11010,18 @@ public final class FileIndex: @unchecked Sendable {
         roots rootURLs: [URL] = [],
         buildsSearchStructures: Bool = true,
         phase: IndexPhase = .ready,
-        status: String? = nil
+        status: String? = nil,
+        prefersDegradedSearch: Bool = false
     ) {
         let recordsByPath = Dictionary(uniqueKeysWithValues: records.map { ($0.path, $0) })
         let canonicalRoots = canonicalizedRoots(rootURLs).map(\.path)
         indexQueue.sync {
-            let snapshot = SearchSnapshot(records: records, roots: canonicalRoots, buildsSearchStructures: buildsSearchStructures)
+            let snapshot = SearchSnapshot(
+                records: records,
+                roots: canonicalRoots,
+                buildsSearchStructures: buildsSearchStructures,
+                prefersDegradedSearch: prefersDegradedSearch
+            )
             lock.withLock {
                 roots = canonicalRoots
                 self.recordsByPath = recordsByPath

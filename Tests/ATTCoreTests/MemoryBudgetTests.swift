@@ -338,7 +338,10 @@ struct MemoryBudgetTests {
 
         try await waitUntil {
             let stats = index.currentStats()
-            return !stats.isIndexing && stats.indexedCount >= files.count + 1
+            let diagnostics = index.currentDiagnostics()
+            return !stats.isIndexing
+                && stats.indexedCount >= files.count + 1
+                && diagnostics.completedSnapshotRebuilds > 0
         }
 
         let before = index.currentDiagnostics()
@@ -347,7 +350,7 @@ struct MemoryBudgetTests {
             index.update(paths: [file.path])
         }
 
-        try await waitUntil {
+        try await waitUntil(timeout: .seconds(15)) {
             index.currentDiagnostics().completedRefreshBatches > before.completedRefreshBatches
         }
 
@@ -1093,7 +1096,7 @@ struct MemoryBudgetTests {
     }
 
     private func waitUntil(
-        timeout: Duration = .seconds(5),
+        timeout: Duration = .seconds(30),
         pollInterval: Duration = .milliseconds(25),
         _ condition: () -> Bool
     ) async throws {

@@ -26,6 +26,11 @@ struct FileSystemEvent {
     var itemIsDirectory: Bool {
         flags & FSEventStreamEventFlags(kFSEventStreamEventFlagItemIsDir) != 0
     }
+
+    var itemChangeRequiresDirectoryScope: Bool {
+        flags & FSEventStreamEventFlags(kFSEventStreamEventFlagItemRemoved) != 0
+            || flags & FSEventStreamEventFlags(kFSEventStreamEventFlagItemRenamed) != 0
+    }
 }
 
 enum FSEventIndexFilter {
@@ -420,8 +425,16 @@ private final class FSEventHistoryReplayCollector: @unchecked Sendable {
                 fallbackRootPaths.insert(rootPath)
             } else {
                 guard reconciliationPaths.count < Self.maximumHistoricalReconciliationPaths else {
-                    reconciliationPaths.removeAll(keepingCapacity: false)
-                    requiresGlobalFallback = true
+                    let collapsedParentScopes = Set(reconciliationPaths.map {
+                        parentScope(for: $0, rootPath: matchingRoot(for: $0) ?? rootPath)
+                    })
+                    let collapsedPaths = Set(Self.collapsedPaths(collapsedParentScopes))
+                    if collapsedPaths.count < Self.maximumHistoricalReconciliationPaths {
+                        reconciliationPaths = collapsedPaths
+                    } else {
+                        reconciliationPaths.removeAll(keepingCapacity: false)
+                        requiresGlobalFallback = true
+                    }
                     continue
                 }
             }
@@ -497,6 +510,14 @@ private final class FSEventHistoryReplayCollector: @unchecked Sendable {
             return path
         }
 
+        if event.requiresRecursiveRescan || event.itemChangeRequiresDirectoryScope {
+            return parentScope(for: path, rootPath: rootPath)
+        }
+
+        return path
+    }
+
+    private func parentScope(for path: String, rootPath: String) -> String {
         let parent = URL(fileURLWithPath: path).deletingLastPathComponent().standardizedFileURL.path
         guard parent != "/", parent == rootPath || parent.hasPrefix(rootPath + "/") else {
             return rootPath
