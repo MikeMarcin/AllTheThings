@@ -1030,6 +1030,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private let searchQueue = DispatchQueue(label: "att.search", qos: .userInitiated)
     private let searchPreviewQueue = DispatchQueue(label: "att.search.preview", qos: .userInteractive, attributes: .concurrent)
     private let explanationQueue = DispatchQueue(label: "att.search.explain", qos: .utility)
+    private let fseventFilterQueue = DispatchQueue(label: "att.fsevents.filter", qos: .utility)
     private let applicationSearchCatalog = ApplicationSearchCatalog()
     private let defaults = UserDefaults.standard
 
@@ -1081,9 +1082,14 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var visibleColumns: Set<Column>
     private var indexedRoots: [URL]
     private var rootDisplayNames: [String: String] = [:]
+    private var pendingRawFSEvents: [FileSystemEvent] = []
+    private var rawFSEventFilterDebounce: DispatchWorkItem?
     private var pendingEventPaths = Set<String>()
     private var pendingRecursiveEventPaths = Set<String>()
     private var eventDebounce: DispatchWorkItem?
+    private var lastDroppedOnlyFSEventLogDate: Date?
+    private var suppressedDroppedOnlyFSEventCount = 0
+    private var suppressedDroppedOnlyFSEventBatchCount = 0
     private var activeFSEventReplay: FSEventHistoryReplayCancellable?
     private var activeFSEventReconciliationID: UUID?
     private var fseventCatchUpStartedAt: Date?
@@ -4027,6 +4033,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     private func startWatchingIfNeeded() {
         guard AppSettings.indexingSetupCompleted(defaults: defaults), !indexedRoots.isEmpty else {
+            rawFSEventFilterDebounce?.cancel()
+            rawFSEventFilterDebounce = nil
+            pendingRawFSEvents.removeAll(keepingCapacity: false)
             cancelFSEventCatchUp()
             watcher.stop()
             return
@@ -4038,6 +4047,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func prepareFSEventsForFreshIndexBuild() {
+        rawFSEventFilterDebounce?.cancel()
+        rawFSEventFilterDebounce = nil
+        pendingRawFSEvents.removeAll(keepingCapacity: false)
         eventDebounce?.cancel()
         eventDebounce = nil
         pendingEventPaths.removeAll(keepingCapacity: false)
@@ -4101,25 +4113,40 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             switch action {
             case let .reconcile(paths, baselineEventID):
                 let paths = self.pathsIncludingReadableZeroRowRecoveryCandidates(paths)
+                let routedScopes = FSEventReconciliationScopeRouter.route(paths: paths)
                 DiagnosticLogger.shared.log(
                     category: "fsevents",
                     event: "fsevents.reconciliationReconcile",
                     fields: [
-                        "pathCount": .publicInt(paths.count)
+                        "pathCount": .publicInt(paths.count),
+                        "directoryScopeCount": .publicInt(routedScopes.directoryPaths.count),
+                        "updatePathCount": .publicInt(routedScopes.updatePaths.count)
                     ],
                     diagnosticFields: [
-                        "paths": .pathArray(paths)
+                        "paths": .pathArray(paths),
+                        "directoryScopes": .pathArray(routedScopes.directoryPaths),
+                        "updatePaths": .pathArray(routedScopes.updatePaths)
                     ]
                 )
-                let result = self.index.reconcileIndexedRootsInBackground(
-                    rootURLs: paths.map { URL(fileURLWithPath: $0, isDirectory: true) },
-                    activityPresentation: .backgroundCatchUp
-                )
-                self.handleScopedFSEventCatchUpRequestResult(
-                    result,
-                    roots: roots,
-                    baselineEventID: baselineEventID
-                )
+                if !routedScopes.updatePaths.isEmpty {
+                    self.index.update(paths: routedScopes.updatePaths)
+                }
+                if routedScopes.directoryPaths.isEmpty {
+                    self.fseventCursorStore.markBaseline(for: self.rootPaths(roots), eventID: baselineEventID)
+                    self.startWatchingIfNeeded()
+                    self.updateStatus()
+                    self.scheduleZeroRowRootRecoveryIfNeeded()
+                } else {
+                    let result = self.index.reconcileIndexedRootsInBackground(
+                        rootURLs: routedScopes.directoryPaths.map { URL(fileURLWithPath: $0, isDirectory: true) },
+                        activityPresentation: .backgroundCatchUp
+                    )
+                    self.handleScopedFSEventCatchUpRequestResult(
+                        result,
+                        roots: roots,
+                        baselineEventID: baselineEventID
+                    )
+                }
             case let .upToDate(baselineEventID):
                 DiagnosticLogger.shared.log(
                     category: "fsevents",
@@ -4224,41 +4251,115 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func coalesceFSEvents(_ events: [FileSystemEvent]) {
-        let filteredEvents = FSEventIndexFilter.indexableEvents(
-            events,
-            rootPaths: rootPaths(indexedRoots),
-            exclusionPatterns: index.allExclusionPatterns()
-        )
-        guard !filteredEvents.isEmpty else {
-            DiagnosticLogger.shared.log(
-                category: "fsevents",
-                event: "fsevents.eventsReceived",
-                fields: [
-                    "eventCount": .publicInt(events.count),
-                    "filteredEventCount": .publicInt(0),
-                    "droppedExcludedEventCount": .publicInt(events.count),
-                    "recursiveEventCount": .publicInt(0)
-                ]
+        pendingRawFSEvents.append(contentsOf: events)
+        scheduleRawFSEventFiltering()
+    }
+
+    private func scheduleRawFSEventFiltering() {
+        rawFSEventFilterDebounce?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.filterPendingRawFSEvents()
+        }
+        rawFSEventFilterDebounce = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + energyMode.eventDebounceDelay, execute: workItem)
+    }
+
+    private func filterPendingRawFSEvents() {
+        rawFSEventFilterDebounce = nil
+        let events = pendingRawFSEvents
+        pendingRawFSEvents.removeAll(keepingCapacity: true)
+        guard !events.isEmpty else { return }
+
+        let rootPaths = rootPaths(indexedRoots)
+        let exclusionPatterns = index.allExclusionPatterns()
+        fseventFilterQueue.async { [events, rootPaths, exclusionPatterns] in
+            let filteredEvents = FSEventIndexFilter.indexableEvents(
+                events,
+                context: FSEventIndexFilter.Context(
+                    rootPaths: rootPaths,
+                    exclusionPatterns: exclusionPatterns
+                )
             )
+            DispatchQueue.main.async { [weak self] in
+                self?.applyFilteredFSEvents(originalEventCount: events.count, filteredEvents: filteredEvents)
+            }
+        }
+    }
+
+    private func applyFilteredFSEvents(originalEventCount: Int, filteredEvents: [FileSystemEvent]) {
+        guard !filteredEvents.isEmpty else {
+            logDroppedOnlyFSEventBatch(eventCount: originalEventCount)
             return
         }
 
+        flushSuppressedDroppedOnlyFSEventLogs()
+        let recursiveEventCount = filteredEvents.filter(\.requiresRecursiveRescan).count
         pendingEventPaths.formUnion(filteredEvents.map(\.path))
         pendingRecursiveEventPaths.formUnion(filteredEvents.filter(\.requiresRecursiveRescan).map(\.path))
         DiagnosticLogger.shared.log(
             category: "fsevents",
             event: "fsevents.eventsReceived",
             fields: [
-                "eventCount": .publicInt(events.count),
+                "eventCount": .publicInt(originalEventCount),
                 "filteredEventCount": .publicInt(filteredEvents.count),
-                "droppedExcludedEventCount": .publicInt(events.count - filteredEvents.count),
-                "recursiveEventCount": .publicInt(filteredEvents.filter(\.requiresRecursiveRescan).count)
+                "droppedExcludedEventCount": .publicInt(originalEventCount - filteredEvents.count),
+                "recursiveEventCount": .publicInt(recursiveEventCount)
             ],
             diagnosticFields: [
                 "paths": .pathArray(filteredEvents.map(\.path))
             ]
         )
         scheduleCoalescedFSEventFlush()
+    }
+
+    private func logDroppedOnlyFSEventBatch(eventCount: Int) {
+        let now = Date()
+        let logInterval: TimeInterval = 5
+        if let lastDroppedOnlyFSEventLogDate,
+           now.timeIntervalSince(lastDroppedOnlyFSEventLogDate) < logInterval {
+            suppressedDroppedOnlyFSEventCount += eventCount
+            suppressedDroppedOnlyFSEventBatchCount += 1
+            return
+        }
+
+        let totalEventCount = eventCount + suppressedDroppedOnlyFSEventCount
+        let batchCount = 1 + suppressedDroppedOnlyFSEventBatchCount
+        suppressedDroppedOnlyFSEventCount = 0
+        suppressedDroppedOnlyFSEventBatchCount = 0
+        lastDroppedOnlyFSEventLogDate = now
+
+        DiagnosticLogger.shared.log(
+            category: "fsevents",
+            event: "fsevents.eventsReceived",
+            fields: [
+                "eventCount": .publicInt(totalEventCount),
+                "filteredEventCount": .publicInt(0),
+                "droppedExcludedEventCount": .publicInt(totalEventCount),
+                "recursiveEventCount": .publicInt(0),
+                "batchCount": .publicInt(batchCount)
+            ]
+        )
+    }
+
+    private func flushSuppressedDroppedOnlyFSEventLogs() {
+        guard suppressedDroppedOnlyFSEventCount > 0 else { return }
+        let totalEventCount = suppressedDroppedOnlyFSEventCount
+        let batchCount = suppressedDroppedOnlyFSEventBatchCount
+        suppressedDroppedOnlyFSEventCount = 0
+        suppressedDroppedOnlyFSEventBatchCount = 0
+        lastDroppedOnlyFSEventLogDate = Date()
+
+        DiagnosticLogger.shared.log(
+            category: "fsevents",
+            event: "fsevents.eventsReceived",
+            fields: [
+                "eventCount": .publicInt(totalEventCount),
+                "filteredEventCount": .publicInt(0),
+                "droppedExcludedEventCount": .publicInt(totalEventCount),
+                "recursiveEventCount": .publicInt(0),
+                "batchCount": .publicInt(batchCount)
+            ]
+        )
     }
 
     private func scheduleCoalescedFSEventFlush() {
@@ -4271,6 +4372,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func reschedulePendingFSEventFlushIfNeeded() {
+        if rawFSEventFilterDebounce != nil, !pendingRawFSEvents.isEmpty {
+            scheduleRawFSEventFiltering()
+        }
         guard eventDebounce != nil, !pendingEventPaths.isEmpty else { return }
         scheduleCoalescedFSEventFlush()
     }

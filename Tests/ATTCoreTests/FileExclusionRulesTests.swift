@@ -41,6 +41,14 @@ struct FileExclusionRulesTests {
             "/tmp/project/build/default.profdata",
             "/tmp/project/.venv/lib/python3.14/site-packages/babel/locale-data/en.dat",
             "/tmp/project/.build/arm64-apple-macosx/debug/index/store/v5/records/2W/unit",
+            "/tmp/project/.build/debug/AllTheThings.build/main.swift.o",
+            "/tmp/project/.build/release/AllTheThings",
+            "/tmp/project/.build/arm64-apple-macosx/debug/AllTheThings.build/App.swift.o",
+            "/tmp/project/.build/arm64-apple-macosx/release/AllTheThings",
+            "/tmp/project/.build/arm64-apple-macosx/index/build.db",
+            "/tmp/project/.build/arm64-apple-macosx/ModuleCache/SwiftShims.pcm",
+            "/tmp/project/.build/plugins/cache/tool-output.json",
+            "/tmp/project/.build/artifacts/package/checksum.zip",
             "/tmp/project/__pycache__/module.pyc",
             "/tmp/project/Sources/__pycache__/module.pyc",
             "/tmp/project/Library/Caches/com.example/cache.db"
@@ -101,6 +109,11 @@ struct FileExclusionRulesTests {
         ))
         #expect(!rules.excludes(
             url: URL(fileURLWithPath: "/tmp/project/vendor/library/src/file.c"),
+            roots: [root],
+            isDirectory: false
+        ))
+        #expect(!rules.excludes(
+            url: URL(fileURLWithPath: "/tmp/project/.build/checkouts/Dependency/Sources/Dependency.swift"),
             roots: [root],
             isDirectory: false
         ))
