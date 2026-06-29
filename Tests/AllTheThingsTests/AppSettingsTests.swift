@@ -259,8 +259,8 @@ struct AppSettingsTests {
         #expect(AppSettings.indexedRoots(defaults: defaults) == [root.standardizedFileURL])
     }
 
-    @Test("exclusion defaults migration adds generated SDK and index-store noise")
-    func exclusionDefaultsMigrationAddsGeneratedSDKAndIndexStoreNoise() throws {
+    @Test("exclusion defaults migration adds generated SDK build and buck noise")
+    func exclusionDefaultsMigrationAddsGeneratedSDKBuildAndBuckNoise() throws {
         let (defaults, suiteName) = try makeDefaults()
         defer {
             defaults.removePersistentDomain(forName: suiteName)
@@ -285,6 +285,9 @@ struct AppSettingsTests {
         #expect(patterns.contains("Engine/Binaries/ThirdParty/DotNet/"))
         #expect(patterns.contains("Engine/Binaries/ThirdParty/Python3/"))
         #expect(patterns.contains(".build/**/index/store/"))
+        #expect(patterns.contains("buck-out/"))
+        #expect(patterns.contains("bazel-out/"))
+        #expect(patterns.contains(".buckd/"))
         #expect(!patterns.contains("Engine/Content/"))
         #expect(!patterns.contains("Engine/Source/ThirdParty/"))
         #expect(!patterns.contains("Engine/Source/Runtime/Engine/Private/"))
