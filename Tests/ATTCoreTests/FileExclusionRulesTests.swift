@@ -49,6 +49,10 @@ struct FileExclusionRulesTests {
             "/tmp/project/.build/arm64-apple-macosx/ModuleCache/SwiftShims.pcm",
             "/tmp/project/.build/plugins/cache/tool-output.json",
             "/tmp/project/.build/artifacts/package/checksum.zip",
+            "/tmp/project/buck-out/v2/gen/project/module.o",
+            "/tmp/project/Subproject/buck-out/v2/gen/project/module.o",
+            "/tmp/project/bazel-out/darwin-fastbuild/bin/app",
+            "/tmp/project/.buckd/log/buckd.log",
             "/tmp/project/__pycache__/module.pyc",
             "/tmp/project/Sources/__pycache__/module.pyc",
             "/tmp/project/Library/Caches/com.example/cache.db"
@@ -114,6 +118,11 @@ struct FileExclusionRulesTests {
         ))
         #expect(!rules.excludes(
             url: URL(fileURLWithPath: "/tmp/project/.build/checkouts/Dependency/Sources/Dependency.swift"),
+            roots: [root],
+            isDirectory: false
+        ))
+        #expect(!rules.excludes(
+            url: URL(fileURLWithPath: "/tmp/project/buck/prelude/toolchains.bzl"),
             roots: [root],
             isDirectory: false
         ))
@@ -294,6 +303,14 @@ struct FileExclusionRulesTests {
                 ("/tmp/project/Example.app/Contents/_CodeSignature/CodeResources", false),
                 ("/tmp/project/.build/arm64-apple-macosx/debug/index/store", true),
                 ("/tmp/project/.build/arm64-apple-macosx/debug/index/store/v5/records/unit", false),
+                ("/tmp/project/buck-out", true),
+                ("/tmp/project/buck-out/v2/gen/project/module.o", false),
+                ("/tmp/project/Subproject/buck-out", true),
+                ("/tmp/project/Subproject/buck-out/v2/gen/project/module.o", false),
+                ("/tmp/project/bazel-out", true),
+                ("/tmp/project/bazel-out/darwin-fastbuild/bin/app", false),
+                ("/tmp/project/.buckd", true),
+                ("/tmp/project/.buckd/log/buckd.log", false),
                 ("/tmp/project/Engine/Binaries/ThirdParty/DotNet/8.0/sdk/tool.dll", false),
                 ("/tmp/project/Engine/Source/Runtime/Engine/Private/Generated.cpp", false)
             ]

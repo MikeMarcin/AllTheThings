@@ -68,7 +68,7 @@ enum AppSettings {
     static let appSearchRootsDidChangeNotification = Notification.Name("com.allthethings.settings.appSearchRootsDidChange")
     static let exclusionPatternsDidChangeNotification = Notification.Name("com.allthethings.settings.exclusionPatternsDidChange")
 
-    private static let currentExclusionDefaultsVersion = 13
+    private static let currentExclusionDefaultsVersion = 14
     private static let currentIndexedRootDefaultsVersion = 2
     private static let versionOneDefaultExclusionPatterns = [
         "node_modules/",
@@ -642,6 +642,11 @@ enum AppSettings {
             additions.append(".build/*/ModuleCache/")
             additions.append(".build/plugins/")
             additions.append(".build/artifacts/")
+        }
+        if version < 14 {
+            additions.append("buck-out/")
+            additions.append("bazel-out/")
+            additions.append(".buckd/")
         }
         return additions
     }
