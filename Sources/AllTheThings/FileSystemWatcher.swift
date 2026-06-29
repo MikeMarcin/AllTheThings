@@ -2,7 +2,7 @@ import CoreServices
 import ATTCore
 import Foundation
 
-struct FileSystemEvent {
+struct FileSystemEvent: Sendable {
     let path: String
     let flags: FSEventStreamEventFlags
     let eventID: FSEventStreamEventId
@@ -34,31 +34,159 @@ struct FileSystemEvent {
 }
 
 enum FSEventIndexFilter {
+    struct Context: Sendable {
+        let rootPaths: [String]
+        let exclusionPatterns: [String]
+        let activePatterns: Set<String>
+
+        init(rootPaths: [String], exclusionPatterns: [String]) {
+            self.rootPaths = rootPaths
+            self.exclusionPatterns = exclusionPatterns
+            activePatterns = Set(exclusionPatterns)
+        }
+    }
+
     static func indexableEvents(
         _ events: [FileSystemEvent],
         rootPaths: [String],
         exclusionPatterns: [String]
     ) -> [FileSystemEvent] {
+        indexableEvents(
+            events,
+            context: Context(rootPaths: rootPaths, exclusionPatterns: exclusionPatterns)
+        )
+    }
+
+    static func indexableEvents(
+        _ events: [FileSystemEvent],
+        context: Context
+    ) -> [FileSystemEvent] {
         guard !events.isEmpty else { return [] }
-        let activePatterns = Set(exclusionPatterns)
-        let exclusions = FileExclusionRules(patterns: exclusionPatterns)
-        return events.filter { event in
-            if isKnownExcludedEventPath(event.path, activePatterns: activePatterns) {
-                return false
+        let events = coalescedEventsByPath(events)
+        var exclusions: FileExclusionRules?
+        var filteredEvents: [FileSystemEvent] = []
+        filteredEvents.reserveCapacity(events.count)
+
+        for event in events {
+            if isKnownExcludedEventPath(event.path, activePatterns: context.activePatterns) {
+                continue
             }
-            return shouldQueue(event, rootPaths: rootPaths, exclusions: exclusions)
+            if exclusions == nil {
+                exclusions = FileExclusionRules(patterns: context.exclusionPatterns)
+            }
+            guard let exclusions, shouldQueue(event, rootPaths: context.rootPaths, exclusions: exclusions) else {
+                continue
+            }
+            filteredEvents.append(event)
         }
+
+        return filteredEvents
+    }
+
+    private static func coalescedEventsByPath(_ events: [FileSystemEvent]) -> [FileSystemEvent] {
+        guard events.count > 1 else { return events }
+
+        var coalescedEvents: [FileSystemEvent] = []
+        var indexesByPath: [String: Int] = [:]
+        coalescedEvents.reserveCapacity(events.count)
+        indexesByPath.reserveCapacity(events.count)
+
+        for event in events {
+            if let existingIndex = indexesByPath[event.path] {
+                let existing = coalescedEvents[existingIndex]
+                coalescedEvents[existingIndex] = FileSystemEvent(
+                    path: existing.path,
+                    flags: existing.flags | event.flags,
+                    eventID: max(existing.eventID, event.eventID)
+                )
+            } else {
+                indexesByPath[event.path] = coalescedEvents.count
+                coalescedEvents.append(event)
+            }
+        }
+
+        return coalescedEvents
     }
 
     static func isKnownExcludedEventPath(_ path: String, activePatterns: Set<String>) -> Bool {
         let lowerPath = path.lowercased()
-        let lastComponent = URL(fileURLWithPath: path).lastPathComponent.lowercased()
+        let lastComponent = lastPathComponent(in: lowerPath)
+
+        if activePatterns.contains(".git/*"), containsComponent(".git", in: lowerPath) {
+            if lowerPath.hasSuffix("/.git") {
+                return false
+            }
+            if containsPathFragment("/.git/hooks", in: lowerPath)
+                || containsPathFragment("/.git/info", in: lowerPath)
+                || lowerPath.hasSuffix("/.git/config")
+                || lowerPath.hasSuffix("/.git/head")
+                || lowerPath.hasSuffix("/.git/description")
+            {
+                return false
+            }
+            return true
+        }
+        if activePatterns.contains(".hg/store/"), containsPathFragment("/.hg/store", in: lowerPath) {
+            return true
+        }
+        if activePatterns.contains(".svn/pristine/"), containsPathFragment("/.svn/pristine", in: lowerPath) {
+            return true
+        }
 
         if activePatterns.contains("node_modules/"), containsComponent("node_modules", in: lowerPath) {
             return true
         }
         if activePatterns.contains("DerivedData/"), containsComponent("deriveddata", in: lowerPath) {
             return true
+        }
+        if activePatterns.contains(".gradle/caches/"), containsPathFragment("/.gradle/caches", in: lowerPath) {
+            return true
+        }
+        if activePatterns.contains(".dart_tool/"), containsComponent(".dart_tool", in: lowerPath) {
+            return true
+        }
+        if activePatterns.contains(".next/cache/"), containsPathFragment("/.next/cache", in: lowerPath) {
+            return true
+        }
+        if activePatterns.contains(".parcel-cache/"), containsComponent(".parcel-cache", in: lowerPath) {
+            return true
+        }
+        if activePatterns.contains(".turbo/"), containsComponent(".turbo", in: lowerPath) {
+            return true
+        }
+        if activePatterns.contains(".build/**/index/store/"), lowerPath.contains("/.build/"),
+           containsPathFragment("/index/store", in: lowerPath) {
+            return true
+        }
+        if lowerPath.contains("/.build/") {
+            if activePatterns.contains(".build/debug/"), containsPathFragment("/.build/debug", in: lowerPath) {
+                return true
+            }
+            if activePatterns.contains(".build/release/"), containsPathFragment("/.build/release", in: lowerPath) {
+                return true
+            }
+            if activePatterns.contains(".build/plugins/"), containsPathFragment("/.build/plugins", in: lowerPath) {
+                return true
+            }
+            if activePatterns.contains(".build/artifacts/"), containsPathFragment("/.build/artifacts", in: lowerPath) {
+                return true
+            }
+            if activePatterns.contains(".build/*/debug/"),
+               containsBuildNestedDirectory("debug", in: lowerPath) {
+                return true
+            }
+            if activePatterns.contains(".build/*/release/"),
+               containsBuildNestedDirectory("release", in: lowerPath) {
+                return true
+            }
+            if activePatterns.contains(".build/*/index/"),
+               containsBuildNestedDirectory("index", in: lowerPath) {
+                return true
+            }
+            if activePatterns.contains(".build/*/ModuleCache/"),
+               containsBuildNestedDirectory("modulecache", in: lowerPath) {
+                return true
+            }
         }
         if activePatterns.contains("CMakeFiles/"), containsComponent("cmakefiles", in: lowerPath) {
             return true
@@ -107,8 +235,45 @@ enum FSEventIndexFilter {
         if activePatterns.contains("*.dSYM/"), lowerPath.contains(".dsym/") || lowerPath.hasSuffix(".dsym") {
             return true
         }
+        if activePatterns.contains(".venv/"), containsComponent(".venv", in: lowerPath) {
+            return true
+        }
+        if activePatterns.contains("venv/"), containsComponent("venv", in: lowerPath) {
+            return true
+        }
+        if activePatterns.contains(".tox/"), containsComponent(".tox", in: lowerPath) {
+            return true
+        }
+        if activePatterns.contains("__pycache__/"), containsComponent("__pycache__", in: lowerPath) {
+            return true
+        }
+        if activePatterns.contains(".pytest_cache/"), containsComponent(".pytest_cache", in: lowerPath) {
+            return true
+        }
+        if activePatterns.contains(".mypy_cache/"), containsComponent(".mypy_cache", in: lowerPath) {
+            return true
+        }
+        if activePatterns.contains(".ruff_cache/"), containsComponent(".ruff_cache", in: lowerPath) {
+            return true
+        }
+        if activePatterns.contains(".cache/"), containsComponent(".cache", in: lowerPath) {
+            return true
+        }
+        if activePatterns.contains("Library/Caches/"), containsPathFragment("/library/caches", in: lowerPath) {
+            return true
+        }
+        if activePatterns.contains(".Trash/"), containsComponent(".trash", in: lowerPath) {
+            return true
+        }
 
         return false
+    }
+
+    private static func lastPathComponent(in lowerPath: String) -> Substring {
+        guard let slashIndex = lowerPath.lastIndex(of: "/") else {
+            return Substring(lowerPath)
+        }
+        return lowerPath[lowerPath.index(after: slashIndex)...]
     }
 
     private static func containsComponent(_ component: String, in lowerPath: String) -> Bool {
@@ -117,6 +282,14 @@ enum FSEventIndexFilter {
 
     private static func containsPathFragment(_ fragment: String, in lowerPath: String) -> Bool {
         lowerPath.contains(fragment + "/") || lowerPath.hasSuffix(fragment)
+    }
+
+    private static func containsBuildNestedDirectory(_ directory: String, in lowerPath: String) -> Bool {
+        guard let buildRange = lowerPath.range(of: "/.build/") else { return false }
+        let remainder = lowerPath[buildRange.upperBound...]
+        let components = remainder.split(separator: "/", maxSplits: 2, omittingEmptySubsequences: true)
+        guard components.count >= 2 else { return false }
+        return components[1] == Substring(directory)
     }
 
     private static func shouldQueue(
@@ -136,6 +309,56 @@ enum FSEventIndexFilter {
 
         let directoryDecision = exclusions.decision(url: url, roots: rootPaths, isDirectory: true)
         return directoryDecision != .prune
+    }
+}
+
+struct FSEventReconciliationScopeRouting: Equatable, Sendable {
+    let directoryPaths: [String]
+    let updatePaths: [String]
+
+    var isEmpty: Bool {
+        directoryPaths.isEmpty && updatePaths.isEmpty
+    }
+}
+
+enum FSEventReconciliationScopeRouter {
+    static func route(paths: [String], fileManager: FileManager = .default) -> FSEventReconciliationScopeRouting {
+        route(paths: paths) { path in
+            var isDirectory = ObjCBool(false)
+            guard fileManager.fileExists(atPath: path, isDirectory: &isDirectory) else {
+                return false
+            }
+            return isDirectory.boolValue
+        }
+    }
+
+    static func route(paths: [String], isDirectory: (String) -> Bool) -> FSEventReconciliationScopeRouting {
+        var seen = Set<String>()
+        var directoryPaths: [String] = []
+        var updatePaths: [String] = []
+
+        for rawPath in paths {
+            let path = URL(fileURLWithPath: rawPath).standardizedFileURL.path
+            guard seen.insert(path).inserted else { continue }
+            if isDirectory(path) {
+                directoryPaths.append(path)
+            } else {
+                updatePaths.append(path)
+            }
+        }
+
+        if !directoryPaths.isEmpty && !updatePaths.isEmpty {
+            updatePaths.removeAll { updatePath in
+                directoryPaths.contains { directoryPath in
+                    updatePath == directoryPath || updatePath.hasPrefix(directoryPath + "/")
+                }
+            }
+        }
+
+        return FSEventReconciliationScopeRouting(
+            directoryPaths: directoryPaths,
+            updatePaths: updatePaths
+        )
     }
 }
 

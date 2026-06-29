@@ -347,6 +347,78 @@ struct FileSystemWatcherTests {
         #expect(filtered.last?.requiresRecursiveRescan == true)
     }
 
+    @Test("known excluded FSEvent paths cover default generated churn")
+    func knownExcludedFSEventPathsCoverDefaultGeneratedChurn() {
+        let root = "/tmp/allthethings/root-a"
+        let patterns = Set(FileExclusionRules.defaultPatterns)
+        let excludedPaths = [
+            "\(root)/.git/objects/ab/cdef",
+            "\(root)/.git/FETCH_HEAD",
+            "\(root)/.gradle/caches/modules-2/files-2.1/module.bin",
+            "\(root)/.build/debug/index/store/records",
+            "\(root)/.build/debug/AllTheThings.build/main.swift.o",
+            "\(root)/.build/arm64-apple-macosx/debug/AllTheThings.build/App.swift.o",
+            "\(root)/.build/arm64-apple-macosx/ModuleCache/SwiftShims.pcm",
+            "\(root)/.build/plugins/cache/tool-output.json",
+            "\(root)/.build/artifacts/package/checksum.zip",
+            "\(root)/.next/cache/webpack/client.pack",
+            "\(root)/build/debug/_deps/package/CMakeLists.txt",
+            "\(root)/Sources/__pycache__/module.pyc",
+            "\(root)/coverage/default.profraw",
+            "\(root)/App.dSYM/Contents/Resources/DWARF/App",
+            "\(root)/Library/Caches/com.example/cache.db"
+        ]
+
+        for path in excludedPaths {
+            #expect(FSEventIndexFilter.isKnownExcludedEventPath(path, activePatterns: patterns))
+        }
+        #expect(!FSEventIndexFilter.isKnownExcludedEventPath("\(root)/.git/config", activePatterns: patterns))
+        #expect(!FSEventIndexFilter.isKnownExcludedEventPath("\(root)/.git/hooks/pre-commit", activePatterns: patterns))
+        #expect(!FSEventIndexFilter.isKnownExcludedEventPath(
+            "\(root)/.build/checkouts/Dependency/Sources/Dependency.swift",
+            activePatterns: patterns
+        ))
+    }
+
+    @Test("FSEvent reconciliation routes files through updates and directories through reconciliation")
+    func fseventReconciliationRoutesFilesAndDirectoriesSeparately() {
+        let root = "/tmp/allthethings/root-a"
+        let filePath = "\(root)/Sources/App.swift"
+        let directoryPath = "\(root)/Assets"
+        let childCoveredByDirectory = "\(directoryPath)/sprite.png"
+        let missingPath = "\(root)/Deleted/File.swift"
+
+        let routed = FSEventReconciliationScopeRouter.route(
+            paths: [filePath, directoryPath, childCoveredByDirectory, missingPath, filePath],
+            isDirectory: { $0 == directoryPath }
+        )
+
+        #expect(routed.directoryPaths == [directoryPath])
+        #expect(routed.updatePaths == [filePath, missingPath])
+    }
+
+    @Test("live FSEvents coalesce duplicate paths while preserving recursive flags")
+    func liveFSEventsCoalesceDuplicatePathsWhilePreservingRecursiveFlags() {
+        let root = URL(fileURLWithPath: "/tmp/allthethings/root-a", isDirectory: true)
+        let sourcePath = root.appendingPathComponent("Sources/App.swift").path
+        let filtered = FSEventIndexFilter.indexableEvents(
+            [
+                FileSystemEvent(path: sourcePath, flags: 0, eventID: 41),
+                FileSystemEvent(
+                    path: sourcePath,
+                    flags: FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs),
+                    eventID: 45
+                )
+            ],
+            rootPaths: [root.path],
+            exclusionPatterns: FileExclusionRules.defaultPatterns
+        )
+
+        #expect(filtered.map(\.path) == [sourcePath])
+        #expect(filtered.first?.eventID == 45)
+        #expect(filtered.first?.requiresRecursiveRescan == true)
+    }
+
     @Test("FSEvent reconciliation falls back when a cursor is missing")
     func fseventReconciliationFallsBackForMissingCursor() async {
         let root = URL(fileURLWithPath: "/tmp/allthethings/root-a", isDirectory: true)
