@@ -543,6 +543,9 @@ public final class FileIndex: @unchecked Sendable {
     private static let largeOverlayPersistDefaultDelay: TimeInterval = 30
     private static let largeOverlayChangedPathDefaultThreshold = 10_000
     private static let largeOverlayDrainBackoffDefaultDelay: TimeInterval = 5
+    private static let metadataOverlayPersistDefaultDelay: TimeInterval = 30
+    private static let metadataOverlayCheckpointDefaultDelay: TimeInterval = 300
+    private static let metadataOverlayPersistDefaultLimit = 10_000
     private static let degradedSearchMaximumScanLimit = 25_000
     public static let maximumIndexedRootCount = RootAttributionTable.maximumRootCount
     private static let memoryTelemetrySinkForTesting = MemoryTelemetrySinkBox()
@@ -646,6 +649,196 @@ public final class FileIndex: @unchecked Sendable {
             componentGramIndex: nil,
             pathGramIndex: nil
         )
+    }
+
+    private struct PersistedMetadataOverlay {
+        private static let magic: UInt64 = 0x314c41574d545441 // ATTMWAL1 little-endian bytes.
+        private static let currentSchemaVersion: UInt32 = 1
+        private static let headerSize = 40
+        private static let maximumStringByteCount = 16 * 1024 * 1024
+
+        let baseSnapshotSchemaVersion: Int
+        let baseRecordCount: Int
+        let baseSavedAt: Date
+        let savedAt: Date
+        let replacements: [FileRecord]
+
+        init(
+            baseSnapshotSchemaVersion: Int,
+            baseRecordCount: Int,
+            baseSavedAt: Date,
+            replacements: [FileRecord],
+            savedAt: Date = Date()
+        ) {
+            self.baseSnapshotSchemaVersion = baseSnapshotSchemaVersion
+            self.baseRecordCount = baseRecordCount
+            self.baseSavedAt = baseSavedAt
+            self.savedAt = savedAt
+            self.replacements = replacements
+        }
+
+        func encodedData() throws -> Data {
+            guard
+                baseSnapshotSchemaVersion >= 0,
+                baseSnapshotSchemaVersion <= Int(UInt32.max),
+                baseRecordCount >= 0
+            else {
+                throw CocoaError(.fileWriteUnknown)
+            }
+
+            var data = Data()
+            data.reserveCapacity(Self.headerSize + replacements.count * 128)
+            data.appendUInt64LE(Self.magic)
+            data.appendUInt32LE(Self.currentSchemaVersion)
+            data.appendUInt32LE(UInt32(baseSnapshotSchemaVersion))
+            data.appendUInt64LE(UInt64(baseRecordCount))
+            data.appendUInt64LE(baseSavedAt.timeIntervalSinceReferenceDate.bitPattern)
+            data.appendUInt64LE(savedAt.timeIntervalSinceReferenceDate.bitPattern)
+            data.appendUInt64LE(UInt64(replacements.count))
+
+            for record in replacements {
+                try Self.append(record, to: &data)
+            }
+
+            return data
+        }
+
+        static func decode(from data: Data) throws -> PersistedMetadataOverlay {
+            var reader = MetadataOverlayReader(data: data)
+            let magic = try reader.readUInt64()
+            let version = try reader.readUInt32()
+            let baseSnapshotSchemaVersion = try reader.readUInt32()
+            let baseRecordCount = try reader.readUInt64()
+            let baseSavedAtBits = try reader.readUInt64()
+            let savedAtBits = try reader.readUInt64()
+            let replacementCount = try reader.readUInt64()
+
+            guard magic == Self.magic, version == Self.currentSchemaVersion else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            guard baseRecordCount <= UInt64(Int.max), replacementCount <= UInt64(Int.max) else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+
+            var replacements: [FileRecord] = []
+            replacements.reserveCapacity(Int(replacementCount))
+            for _ in 0..<Int(replacementCount) {
+                replacements.append(try Self.readRecord(from: &reader))
+            }
+            guard reader.isAtEnd else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+
+            return PersistedMetadataOverlay(
+                baseSnapshotSchemaVersion: Int(baseSnapshotSchemaVersion),
+                baseRecordCount: Int(baseRecordCount),
+                baseSavedAt: Date(timeIntervalSinceReferenceDate: TimeInterval(bitPattern: baseSavedAtBits)),
+                replacements: replacements,
+                savedAt: Date(timeIntervalSinceReferenceDate: TimeInterval(bitPattern: savedAtBits))
+            )
+        }
+
+        private static func append(_ record: FileRecord, to data: inout Data) throws {
+            var flags: UInt32 = 0
+            if record.isDirectory { flags |= 1 }
+            if record.isHidden { flags |= 2 }
+            if record.createdTime != nil { flags |= 4 }
+
+            data.appendUInt64LE(record.id)
+            data.appendUInt32LE(flags)
+            data.appendUInt64LE(record.sizeBytes)
+            data.appendUInt64LE(record.modifiedTime.bitPattern)
+            data.appendUInt64LE((record.createdTime ?? 0).bitPattern)
+            try data.appendLengthPrefixedUTF8(record.path, maximumByteCount: maximumStringByteCount)
+            try data.appendLengthPrefixedUTF8(record.name, maximumByteCount: maximumStringByteCount)
+            try data.appendLengthPrefixedUTF8(record.directoryPath, maximumByteCount: maximumStringByteCount)
+            try data.appendLengthPrefixedUTF8(record.fileExtension, maximumByteCount: maximumStringByteCount)
+            try data.appendLengthPrefixedUTF8(record.volumeName, maximumByteCount: maximumStringByteCount)
+            try data.appendLengthPrefixedUTF8(record.normalizedName, maximumByteCount: maximumStringByteCount)
+            try data.appendLengthPrefixedUTF8(record.normalizedPath, maximumByteCount: maximumStringByteCount)
+        }
+
+        private static func readRecord(from reader: inout MetadataOverlayReader) throws -> FileRecord {
+            let id = try reader.readUInt64()
+            let flags = try reader.readUInt32()
+            let sizeBytes = try reader.readUInt64()
+            let modifiedTime = TimeInterval(bitPattern: try reader.readUInt64())
+            let createdBits = try reader.readUInt64()
+            let path = try reader.readString(maximumByteCount: maximumStringByteCount)
+            let name = try reader.readString(maximumByteCount: maximumStringByteCount)
+            let directoryPath = try reader.readString(maximumByteCount: maximumStringByteCount)
+            let fileExtension = try reader.readString(maximumByteCount: maximumStringByteCount)
+            let volumeName = try reader.readString(maximumByteCount: maximumStringByteCount)
+            let normalizedName = try reader.readString(maximumByteCount: maximumStringByteCount)
+            let normalizedPath = try reader.readString(maximumByteCount: maximumStringByteCount)
+
+            return FileRecord(
+                id: id,
+                path: path,
+                name: name,
+                directoryPath: directoryPath,
+                fileExtension: fileExtension,
+                sizeBytes: sizeBytes,
+                modifiedTime: modifiedTime,
+                createdTime: flags & 4 == 0 ? nil : TimeInterval(bitPattern: createdBits),
+                isDirectory: flags & 1 != 0,
+                isHidden: flags & 2 != 0,
+                volumeName: volumeName,
+                normalizedName: normalizedName,
+                normalizedPath: normalizedPath
+            )
+        }
+    }
+
+    private struct MetadataOverlayReader {
+        private let data: Data
+        private var offset = 0
+
+        init(data: Data) {
+            self.data = data
+        }
+
+        var isAtEnd: Bool {
+            offset == data.count
+        }
+
+        mutating func readUInt32() throws -> UInt32 {
+            guard offset + 4 <= data.count else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            let value = UInt32(data[offset])
+                | (UInt32(data[offset + 1]) << 8)
+                | (UInt32(data[offset + 2]) << 16)
+                | (UInt32(data[offset + 3]) << 24)
+            offset += 4
+            return value
+        }
+
+        mutating func readUInt64() throws -> UInt64 {
+            guard offset + 8 <= data.count else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            var value: UInt64 = 0
+            for index in 0..<8 {
+                value |= UInt64(data[offset + index]) << UInt64(index * 8)
+            }
+            offset += 8
+            return value
+        }
+
+        mutating func readString(maximumByteCount: Int) throws -> String {
+            let length = try readUInt32()
+            guard length <= UInt32(maximumByteCount), UInt64(length) <= UInt64(data.count - offset) else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+
+            let end = offset + Int(length)
+            guard let value = String(data: Data(data[offset..<end]), encoding: .utf8) else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            offset = end
+            return value
+        }
     }
 
     private struct RecordCollectionMetrics {
@@ -2674,6 +2867,9 @@ public final class FileIndex: @unchecked Sendable {
     private var largeOverlayPersistDelayOverride: TimeInterval?
     private var largeOverlayChangedPathThresholdOverride: Int?
     private var largeOverlayDrainBackoffDelayOverride: TimeInterval?
+    private var metadataOverlayPersistDelayOverride: TimeInterval?
+    private var metadataOverlayCheckpointDelayOverride: TimeInterval?
+    private var metadataOverlayPersistLimitOverride: Int?
     private var checkpointWriteInFlight = false
     private var cachedStorageInsights: IndexStorageInsights?
     private var storageInsightsRefreshInFlight = false
@@ -2735,6 +2931,9 @@ public final class FileIndex: @unchecked Sendable {
         self.largeOverlayPersistDelayOverride = nil
         self.largeOverlayChangedPathThresholdOverride = nil
         self.largeOverlayDrainBackoffDelayOverride = nil
+        self.metadataOverlayPersistDelayOverride = nil
+        self.metadataOverlayCheckpointDelayOverride = nil
+        self.metadataOverlayPersistLimitOverride = nil
 
         let supportRoot = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
@@ -2769,7 +2968,10 @@ public final class FileIndex: @unchecked Sendable {
         largeOverlayPersistRecordLimit: Int?,
         largeOverlayPersistDelay: TimeInterval?,
         largeOverlayChangedPathThreshold: Int? = nil,
-        largeOverlayDrainBackoffDelay: TimeInterval? = nil
+        largeOverlayDrainBackoffDelay: TimeInterval? = nil,
+        metadataOverlayPersistDelay: TimeInterval? = nil,
+        metadataOverlayCheckpointDelay: TimeInterval? = nil,
+        metadataOverlayPersistLimit: Int? = nil
     ) {
         precondition(!loadsSnapshotImmediately, "Large overlay persist overrides are only for deferred-load test indexes.")
         self.init(
@@ -2782,6 +2984,9 @@ public final class FileIndex: @unchecked Sendable {
         self.largeOverlayPersistDelayOverride = largeOverlayPersistDelay.map { max(0, $0) }
         self.largeOverlayChangedPathThresholdOverride = largeOverlayChangedPathThreshold.map { max(0, $0) }
         self.largeOverlayDrainBackoffDelayOverride = largeOverlayDrainBackoffDelay.map { max(0, $0) }
+        self.metadataOverlayPersistDelayOverride = metadataOverlayPersistDelay.map { max(0, $0) }
+        self.metadataOverlayCheckpointDelayOverride = metadataOverlayCheckpointDelay.map { max(0, $0) }
+        self.metadataOverlayPersistLimitOverride = metadataOverlayPersistLimit.map { max(0, $0) }
     }
 
     public func currentStats() -> IndexStats {
@@ -7582,7 +7787,15 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         let metrics = RecordCollectionMetrics(recordCount: persisted.store.count, totalPathBytes: 0, maxPathBytes: 0)
-        let snapshot = SearchSnapshot(store: persisted.store, persistedStructures: persisted.searchStructures)
+        let baseSnapshot = SearchSnapshot(store: persisted.store, persistedStructures: persisted.searchStructures)
+        let currentExclusionPatterns = lock.withLock { exclusionRules.patterns }
+        let snapshot: SearchSnapshot
+        if persisted.manifest.exclusionPatterns == currentExclusionPatterns {
+            snapshot = loadPersistedMetadataOverlay(baseSnapshot: baseSnapshot, manifest: persisted.manifest)
+        } else {
+            discardPersistedMetadataOverlay(reason: "settingsMismatch")
+            snapshot = baseSnapshot
+        }
         let loadedOptimized = snapshot.isOptimizedForSearch
         MemoryTelemetry.log(
             "snapshot.load.mapped",
@@ -9305,6 +9518,7 @@ public final class FileIndex: @unchecked Sendable {
             try fileManager.removeItem(at: snapshotURL)
         }
         try fileManager.moveItem(at: packageURL, to: snapshotURL)
+        removePersistedMetadataOverlay()
         removeScanCheckpoint()
         cleanupObsoleteIndexFiles()
         invalidateStorageInsightsCache()
@@ -9483,6 +9697,30 @@ public final class FileIndex: @unchecked Sendable {
         return requested
     }
 
+    private static func configuredMetadataOverlayPersistDelay() -> TimeInterval {
+        guard
+            let rawValue = ProcessInfo.processInfo.environment["ATT_INDEX_METADATA_OVERLAY_PERSIST_DELAY_SECONDS"],
+            let requested = TimeInterval(rawValue),
+            requested >= 0
+        else {
+            return metadataOverlayPersistDefaultDelay
+        }
+
+        return requested
+    }
+
+    private static func configuredMetadataOverlayCheckpointDelay() -> TimeInterval {
+        guard
+            let rawValue = ProcessInfo.processInfo.environment["ATT_INDEX_METADATA_OVERLAY_CHECKPOINT_DELAY_SECONDS"],
+            let requested = TimeInterval(rawValue),
+            requested >= 0
+        else {
+            return metadataOverlayCheckpointDefaultDelay
+        }
+
+        return requested
+    }
+
     private func largeOverlayPersistRecordLimit() -> Int {
         largeOverlayPersistRecordLimitOverride ?? Self.configuredLargeOverlayPersistRecordLimit()
     }
@@ -9500,6 +9738,18 @@ public final class FileIndex: @unchecked Sendable {
 
     private func largeOverlayDrainBackoffDelay() -> TimeInterval {
         largeOverlayDrainBackoffDelayOverride ?? Self.largeOverlayDrainBackoffDefaultDelay
+    }
+
+    private func metadataOverlayPersistDelay() -> TimeInterval {
+        metadataOverlayPersistDelayOverride ?? Self.configuredMetadataOverlayPersistDelay()
+    }
+
+    private func metadataOverlayCheckpointDelay() -> TimeInterval {
+        metadataOverlayCheckpointDelayOverride ?? Self.configuredMetadataOverlayCheckpointDelay()
+    }
+
+    private func metadataOverlayPersistLimit() -> Int {
+        metadataOverlayPersistLimitOverride ?? Self.metadataOverlayPersistDefaultLimit
     }
 
     private func scheduleUpdateDrainIfNeeded(delay: DispatchTimeInterval) {
@@ -9871,7 +10121,10 @@ public final class FileIndex: @unchecked Sendable {
             }
 
             publishStats()
-            scheduleRefreshPersistIfReasonable(updatedSnapshot)
+            scheduleMetadataOverlayPersistIfReasonable(
+                updatedSnapshot,
+                changedPathCount: changedPathCount
+            )
             MemoryTelemetry.log(
                 "update.metadataApplied",
                 records: RecordCollectionMetrics(recordCount: updatedSnapshot.count, totalPathBytes: 0, maxPathBytes: 0),
@@ -10235,7 +10488,85 @@ public final class FileIndex: @unchecked Sendable {
         schedulePersist()
     }
 
-    private func schedulePersist(delay: TimeInterval = 1.5) {
+    private enum PersistMode {
+        case automatic
+        case metadataOverlayCheckpoint
+    }
+
+    private func scheduleMetadataOverlayPersistIfReasonable(
+        _ snapshot: SearchSnapshot,
+        changedPathCount: Int
+    ) {
+        guard
+            let replacingStore = snapshot.store as? ReplacingRecordStore,
+            replacingStore.metadataBaseStoreKind == .mapped
+        else {
+            scheduleRefreshPersistIfReasonable(snapshot)
+            return
+        }
+
+        let replacementCount = replacingStore.metadataReplacementCount
+        guard replacementCount <= metadataOverlayPersistLimit() else {
+            scheduleMetadataOverlayCheckpoint(
+                snapshot,
+                replacementCount: replacementCount,
+                changedPathCount: changedPathCount,
+                reason: "replacementLimit",
+                delay: largeOverlayPersistDelay()
+            )
+            return
+        }
+
+        let delay = metadataOverlayPersistDelay()
+        MemoryTelemetry.log(
+            "metadataOverlay.persist.scheduled",
+            records: Self.countOnlyMetrics(for: snapshot.store),
+            structures: snapshot.diagnostics,
+            refreshBatchSize: changedPathCount,
+            activeIndexJobs: currentActiveIndexJobCount()
+        )
+        DiagnosticLogger.shared.log(
+            category: "index",
+            event: "index.metadataOverlayPersistScheduled",
+            fields: [
+                "recordCount": .publicInt(snapshot.count),
+                "replacementCount": .publicInt(replacementCount),
+                "changedPathCount": .publicInt(changedPathCount),
+                "delaySeconds": .publicDouble(delay)
+            ]
+        )
+        schedulePersist(delay: delay)
+    }
+
+    private func scheduleMetadataOverlayCheckpoint(
+        _ snapshot: SearchSnapshot,
+        replacementCount: Int,
+        changedPathCount: Int,
+        reason: String,
+        delay: TimeInterval
+    ) {
+        MemoryTelemetry.log(
+            "metadataOverlay.checkpoint.scheduled",
+            records: Self.countOnlyMetrics(for: snapshot.store),
+            structures: snapshot.diagnostics,
+            refreshBatchSize: changedPathCount,
+            activeIndexJobs: currentActiveIndexJobCount()
+        )
+        DiagnosticLogger.shared.log(
+            category: "index",
+            event: "index.metadataOverlayCheckpointScheduled",
+            fields: [
+                "recordCount": .publicInt(snapshot.count),
+                "replacementCount": .publicInt(replacementCount),
+                "changedPathCount": .publicInt(changedPathCount),
+                "reason": .publicString(reason),
+                "delaySeconds": .publicDouble(delay)
+            ]
+        )
+        schedulePersist(delay: delay, mode: .metadataOverlayCheckpoint)
+    }
+
+    private func schedulePersist(delay: TimeInterval = 1.5, mode: PersistMode = .automatic) {
         let revision = lock.withLock { () -> UInt64 in
             persistRevision &+= 1
             return persistRevision
@@ -10243,12 +10574,23 @@ public final class FileIndex: @unchecked Sendable {
 
         indexQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self, self.isPersistRevisionCurrent(revision) else { return }
-            self.persistSnapshot()
+            self.persistSnapshot(forceMappedCheckpoint: mode == .metadataOverlayCheckpoint)
         }
     }
 
     @discardableResult
-    private func persistSnapshot(schedulesPathGramBuild: Bool = true) -> Bool {
+    private func persistSnapshot(
+        schedulesPathGramBuild: Bool = true,
+        forceMappedCheckpoint: Bool = false
+    ) -> Bool {
+        let started = Date()
+        let jobID = beginIndexJob("persist")
+        let persistenceGeneration = beginPersistenceStatus(startedAt: started)
+        defer {
+            endIndexJob("persist", jobID: jobID)
+            finishPersistenceStatus(generationAtStart: persistenceGeneration)
+        }
+
         let snapshotData = lock.withLock {
             (
                 roots: roots,
@@ -10257,10 +10599,6 @@ public final class FileIndex: @unchecked Sendable {
             )
         }
 
-        let jobID = beginIndexJob("persist")
-        defer { endIndexJob("persist", jobID: jobID) }
-
-        let started = Date()
         let metrics = Self.countOnlyMetrics(for: snapshotData.snapshot.store)
         MemoryTelemetry.log(
             "snapshot.persist.begin",
@@ -10279,6 +10617,20 @@ public final class FileIndex: @unchecked Sendable {
         )
 
         do {
+            if
+                !forceMappedCheckpoint,
+                let replacingStore = snapshotData.snapshot.store as? ReplacingRecordStore,
+                replacingStore.metadataBaseStoreKind == .mapped,
+                replacingStore.metadataReplacementCount <= metadataOverlayPersistLimit()
+            {
+                try persistMetadataOverlay(
+                    replacingStore: replacingStore,
+                    snapshot: snapshotData.snapshot,
+                    started: started
+                )
+                return true
+            }
+
             var persistedSnapshot: SearchSnapshot?
             _ = try persistMappedSnapshot(
                 roots: snapshotData.roots,
@@ -10370,6 +10722,224 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
+    private func beginPersistenceStatus(startedAt: Date) -> UInt64 {
+        let generationAtStart = lock.withLock { () -> UInt64 in
+            let generationAtStart = generation
+            indexing = true
+            reconciling = false
+            updating = false
+            phase = .saving
+            status = "Saving index"
+            activeOperationStartedAt = startedAt
+            lastUpdated = Date()
+            return generationAtStart
+        }
+        publishStats()
+        return generationAtStart
+    }
+
+    private func finishPersistenceStatus(generationAtStart: UInt64) {
+        let didFinish = lock.withLock { () -> Bool in
+            guard generation == generationAtStart, phase == .saving else { return false }
+            indexing = false
+            reconciling = false
+            updating = false
+            phase = .ready
+            status = "Saved index"
+            activeOperationStartedAt = nil
+            lastUpdated = Date()
+            return true
+        }
+        if didFinish {
+            publishStats()
+        }
+    }
+
+    private func persistMetadataOverlay(
+        replacingStore: ReplacingRecordStore,
+        snapshot: SearchSnapshot,
+        started: Date
+    ) throws {
+        guard fileManager.fileExists(atPath: snapshotURL.path) else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+
+        let replacements = replacingStore.metadataReplacementRecords
+        guard !replacements.isEmpty else {
+            removePersistedMetadataOverlay()
+            return
+        }
+
+        let baseIdentity = try metadataOverlayBaseIdentity()
+        guard
+            baseIdentity.schemaVersion == snapshot.store.schemaVersion,
+            baseIdentity.recordCount == snapshot.store.count
+        else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+
+        let overlay = PersistedMetadataOverlay(
+            baseSnapshotSchemaVersion: baseIdentity.schemaVersion,
+            baseRecordCount: baseIdentity.recordCount,
+            baseSavedAt: baseIdentity.savedAt,
+            replacements: replacements
+        )
+        let data = try overlay.encodedData()
+        try data.write(to: metadataOverlayURL(), options: .atomic)
+        invalidateStorageInsightsCache()
+
+        MemoryTelemetry.log(
+            "metadataOverlay.persist.finished",
+            records: Self.countOnlyMetrics(for: snapshot.store),
+            structures: snapshot.diagnostics,
+            activeIndexJobs: currentActiveIndexJobCount()
+        )
+        DiagnosticLogger.shared.log(
+            category: "index",
+            event: "index.metadataOverlayPersistFinished",
+            fields: [
+                "recordCount": .publicInt(snapshot.count),
+                "replacementCount": .publicInt(replacements.count),
+                "durationSeconds": .publicDouble(Date().timeIntervalSince(started)),
+                "pendingRefreshPathCount": .publicInt(lock.withLock { pendingRefreshPaths.count })
+            ]
+        )
+        scheduleMetadataOverlayCheckpoint(
+            snapshot,
+            replacementCount: replacements.count,
+            changedPathCount: 0,
+            reason: "age",
+            delay: metadataOverlayCheckpointDelay()
+        )
+    }
+
+    private func metadataOverlayBaseIdentity() throws -> (schemaVersion: Int, recordCount: Int, savedAt: Date) {
+        let manifestURL = snapshotURL.appendingPathComponent(SnapshotLayout.FileName.manifest, isDirectory: false)
+        let manifest = try JSONDecoder().decode(CompactSnapshotManifest.self, from: Data(contentsOf: manifestURL))
+        return (manifest.schemaVersion, manifest.recordCount, manifest.savedAt)
+    }
+
+    private func metadataOverlayURL() -> URL {
+        snapshotURL.appendingPathComponent(SnapshotLayout.FileName.metadataOverlay, isDirectory: false)
+    }
+
+    private func removePersistedMetadataOverlay() {
+        try? fileManager.removeItem(at: metadataOverlayURL())
+    }
+
+    private func loadPersistedMetadataOverlay(
+        baseSnapshot: SearchSnapshot,
+        manifest: CompactSnapshotManifest
+    ) -> SearchSnapshot {
+        let overlayURL = metadataOverlayURL()
+        guard fileManager.fileExists(atPath: overlayURL.path) else {
+            return baseSnapshot
+        }
+
+        do {
+            let overlay = try PersistedMetadataOverlay.decode(from: Data(contentsOf: overlayURL, options: [.mappedIfSafe]))
+            guard
+                overlay.baseSnapshotSchemaVersion == manifest.schemaVersion,
+                overlay.baseRecordCount == baseSnapshot.store.count,
+                Self.metadataOverlayBaseDateMatches(overlay.baseSavedAt, manifest.savedAt)
+            else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+
+            var upserts: [String: FileRecord] = [:]
+            upserts.reserveCapacity(overlay.replacements.count)
+            for record in overlay.replacements {
+                upserts[record.path] = record
+            }
+
+            if let updatedSnapshot = baseSnapshot.updatingMetadata(for: upserts) {
+                DiagnosticLogger.shared.log(
+                    category: "index",
+                    event: "index.metadataOverlayLoadApplied",
+                    fields: [
+                        "replacementCount": .publicInt(upserts.count)
+                    ]
+                )
+                return updatedSnapshot
+            }
+
+            let replacingSnapshot = try metadataOverlaySnapshotWithoutSearchStructures(
+                baseSnapshot: baseSnapshot,
+                replacements: Array(upserts.values)
+            )
+            DiagnosticLogger.shared.log(
+                category: "index",
+                event: "index.metadataOverlayLoadApplied",
+                fields: [
+                    "replacementCount": .publicInt(upserts.count),
+                    "optimizedForSearch": .publicBool(false)
+                ]
+            )
+            return replacingSnapshot
+        } catch {
+            discardPersistedMetadataOverlay(reason: "invalidBaseOrCorrupt", error: error)
+            return baseSnapshot
+        }
+    }
+
+    private static func metadataOverlayBaseDateMatches(_ lhs: Date, _ rhs: Date) -> Bool {
+        abs(lhs.timeIntervalSinceReferenceDate - rhs.timeIntervalSinceReferenceDate) < 0.000_001
+    }
+
+    private func discardPersistedMetadataOverlay(reason: String, error: Error? = nil) {
+        guard fileManager.fileExists(atPath: metadataOverlayURL().path) else { return }
+        removePersistedMetadataOverlay()
+        var fields: [String: DiagnosticLogFieldValue] = [
+            "reason": .publicString(reason)
+        ]
+        if let error {
+            fields["error"] = .errorText(error.localizedDescription)
+        }
+        DiagnosticLogger.shared.log(
+            level: error == nil ? .info : .error,
+            category: "index",
+            event: "index.metadataOverlayDiscarded",
+            fields: fields
+        )
+    }
+
+    private func metadataOverlaySnapshotWithoutSearchStructures(
+        baseSnapshot: SearchSnapshot,
+        replacements: [FileRecord]
+    ) throws -> SearchSnapshot {
+        var rowReplacements: [Int: FileRecord] = [:]
+        rowReplacements.reserveCapacity(replacements.count)
+
+        for replacement in replacements {
+            guard
+                let rowID = baseSnapshot.store.rowID(forPath: replacement.path),
+                Self.metadataSearchKeysMatch(store: baseSnapshot.store, rowID: rowID, replacement: replacement)
+            else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            rowReplacements[rowID] = replacement
+        }
+
+        return SearchSnapshot(
+            store: ReplacingRecordStore(base: baseSnapshot.store, replacements: rowReplacements),
+            buildsSearchStructures: false,
+            prefersDegradedSearch: true
+        )
+    }
+
+    private static func metadataSearchKeysMatch(
+        store: RecordStore,
+        rowID: Int,
+        replacement: FileRecord
+    ) -> Bool {
+        store.path(at: rowID) == replacement.path
+            && store.name(at: rowID) == replacement.name
+            && store.directoryPath(at: rowID) == replacement.directoryPath
+            && store.fileExtension(at: rowID) == replacement.fileExtension
+            && store.normalizedName(at: rowID) == replacement.normalizedName
+            && store.normalizedPath(at: rowID) == replacement.normalizedPath
+    }
+
     private func persistMappedSnapshot(
         roots: [String],
         exclusionPatterns: [String],
@@ -10399,6 +10969,7 @@ public final class FileIndex: @unchecked Sendable {
             try fileManager.removeItem(at: snapshotURL)
         }
         try fileManager.moveItem(at: temporaryURL, to: snapshotURL)
+        removePersistedMetadataOverlay()
         removeScanCheckpoint()
         cleanupObsoleteIndexFiles()
         invalidateStorageInsightsCache()
@@ -11930,5 +12501,38 @@ private extension NSLock {
         lock()
         defer { unlock() }
         return try body()
+    }
+}
+
+private extension Data {
+    mutating func appendUInt32LE(_ value: UInt32) {
+        append(contentsOf: [
+            UInt8(value & 0xff),
+            UInt8((value >> 8) & 0xff),
+            UInt8((value >> 16) & 0xff),
+            UInt8((value >> 24) & 0xff)
+        ])
+    }
+
+    mutating func appendUInt64LE(_ value: UInt64) {
+        append(contentsOf: [
+            UInt8(value & 0xff),
+            UInt8((value >> 8) & 0xff),
+            UInt8((value >> 16) & 0xff),
+            UInt8((value >> 24) & 0xff),
+            UInt8((value >> 32) & 0xff),
+            UInt8((value >> 40) & 0xff),
+            UInt8((value >> 48) & 0xff),
+            UInt8((value >> 56) & 0xff)
+        ])
+    }
+
+    mutating func appendLengthPrefixedUTF8(_ value: String, maximumByteCount: Int) throws {
+        let bytes = Array(value.utf8)
+        guard bytes.count <= maximumByteCount, bytes.count <= Int(UInt32.max) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        appendUInt32LE(UInt32(bytes.count))
+        append(contentsOf: bytes)
     }
 }
