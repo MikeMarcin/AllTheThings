@@ -866,11 +866,29 @@ final class ReplacingRecordStore: RecordStore {
     var storedResultCount: Int? { base.storedResultCount }
     var storedRootAttribution: RootAttributionTable? { rootAttribution }
     var schemaVersion: Int { base.schemaVersion }
+    var metadataReplacementCount: Int { replacements.count }
+    var metadataReplacementRecords: [FileRecord] {
+        replacements.keys.sorted().compactMap { replacements[$0] }
+    }
+    var metadataBaseStoreKind: RecordStoreKind { base.kind }
 
     init(base: RecordStore, replacements: [Int: FileRecord]) {
-        self.base = base
-        self.replacements = replacements
-        self.rootAttribution = Self.adjustedRootAttribution(base: base, replacements: replacements)
+        let resolvedBase: RecordStore
+        let resolvedReplacements: [Int: FileRecord]
+        if let replacingBase = base as? ReplacingRecordStore {
+            var mergedReplacements = replacingBase.replacements
+            for (rowID, record) in replacements {
+                mergedReplacements[rowID] = record
+            }
+            resolvedBase = replacingBase.base
+            resolvedReplacements = mergedReplacements
+        } else {
+            resolvedBase = base
+            resolvedReplacements = replacements
+        }
+        self.base = resolvedBase
+        self.replacements = resolvedReplacements
+        self.rootAttribution = Self.adjustedRootAttribution(base: resolvedBase, replacements: resolvedReplacements)
     }
 
     func record(at index: Int) -> FileRecord {

@@ -861,8 +861,8 @@ struct FileIndexTests {
         }
     }
 
-    @Test("large overlay updates schedule mapped snapshot compaction")
-    func largeOverlayUpdatesScheduleMappedSnapshotCompaction() async throws {
+    @Test("large structural overlay updates schedule mapped snapshot compaction")
+    func largeStructuralOverlayUpdatesScheduleMappedSnapshotCompaction() async throws {
         let fileManager = FileManager.default
         let root = fileManager.temporaryDirectory
             .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
@@ -889,8 +889,9 @@ struct FileIndexTests {
         }
 
         let before = index.currentDiagnostics()
-        try "new".write(to: updatedFile, atomically: true, encoding: .utf8)
-        index.update(paths: [updatedFile.path])
+        let addedFile = root.appendingPathComponent("Added.txt")
+        try "new".write(to: addedFile, atomically: true, encoding: .utf8)
+        index.update(paths: [addedFile.path])
 
         try await waitUntil(timeout: .seconds(5)) {
             let diagnostics = index.currentDiagnostics()
@@ -905,6 +906,206 @@ struct FileIndexTests {
                 && diagnostics.recordStoreKind == .mapped
                 && diagnostics.overlayCount == 0
         }
+    }
+
+    @Test("metadata-only updates persist sidecar without compacting mapped snapshot")
+    func metadataOnlyUpdatesPersistSidecarWithoutCompactingMappedSnapshot() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        let updatedFile = root.appendingPathComponent("Updated.txt")
+        try "old".write(to: updatedFile, atomically: true, encoding: .utf8)
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        defer {
+            try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName))
+        }
+        let index = FileIndex(
+            applicationName: applicationName,
+            loadsSnapshotImmediately: false,
+            largeOverlayPersistRecordLimit: nil,
+            largeOverlayPersistDelay: nil,
+            metadataOverlayPersistDelay: 0.1
+        )
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil {
+            let diagnostics = index.currentDiagnostics()
+            return !index.currentStats().isIndexing
+                && diagnostics.recordStoreKind == .mapped
+                && diagnostics.optimizedCount == diagnostics.indexedCount
+        }
+
+        let before = index.currentDiagnostics()
+        let recorder = StatsRecorder()
+        index.onStatsChanged = { @MainActor @Sendable stats in
+            recorder.append(stats)
+        }
+
+        let newContents = "new metadata payload"
+        try newContents.write(to: updatedFile, atomically: true, encoding: .utf8)
+        index.update(paths: [updatedFile.path])
+
+        try await waitUntil(timeout: .seconds(5)) {
+            let diagnostics = index.currentDiagnostics()
+            return diagnostics.completedRefreshBatches > before.completedRefreshBatches
+                && diagnostics.overlayCount == 1
+                && diagnostics.optimizedCount == diagnostics.indexedCount
+                && diagnostics.nameGramPostingCount == before.nameGramPostingCount
+        }
+
+        let packageURL = SnapshotLayout.packageURL(in: supportDirectory(applicationName: applicationName))
+        let metadataOverlayURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.metadataOverlay)
+        try await waitUntil(timeout: .seconds(5)) {
+            fileManager.fileExists(atPath: metadataOverlayURL.path)
+                && index.currentDiagnostics().activeIndexJobs == 0
+        }
+
+        let afterPersist = index.currentDiagnostics()
+        #expect(afterPersist.recordStoreKind == .overlay)
+        #expect(afterPersist.overlayCount == 1)
+        #expect(afterPersist.completedSnapshotRebuilds == before.completedSnapshotRebuilds)
+        #expect(recorder.snapshot().contains { $0.phase == .saving })
+
+        let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
+        let reloadedDiagnostics = reloaded.currentDiagnostics()
+        #expect(reloadedDiagnostics.recordStoreKind == .overlay)
+        #expect(reloadedDiagnostics.overlayCount == 1)
+        #expect(reloadedDiagnostics.optimizedCount == reloadedDiagnostics.indexedCount)
+        #expect(reloadedDiagnostics.nameGramPostingCount == before.nameGramPostingCount)
+
+        let response = reloaded.search(SearchRequest(
+            query: "Updated",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10)
+        let result = try #require(response.results.first { $0.record.path == updatedFile.path })
+        #expect(result.record.sizeBytes == UInt64(newContents.utf8.count))
+    }
+
+    @Test("metadata overlay checkpoints into mapped snapshot after quiet interval")
+    func metadataOverlayCheckpointsIntoMappedSnapshotAfterQuietInterval() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        let updatedFile = root.appendingPathComponent("Updated.txt")
+        try "old".write(to: updatedFile, atomically: true, encoding: .utf8)
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        defer {
+            try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName))
+        }
+        let index = FileIndex(
+            applicationName: applicationName,
+            loadsSnapshotImmediately: false,
+            largeOverlayPersistRecordLimit: nil,
+            largeOverlayPersistDelay: nil,
+            metadataOverlayPersistDelay: 0.05,
+            metadataOverlayCheckpointDelay: 1
+        )
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil {
+            let diagnostics = index.currentDiagnostics()
+            return !index.currentStats().isIndexing
+                && diagnostics.recordStoreKind == .mapped
+                && diagnostics.optimizedCount == diagnostics.indexedCount
+        }
+
+        let newContents = "new metadata payload"
+        try newContents.write(to: updatedFile, atomically: true, encoding: .utf8)
+        index.update(paths: [updatedFile.path])
+
+        let packageURL = SnapshotLayout.packageURL(in: supportDirectory(applicationName: applicationName))
+        let metadataOverlayURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.metadataOverlay)
+        try await waitUntil(timeout: .seconds(5)) {
+            fileManager.fileExists(atPath: metadataOverlayURL.path)
+        }
+        let overlayData = try Data(contentsOf: metadataOverlayURL)
+        #expect(Array(overlayData.prefix(8)) == Array("ATTMWAL1".utf8))
+
+        try await waitUntil(timeout: .seconds(10)) {
+            let diagnostics = index.currentDiagnostics()
+            return diagnostics.recordStoreKind == .mapped
+                && diagnostics.overlayCount == 0
+                && !fileManager.fileExists(atPath: metadataOverlayURL.path)
+                && diagnostics.activeIndexJobs == 0
+        }
+
+        let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
+        let response = reloaded.search(SearchRequest(
+            query: "Updated",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10)
+        let result = try #require(response.results.first { $0.record.path == updatedFile.path })
+        #expect(result.record.sizeBytes == UInt64(newContents.utf8.count))
+    }
+
+    @Test("full rebuild discards metadata overlay WAL")
+    func fullRebuildDiscardsMetadataOverlayWAL() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        let updatedFile = root.appendingPathComponent("Updated.txt")
+        try "old".write(to: updatedFile, atomically: true, encoding: .utf8)
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        defer {
+            try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName))
+        }
+        let index = FileIndex(
+            applicationName: applicationName,
+            loadsSnapshotImmediately: false,
+            largeOverlayPersistRecordLimit: nil,
+            largeOverlayPersistDelay: nil,
+            metadataOverlayPersistDelay: 0.05,
+            metadataOverlayCheckpointDelay: 60
+        )
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil {
+            let diagnostics = index.currentDiagnostics()
+            return !index.currentStats().isIndexing
+                && diagnostics.recordStoreKind == .mapped
+                && diagnostics.optimizedCount == diagnostics.indexedCount
+        }
+
+        let newContents = "new metadata payload"
+        try newContents.write(to: updatedFile, atomically: true, encoding: .utf8)
+        index.update(paths: [updatedFile.path])
+
+        let packageURL = SnapshotLayout.packageURL(in: supportDirectory(applicationName: applicationName))
+        let metadataOverlayURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.metadataOverlay)
+        try await waitUntil(timeout: .seconds(5)) {
+            fileManager.fileExists(atPath: metadataOverlayURL.path)
+        }
+
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil(timeout: .seconds(10)) {
+            let diagnostics = index.currentDiagnostics()
+            return !index.currentStats().isIndexing
+                && diagnostics.recordStoreKind == .mapped
+                && diagnostics.overlayCount == 0
+                && !fileManager.fileExists(atPath: metadataOverlayURL.path)
+        }
+
+        let response = index.search(SearchRequest(
+            query: "Updated",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10)
+        let result = try #require(response.results.first { $0.record.path == updatedFile.path })
+        #expect(result.record.sizeBytes == UInt64(newContents.utf8.count))
     }
 
     @Test("large directory reconciliation publishes unoptimized overlay before compaction")

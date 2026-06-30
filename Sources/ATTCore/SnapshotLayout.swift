@@ -40,6 +40,7 @@ enum SnapshotLayout {
         static let componentPostings = "componentPostings.bin"
         static let pathPostings = "pathPostings.bin"
         static let extensionPostings = "extensionPostings.bin"
+        static let metadataOverlay = "metadataOverlay.bin"
         static let scanState = "scan-state.json"
     }
 
