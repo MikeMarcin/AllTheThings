@@ -397,6 +397,47 @@ struct FileSystemWatcherTests {
         #expect(routed.updatePaths == [filePath, missingPath])
     }
 
+    @Test("live FSEvents route exact files separately from broad directory scopes")
+    func liveFSEventsRouteExactFilesSeparatelyFromBroadDirectoryScopes() {
+        let root = "/tmp/allthethings/root-a"
+        let safeFile = "\(root)/Sources/App.swift"
+        let assetDirectory = "\(root)/Assets"
+        let coveredAsset = "\(assetDirectory)/sprite.png"
+        let deletedFile = "\(root)/Deleted/Old.swift"
+        let recursiveFile = "\(root)/Generated/output.txt"
+
+        let routed = FSEventLiveRefreshScopeRouter.route(
+            events: [
+                FileSystemEvent(path: safeFile, flags: 0, eventID: 1),
+                FileSystemEvent(
+                    path: assetDirectory,
+                    flags: FSEventStreamEventFlags(kFSEventStreamEventFlagItemIsDir),
+                    eventID: 2
+                ),
+                FileSystemEvent(path: coveredAsset, flags: 0, eventID: 3),
+                FileSystemEvent(
+                    path: deletedFile,
+                    flags: FSEventStreamEventFlags(kFSEventStreamEventFlagItemRemoved),
+                    eventID: 4
+                ),
+                FileSystemEvent(
+                    path: recursiveFile,
+                    flags: FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs),
+                    eventID: 5
+                )
+            ],
+            rootPaths: [root]
+        )
+
+        #expect(routed.exactPaths == [safeFile])
+        #expect(Set(routed.directoryPaths) == [
+            assetDirectory,
+            "\(root)/Deleted",
+            "\(root)/Generated"
+        ])
+        #expect(routed.recursivePaths == [recursiveFile])
+    }
+
     @Test("live FSEvents coalesce duplicate paths while preserving recursive flags")
     func liveFSEventsCoalesceDuplicatePathsWhilePreservingRecursiveFlags() {
         let root = URL(fileURLWithPath: "/tmp/allthethings/root-a", isDirectory: true)

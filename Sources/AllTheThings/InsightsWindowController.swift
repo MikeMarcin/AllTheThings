@@ -182,6 +182,7 @@ private enum InsightsTab: Int, CaseIterable {
     case summary
     case index
     case activity
+    case energy
 
     var title: String {
         switch self {
@@ -191,6 +192,8 @@ private enum InsightsTab: Int, CaseIterable {
             "Index"
         case .activity:
             "Activity"
+        case .energy:
+            "Energy"
         }
     }
 
@@ -202,6 +205,30 @@ private enum InsightsTab: Int, CaseIterable {
             "Insights.IndexPage"
         case .activity:
             "Insights.ActivityPage"
+        case .energy:
+            "Insights.EnergyPage"
+        }
+    }
+}
+
+private enum InsightsTabLayout {
+    static let segmentWidths: [CGFloat] = [84, 64, 84, 72]
+    static let controlWidth = segmentWidths.reduce(0, +)
+}
+
+enum InsightsEnergyRange: Int, CaseIterable {
+    case hour
+    case day
+    case calendar
+
+    var title: String {
+        switch self {
+        case .hour:
+            "1h"
+        case .day:
+            "1d"
+        case .calendar:
+            "3m"
         }
     }
 }
@@ -247,8 +274,18 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
     private let storageTitleLabel = NSTextField(labelWithString: "")
     private let storageFactsStack = NSStackView()
     private let treemapView = InsightsTreemapView()
+    private let indexFilesChartView = InsightsIndexFilesChartView()
     private let activityChartView = InsightsBarChartView()
     private let activityFactsStack = NSStackView()
+    private let energyRangeControl = NSSegmentedControl(
+        labels: InsightsEnergyRange.allCases.map(\.title),
+        trackingMode: .selectOne,
+        target: nil,
+        action: nil
+    )
+    private let energyChartView = InsightsEnergyChartView()
+    private let energyFactsStack = NSStackView()
+    private let energyTilesContainer = NSView()
     private let rootsTableView = NSTableView()
     private let statusLabel = NSTextField(labelWithString: "Loading insights...")
     private let revealDataFolderButton = NSButton()
@@ -262,12 +299,14 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
     private var refreshTimer: Timer?
     private var latestSnapshot: IndexInsightsSnapshot?
     private var displayedRoots: [IndexRootInsight] = []
+    private var displayedIndexFiles: [InsightsIndexFileDisplayItem] = []
     private var unrepresentedRootPaths = Set<String>()
     private var rootAccessStatuses: [String: InsightsRootAccessStatus] = [:]
     private var isRefreshingInsights = false
     private var isViewVisible = false
     private var overviewTileConstraints: [NSLayoutConstraint] = []
     private var healthTileConstraints: [NSLayoutConstraint] = []
+    private var energyTileConstraints: [NSLayoutConstraint] = []
     private var tabPages: [InsightsTab: NSView] = [:]
     private var selectedTab: InsightsTab = .summary
     private var activeTabPage: NSView?
@@ -369,7 +408,10 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         tabControl.controlSize = .regular
         tabControl.font = .systemFont(ofSize: 13, weight: .medium)
         for segment in 0..<tabControl.segmentCount {
-            tabControl.setWidth(96, forSegment: segment)
+            let width = segment < InsightsTabLayout.segmentWidths.count
+                ? InsightsTabLayout.segmentWidths[segment]
+                : 84
+            tabControl.setWidth(width, forSegment: segment)
         }
         tabControl.target = self
         tabControl.action = #selector(tabSelectionDidChange(_:))
@@ -380,6 +422,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
 
         configureFactsStack(storageFactsStack)
         configureFactsStack(activityFactsStack)
+        configureFactsStack(energyFactsStack)
         configureFactsStack(lifetimeFactsStack)
 
         overviewTilesContainer.translatesAutoresizingMaskIntoConstraints = false
@@ -434,7 +477,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
             storageChartStack.trailingAnchor.constraint(equalTo: storageFactsTable.leadingAnchor, constant: -14),
             storageChartStack.widthAnchor.constraint(greaterThanOrEqualToConstant: 360),
 
-            storageFactsTable.topAnchor.constraint(equalTo: storageBody.topAnchor),
+            storageFactsTable.topAnchor.constraint(equalTo: treemapView.topAnchor),
             storageFactsTable.trailingAnchor.constraint(equalTo: storageBody.trailingAnchor),
             storageFactsTable.bottomAnchor.constraint(lessThanOrEqualTo: storageBody.bottomAnchor),
             storageFactsTable.widthAnchor.constraint(equalToConstant: 292)
@@ -443,6 +486,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         storageCard.setAccessibilityIdentifier("Insights.StorageCard")
 
         let rootsLabel = makeSectionLabel("Indexed Roots")
+        rootsLabel.setAccessibilityIdentifier("Insights.RootsLabel")
         configureRootsTable()
         let rootsScrollView = NSScrollView()
         rootsScrollView.translatesAutoresizingMaskIntoConstraints = false
@@ -453,7 +497,25 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         let rootsCard = makeCard(containing: rootsScrollView)
         rootsCard.setAccessibilityIdentifier("Insights.RootsCard")
 
+        let indexFilesLabel = makeSectionLabel("Index Files")
+        indexFilesLabel.setAccessibilityIdentifier("Insights.IndexFilesLabel")
+        let indexFilesBody = NSView()
+        indexFilesBody.translatesAutoresizingMaskIntoConstraints = false
+        indexFilesChartView.translatesAutoresizingMaskIntoConstraints = false
+        indexFilesChartView.setAccessibilityIdentifier("Insights.IndexFilesChart")
+        indexFilesBody.addSubview(indexFilesChartView)
+        NSLayoutConstraint.activate([
+            indexFilesChartView.centerXAnchor.constraint(equalTo: indexFilesBody.centerXAnchor),
+            indexFilesChartView.centerYAnchor.constraint(equalTo: indexFilesBody.centerYAnchor),
+            indexFilesChartView.widthAnchor.constraint(equalToConstant: 136),
+            indexFilesChartView.heightAnchor.constraint(equalToConstant: 136),
+            indexFilesBody.heightAnchor.constraint(greaterThanOrEqualToConstant: 136)
+        ])
+        let indexFilesCard = makeCard(containing: indexFilesBody)
+        indexFilesCard.setAccessibilityIdentifier("Insights.IndexFilesCard")
+
         activityChartView.translatesAutoresizingMaskIntoConstraints = false
+        activityChartView.setAccessibilityIdentifier("Insights.ActivityChart")
         let activityFactsTable = makeFactTable(
             containing: activityFactsStack,
             accessibilityIdentifier: "Insights.ActivityFactsTable"
@@ -476,6 +538,53 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         ])
         let activityCard = makeCard(containing: activityBody)
         activityCard.setAccessibilityIdentifier("Insights.ActivityCard")
+
+        energyTilesContainer.translatesAutoresizingMaskIntoConstraints = false
+        energyTilesContainer.setAccessibilityIdentifier("Insights.EnergyTiles")
+        energyRangeControl.translatesAutoresizingMaskIntoConstraints = false
+        energyRangeControl.segmentStyle = .separated
+        energyRangeControl.controlSize = .small
+        energyRangeControl.selectedSegment = InsightsEnergyRange.hour.rawValue
+        energyRangeControl.target = self
+        energyRangeControl.action = #selector(energyRangeDidChange(_:))
+        energyRangeControl.setAccessibilityIdentifier("Insights.EnergyRangeControl")
+        energyChartView.translatesAutoresizingMaskIntoConstraints = false
+        energyChartView.setAccessibilityIdentifier("Insights.EnergyChart")
+        let energyFactsTable = makeFactTable(
+            containing: energyFactsStack,
+            accessibilityIdentifier: "Insights.EnergyFactsTable"
+        )
+        let energyBody = NSView()
+        energyBody.translatesAutoresizingMaskIntoConstraints = false
+        energyBody.addSubview(energyTilesContainer)
+        energyBody.addSubview(energyRangeControl)
+        energyBody.addSubview(energyChartView)
+        energyBody.addSubview(energyFactsTable)
+        NSLayoutConstraint.activate([
+            energyTilesContainer.topAnchor.constraint(equalTo: energyBody.topAnchor),
+            energyTilesContainer.leadingAnchor.constraint(equalTo: energyBody.leadingAnchor),
+            energyTilesContainer.trailingAnchor.constraint(equalTo: energyBody.trailingAnchor),
+            energyTilesContainer.heightAnchor.constraint(equalToConstant: 158),
+
+            energyRangeControl.topAnchor.constraint(equalTo: energyTilesContainer.bottomAnchor, constant: 12),
+            energyRangeControl.centerXAnchor.constraint(equalTo: energyChartView.centerXAnchor),
+            energyRangeControl.widthAnchor.constraint(equalToConstant: 196),
+            energyRangeControl.heightAnchor.constraint(equalToConstant: 24),
+
+            energyChartView.topAnchor.constraint(equalTo: energyRangeControl.bottomAnchor, constant: 8),
+            energyChartView.leadingAnchor.constraint(equalTo: energyBody.leadingAnchor),
+            energyChartView.bottomAnchor.constraint(equalTo: energyBody.bottomAnchor),
+            energyChartView.trailingAnchor.constraint(equalTo: energyFactsTable.leadingAnchor, constant: -14),
+
+            energyFactsTable.centerYAnchor.constraint(equalTo: energyChartView.centerYAnchor),
+            energyFactsTable.topAnchor.constraint(greaterThanOrEqualTo: energyChartView.topAnchor),
+            energyFactsTable.trailingAnchor.constraint(equalTo: energyBody.trailingAnchor),
+            energyFactsTable.bottomAnchor.constraint(lessThanOrEqualTo: energyChartView.bottomAnchor),
+            energyFactsTable.widthAnchor.constraint(equalToConstant: 292),
+            energyChartView.heightAnchor.constraint(equalToConstant: 216)
+        ])
+        let energyCard = makeCard(containing: energyBody)
+        energyCard.setAccessibilityIdentifier("Insights.EnergyCard")
 
         healthTilesContainer.translatesAutoresizingMaskIntoConstraints = false
         healthTilesContainer.setAccessibilityIdentifier("Insights.HealthTiles")
@@ -509,15 +618,21 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         indexPage.addSubview(storageCard)
         indexPage.addSubview(rootsLabel)
         indexPage.addSubview(rootsCard)
+        indexPage.addSubview(indexFilesLabel)
+        indexPage.addSubview(indexFilesCard)
 
         let activityPage = makePage(accessibilityIdentifier: InsightsTab.activity.accessibilityIdentifier)
         activityPage.addSubview(queryPanel)
         activityPage.addSubview(activityCard)
 
+        let energyPage = makePage(accessibilityIdentifier: InsightsTab.energy.accessibilityIdentifier)
+        energyPage.addSubview(energyCard)
+
         tabPages = [
             .summary: summaryPage,
             .index: indexPage,
-            .activity: activityPage
+            .activity: activityPage,
+            .energy: energyPage
         ]
 
         for item in [
@@ -560,16 +675,27 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
             storageCard.topAnchor.constraint(equalTo: indexPage.topAnchor),
             storageCard.leadingAnchor.constraint(equalTo: indexPage.leadingAnchor),
             storageCard.trailingAnchor.constraint(equalTo: indexPage.trailingAnchor),
-            treemapView.heightAnchor.constraint(equalToConstant: 210),
+            treemapView.heightAnchor.constraint(equalToConstant: 176),
 
             rootsLabel.topAnchor.constraint(equalTo: storageCard.bottomAnchor, constant: 12),
-            rootsLabel.leadingAnchor.constraint(equalTo: indexPage.leadingAnchor),
+            rootsLabel.leadingAnchor.constraint(equalTo: rootsScrollView.leadingAnchor),
+            rootsLabel.trailingAnchor.constraint(lessThanOrEqualTo: indexFilesLabel.leadingAnchor, constant: -12),
+
+            indexFilesLabel.centerYAnchor.constraint(equalTo: rootsLabel.centerYAnchor),
+            indexFilesLabel.leadingAnchor.constraint(equalTo: indexFilesChartView.leadingAnchor),
+            indexFilesLabel.trailingAnchor.constraint(lessThanOrEqualTo: indexPage.trailingAnchor),
 
             rootsCard.topAnchor.constraint(equalTo: rootsLabel.bottomAnchor, constant: 8),
             rootsCard.leadingAnchor.constraint(equalTo: indexPage.leadingAnchor),
-            rootsCard.trailingAnchor.constraint(equalTo: indexPage.trailingAnchor),
+            rootsCard.trailingAnchor.constraint(equalTo: indexFilesCard.leadingAnchor, constant: -12),
             rootsCard.bottomAnchor.constraint(equalTo: indexPage.bottomAnchor),
-            rootsScrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 160),
+            rootsCard.widthAnchor.constraint(greaterThanOrEqualToConstant: 430),
+            rootsScrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 136),
+
+            indexFilesCard.topAnchor.constraint(equalTo: rootsCard.topAnchor),
+            indexFilesCard.trailingAnchor.constraint(equalTo: indexPage.trailingAnchor),
+            indexFilesCard.bottomAnchor.constraint(equalTo: indexPage.bottomAnchor),
+            indexFilesCard.widthAnchor.constraint(equalToConstant: 176),
 
             queryPanel.topAnchor.constraint(equalTo: activityPage.topAnchor),
             queryPanel.leadingAnchor.constraint(equalTo: activityPage.leadingAnchor),
@@ -580,8 +706,14 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
             activityCard.topAnchor.constraint(equalTo: queryPanel.bottomAnchor, constant: 12),
             activityCard.leadingAnchor.constraint(equalTo: activityPage.leadingAnchor),
             activityCard.trailingAnchor.constraint(equalTo: activityPage.trailingAnchor),
-            activityCard.bottomAnchor.constraint(lessThanOrEqualTo: activityPage.bottomAnchor),
-            activityChartView.heightAnchor.constraint(equalToConstant: 216)
+            activityCard.bottomAnchor.constraint(equalTo: activityPage.bottomAnchor),
+            activityChartView.heightAnchor.constraint(greaterThanOrEqualToConstant: 160),
+
+            energyCard.topAnchor.constraint(equalTo: energyPage.topAnchor),
+            energyCard.leadingAnchor.constraint(equalTo: energyPage.leadingAnchor),
+            energyCard.trailingAnchor.constraint(equalTo: energyPage.trailingAnchor),
+            energyCard.bottomAnchor.constraint(equalTo: energyPage.bottomAnchor),
+            energyCard.heightAnchor.constraint(greaterThanOrEqualToConstant: 430)
         ])
 
         showTab(selectedTab)
@@ -607,7 +739,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
             tabControl.centerYAnchor.constraint(equalTo: titlebarGuide.centerYAnchor),
             tabControl.leadingAnchor.constraint(greaterThanOrEqualTo: titlebarGuide.leadingAnchor, constant: 140),
             tabControl.trailingAnchor.constraint(lessThanOrEqualTo: titlebarGuide.trailingAnchor, constant: -140),
-            tabControl.widthAnchor.constraint(equalToConstant: 288),
+            tabControl.widthAnchor.constraint(equalToConstant: InsightsTabLayout.controlWidth),
             tabControl.heightAnchor.constraint(equalToConstant: 26),
 
             titlebarActionStack.centerYAnchor.constraint(equalTo: titlebarGuide.centerYAnchor),
@@ -622,6 +754,14 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
     @objc private func tabSelectionDidChange(_ sender: NSSegmentedControl) {
         guard let tab = InsightsTab(rawValue: sender.selectedSegment) else { return }
         showTab(tab)
+    }
+
+    @objc private func energyRangeDidChange(_ sender: NSSegmentedControl) {
+        guard let range = InsightsEnergyRange(rawValue: sender.selectedSegment) else { return }
+        energyChartView.range = range
+        if let latestSnapshot {
+            rebuildEnergyInsights(latestSnapshot)
+        }
     }
 
     private func showTab(_ tab: InsightsTab) {
@@ -699,6 +839,10 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
             snapshotRoots: snapshot.roots,
             configuredRootPaths: configuredIndexedRootPaths()
         )
+        displayedIndexFiles = InsightsIndexFileDisplay.items(
+            sidecars: snapshot.storage.sidecars,
+            packageBytes: snapshot.storage.indexPackageBytes
+        )
         rootAccessStatuses = InsightsRootAccessStatus.statuses(for: displayedRoots)
         unrepresentedRootPaths = Set(displayedRoots.filter(InsightsRootDisplay.isUnrepresented).map(\.path))
         sortDisplayedRoots()
@@ -709,7 +853,9 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         rebuildOverviewGrid(snapshot, displayedRootCount: displayedRoots.count)
         rebuildQueryPathPanel(snapshot)
         treemapView.roots = displayedRoots
+        indexFilesChartView.items = displayedIndexFiles
         activityChartView.buckets = Array(snapshot.usage.dailyBuckets.suffix(30))
+        energyChartView.usage = snapshot.usage
         rootsTableView.reloadData()
 
         storageTitleLabel.stringValue = storageTitleText(roots: displayedRoots)
@@ -720,6 +866,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
             activePlaceholder: InsightsRootDisplay.activePlaceholderLabel(for: snapshot.stats)
         )
         rebuildActivityFacts(snapshot)
+        rebuildEnergyInsights(snapshot)
         rebuildHealthGrid(snapshot)
         rebuildLifetimeFacts(snapshot)
     }
@@ -729,11 +876,16 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         overviewTileConstraints.removeAll()
         overviewTilesContainer.subviews.forEach { $0.removeFromSuperview() }
 
+        let todayEnergy = snapshot.usage.dailyBuckets.last?.energy.total ?? EnergyUsageCounters()
         let tiles = [
             makeMetricTile(title: "Tracked Files", value: snapshot.stats.indexedCount.formatted(), detail: "\(displayedRootCount) roots"),
             makeMetricTile(title: "ATT Data", value: byteString(snapshot.storage.totalATTDataBytes), detail: "Index \(byteString(snapshot.storage.indexPackageBytes))"),
             makeMetricTile(title: "Preview Results", value: snapshot.usage.initialSearches.completed.formatted(), detail: "\(snapshot.usage.initialSearches.cancelled.formatted()) cancelled"),
-            makeMetricTile(title: "Index Updates", value: snapshot.usage.health.incrementalRefreshBatches.formatted(), detail: "\(snapshot.usage.health.fullRebuilds.formatted()) rebuilds"),
+            makeMetricTile(
+                title: "Index Updates",
+                value: snapshot.usage.health.incrementalRefreshBatches.formatted(),
+                detail: "\(durationString(todayEnergy.cpuTime)) CPU · \(wakeupsPerMinuteString(todayEnergy.wakeupsPerMinute))"
+            ),
             makeMetricTile(title: "Memory", value: byteString(snapshot.usage.dailyBuckets.last?.memory.latestBytes ?? 0), detail: "latest sample"),
             makeMetricTile(title: "Launches", value: snapshot.lifetime.launchCount.formatted(), detail: dateOnlyString(snapshot.lifetime.firstLaunchDate))
         ]
@@ -819,9 +971,21 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
             activePlaceholder: activePlaceholder
         )
         replaceFacts(in: storageFactsStack, with: [
-            InsightsFact("ATT Data", byteString(snapshot.storage.totalATTDataBytes)),
-            InsightsFact("Index Package", byteString(snapshot.storage.indexPackageBytes)),
-            InsightsFact("Cache", byteString(snapshot.storage.cacheBytes)),
+            InsightsFact(
+                "Total Size",
+                byteString(snapshot.storage.totalATTDataBytes),
+                tooltip: "Total allocated disk space in AllTheThings support and cache locations."
+            ),
+            InsightsFact(
+                "Index Package",
+                byteString(snapshot.storage.indexPackageBytes),
+                tooltip: "Allocated size of the saved index package, including records and sidecar files."
+            ),
+            InsightsFact(
+                "Cache",
+                byteString(snapshot.storage.cacheBytes),
+                tooltip: "Allocated disk space in AllTheThings cache folders."
+            ),
             InsightsFact("Measurement", storageMeasurementValue(snapshot.storage), tooltip: storageMeasurementText(snapshot.storage)),
             InsightsFact("Roots", rootValue, tooltip: storageDetails)
         ])
@@ -842,6 +1006,81 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         ])
     }
 
+    private func rebuildEnergyInsights(_ snapshot: IndexInsightsSnapshot) {
+        let usage = snapshot.usage
+        let now = snapshot.generatedAt
+        let recentHourSamples = energySamples(inLast: 60 * 60, from: usage, referenceDate: now)
+        let oneHour = energyBreakdown(samples: recentHourSamples)
+        let currentSample = usage.recentEnergySamples.last
+        let dayRollups = energyRollups(inLast: 24 * 60 * 60, from: usage, referenceDate: now)
+        let oneDay = energyBreakdown(rollups: dayRollups)
+        let live = snapshot.health.maintenance
+        let backlogValue = live.pendingRefreshPathCount + live.pendingReconciliationScopeCount
+
+        let tiles = [
+            makeHealthTile(
+                title: "CPU Load",
+                value: currentSample.map { cpuLoadString($0.cpuLoad) } ?? "No samples",
+                detail: currentSample.map { "\($0.mode == .foreground ? "foreground" : "background") · \(durationString($0.cpuTime)) CPU" } ?? "waiting for first sample"
+            ),
+            makeHealthTile(
+                title: "1h CPU",
+                value: durationString(oneHour.total.cpuTime),
+                detail: "\(cpuLoadString(oneHour.total.averageCPULoad)) average load"
+            ),
+            makeHealthTile(
+                title: "1h Background",
+                value: durationString(oneHour.background.cpuTime),
+                detail: "\(backgroundShareString(oneHour)) of CPU"
+            ),
+            makeHealthTile(
+                title: "Wakeups",
+                value: wakeupsPerMinuteString(oneHour.total.wakeupsPerMinute),
+                detail: "\(oneHour.total.wakeups.formatted()) in the last hour"
+            ),
+            makeHealthTile(
+                title: "24h Peak",
+                value: cpuLoadString(oneDay.total.peakCPULoad),
+                detail: "\(durationString(oneDay.total.cpuTime)) CPU total"
+            ),
+            makeHealthTile(
+                title: "Energy Backlog",
+                value: live.pendingBackgroundRefreshPathCount.formatted(),
+                detail: "\(backlogValue.formatted()) queued · \(deferredMaintenanceDetail(live))"
+            )
+        ]
+        energyTileConstraints = layoutTileGrid(tiles, in: energyTilesContainer, columns: 3, rowGap: 8, columnGap: 8)
+
+        let selectedRange = InsightsEnergyRange(rawValue: energyRangeControl.selectedSegment) ?? .hour
+        let selected = energyBreakdown(for: selectedRange, usage: usage, referenceDate: now)
+        if selectedRange == .calendar {
+            let buckets = calendarEnergyBuckets(from: usage, referenceDate: now)
+            let activity = buckets.reduce(0) { $0 + $1.calendarActivityScore }
+            let backgroundImpact = buckets.reduce(0) { $0 + $1.backgroundEnergyImpactScore }
+            replaceFacts(in: energyFactsStack, with: [
+                InsightsFact("Date Range", calendarEnergyDateRangeString(referenceDate: now)),
+                InsightsFact("Activity", scoreString(activity)),
+                InsightsFact("Background Impact", scoreString(backgroundImpact)),
+                InsightsFact("CPU Time", durationString(selected.total.cpuTime)),
+                InsightsFact("Background CPU", durationString(selected.background.cpuTime)),
+                InsightsFact("Background Share", backgroundShareString(selected)),
+                InsightsFact("Wakeups / Min", wakeupsPerMinuteString(selected.total.wakeupsPerMinute)),
+                InsightsFact("Samples", selected.total.samples.formatted())
+            ])
+        } else {
+            replaceFacts(in: energyFactsStack, with: [
+                InsightsFact("Range", selectedRange.title),
+                InsightsFact("CPU Time", durationString(selected.total.cpuTime)),
+                InsightsFact("Avg CPU Load", cpuLoadString(selected.total.averageCPULoad)),
+                InsightsFact("Foreground CPU", durationString(selected.foreground.cpuTime)),
+                InsightsFact("Background CPU", durationString(selected.background.cpuTime)),
+                InsightsFact("Background Share", backgroundShareString(selected)),
+                InsightsFact("Wakeups / Min", wakeupsPerMinuteString(selected.total.wakeupsPerMinute)),
+                InsightsFact("Samples", selected.total.samples.formatted())
+            ])
+        }
+    }
+
     private func rebuildLifetimeFacts(_ snapshot: IndexInsightsSnapshot) {
         replaceFacts(in: lifetimeFactsStack, with: [
             InsightsFact("First Launch", dateOnlyString(snapshot.lifetime.firstLaunchDate)),
@@ -858,9 +1097,13 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         rowGap: CGFloat,
         columnGap: CGFloat
     ) -> [NSLayoutConstraint] {
-        NSLayoutConstraint.deactivate(
-            container === overviewTilesContainer ? overviewTileConstraints : healthTileConstraints
-        )
+        if container === overviewTilesContainer {
+            NSLayoutConstraint.deactivate(overviewTileConstraints)
+        } else if container === healthTilesContainer {
+            NSLayoutConstraint.deactivate(healthTileConstraints)
+        } else if container === energyTilesContainer {
+            NSLayoutConstraint.deactivate(energyTileConstraints)
+        }
         container.subviews.forEach { $0.removeFromSuperview() }
 
         for tile in tiles {
@@ -1037,7 +1280,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int {
-        displayedRoots.count
+        return displayedRoots.count
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
@@ -1139,6 +1382,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
 
         let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
             guard response == .alertFirstButtonReturn, let self, let snapshot = self.latestSnapshot else { return }
+            self.index.flushUsageMetrics()
             let report = DiagnosticsReportBuilder.build(
                 snapshot: snapshot,
                 defaults: self.defaults,
@@ -1169,6 +1413,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
 
         let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
             guard response == .OK, let self, let url = panel.url else { return }
+            self.index.flushUsageMetrics()
             let report = DiagnosticsReportBuilder.build(
                 snapshot: snapshot,
                 defaults: self.defaults,
@@ -1696,6 +1941,152 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         return String(format: "%.2f s", duration)
     }
 
+    private func cpuPerWallString(_ counters: IndexMaintenanceOperationCounters) -> String {
+        guard counters.wallTime > 0, counters.approximateCPUTime > 0 else {
+            return "0%"
+        }
+        let percent = counters.approximateCPUTime / counters.wallTime * 100
+        if percent < 10 {
+            return String(format: "%.1f%%", percent)
+        }
+        return "\(Int(percent.rounded()))%"
+    }
+
+    private func cpuLoadString(_ load: Double) -> String {
+        guard load.isFinite, load > 0 else { return "0%" }
+        let percent = load * 100
+        if percent < 10 {
+            return String(format: "%.1f%%", percent)
+        }
+        return "\(Int(percent.rounded()))%"
+    }
+
+    private func wakeupsPerMinuteString(_ value: Double) -> String {
+        guard value.isFinite, value > 0 else { return "0/min" }
+        if value < 10 {
+            return String(format: "%.1f/min", value)
+        }
+        return "\(Int(value.rounded()).formatted())/min"
+    }
+
+    private func scoreString(_ value: Double) -> String {
+        guard value.isFinite, value > 0 else { return "0.0" }
+        return String(format: "%.1f", value)
+    }
+
+    private func backgroundShareString(_ energy: EnergyUsageBreakdown) -> String {
+        let totalCPU = energy.total.cpuTime
+        guard totalCPU > 0 else { return "0%" }
+        return cpuLoadString(energy.background.cpuTime / totalCPU)
+    }
+
+    private func energySamples(
+        inLast interval: TimeInterval,
+        from usage: IndexUsageMetrics,
+        referenceDate: Date
+    ) -> [EnergyUsageIntervalSample] {
+        let cutoff = referenceDate.addingTimeInterval(-interval)
+        return usage.recentEnergySamples.filter { $0.completedAt >= cutoff }
+    }
+
+    private func energyRollups(
+        inLast interval: TimeInterval,
+        from usage: IndexUsageMetrics,
+        referenceDate: Date
+    ) -> [EnergyUsageRollup] {
+        let cutoff = referenceDate.addingTimeInterval(-interval)
+        return usage.energyRollups.filter { $0.bucketStart >= cutoff }
+    }
+
+    private func energyBreakdown(for range: InsightsEnergyRange, usage: IndexUsageMetrics, referenceDate: Date) -> EnergyUsageBreakdown {
+        switch range {
+        case .hour:
+            return energyBreakdown(samples: energySamples(inLast: 60 * 60, from: usage, referenceDate: referenceDate))
+        case .day:
+            return energyBreakdown(rollups: energyRollups(inLast: 24 * 60 * 60, from: usage, referenceDate: referenceDate))
+        case .calendar:
+            return energyBreakdown(dailyBuckets: calendarEnergyBuckets(from: usage, referenceDate: referenceDate))
+        }
+    }
+
+    private func calendarEnergyBuckets(from usage: IndexUsageMetrics, referenceDate: Date) -> [DailyUsageBucket] {
+        guard let range = calendarEnergyDateRange(referenceDate: referenceDate) else {
+            return usage.dailyBuckets
+        }
+
+        let calendar = Calendar.current
+        let startKey = calendarDayKey(for: range.start, calendar: calendar)
+        let endKey = calendarDayKey(for: range.end, calendar: calendar)
+        return usage.dailyBuckets.filter { $0.day >= startKey && $0.day <= endKey }
+    }
+
+    private func calendarEnergyDateRangeString(referenceDate: Date) -> String {
+        guard let range = calendarEnergyDateRange(referenceDate: referenceDate) else {
+            return "Last 3 months"
+        }
+
+        let calendar = Calendar.current
+        let startComponents = calendar.dateComponents([.year], from: range.start)
+        let endComponents = calendar.dateComponents([.year], from: range.end)
+        let startFormatter = DateFormatter()
+        let endFormatter = DateFormatter()
+        startFormatter.dateFormat = startComponents.year == endComponents.year ? "MMM d" : "MMM d, yyyy"
+        endFormatter.dateFormat = "MMM d, yyyy"
+        return "\(startFormatter.string(from: range.start)) - \(endFormatter.string(from: range.end))"
+    }
+
+    private func calendarEnergyDateRange(referenceDate: Date) -> (start: Date, end: Date)? {
+        let calendar = Calendar.current
+        guard
+            let monthStart = calendar.date(
+                from: calendar.dateComponents([.year, .month], from: referenceDate)
+            ),
+            let firstMonthStart = calendar.date(byAdding: .month, value: -2, to: monthStart),
+            let nextMonthStart = calendar.date(byAdding: .month, value: 1, to: monthStart),
+            let lastDay = calendar.date(byAdding: .day, value: -1, to: nextMonthStart)
+        else {
+            return nil
+        }
+
+        return (firstMonthStart, lastDay)
+    }
+
+    private func calendarDayKey(for date: Date, calendar: Calendar) -> String {
+        let components = calendar.dateComponents([.year, .month, .day], from: date)
+        return String(
+            format: "%04d-%02d-%02d",
+            components.year ?? 0,
+            components.month ?? 0,
+            components.day ?? 0
+        )
+    }
+
+    private func energyBreakdown(samples: [EnergyUsageIntervalSample]) -> EnergyUsageBreakdown {
+        var breakdown = EnergyUsageBreakdown()
+        for sample in samples {
+            breakdown.record(sample)
+        }
+        return breakdown
+    }
+
+    private func energyBreakdown(rollups: [EnergyUsageRollup]) -> EnergyUsageBreakdown {
+        var breakdown = EnergyUsageBreakdown()
+        for rollup in rollups {
+            breakdown.foreground.add(rollup.energy.foreground)
+            breakdown.background.add(rollup.energy.background)
+        }
+        return breakdown
+    }
+
+    private func energyBreakdown(dailyBuckets: [DailyUsageBucket]) -> EnergyUsageBreakdown {
+        var breakdown = EnergyUsageBreakdown()
+        for bucket in dailyBuckets {
+            breakdown.foreground.add(bucket.energy.foreground)
+            breakdown.background.add(bucket.energy.background)
+        }
+        return breakdown
+    }
+
     private func dateOnlyString(_ date: Date?) -> String {
         guard let date else { return "unknown" }
         let formatter = DateFormatter()
@@ -1717,6 +2108,39 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
     private func optionalDurationString(_ duration: TimeInterval?) -> String {
         guard let duration else { return "none" }
         return durationString(duration)
+    }
+
+    private func maintenanceKindTitle(_ kind: IndexMaintenanceOperationKind) -> String {
+        switch kind {
+        case .exactRefresh:
+            "Exact refresh"
+        case .directoryRefresh:
+            "Directory refresh"
+        case .reconcile:
+            "Reconcile"
+        case .fullRebuild:
+            "Full rebuild"
+        case .snapshotPersist:
+            "Snapshot persist"
+        case .metadataOverlayPersist:
+            "Metadata persist"
+        case .optimization:
+            "Optimization"
+        case .pathGramBuild:
+            "Path grams"
+        case .backgroundSlice:
+            "Background slice"
+        }
+    }
+
+    private func deferredMaintenanceDetail(_ live: IndexMaintenanceLiveDiagnostics) -> String {
+        if let reason = live.deferredOptimizationReason {
+            return "opt \(reason)"
+        }
+        if let reason = live.deferredCheckpointReason {
+            return "checkpoint \(reason)"
+        }
+        return live.isFullReconciliationPending ? "full reconcile" : "no deferral"
     }
 
     private func totalFileActionString(_ actions: [FileActionMetric: UInt64]) -> String {
@@ -1811,6 +2235,65 @@ enum InsightsRootDisplay {
         }
 
         return roots
+    }
+}
+
+struct InsightsIndexFileDisplayItem: Equatable {
+    let name: String
+    let bytes: UInt64
+    let packageBytes: UInt64
+    let isPackageOverhead: Bool
+
+    var share: Double {
+        packageBytes > 0 ? Double(bytes) / Double(packageBytes) : 0
+    }
+
+    var tooltip: String {
+        let description = isPackageOverhead ? "Package overhead" : name
+        return "\(description): \(InsightsIndexFileDisplay.byteString(bytes)) allocated on disk"
+    }
+}
+
+enum InsightsIndexFileDisplay {
+    static func items(sidecars: [IndexSidecarInsight], packageBytes: UInt64) -> [InsightsIndexFileDisplayItem] {
+        let sidecarBytes = sidecars.reduce(UInt64(0)) { $0 &+ $1.allocatedBytes }
+        let totalBytes = max(packageBytes, sidecarBytes)
+        var items = sidecars.map {
+            InsightsIndexFileDisplayItem(
+                name: $0.name,
+                bytes: $0.allocatedBytes,
+                packageBytes: totalBytes,
+                isPackageOverhead: false
+            )
+        }
+
+        if totalBytes > sidecarBytes {
+            items.append(InsightsIndexFileDisplayItem(
+                name: "Package overhead",
+                bytes: totalBytes - sidecarBytes,
+                packageBytes: totalBytes,
+                isPackageOverhead: true
+            ))
+        }
+
+        return items.sorted(by: defaultSort)
+    }
+
+    static func defaultSort(_ lhs: InsightsIndexFileDisplayItem, _ rhs: InsightsIndexFileDisplayItem) -> Bool {
+        if lhs.bytes != rhs.bytes {
+            return lhs.bytes > rhs.bytes
+        }
+        if lhs.isPackageOverhead != rhs.isPackageOverhead {
+            return !lhs.isPackageOverhead
+        }
+        return lhs.name < rhs.name
+    }
+
+    static func byteString(_ bytes: UInt64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        formatter.allowsNonnumericFormatting = false
+        return formatter.string(fromByteCount: Int64(clamping: bytes))
     }
 }
 
@@ -2163,6 +2646,8 @@ private final class InsightsTileView: NSStackView {
 
 enum InsightsHoverCardLayout {
     static let lineHeight: CGFloat = 16
+    static let separatorHeight: CGFloat = 8
+    static let rowColumnGap: CGFloat = 18
 
     static var titleAttributes: [NSAttributedString.Key: Any] {
         [
@@ -2178,14 +2663,20 @@ enum InsightsHoverCardLayout {
         ]
     }
 
+    static var valueAttributes: [NSAttributedString.Key: Any] {
+        [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular),
+            .foregroundColor: NSColor.secondaryLabelColor
+        ]
+    }
+
     static func placardRect(lines: [String], near point: NSPoint, in bounds: NSRect) -> NSRect {
         guard !lines.isEmpty, bounds.width > 0, bounds.height > 0 else { return .zero }
-        let measured = lines.enumerated().map { index, line in
-            line.size(withAttributes: index == 0 ? Self.titleAttributes : Self.detailAttributes)
-        }
+        let rows = lines.enumerated().map { HoverLine(index: $0.offset, rawValue: $0.element) }
+        let measured = measuredSize(for: rows)
         let maximumWidth = max(120, bounds.width - 20)
-        let width = min(max(measured.map(\.width).max() ?? 0, 160) + 20, maximumWidth)
-        let height = CGFloat(lines.count) * Self.lineHeight + 18
+        let width = min(max(measured.width, 160) + 20, maximumWidth)
+        let height = measured.height + 18
         var origin = NSPoint(x: point.x + 12, y: point.y + 12)
         if origin.x + width > bounds.maxX - 8 {
             origin.x = point.x - width - 12
@@ -2196,6 +2687,66 @@ enum InsightsHoverCardLayout {
         origin.x = min(max(origin.x, bounds.minX + 8), max(bounds.minX + 8, bounds.maxX - width - 8))
         origin.y = min(max(origin.y, bounds.minY + 8), max(bounds.minY + 8, bounds.maxY - height - 8))
         return NSRect(origin: origin, size: NSSize(width: width, height: height))
+    }
+
+    static func height(for line: HoverLine) -> CGFloat {
+        switch line {
+        case .separator:
+            return separatorHeight
+        case .title, .detail, .row:
+            return lineHeight
+        }
+    }
+
+    static func measuredSize(for lines: [HoverLine]) -> NSSize {
+        var maximumTextWidth: CGFloat = 0
+        var maximumLabelWidth: CGFloat = 0
+        var maximumValueWidth: CGFloat = 0
+        var height: CGFloat = 0
+
+        for line in lines {
+            height += Self.height(for: line)
+            switch line {
+            case let .title(text):
+                maximumTextWidth = max(maximumTextWidth, text.size(withAttributes: titleAttributes).width)
+            case let .detail(text):
+                maximumTextWidth = max(maximumTextWidth, text.size(withAttributes: detailAttributes).width)
+            case let .row(label, value):
+                maximumLabelWidth = max(maximumLabelWidth, label.size(withAttributes: detailAttributes).width)
+                maximumValueWidth = max(maximumValueWidth, value.size(withAttributes: valueAttributes).width)
+            case .separator:
+                break
+            }
+        }
+
+        let rowWidth = maximumLabelWidth > 0 || maximumValueWidth > 0
+            ? maximumLabelWidth + rowColumnGap + maximumValueWidth
+            : 0
+        return NSSize(width: max(maximumTextWidth, rowWidth), height: height)
+    }
+}
+
+enum HoverLine: Equatable {
+    case title(String)
+    case detail(String)
+    case row(label: String, value: String)
+    case separator
+
+    init(index: Int, rawValue: String) {
+        if rawValue.isEmpty {
+            self = .separator
+            return
+        }
+        if index == 0 {
+            self = .title(rawValue)
+            return
+        }
+        let parts = rawValue.split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: false)
+        if parts.count == 2 {
+            self = .row(label: String(parts[0]), value: String(parts[1]))
+        } else {
+            self = .detail(rawValue)
+        }
     }
 }
 
@@ -2232,21 +2783,54 @@ private final class InsightsHoverCardView: NSView {
         NSColor.separatorColor.withAlphaComponent(0.85).setStroke()
         NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), xRadius: 7, yRadius: 7).stroke()
 
+        let parsedLines = lines.enumerated().map { HoverLine(index: $0.offset, rawValue: $0.element) }
+        let contentX = rect.minX + 10
+        let contentWidth = rect.width - 20
+        let rowMetrics = InsightsHoverCardLayout.measuredSize(for: parsedLines)
+        let valueColumnWidth = parsedLines.reduce(CGFloat(0)) { width, line in
+            guard case let .row(_, value) = line else { return width }
+            return max(width, value.size(withAttributes: InsightsHoverCardLayout.valueAttributes).width)
+        }
+        let valueX = contentX + contentWidth - valueColumnWidth
+        let labelWidth = max(0, min(rowMetrics.width, valueX - contentX - InsightsHoverCardLayout.rowColumnGap))
+
         var y = rect.minY + 9
-        for (index, line) in lines.enumerated() {
-            let attributes = index == 0
-                ? InsightsHoverCardLayout.titleAttributes
-                : InsightsHoverCardLayout.detailAttributes
-            line.draw(
-                in: NSRect(x: rect.minX + 10, y: y, width: rect.width - 20, height: InsightsHoverCardLayout.lineHeight),
-                withAttributes: attributes
-            )
-            y += InsightsHoverCardLayout.lineHeight
+        for line in parsedLines {
+            switch line {
+            case let .title(text):
+                text.draw(
+                    in: NSRect(x: contentX, y: y, width: contentWidth, height: InsightsHoverCardLayout.lineHeight),
+                    withAttributes: InsightsHoverCardLayout.titleAttributes
+                )
+            case let .detail(text):
+                text.draw(
+                    in: NSRect(x: contentX, y: y, width: contentWidth, height: InsightsHoverCardLayout.lineHeight),
+                    withAttributes: InsightsHoverCardLayout.detailAttributes
+                )
+            case let .row(label, value):
+                label.draw(
+                    in: NSRect(x: contentX, y: y, width: labelWidth, height: InsightsHoverCardLayout.lineHeight),
+                    withAttributes: InsightsHoverCardLayout.detailAttributes
+                )
+                value.draw(
+                    in: NSRect(x: valueX, y: y, width: valueColumnWidth, height: InsightsHoverCardLayout.lineHeight),
+                    withAttributes: InsightsHoverCardLayout.valueAttributes
+                )
+            case .separator:
+                NSColor.separatorColor.withAlphaComponent(0.45).setStroke()
+                let path = NSBezierPath()
+                path.lineWidth = 1
+                let separatorY = y + InsightsHoverCardLayout.separatorHeight / 2
+                path.move(to: NSPoint(x: contentX, y: separatorY))
+                path.line(to: NSPoint(x: contentX + contentWidth, y: separatorY))
+                path.stroke()
+            }
+            y += InsightsHoverCardLayout.height(for: line)
         }
     }
 }
 
-private enum InsightsHoverCard {
+enum InsightsHoverCard {
     @MainActor
     static func show(lines: [String], near point: NSPoint, from sourceView: NSView) {
         guard !lines.isEmpty, let contentView = sourceView.window?.contentView else { return }
@@ -2665,6 +3249,306 @@ enum InsightsRouteMixLayout {
             return String(format: "%.1f%%", percent)
         }
         return "\(Int(percent.rounded()))%"
+    }
+}
+
+struct InsightsIndexFileChartSlice: Equatable {
+    let name: String
+    let bytes: UInt64
+    let itemCount: Int
+    let isGrouped: Bool
+}
+
+struct InsightsIndexFileChartSpan: Equatable {
+    let slice: InsightsIndexFileChartSlice
+    let startAngle: CGFloat
+    let endAngle: CGFloat
+}
+
+enum InsightsIndexFilesChartLayout {
+    static let maximumVisibleSlices = 8
+    private static let chartInset: CGFloat = 4
+    private static let maximumChartSize: CGFloat = 128
+
+    static func chartRect(in bounds: NSRect) -> NSRect {
+        let size = max(0, min(maximumChartSize, bounds.width - chartInset * 2, bounds.height - chartInset * 2))
+        return NSRect(
+            x: bounds.midX - size / 2,
+            y: bounds.midY - size / 2,
+            width: size,
+            height: size
+        )
+    }
+
+    static func outerRadius(in bounds: NSRect) -> CGFloat {
+        chartRect(in: bounds).width / 2
+    }
+
+    static func innerRadius(in bounds: NSRect) -> CGFloat {
+        outerRadius(in: bounds) * 0.56
+    }
+
+    static func slices(from items: [InsightsIndexFileDisplayItem]) -> [InsightsIndexFileChartSlice] {
+        let positiveItems = items
+            .filter { $0.bytes > 0 }
+            .sorted(by: InsightsIndexFileDisplay.defaultSort)
+        guard positiveItems.count > maximumVisibleSlices else {
+            return positiveItems.map {
+                InsightsIndexFileChartSlice(name: $0.name, bytes: $0.bytes, itemCount: 1, isGrouped: false)
+            }
+        }
+
+        let primary = positiveItems.prefix(maximumVisibleSlices - 1)
+        let remainder = positiveItems.dropFirst(maximumVisibleSlices - 1)
+        var slices = primary.map {
+            InsightsIndexFileChartSlice(name: $0.name, bytes: $0.bytes, itemCount: 1, isGrouped: false)
+        }
+        let remainderBytes = remainder.reduce(UInt64(0)) { $0 &+ $1.bytes }
+        if remainderBytes > 0 {
+            slices.append(InsightsIndexFileChartSlice(
+                name: "Other files",
+                bytes: remainderBytes,
+                itemCount: remainder.count,
+                isGrouped: true
+            ))
+        }
+        return slices
+    }
+
+    static func spans(from items: [InsightsIndexFileDisplayItem]) -> [InsightsIndexFileChartSpan] {
+        let slices = slices(from: items)
+        let total = slices.reduce(UInt64(0)) { $0 &+ $1.bytes }
+        guard total > 0 else { return [] }
+
+        var start: CGFloat = 0
+        return slices.enumerated().map { index, slice in
+            let isLast = index == slices.count - 1
+            let span = isLast
+                ? 360 - start
+                : max(0.5, CGFloat(Double(slice.bytes) / Double(total) * 360))
+            let end = min(360, start + span)
+            defer { start = end }
+            return InsightsIndexFileChartSpan(slice: slice, startAngle: start, endAngle: end)
+        }
+    }
+
+    static func sliceIndex(at point: NSPoint, items: [InsightsIndexFileDisplayItem], in bounds: NSRect) -> Int? {
+        let rect = chartRect(in: bounds)
+        guard rect.width > 0, rect.height > 0 else { return nil }
+        let center = NSPoint(x: rect.midX, y: rect.midY)
+        let dx = point.x - center.x
+        let dy = point.y - center.y
+        let radius = sqrt(dx * dx + dy * dy)
+        guard radius >= innerRadius(in: bounds), radius <= outerRadius(in: bounds) else { return nil }
+
+        let rawDegrees = CGFloat(atan2(Double(dy), Double(dx)) * 180 / Double.pi)
+        let normalized = (rawDegrees + 90 + 360).truncatingRemainder(dividingBy: 360)
+        return spans(from: items).firstIndex { span in
+            normalized >= span.startAngle && normalized < span.endAngle
+        }
+    }
+
+    static func percentString(bytes: UInt64, total: UInt64) -> String {
+        guard total > 0 else { return "0%" }
+        let percent = Double(bytes) / Double(total) * 100
+        if percent > 0, percent < 0.1 {
+            return "<0.1%"
+        }
+        if percent < 10 {
+            return String(format: "%.1f%%", percent)
+        }
+        return "\(Int(percent.rounded()))%"
+    }
+}
+
+private final class InsightsIndexFilesChartView: NSView {
+    var items: [InsightsIndexFileDisplayItem] = [] {
+        didSet {
+            refreshHoverAfterContentUpdate()
+            needsDisplay = true
+        }
+    }
+
+    override var isFlipped: Bool { true }
+
+    private var trackingArea: NSTrackingArea?
+    private var hoveredSliceIndex: Int?
+    private var hoverPoint: NSPoint?
+    private static let palette: [NSColor] = [
+        .systemBlue,
+        .systemGreen,
+        .systemOrange,
+        .systemPink,
+        .systemPurple,
+        .systemTeal,
+        .systemIndigo,
+        .systemRed
+    ]
+
+    override func updateTrackingAreas() {
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.activeAlways, .inVisibleRect, .mouseEnteredAndExited, .mouseMoved],
+            owner: self,
+            userInfo: nil
+        )
+        trackingArea = area
+        addTrackingArea(area)
+        super.updateTrackingAreas()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        updateHover(at: point)
+        updateHoverCard()
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hoveredSliceIndex = nil
+        hoverPoint = nil
+        InsightsHoverCard.hide(from: self)
+        needsDisplay = true
+    }
+
+    private func refreshHoverAfterContentUpdate() {
+        guard let hoverPoint, bounds.contains(hoverPoint), window?.isKeyWindow != false else {
+            hoveredSliceIndex = nil
+            self.hoverPoint = nil
+            InsightsHoverCard.hide(from: self)
+            return
+        }
+        updateHover(at: hoverPoint)
+        updateHoverCard()
+    }
+
+    private func updateHover(at point: NSPoint) {
+        hoverPoint = point
+        hoveredSliceIndex = InsightsIndexFilesChartLayout.sliceIndex(at: point, items: items, in: bounds)
+    }
+
+    private func updateHoverCard() {
+        guard
+            let hoveredSliceIndex,
+            let hoverPoint,
+            hoveredSliceIndex < InsightsIndexFilesChartLayout.spans(from: items).count
+        else {
+            InsightsHoverCard.hide(from: self)
+            return
+        }
+
+        let spans = InsightsIndexFilesChartLayout.spans(from: items)
+        let slice = spans[hoveredSliceIndex].slice
+        let total = items.first?.packageBytes ?? spans.reduce(UInt64(0)) { $0 &+ $1.slice.bytes }
+        var lines = [
+            slice.name,
+            "\(Self.byteString(slice.bytes)) allocated",
+            "\(InsightsIndexFilesChartLayout.percentString(bytes: slice.bytes, total: total)) of index package"
+        ]
+        if slice.isGrouped {
+            lines.append("\(slice.itemCount.formatted()) smaller files")
+        }
+        InsightsHoverCard.show(lines: lines, near: hoverPoint, from: self)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        let isDark = InsightsPanelPalette.isDarkAppearance(effectiveAppearance)
+        InsightsPanelPalette.chartBackgroundColor(isDark: isDark).setFill()
+        bounds.fill()
+
+        let spans = InsightsIndexFilesChartLayout.spans(from: items)
+        guard !items.isEmpty else {
+            drawEmpty("No index package")
+            return
+        }
+        guard !spans.isEmpty else {
+            drawEmpty("No bytes yet")
+            return
+        }
+
+        let rect = InsightsIndexFilesChartLayout.chartRect(in: bounds)
+        let center = NSPoint(x: rect.midX, y: rect.midY)
+        let outerRadius = InsightsIndexFilesChartLayout.outerRadius(in: bounds)
+        let innerRadius = InsightsIndexFilesChartLayout.innerRadius(in: bounds)
+
+        for (index, span) in spans.enumerated() {
+            let path = NSBezierPath()
+            path.move(to: center)
+            path.appendArc(
+                withCenter: center,
+                radius: outerRadius,
+                startAngle: span.startAngle - 90,
+                endAngle: span.endAngle - 90,
+                clockwise: false
+            )
+            path.close()
+            Self.palette[index % Self.palette.count].withAlphaComponent(0.78).setFill()
+            path.fill()
+
+            if hoveredSliceIndex == index {
+                NSColor.labelColor.withAlphaComponent(isDark ? 0.65 : 0.45).setStroke()
+                path.lineWidth = 2
+                path.stroke()
+            }
+        }
+
+        InsightsPanelPalette.chartBackgroundColor(isDark: isDark).setFill()
+        NSBezierPath(ovalIn: NSRect(
+            x: center.x - innerRadius,
+            y: center.y - innerRadius,
+            width: innerRadius * 2,
+            height: innerRadius * 2
+        )).fill()
+        drawCenterLabel(total: items.first?.packageBytes ?? 0, in: rect)
+    }
+
+    private func drawCenterLabel(total: UInt64, in rect: NSRect) {
+        let titleAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 10, weight: .medium),
+            .foregroundColor: NSColor.secondaryLabelColor
+        ]
+        let valueAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold),
+            .foregroundColor: NSColor.labelColor
+        ]
+        let title = "Package"
+        let value = Self.byteString(total)
+        let titleSize = title.size(withAttributes: titleAttributes)
+        let valueSize = value.size(withAttributes: valueAttributes)
+        let y = rect.midY - (titleSize.height + valueSize.height + 2) / 2
+        title.draw(
+            at: NSPoint(x: rect.midX - titleSize.width / 2, y: y),
+            withAttributes: titleAttributes
+        )
+        value.draw(
+            at: NSPoint(x: rect.midX - valueSize.width / 2, y: y + titleSize.height + 2),
+            withAttributes: valueAttributes
+        )
+    }
+
+    private func drawEmpty(_ text: String) {
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+            .foregroundColor: NSColor.secondaryLabelColor
+        ]
+        let size = text.size(withAttributes: attributes)
+        text.draw(
+            at: NSPoint(x: bounds.midX - size.width / 2, y: bounds.midY - size.height / 2),
+            withAttributes: attributes
+        )
+    }
+
+    private static func byteString(_ bytes: UInt64) -> String {
+        InsightsIndexFileDisplay.byteString(bytes)
     }
 }
 
@@ -3199,6 +4083,291 @@ private final class InsightsBarChartView: NSView {
             at: NSPoint(x: bounds.midX - size.width / 2, y: bounds.midY - size.height / 2),
             withAttributes: attributes
         )
+    }
+}
+
+private final class InsightsMaintenanceCostChartView: NSView {
+    var buckets: [DailyUsageBucket] = [] {
+        didSet {
+            refreshHoverAfterContentUpdate()
+            needsDisplay = true
+        }
+    }
+
+    override var isFlipped: Bool { true }
+
+    private var trackingArea: NSTrackingArea?
+    private var hoveredBucketIndex: Int?
+    private var hoverPoint: NSPoint?
+
+    override func updateTrackingAreas() {
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.activeAlways, .inVisibleRect, .mouseEnteredAndExited, .mouseMoved],
+            owner: self,
+            userInfo: nil
+        )
+        trackingArea = area
+        addTrackingArea(area)
+        super.updateTrackingAreas()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        updateHover(at: point)
+        updateHoverCard()
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hoveredBucketIndex = nil
+        hoverPoint = nil
+        InsightsHoverCard.hide(from: self)
+        needsDisplay = true
+    }
+
+    private func refreshHoverAfterContentUpdate() {
+        guard
+            let hoverPoint,
+            bounds.contains(hoverPoint),
+            window?.isKeyWindow != false
+        else {
+            hoveredBucketIndex = nil
+            self.hoverPoint = nil
+            InsightsHoverCard.hide(from: self)
+            return
+        }
+
+        updateHover(at: hoverPoint)
+        updateHoverCard()
+    }
+
+    private func updateHover(at point: NSPoint) {
+        hoverPoint = point
+        hoveredBucketIndex = InsightsMaintenanceCostChartLayout.bucketIndex(
+            at: point,
+            bucketCount: buckets.count,
+            in: bounds
+        )
+    }
+
+    private func updateHoverCard() {
+        guard let hoveredBucketIndex, let hoverPoint, hoveredBucketIndex < buckets.count else {
+            InsightsHoverCard.hide(from: self)
+            return
+        }
+
+        InsightsHoverCard.show(
+            lines: placardLines(for: buckets[hoveredBucketIndex]),
+            near: hoverPoint,
+            from: self
+        )
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        let isDark = InsightsPanelPalette.isDarkAppearance(effectiveAppearance)
+        InsightsPanelPalette.chartBackgroundColor(isDark: isDark).setFill()
+        bounds.fill()
+
+        guard buckets.contains(where: { $0.maintenance.background.operations > 0 }) else {
+            drawEmpty("No background maintenance samples yet")
+            return
+        }
+
+        let values = buckets.map {
+            max($0.maintenance.background.wallTime, $0.maintenance.background.approximateCPUTime)
+        }
+        let maxValue = max(values.max() ?? 0, 0.001)
+        let plot = InsightsMaintenanceCostChartLayout.plotRect(in: bounds)
+        let bucketRects = InsightsMaintenanceCostChartLayout.bucketRects(bucketCount: buckets.count, in: bounds)
+
+        if let hoveredBucketIndex, hoveredBucketIndex < bucketRects.count {
+            let highlightRect = bucketRects[hoveredBucketIndex].insetBy(dx: -1, dy: 0)
+            NSColor.labelColor.withAlphaComponent(isDark ? 0.10 : 0.06).setFill()
+            NSBezierPath(roundedRect: highlightRect, xRadius: 3, yRadius: 3).fill()
+        }
+
+        for (index, bucket) in buckets.enumerated() {
+            let bucketRect = bucketRects[index]
+            let background = bucket.maintenance.background
+            let wallHeight = CGFloat(background.wallTime / maxValue) * plot.height
+            let cpuHeight = CGFloat(background.approximateCPUTime / maxValue) * plot.height
+            let bars = InsightsMaintenanceCostChartLayout.comparisonBarRects(in: bucketRect)
+            drawBar(
+                x: bars.wall.minX,
+                width: bars.wall.width,
+                height: wallHeight,
+                color: .systemOrange.withAlphaComponent(0.82),
+                plot: plot
+            )
+            drawBar(
+                x: bars.cpu.minX,
+                width: bars.cpu.width,
+                height: cpuHeight,
+                color: .systemRed.withAlphaComponent(0.76),
+                plot: plot
+            )
+        }
+
+        drawLegend(in: InsightsMaintenanceCostChartLayout.legendRect(in: bounds))
+    }
+
+    private func drawBar(x: CGFloat, width: CGFloat, height: CGFloat, color: NSColor, plot: NSRect) {
+        guard height > 0 else { return }
+        color.setFill()
+        let rect = NSRect(x: x, y: plot.maxY - height, width: width, height: height)
+        NSBezierPath(roundedRect: rect, xRadius: 2, yRadius: 2).fill()
+    }
+
+    private func drawLegend(in rect: NSRect) {
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 10, weight: .medium),
+            .foregroundColor: NSColor.secondaryLabelColor
+        ]
+        var x = rect.minX
+        for item in InsightsMaintenanceCostChartLayout.legendItems {
+            item.color.setFill()
+            NSBezierPath(
+                roundedRect: NSRect(x: x, y: rect.minY + 3, width: 8, height: 8),
+                xRadius: 2,
+                yRadius: 2
+            ).fill()
+            x += 12
+            item.title.draw(at: NSPoint(x: x, y: rect.minY), withAttributes: attributes)
+            x += item.title.size(withAttributes: attributes).width + 14
+        }
+    }
+
+    private func placardLines(for bucket: DailyUsageBucket) -> [String] {
+        let background = bucket.maintenance.background
+        let foreground = bucket.maintenance.interactive
+        return [
+            bucket.day,
+            "\(Self.durationString(background.approximateCPUTime)) background approx CPU",
+            "\(Self.durationString(background.wallTime)) background wall time",
+            "\(Self.cpuPerWallString(background)) background CPU / wall",
+            "\(background.operations.formatted()) background operations",
+            "\(background.paths.formatted()) paths · \(background.visited.formatted()) visits",
+            "\(foreground.operations.formatted()) foreground operations"
+        ]
+    }
+
+    private func drawEmpty(_ text: String) {
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 13, weight: .medium),
+            .foregroundColor: NSColor.secondaryLabelColor
+        ]
+        let size = text.size(withAttributes: attributes)
+        text.draw(
+            at: NSPoint(x: bounds.midX - size.width / 2, y: bounds.midY - size.height / 2),
+            withAttributes: attributes
+        )
+    }
+
+    private static func durationString(_ duration: TimeInterval) -> String {
+        if duration <= 0 {
+            return "0 ms"
+        }
+        if duration < 1 {
+            return "\(Int((duration * 1_000).rounded())) ms"
+        }
+        return String(format: "%.2f s", duration)
+    }
+
+    private static func cpuPerWallString(_ counters: IndexMaintenanceOperationCounters) -> String {
+        guard counters.wallTime > 0, counters.approximateCPUTime > 0 else {
+            return "0%"
+        }
+        let percent = counters.approximateCPUTime / counters.wallTime * 100
+        if percent < 10 {
+            return String(format: "%.1f%%", percent)
+        }
+        return "\(Int(percent.rounded()))%"
+    }
+}
+
+enum InsightsMaintenanceCostChartLayout {
+    static let inset = NSEdgeInsets(top: 10, left: 8, bottom: 10, right: 8)
+    static let legendHeight: CGFloat = 14
+    static let legendGap: CGFloat = 8
+    static let bucketGap: CGFloat = 3
+    static let comparisonGap: CGFloat = 2
+    static let legendItems: [(title: String, color: NSColor)] = [
+        ("Background wall", .systemOrange.withAlphaComponent(0.82)),
+        ("Background CPU", .systemRed.withAlphaComponent(0.76))
+    ]
+
+    static func plotRect(in bounds: NSRect) -> NSRect {
+        let content = bounds.insetBy(dx: inset.left, dy: 0)
+        let y = bounds.minY + inset.top
+        let bottomReserved = inset.bottom + legendHeight + legendGap
+        return NSRect(
+            x: content.minX,
+            y: y,
+            width: max(0, content.width),
+            height: max(0, bounds.height - inset.top - bottomReserved)
+        )
+    }
+
+    static func legendRect(in bounds: NSRect) -> NSRect {
+        let plot = plotRect(in: bounds)
+        return NSRect(
+            x: plot.minX,
+            y: plot.maxY + legendGap,
+            width: plot.width,
+            height: legendHeight
+        )
+    }
+
+    static func bucketRects(bucketCount: Int, in bounds: NSRect) -> [NSRect] {
+        guard bucketCount > 0 else { return [] }
+        let plot = plotRect(in: bounds)
+        guard plot.width > 0, plot.height > 0 else { return [] }
+        let barWidth = max(
+            3,
+            (plot.width - CGFloat(max(bucketCount - 1, 0)) * bucketGap) / CGFloat(bucketCount)
+        )
+        var rects: [NSRect] = []
+        rects.reserveCapacity(bucketCount)
+        var x = plot.minX
+        for _ in 0..<bucketCount {
+            rects.append(NSRect(x: x, y: plot.minY, width: min(barWidth, plot.maxX - x), height: plot.height))
+            x += barWidth + bucketGap
+        }
+        return rects
+    }
+
+    static func bucketIndex(at point: NSPoint, bucketCount: Int, in bounds: NSRect) -> Int? {
+        bucketRects(bucketCount: bucketCount, in: bounds)
+            .firstIndex { $0.insetBy(dx: -1, dy: 0).contains(point) }
+    }
+
+    static func comparisonBarRects(in bucketRect: NSRect) -> (wall: NSRect, cpu: NSRect) {
+        let gap = bucketRect.width >= 8 ? comparisonGap : 1
+        let width = max(1, (bucketRect.width - gap) / 2)
+        let wall = NSRect(
+            x: bucketRect.minX,
+            y: bucketRect.minY,
+            width: min(width, bucketRect.width),
+            height: bucketRect.height
+        )
+        let cpuX = min(bucketRect.maxX, wall.maxX + gap)
+        let cpu = NSRect(
+            x: cpuX,
+            y: bucketRect.minY,
+            width: max(0, min(width, bucketRect.maxX - cpuX)),
+            height: bucketRect.height
+        )
+        return (wall, cpu)
     }
 }
 

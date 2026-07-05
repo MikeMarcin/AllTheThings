@@ -88,6 +88,24 @@ public struct FileExclusionRules: @unchecked Sendable {
         self.rules = patterns.compactMap(Rule.init(rawPattern:))
     }
 
+    public func canPruneDirectoryComponentBeforeStat(_ component: String) -> Bool {
+        let lowercasedComponent = component.lowercased()
+        guard Self.fastPruneDirectoryComponents.contains(lowercasedComponent) else {
+            return false
+        }
+
+        let negatedPatterns = patterns.lazy
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .filter { $0.hasPrefix("!") }
+        guard !negatedPatterns.contains(where: { $0.contains(lowercasedComponent) }) else {
+            return false
+        }
+
+        return patterns.contains { pattern in
+            Self.pattern(pattern, prunesDirectoryComponent: lowercasedComponent)
+        }
+    }
+
     public func excludes(url: URL, roots: [String], isDirectory: Bool? = nil) -> Bool {
         decision(url: url, roots: roots, isDirectory: isDirectory) != .index
     }
@@ -149,6 +167,38 @@ public struct FileExclusionRules: @unchecked Sendable {
         }
 
         return relativePaths.isEmpty ? [path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))] : relativePaths
+    }
+
+    private static let fastPruneDirectoryComponents: Set<String> = [
+        "node_modules",
+        "deriveddata",
+        ".turbo",
+        "cmakefiles",
+        "buck-out",
+        "bazel-out",
+        ".buckd",
+        ".venv",
+        "venv",
+        ".tox",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".cache",
+        ".trash"
+    ]
+
+    private static func pattern(_ pattern: String, prunesDirectoryComponent lowercasedComponent: String) -> Bool {
+        var normalized = pattern.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty, !normalized.hasPrefix("!") else { return false }
+        while normalized.hasSuffix("/") {
+            normalized.removeLast()
+        }
+        guard !normalized.contains("*"), !normalized.contains("?"), !normalized.contains("[") else {
+            return false
+        }
+
+        return normalized.split(separator: "/").last == Substring(lowercasedComponent)
     }
 
     private final class Rule: @unchecked Sendable {

@@ -200,6 +200,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSear
 
     func applicationWillTerminate(_ notification: Notification) {
         DiagnosticLogger.shared.log(category: "app", event: "app.terminate")
+        fileIndex.flushUsageMetrics()
         DiagnosticLogger.shared.flush()
     }
 

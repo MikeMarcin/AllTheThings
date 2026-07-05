@@ -15,6 +15,20 @@ public enum SortColumn: String, Codable, CaseIterable, Sendable {
     case root
 }
 
+public extension SortColumn {
+    static let optimizedIndexColumns: [SortColumn] = [
+        .name,
+        .path,
+        .modified,
+        .created,
+        .size,
+        .fileExtension,
+        .kind,
+        .volume,
+        .root
+    ]
+}
+
 public struct SortSpec: Codable, Equatable, Sendable {
     public let column: SortColumn
     public let ascending: Bool
@@ -298,6 +312,24 @@ public enum IndexActivityPresentation: String, Codable, Equatable, Sendable {
     case backgroundCatchUp
 }
 
+public enum IndexWorkPriority: String, Sendable {
+    case interactive
+    case background
+
+    static func merged(_ lhs: IndexWorkPriority, _ rhs: IndexWorkPriority) -> IndexWorkPriority {
+        lhs == .interactive || rhs == .interactive ? .interactive : .background
+    }
+
+    var maintenancePriority: IndexMaintenancePriority {
+        switch self {
+        case .interactive:
+            .interactive
+        case .background:
+            .background
+        }
+    }
+}
+
 public enum ReconciliationRequestResult: Equatable, Sendable {
     case ignored
     case started
@@ -452,6 +484,8 @@ struct FileIndexDiagnostics: Sendable {
     let componentGramPostingCount: Int
     let extensionKeyCount: Int
     let extensionPostingCount: Int
+    let pendingRefreshPathCount: Int
+    let pendingBackgroundRefreshPathCount: Int
     let completedRefreshBatches: UInt64
     let completedSnapshotRebuilds: UInt64
     let activeIndexJobs: Int
@@ -543,12 +577,45 @@ public final class FileIndex: @unchecked Sendable {
     private static let largeOverlayPersistDefaultDelay: TimeInterval = 30
     private static let largeOverlayChangedPathDefaultThreshold = 10_000
     private static let largeOverlayDrainBackoffDefaultDelay: TimeInterval = 5
+    private static let backgroundRefreshBatchDefaultLimit = 64
+    private static let backgroundRefreshDrainBackoffDefaultDelay: TimeInterval = 15
+    private static let backgroundDirectoryScanBudgetDefault: TimeInterval = 1.5
+    private static let backgroundDirectoryMaxDeferralDefault: TimeInterval = 30 * 60
+    private static let backgroundOptimizationPersistDefaultDelay: TimeInterval = 300
     private static let metadataOverlayPersistDefaultDelay: TimeInterval = 30
     private static let metadataOverlayCheckpointDefaultDelay: TimeInterval = 300
     private static let metadataOverlayPersistDefaultLimit = 10_000
+    private static let usageMetricsMaintenanceSaveDefaultDelay: TimeInterval = 15
     private static let degradedSearchMaximumScanLimit = 25_000
+    private static let previewIndexedCandidateScanLimit = 50_000
+    private static let previewOrderedCandidateScanLimit = 25_000
     public static let maximumIndexedRootCount = RootAttributionTable.maximumRootCount
     private static let memoryTelemetrySinkForTesting = MemoryTelemetrySinkBox()
+
+    private static func sortOrderFileName(for column: SortColumn) -> String? {
+        switch column {
+        case .relevance:
+            return nil
+        case .name:
+            return SnapshotLayout.FileName.nameOrder
+        case .path:
+            return SnapshotLayout.FileName.pathOrder
+        case .modified:
+            return SnapshotLayout.FileName.modifiedOrder
+        case .created:
+            return SnapshotLayout.FileName.createdOrder
+        case .size:
+            return SnapshotLayout.FileName.sizeOrder
+        case .fileExtension:
+            return SnapshotLayout.FileName.extensionOrder
+        case .kind:
+            return SnapshotLayout.FileName.kindOrder
+        case .volume:
+            return SnapshotLayout.FileName.volumeOrder
+        case .root:
+            return SnapshotLayout.FileName.rootOrder
+        }
+    }
 
     private final class MemoryTelemetrySinkBox: @unchecked Sendable {
         private let lock = NSLock()
@@ -638,6 +705,7 @@ public final class FileIndex: @unchecked Sendable {
     private struct PersistedSearchStructures {
         let modifiedDescending: [Int]?
         let visibleModifiedDescending: [Int]?
+        let sortOrdersAscending: [SortColumn: [Int]]
         let nameGramIndex: MappedIntPostingIndex?
         let componentGramIndex: MappedIntPostingIndex?
         let pathGramIndex: MappedIntPostingIndex?
@@ -645,6 +713,7 @@ public final class FileIndex: @unchecked Sendable {
         static let empty = PersistedSearchStructures(
             modifiedDescending: nil,
             visibleModifiedDescending: nil,
+            sortOrdersAscending: [:],
             nameGramIndex: nil,
             componentGramIndex: nil,
             pathGramIndex: nil
@@ -975,20 +1044,58 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
+    private struct RankedSearchMatch {
+        let rank: Int32
+        let match: SearchMatch
+    }
+
     private struct RefreshUpdateResult {
         let applied: Bool
         let largeOverlay: Bool
+        let priority: IndexWorkPriority
         let batchPathCount: Int
         let changedPathCount: Int
+        let visitedCount: Int
+        let exclusionInstrumentation: FileExclusionQuery.Instrumentation
         let reconciledDirectoryPrefixes: [String]
+        let deferredRefreshes: [PendingRefreshWork]
+        let deferredDirectoryVisitCount: Int
 
         static let none = RefreshUpdateResult(
             applied: false,
             largeOverlay: false,
+            priority: .interactive,
             batchPathCount: 0,
             changedPathCount: 0,
-            reconciledDirectoryPrefixes: []
+            visitedCount: 0,
+            exclusionInstrumentation: FileExclusionQuery.Instrumentation(),
+            reconciledDirectoryPrefixes: [],
+            deferredRefreshes: [],
+            deferredDirectoryVisitCount: 0
         )
+    }
+
+    private struct PendingRefreshWork: Sendable {
+        let path: String
+        var priority: IndexWorkPriority
+        var firstQueuedAt: Date
+        var lastQueuedAt: Date
+
+        mutating func merge(priority newPriority: IndexWorkPriority, queuedAt: Date) {
+            priority = IndexWorkPriority.merged(priority, newPriority)
+            lastQueuedAt = queuedAt
+        }
+
+        mutating func promote() {
+            priority = .interactive
+        }
+    }
+
+    private struct DirectoryUpdateScanResult {
+        let records: [String: FileRecord]
+        let completed: Bool
+        let visitedCount: Int
+        let exclusionInstrumentation: FileExclusionQuery.Instrumentation
     }
 
     private struct RowInterval {
@@ -1061,6 +1168,79 @@ public final class FileIndex: @unchecked Sendable {
         let store: HeapPagedRecordStore?
         let visited: Int
         let frontierMetrics: ScanFrontierMetrics
+        let exclusionInstrumentation: FileExclusionQuery.Instrumentation
+    }
+
+    private struct MaintenanceMeasurement {
+        let startedAt: Date
+        let startingCPUTime: TimeInterval
+
+        init(startedAt: Date = Date()) {
+            self.startedAt = startedAt
+            self.startingCPUTime = Self.currentProcessCPUTime()
+        }
+
+        func operation(
+            kind: IndexMaintenanceOperationKind,
+            priority: IndexMaintenancePriority,
+            completedAt: Date = Date(),
+            paths: Int = 0,
+            records: Int = 0,
+            visited: Int = 0,
+            yieldedSlices: Int = 0,
+            deferredPaths: Int = 0,
+            largeOverlays: Int = 0,
+            optimizationDeferrals: Int = 0,
+            exclusionInstrumentation: FileExclusionQuery.Instrumentation = FileExclusionQuery.Instrumentation()
+        ) -> IndexMaintenanceOperationMetric {
+            IndexMaintenanceOperationMetric(
+                kind: kind,
+                priority: priority,
+                completedAt: completedAt,
+                wallTime: completedAt.timeIntervalSince(startedAt),
+                approximateCPUTime: max(Self.currentProcessCPUTime() - startingCPUTime, 0),
+                paths: Self.uint64(paths),
+                records: Self.uint64(records),
+                visited: Self.uint64(visited),
+                yieldedSlices: Self.uint64(yieldedSlices),
+                deferredPaths: Self.uint64(deferredPaths),
+                largeOverlays: Self.uint64(largeOverlays),
+                optimizationDeferrals: Self.uint64(optimizationDeferrals),
+                exclusionDecisions: Self.uint64(exclusionInstrumentation.compiledExclusionDecisionCount),
+                exclusionRegexMatches: Self.uint64(exclusionInstrumentation.regexMatchCount),
+                exclusionFastPathDecisions: Self.uint64(exclusionInstrumentation.fastPathDecisionCount),
+                exclusionFastPrunes: Self.uint64(exclusionInstrumentation.fastPruneDirectoryCount)
+            )
+        }
+
+        private static func uint64(_ value: Int) -> UInt64 {
+            UInt64(max(value, 0))
+        }
+
+        private static func currentProcessCPUTime() -> TimeInterval {
+            var usage = rusage()
+            guard getrusage(RUSAGE_SELF, &usage) == 0 else { return 0 }
+            return timeInterval(usage.ru_utime) + timeInterval(usage.ru_stime)
+        }
+
+        private static func timeInterval(_ value: timeval) -> TimeInterval {
+            TimeInterval(value.tv_sec) + TimeInterval(value.tv_usec) / 1_000_000
+        }
+    }
+
+    private final class ExclusionInstrumentationAccumulator: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = FileExclusionQuery.Instrumentation()
+
+        func add(_ instrumentation: FileExclusionQuery.Instrumentation) {
+            lock.withLock {
+                value.add(instrumentation)
+            }
+        }
+
+        func snapshot() -> FileExclusionQuery.Instrumentation {
+            lock.withLock { value }
+        }
     }
 
     private struct ScanProgress {
@@ -1320,7 +1500,7 @@ public final class FileIndex: @unchecked Sendable {
             )
         }
 
-        func result() -> (ScanResult, Bool) {
+        func result(exclusionInstrumentation: FileExclusionQuery.Instrumentation) -> (ScanResult, Bool) {
             condition.lock()
             defer { condition.unlock() }
             return (
@@ -1328,7 +1508,8 @@ public final class FileIndex: @unchecked Sendable {
                     records: records,
                     store: builder?.snapshot(includesPathIndex: true),
                     visited: visited,
-                    frontierMetrics: frontierMetrics
+                    frontierMetrics: frontierMetrics,
+                    exclusionInstrumentation: exclusionInstrumentation
                 ),
                 shouldStop
             )
@@ -1345,6 +1526,11 @@ public final class FileIndex: @unchecked Sendable {
         let nameDescending: [Int]
         let visibleModifiedDescending: [Int]
         let visibleModifiedAscending: [Int]
+        private let sortOrderLock = NSLock()
+        private var sortOrdersAscending: [SortColumn: [Int]]
+        private var visibleSortOrdersAscending: [SortColumn: [Int]]
+        private var sortRankCache: [SortRankCacheKey: [Int32]] = [:]
+        private var sortRankCacheOrder: [SortRankCacheKey] = []
         let gramIndex: MappedIntPostingIndex?
         let pathGramShards: [PathGramShard]
         let pathGramExpectedRowCount: Int
@@ -1363,6 +1549,12 @@ public final class FileIndex: @unchecked Sendable {
             let firstChild: [Int32]
             let nextSibling: [Int32]
             let roots: [Int32]
+        }
+
+        private struct SortRankCacheKey: Hashable {
+            let column: SortColumn
+            let ascending: Bool
+            let includeHidden: Bool
         }
 
         struct PathGramShard: Sendable {
@@ -1406,6 +1598,7 @@ public final class FileIndex: @unchecked Sendable {
             roots: [String] = [],
             buildsSearchStructures: Bool = true,
             buildsPathGramIndex: Bool = true,
+            optimizedSortColumns: Set<SortColumn> = Set(SortColumn.optimizedIndexColumns),
             prefersDegradedSearch: Bool = false
         ) {
             self.store = HeapPagedRecordStore(records: records, roots: roots)
@@ -1425,7 +1618,8 @@ public final class FileIndex: @unchecked Sendable {
                 self.visibleCount = extensionData.visibleCount
                 let sortedByModified = Self.makeModifiedDescending(store: store)
                 self.modifiedDescending = sortedByModified
-                self.modifiedAscending = Array(sortedByModified.reversed())
+                let sortedByModifiedAscending = Array(sortedByModified.reversed())
+                self.modifiedAscending = sortedByModifiedAscending
                 let sortedByName = Self.makeNameAscending(store: store)
                 self.nameAscending = sortedByName
                 self.nameDescending = Array(sortedByName.reversed())
@@ -1435,6 +1629,12 @@ public final class FileIndex: @unchecked Sendable {
                 )
                 self.visibleModifiedDescending = visibleSortedByModified
                 self.visibleModifiedAscending = Array(visibleSortedByModified.reversed())
+                self.sortOrdersAscending = Self.makeAdditionalSortOrdersAscending(
+                    store: store,
+                    optimizedSortColumns: optimizedSortColumns,
+                    persistedOrders: [:]
+                )
+                self.visibleSortOrdersAscending = [:]
                 self.hasSortedOrder = true
                 self.diagnostics = Self.makeDiagnostics(
                     pathGramIndexEnabled: gramIndex != nil,
@@ -1462,6 +1662,8 @@ public final class FileIndex: @unchecked Sendable {
                 self.nameDescending = []
                 self.visibleModifiedDescending = []
                 self.visibleModifiedAscending = []
+                self.sortOrdersAscending = [:]
+                self.visibleSortOrdersAscending = [:]
                 self.hasSortedOrder = false
                 self.diagnostics = Self.makeDiagnostics(
                     pathGramIndexEnabled: false,
@@ -1479,6 +1681,7 @@ public final class FileIndex: @unchecked Sendable {
             store: RecordStore,
             buildsSearchStructures: Bool = true,
             buildsPathGramIndex: Bool = true,
+            optimizedSortColumns: Set<SortColumn> = Set(SortColumn.optimizedIndexColumns),
             prefersDegradedSearch: Bool = false
         ) {
             self.store = store
@@ -1498,7 +1701,8 @@ public final class FileIndex: @unchecked Sendable {
                 self.visibleCount = extensionData.visibleCount
                 let sortedByModified = Self.makeModifiedDescending(store: store)
                 self.modifiedDescending = sortedByModified
-                self.modifiedAscending = Array(sortedByModified.reversed())
+                let sortedByModifiedAscending = Array(sortedByModified.reversed())
+                self.modifiedAscending = sortedByModifiedAscending
                 let sortedByName = Self.makeNameAscending(store: store)
                 self.nameAscending = sortedByName
                 self.nameDescending = Array(sortedByName.reversed())
@@ -1508,6 +1712,12 @@ public final class FileIndex: @unchecked Sendable {
                 )
                 self.visibleModifiedDescending = visibleSortedByModified
                 self.visibleModifiedAscending = Array(visibleSortedByModified.reversed())
+                self.sortOrdersAscending = Self.makeAdditionalSortOrdersAscending(
+                    store: store,
+                    optimizedSortColumns: optimizedSortColumns,
+                    persistedOrders: [:]
+                )
+                self.visibleSortOrdersAscending = [:]
                 self.hasSortedOrder = true
                 self.diagnostics = Self.makeDiagnostics(
                     pathGramIndexEnabled: gramIndex != nil,
@@ -1535,6 +1745,8 @@ public final class FileIndex: @unchecked Sendable {
                 self.nameDescending = []
                 self.visibleModifiedDescending = []
                 self.visibleModifiedAscending = []
+                self.sortOrdersAscending = [:]
+                self.visibleSortOrdersAscending = [:]
                 self.hasSortedOrder = false
                 self.diagnostics = Self.makeDiagnostics(
                     pathGramIndexEnabled: false,
@@ -1548,7 +1760,11 @@ public final class FileIndex: @unchecked Sendable {
             }
         }
 
-        init(store: RecordStore, persistedStructures: PersistedSearchStructures) {
+        init(
+            store: RecordStore,
+            persistedStructures: PersistedSearchStructures,
+            optimizedSortColumns: Set<SortColumn> = Set(SortColumn.optimizedIndexColumns)
+        ) {
             self.store = store
             self.prefersDegradedSearch = false
             self.gramIndex = persistedStructures.pathGramIndex
@@ -1566,19 +1782,37 @@ public final class FileIndex: @unchecked Sendable {
             let expectedModifiedCount = store.storedResultCount ?? store.count
             if let modifiedDescending = persistedStructures.modifiedDescending, modifiedDescending.count == expectedModifiedCount {
                 self.modifiedDescending = modifiedDescending
-                self.modifiedAscending = Array(modifiedDescending.reversed())
+                let modifiedAscending = Array(modifiedDescending.reversed())
+                self.modifiedAscending = modifiedAscending
                 let visibleModifiedDescending = persistedStructures.visibleModifiedDescending
                     ?? Self.makeVisibleModifiedDescending(modifiedDescending: modifiedDescending, store: store)
                 self.visibleModifiedDescending = visibleModifiedDescending
                 self.visibleModifiedAscending = Array(visibleModifiedDescending.reversed())
                 if nameGramIndex != nil, componentGramIndex != nil {
-                    let sortedByName = Self.makeNameAscending(store: store)
+                    let persistedNameOrder = optimizedSortColumns.contains(.name)
+                        ? persistedStructures.sortOrdersAscending[.name]
+                        : nil
+                    let sortedByName: [Int]
+                    if let persistedNameOrder, persistedNameOrder.count == expectedModifiedCount {
+                        sortedByName = persistedNameOrder
+                    } else {
+                        sortedByName = Self.makeNameAscending(store: store)
+                    }
                     self.nameAscending = sortedByName
                     self.nameDescending = Array(sortedByName.reversed())
+                    self.sortOrdersAscending = Self.makeAdditionalSortOrdersAscending(
+                        store: store,
+                        optimizedSortColumns: optimizedSortColumns,
+                        persistedOrders: persistedStructures.sortOrdersAscending,
+                        buildsMissingOrders: false
+                    )
+                    self.visibleSortOrdersAscending = [:]
                     self.hasSortedOrder = true
                 } else {
                     self.nameAscending = []
                     self.nameDescending = []
+                    self.sortOrdersAscending = [:]
+                    self.visibleSortOrdersAscending = [:]
                     self.hasSortedOrder = false
                 }
             } else {
@@ -1588,6 +1822,8 @@ public final class FileIndex: @unchecked Sendable {
                 self.nameDescending = []
                 self.visibleModifiedDescending = []
                 self.visibleModifiedAscending = []
+                self.sortOrdersAscending = [:]
+                self.visibleSortOrdersAscending = [:]
                 self.hasSortedOrder = false
             }
 
@@ -1614,6 +1850,7 @@ public final class FileIndex: @unchecked Sendable {
             childLinks: ChildLinks? = nil,
             nameAscending: [Int]? = nil,
             nameDescending: [Int]? = nil,
+            sortOrdersAscending: [SortColumn: [Int]] = [:],
             visibleCount: Int?,
             hasSortedOrder: Bool,
             prefersDegradedSearch: Bool = false
@@ -1644,6 +1881,8 @@ public final class FileIndex: @unchecked Sendable {
             )
             self.visibleModifiedDescending = visibleModifiedDescending
             self.visibleModifiedAscending = Array(visibleModifiedDescending.reversed())
+            self.sortOrdersAscending = hasSortedOrder ? sortOrdersAscending : [:]
+            self.visibleSortOrdersAscending = [:]
             self.gramIndex = gramIndex
             self.pathGramShards = gramIndex == nil ? pathGramShards : []
             self.pathGramExpectedRowCount = gramIndex == nil ? pathGramExpectedRowCount : store.count
@@ -1693,6 +1932,12 @@ public final class FileIndex: @unchecked Sendable {
                 unchanged: unchangedDescending,
                 store: updatedStore
             )
+            let updatedSortOrders = Self.updatedAdditionalSortOrdersAscending(
+                existing: sortOrderLock.withLock { sortOrdersAscending },
+                changedIndices: changedIndices,
+                changed: changed,
+                store: updatedStore
+            )
 
             return SearchSnapshot(
                 store: updatedStore,
@@ -1706,6 +1951,7 @@ public final class FileIndex: @unchecked Sendable {
                 childLinks: childLinks,
                 nameAscending: nameAscending,
                 nameDescending: nameDescending,
+                sortOrdersAscending: updatedSortOrders,
                 visibleCount: Self.makeVisibleCount(store: updatedStore),
                 hasSortedOrder: true,
                 prefersDegradedSearch: prefersDegradedSearch
@@ -1722,6 +1968,74 @@ public final class FileIndex: @unchecked Sendable {
                 && existing.normalizedPath == replacement.normalizedPath
         }
 
+        private func currentAdditionalSortOrdersAscending() -> [SortColumn: [Int]] {
+            sortOrderLock.withLock { sortOrdersAscending }
+        }
+
+        func rebasedForMappedPersistence(
+            store mappedStore: RecordStore,
+            completePathGramIndex: MappedIntPostingIndex?,
+            optimizedSortColumns: Set<SortColumn>
+        ) -> SearchSnapshot {
+            let expectedResultCount = mappedStore.storedResultCount ?? mappedStore.count
+            let expectedSourceResultCount = store.storedResultCount ?? store.count
+            let canReuseRowOrderedStructures = store.kind == .mapped
+                && store.count == mappedStore.count
+                && expectedSourceResultCount == expectedResultCount
+            let existingAdditionalOrders = currentAdditionalSortOrdersAscending()
+            guard canReuseRowOrderedStructures else {
+                let existingAdditionalColumns = Set(existingAdditionalOrders.compactMap { entry in
+                    Self.usesAdditionalSortOrder(entry.key) && entry.value.count == expectedSourceResultCount
+                        ? entry.key
+                        : nil
+                })
+                return SearchSnapshot(
+                    store: mappedStore,
+                    buildsSearchStructures: true,
+                    buildsPathGramIndex: false,
+                    optimizedSortColumns: optimizedSortColumns.intersection(existingAdditionalColumns),
+                    prefersDegradedSearch: prefersDegradedSearch
+                )
+            }
+
+            let extensionData = extensionIndex.isEmpty || visibleCount == nil
+                ? Self.makeExtensionIndexAndVisibleCount(store: mappedStore)
+                : nil
+            var validAdditionalOrders: [SortColumn: [Int]] = [:]
+            for (column, order) in existingAdditionalOrders
+                where Self.usesAdditionalSortOrder(column) && order.count == expectedResultCount
+            {
+                validAdditionalOrders[column] = order
+            }
+            let persistedModifiedDescending = hasModifiedSortOrder && modifiedDescending.count == expectedResultCount
+                ? modifiedDescending
+                : Self.makeModifiedDescending(store: mappedStore)
+            let persistedNameAscending = nameAscending.count == expectedResultCount
+                ? nameAscending
+                : nil
+            let persistedNameDescending = nameDescending.count == expectedResultCount
+                ? nameDescending
+                : nil
+
+            return SearchSnapshot(
+                store: mappedStore,
+                modifiedDescending: persistedModifiedDescending,
+                gramIndex: completePathGramIndex,
+                pathGramShards: [],
+                pathGramExpectedRowCount: completePathGramIndex == nil ? 0 : mappedStore.count,
+                nameGramIndex: nameGramIndex ?? Self.makeNameGramIndex(store: mappedStore),
+                componentGramIndex: componentGramIndex ?? Self.makeComponentGramIndex(store: mappedStore),
+                extensionIndex: extensionData?.extensionIndex ?? extensionIndex,
+                childLinks: canReuseRowOrderedStructures ? childLinks : nil,
+                nameAscending: persistedNameAscending,
+                nameDescending: persistedNameDescending,
+                sortOrdersAscending: validAdditionalOrders,
+                visibleCount: extensionData?.visibleCount ?? visibleCount,
+                hasSortedOrder: true,
+                prefersDegradedSearch: prefersDegradedSearch
+            )
+        }
+
         func addingNameGramIndex() -> SearchSnapshot {
             guard nameGramIndex == nil || componentGramIndex == nil else { return self }
             return SearchSnapshot(
@@ -1736,6 +2050,7 @@ public final class FileIndex: @unchecked Sendable {
                 childLinks: childLinks,
                 nameAscending: nameAscending,
                 nameDescending: nameDescending,
+                sortOrdersAscending: currentAdditionalSortOrdersAscending(),
                 visibleCount: visibleCount,
                 hasSortedOrder: hasSortedOrder,
                 prefersDegradedSearch: prefersDegradedSearch
@@ -1757,6 +2072,7 @@ public final class FileIndex: @unchecked Sendable {
                 childLinks: childLinks,
                 nameAscending: nameAscending,
                 nameDescending: nameDescending,
+                sortOrdersAscending: currentAdditionalSortOrdersAscending(),
                 visibleCount: visibleCount ?? extensionData.visibleCount,
                 hasSortedOrder: hasSortedOrder,
                 prefersDegradedSearch: prefersDegradedSearch
@@ -1777,6 +2093,7 @@ public final class FileIndex: @unchecked Sendable {
                 childLinks: childLinks,
                 nameAscending: nameAscending,
                 nameDescending: nameDescending,
+                sortOrdersAscending: currentAdditionalSortOrdersAscending(),
                 visibleCount: visibleCount,
                 hasSortedOrder: true,
                 prefersDegradedSearch: prefersDegradedSearch
@@ -1795,6 +2112,7 @@ public final class FileIndex: @unchecked Sendable {
                 componentGramIndex: componentGramIndex,
                 extensionIndex: extensionIndex,
                 childLinks: childLinks,
+                sortOrdersAscending: currentAdditionalSortOrdersAscending(),
                 visibleCount: visibleCount,
                 hasSortedOrder: hasSortedOrder,
                 prefersDegradedSearch: prefersDegradedSearch
@@ -1818,6 +2136,7 @@ public final class FileIndex: @unchecked Sendable {
                 childLinks: childLinks,
                 nameAscending: nameAscending,
                 nameDescending: nameDescending,
+                sortOrdersAscending: currentAdditionalSortOrdersAscending(),
                 visibleCount: visibleCount,
                 hasSortedOrder: hasSortedOrder,
                 prefersDegradedSearch: prefersDegradedSearch
@@ -1861,6 +2180,7 @@ public final class FileIndex: @unchecked Sendable {
                 childLinks: childLinks,
                 nameAscending: nameAscending,
                 nameDescending: nameDescending,
+                sortOrdersAscending: currentAdditionalSortOrdersAscending(),
                 visibleCount: visibleCount,
                 hasSortedOrder: hasSortedOrder,
                 prefersDegradedSearch: prefersDegradedSearch
@@ -1881,6 +2201,7 @@ public final class FileIndex: @unchecked Sendable {
                 childLinks: childLinks,
                 nameAscending: nameAscending,
                 nameDescending: nameDescending,
+                sortOrdersAscending: currentAdditionalSortOrdersAscending(),
                 visibleCount: visibleCount,
                 hasSortedOrder: hasSortedOrder,
                 prefersDegradedSearch: prefersDegradedSearch
@@ -1901,6 +2222,7 @@ public final class FileIndex: @unchecked Sendable {
                 childLinks: childLinks,
                 nameAscending: nameAscending,
                 nameDescending: nameDescending,
+                sortOrdersAscending: currentAdditionalSortOrdersAscending(),
                 visibleCount: visibleCount,
                 hasSortedOrder: hasSortedOrder,
                 prefersDegradedSearch: prefersDegradedSearch
@@ -1921,6 +2243,7 @@ public final class FileIndex: @unchecked Sendable {
                 childLinks: childLinks,
                 nameAscending: nameAscending,
                 nameDescending: nameDescending,
+                sortOrdersAscending: currentAdditionalSortOrdersAscending(),
                 visibleCount: visibleCount,
                 hasSortedOrder: hasSortedOrder,
                 prefersDegradedSearch: prefersDegradedSearch
@@ -1947,23 +2270,203 @@ public final class FileIndex: @unchecked Sendable {
             store.rootPath(at: index)
         }
 
-        func orderedIndices(for sort: SortSpec, queryIsEmpty: Bool, includeHidden: Bool) -> [Int]? {
+        func orderedIndices(
+            for sort: SortSpec,
+            queryIsEmpty: Bool,
+            includeHidden: Bool,
+            optimizedSortColumns: Set<SortColumn> = Set(SortColumn.optimizedIndexColumns)
+        ) -> [Int]? {
             switch sort.column {
             case .modified:
+                guard optimizedSortColumns.contains(.modified) else { return nil }
                 guard hasModifiedSortOrder else { return nil }
                 if includeHidden {
                     return sort.ascending ? modifiedAscending : modifiedDescending
                 }
                 return sort.ascending ? visibleModifiedAscending : visibleModifiedDescending
             case .name:
+                guard optimizedSortColumns.contains(.name) else { return nil }
                 guard hasSortedOrder else { return nil }
-                return sort.ascending ? nameAscending : nameDescending
+                let order = sort.ascending ? nameAscending : nameDescending
+                return includeHidden ? order : visibleOrder(for: .name, ascendingOrder: nameAscending, ascending: sort.ascending)
             case .relevance where queryIsEmpty:
+                guard optimizedSortColumns.contains(.modified) else { return nil }
                 guard hasModifiedSortOrder else { return nil }
                 return includeHidden ? modifiedDescending : visibleModifiedDescending
-            case .relevance, .path, .created, .size, .fileExtension, .kind, .volume, .root:
+            case .path, .created, .size, .fileExtension, .kind, .volume, .root:
+                guard optimizedSortColumns.contains(sort.column) else { return nil }
+                guard let ascendingOrder = additionalSortOrderAscending(for: sort.column) else { return nil }
+                if includeHidden {
+                    return sort.ascending ? ascendingOrder : Array(ascendingOrder.reversed())
+                }
+                return visibleOrder(for: sort.column, ascendingOrder: ascendingOrder, ascending: sort.ascending)
+            case .relevance:
                 return nil
             }
+        }
+
+        func sortRankMap(
+            for sort: SortSpec,
+            includeHidden: Bool,
+            optimizedSortColumns: Set<SortColumn> = Set(SortColumn.optimizedIndexColumns)
+        ) -> [Int32]? {
+            let key = SortRankCacheKey(
+                column: sort.column,
+                ascending: sort.ascending,
+                includeHidden: includeHidden
+            )
+            if let cached = sortOrderLock.withLock({ sortRankCache[key] }) {
+                return cached
+            }
+
+            guard let order = orderedIndices(
+                for: sort,
+                queryIsEmpty: false,
+                includeHidden: includeHidden,
+                optimizedSortColumns: optimizedSortColumns
+            ) else {
+                return nil
+            }
+
+            var ranks = Array(repeating: Int32(-1), count: count)
+            for (rank, rowID) in order.enumerated() {
+                guard rowID >= 0, rowID < ranks.count, rank <= Int(Int32.max) else {
+                    continue
+                }
+                ranks[rowID] = Int32(rank)
+            }
+
+            return sortOrderLock.withLock {
+                if let cached = sortRankCache[key] {
+                    return cached
+                }
+                sortRankCache[key] = ranks
+                sortRankCacheOrder.removeAll { $0 == key }
+                sortRankCacheOrder.append(key)
+                while sortRankCacheOrder.count > 3 {
+                    let evicted = sortRankCacheOrder.removeFirst()
+                    sortRankCache[evicted] = nil
+                }
+                return ranks
+            }
+        }
+
+        func hasOptimizedSortOrder(
+            for column: SortColumn,
+            optimizedSortColumns: Set<SortColumn>
+        ) -> Bool {
+            guard optimizedSortColumns.contains(column) else { return true }
+            switch column {
+            case .relevance:
+                return true
+            case .modified:
+                return hasModifiedSortOrder
+            case .name:
+                return hasSortedOrder && nameAscending.count == resultCount
+            case .path, .created, .size, .fileExtension, .kind, .volume, .root:
+                return additionalSortOrderAscending(for: column)?.count == resultCount
+            }
+        }
+
+        func persistedSortOrderAscending(for column: SortColumn) -> [Int]? {
+            switch column {
+            case .relevance:
+                return nil
+            case .name:
+                return nameAscending.count == resultCount ? nameAscending : nil
+            case .modified:
+                return modifiedAscending.count == resultCount ? modifiedAscending : nil
+            case .path, .created, .size, .fileExtension, .kind, .volume, .root:
+                return additionalSortOrderAscending(for: column)
+            }
+        }
+
+        func addingOptimizedSortOrders(_ optimizedSortColumns: Set<SortColumn>) -> SearchSnapshot {
+            guard hasSortedOrder else {
+                return addingModifiedSortOrder().addingOptimizedSortOrders(optimizedSortColumns)
+            }
+
+            var additionalOrders = currentAdditionalSortOrdersAscending()
+            var didAddOrder = false
+            for column in optimizedSortColumns where Self.usesAdditionalSortOrder(column) {
+                if additionalOrders[column]?.count == resultCount {
+                    continue
+                }
+                additionalOrders[column] = Self.makeSortOrderAscending(store: store, column: column)
+                didAddOrder = true
+            }
+
+            guard didAddOrder else { return self }
+            return SearchSnapshot(
+                store: store,
+                modifiedDescending: modifiedDescending,
+                gramIndex: gramIndex,
+                pathGramShards: pathGramShards,
+                pathGramExpectedRowCount: pathGramExpectedRowCount,
+                nameGramIndex: nameGramIndex,
+                componentGramIndex: componentGramIndex,
+                extensionIndex: extensionIndex,
+                childLinks: childLinks,
+                nameAscending: nameAscending,
+                nameDescending: nameDescending,
+                sortOrdersAscending: additionalOrders,
+                visibleCount: visibleCount,
+                hasSortedOrder: hasSortedOrder,
+                prefersDegradedSearch: prefersDegradedSearch
+            )
+        }
+
+        func addingOptimizedSortOrder(
+            for column: SortColumn,
+            optimizedSortColumns: Set<SortColumn>
+        ) -> SearchSnapshot {
+            guard optimizedSortColumns.contains(column), Self.usesAdditionalSortOrder(column) else {
+                return self
+            }
+            guard hasSortedOrder else {
+                return addingModifiedSortOrder().addingOptimizedSortOrder(
+                    for: column,
+                    optimizedSortColumns: optimizedSortColumns
+                )
+            }
+
+            var additionalOrders = currentAdditionalSortOrdersAscending()
+            guard additionalOrders[column]?.count != resultCount else { return self }
+            additionalOrders[column] = Self.makeSortOrderAscending(store: store, column: column)
+            return SearchSnapshot(
+                store: store,
+                modifiedDescending: modifiedDescending,
+                gramIndex: gramIndex,
+                pathGramShards: pathGramShards,
+                pathGramExpectedRowCount: pathGramExpectedRowCount,
+                nameGramIndex: nameGramIndex,
+                componentGramIndex: componentGramIndex,
+                extensionIndex: extensionIndex,
+                childLinks: childLinks,
+                nameAscending: nameAscending,
+                nameDescending: nameDescending,
+                sortOrdersAscending: additionalOrders,
+                visibleCount: visibleCount,
+                hasSortedOrder: hasSortedOrder,
+                prefersDegradedSearch: prefersDegradedSearch
+            )
+        }
+
+        private func additionalSortOrderAscending(for column: SortColumn) -> [Int]? {
+            sortOrderLock.withLock { sortOrdersAscending[column] }
+        }
+
+        private func visibleOrder(for column: SortColumn, ascendingOrder: [Int], ascending: Bool) -> [Int] {
+            let visibleAscending = sortOrderLock.withLock { visibleSortOrdersAscending[column] }
+            if let visibleAscending {
+                return ascending ? visibleAscending : Array(visibleAscending.reversed())
+            }
+
+            let computed = ascendingOrder.filter { store.isVisible(at: $0) }
+            sortOrderLock.withLock {
+                visibleSortOrdersAscending[column] = computed
+            }
+            return ascending ? computed : Array(computed.reversed())
         }
 
         func candidatePathIndices(containing tokenBytes: [UInt8]) -> [Int32]? {
@@ -2679,6 +3182,271 @@ public final class FileIndex: @unchecked Sendable {
             return keys.map(\.row)
         }
 
+        private static func makeAdditionalSortOrdersAscending(
+            store: RecordStore,
+            optimizedSortColumns: Set<SortColumn>,
+            persistedOrders: [SortColumn: [Int]],
+            buildsMissingOrders: Bool = true
+        ) -> [SortColumn: [Int]] {
+            var orders: [SortColumn: [Int]] = [:]
+            orders.reserveCapacity(optimizedSortColumns.count)
+
+            for column in optimizedSortColumns where usesAdditionalSortOrder(column) {
+                if let persisted = persistedOrders[column], persisted.count == (store.storedResultCount ?? store.count) {
+                    orders[column] = persisted
+                } else if buildsMissingOrders {
+                    orders[column] = makeSortOrderAscending(store: store, column: column)
+                }
+            }
+
+            return orders
+        }
+
+        private static func updatedAdditionalSortOrdersAscending(
+            existing: [SortColumn: [Int]],
+            changedIndices: [Int],
+            changed: Set<Int>,
+            store: RecordStore
+        ) -> [SortColumn: [Int]] {
+            guard !existing.isEmpty, !changedIndices.isEmpty else { return existing }
+
+            var updated = existing
+            for (column, order) in existing where usesAdditionalSortOrder(column) {
+                let unchanged = order.filter { !changed.contains($0) }
+                let changedAscending = changedIndices.sorted {
+                    sortAscendingPrecedes($0, $1, store: store, column: column)
+                }
+                updated[column] = mergeSortOrderAscending(
+                    changed: changedAscending,
+                    unchanged: unchanged,
+                    store: store,
+                    column: column
+                )
+            }
+            return updated
+        }
+
+        private static func usesAdditionalSortOrder(_ column: SortColumn) -> Bool {
+            switch column {
+            case .path, .created, .size, .fileExtension, .kind, .volume, .root:
+                return true
+            case .relevance, .name, .modified:
+                return false
+            }
+        }
+
+        private static func makeSortOrderAscending(store: RecordStore, column: SortColumn) -> [Int] {
+            struct StringSortKey {
+                let row: Int
+                let value: String
+                let normalizedName: String
+                let path: String
+            }
+
+            struct TimeSortKey {
+                let row: Int
+                let value: TimeInterval
+                let normalizedName: String
+                let path: String
+            }
+
+            struct SizeSortKey {
+                let row: Int
+                let value: UInt64
+                let normalizedName: String
+                let path: String
+            }
+
+            func stringOrder(_ value: (Int) -> String) -> [Int] {
+                var keys: [StringSortKey] = []
+                keys.reserveCapacity(store.storedResultCount ?? store.count)
+                for row in 0..<store.count where store.isResultRow(at: row) {
+                    keys.append(StringSortKey(
+                        row: row,
+                        value: value(row),
+                        normalizedName: store.normalizedName(at: row),
+                        path: store.path(at: row)
+                    ))
+                }
+                keys.sort {
+                    if $0.value != $1.value {
+                        return $0.value < $1.value
+                    }
+                    if $0.normalizedName != $1.normalizedName {
+                        return $0.normalizedName < $1.normalizedName
+                    }
+                    return $0.path < $1.path
+                }
+                return keys.map(\.row)
+            }
+
+            func timeOrder(_ value: (Int) -> TimeInterval) -> [Int] {
+                var keys: [TimeSortKey] = []
+                keys.reserveCapacity(store.storedResultCount ?? store.count)
+                for row in 0..<store.count where store.isResultRow(at: row) {
+                    keys.append(TimeSortKey(
+                        row: row,
+                        value: value(row),
+                        normalizedName: store.normalizedName(at: row),
+                        path: store.path(at: row)
+                    ))
+                }
+                keys.sort {
+                    if $0.value != $1.value {
+                        return $0.value < $1.value
+                    }
+                    if $0.normalizedName != $1.normalizedName {
+                        return $0.normalizedName < $1.normalizedName
+                    }
+                    return $0.path < $1.path
+                }
+                return keys.map(\.row)
+            }
+
+            func sizeOrder() -> [Int] {
+                var keys: [SizeSortKey] = []
+                keys.reserveCapacity(store.storedResultCount ?? store.count)
+                for row in 0..<store.count where store.isResultRow(at: row) {
+                    keys.append(SizeSortKey(
+                        row: row,
+                        value: store.sizeBytes(at: row),
+                        normalizedName: store.normalizedName(at: row),
+                        path: store.path(at: row)
+                    ))
+                }
+                keys.sort {
+                    if $0.value != $1.value {
+                        return $0.value < $1.value
+                    }
+                    if $0.normalizedName != $1.normalizedName {
+                        return $0.normalizedName < $1.normalizedName
+                    }
+                    return $0.path < $1.path
+                }
+                return keys.map(\.row)
+            }
+
+            switch column {
+            case .path:
+                return stringOrder { store.normalizedPath(at: $0) }
+            case .created:
+                return timeOrder { store.createdTime(at: $0) ?? 0 }
+            case .size:
+                return sizeOrder()
+            case .fileExtension:
+                return stringOrder { store.fileExtension(at: $0) }
+            case .kind:
+                return stringOrder {
+                    kindName(isDirectory: store.isDirectory(at: $0), fileExtension: store.fileExtension(at: $0))
+                }
+            case .volume:
+                return stringOrder { store.volumeName(at: $0) }
+            case .root:
+                return stringOrder { store.rootPath(at: $0) ?? "" }
+            case .name:
+                return makeNameAscending(store: store)
+            case .modified:
+                return Array(makeModifiedDescending(store: store).reversed())
+            case .relevance:
+                return []
+            }
+        }
+
+        private static func mergeSortOrderAscending(
+            changed: [Int],
+            unchanged: [Int],
+            store: RecordStore,
+            column: SortColumn
+        ) -> [Int] {
+            var merged: [Int] = []
+            merged.reserveCapacity(changed.count + unchanged.count)
+
+            var changedIndex = 0
+            var unchangedIndex = 0
+            while changedIndex < changed.count, unchangedIndex < unchanged.count {
+                let changedRow = changed[changedIndex]
+                let unchangedRow = unchanged[unchangedIndex]
+                if sortAscendingPrecedes(changedRow, unchangedRow, store: store, column: column) {
+                    merged.append(changedRow)
+                    changedIndex += 1
+                } else {
+                    merged.append(unchangedRow)
+                    unchangedIndex += 1
+                }
+            }
+
+            if changedIndex < changed.count {
+                merged.append(contentsOf: changed[changedIndex...])
+            }
+            if unchangedIndex < unchanged.count {
+                merged.append(contentsOf: unchanged[unchangedIndex...])
+            }
+            return merged
+        }
+
+        private static func sortAscendingPrecedes(
+            _ lhs: Int,
+            _ rhs: Int,
+            store: RecordStore,
+            column: SortColumn
+        ) -> Bool {
+            switch column {
+            case .name:
+                if store.normalizedName(at: lhs) != store.normalizedName(at: rhs) {
+                    return store.normalizedName(at: lhs) < store.normalizedName(at: rhs)
+                }
+            case .path:
+                if store.normalizedPath(at: lhs) != store.normalizedPath(at: rhs) {
+                    return store.normalizedPath(at: lhs) < store.normalizedPath(at: rhs)
+                }
+            case .modified:
+                if store.modifiedTime(at: lhs) != store.modifiedTime(at: rhs) {
+                    return store.modifiedTime(at: lhs) < store.modifiedTime(at: rhs)
+                }
+            case .created:
+                let left = store.createdTime(at: lhs) ?? 0
+                let right = store.createdTime(at: rhs) ?? 0
+                if left != right {
+                    return left < right
+                }
+            case .size:
+                if store.sizeBytes(at: lhs) != store.sizeBytes(at: rhs) {
+                    return store.sizeBytes(at: lhs) < store.sizeBytes(at: rhs)
+                }
+            case .fileExtension:
+                if store.fileExtension(at: lhs) != store.fileExtension(at: rhs) {
+                    return store.fileExtension(at: lhs) < store.fileExtension(at: rhs)
+                }
+            case .kind:
+                let left = kindName(isDirectory: store.isDirectory(at: lhs), fileExtension: store.fileExtension(at: lhs))
+                let right = kindName(isDirectory: store.isDirectory(at: rhs), fileExtension: store.fileExtension(at: rhs))
+                if left != right {
+                    return left < right
+                }
+            case .volume:
+                if store.volumeName(at: lhs) != store.volumeName(at: rhs) {
+                    return store.volumeName(at: lhs) < store.volumeName(at: rhs)
+                }
+            case .root:
+                let left = store.rootPath(at: lhs) ?? ""
+                let right = store.rootPath(at: rhs) ?? ""
+                if left != right {
+                    return left < right
+                }
+            case .relevance:
+                break
+            }
+
+            if store.normalizedName(at: lhs) != store.normalizedName(at: rhs) {
+                return store.normalizedName(at: lhs) < store.normalizedName(at: rhs)
+            }
+            return store.path(at: lhs) < store.path(at: rhs)
+        }
+
+        private static func kindName(isDirectory: Bool, fileExtension: String) -> String {
+            isDirectory && fileExtension == "app" ? "Application" : (isDirectory ? "Folder" : "File")
+        }
+
         private static func makePathGramIndex(store: RecordStore) -> MappedIntPostingIndex? {
             guard store.count <= FileIndex.pathGramRecordLimit else { return nil }
 
@@ -2861,23 +3629,40 @@ public final class FileIndex: @unchecked Sendable {
     private let metricsURL: URL
     private let indexQueue = DispatchQueue(label: "att.index.work", qos: .utility)
     private let checkpointQueue = DispatchQueue(label: "att.index.checkpoint", qos: .utility)
+    private let metricsSaveQueue = DispatchQueue(label: "att.index.metrics", qos: .utility)
     private let checkpointPersistenceLock = NSLock()
     private let storageInsightsLock = NSLock()
     private var largeOverlayPersistRecordLimitOverride: Int?
     private var largeOverlayPersistDelayOverride: TimeInterval?
     private var largeOverlayChangedPathThresholdOverride: Int?
     private var largeOverlayDrainBackoffDelayOverride: TimeInterval?
+    private var backgroundRefreshBatchLimitOverride: Int?
+    private var backgroundRefreshDrainBackoffDelayOverride: TimeInterval?
+    private var backgroundDirectoryScanBudgetOverride: TimeInterval?
+    private var backgroundDirectoryMaxDeferralOverride: TimeInterval?
+    private var backgroundOptimizationPersistDelayOverride: TimeInterval?
     private var metadataOverlayPersistDelayOverride: TimeInterval?
     private var metadataOverlayCheckpointDelayOverride: TimeInterval?
     private var metadataOverlayPersistLimitOverride: Int?
     private var checkpointWriteInFlight = false
+    private var usageMetricsDirtyGeneration: UInt64 = 0
+    private var usageMetricsSavedGeneration: UInt64 = 0
+    private var usageMetricsSaveScheduled = false
+    private var usageMetricsMaintenanceSaveDelayOverride: TimeInterval?
+    private var exactEmptyQuerySortLimitOverride: Int?
     private var cachedStorageInsights: IndexStorageInsights?
     private var storageInsightsRefreshInFlight = false
     private var recordsByPath: [String: FileRecord] = [:]
-    private var searchSnapshot = SearchSnapshot.empty
+    private var searchSnapshot = SearchSnapshot.empty {
+        didSet {
+            rememberOptimizedSearchFallbackWithoutLock(searchSnapshot)
+        }
+    }
+    private var optimizedSearchFallbackSnapshot: SearchSnapshot?
     private var searchSnapshotRevision: UInt64 = 0
     private var roots: [String] = []
     private var exclusionRules: FileExclusionRules
+    private var optimizedSortColumns = Set(SortColumn.optimizedIndexColumns)
     private var exclusionEvaluationMode: ExclusionEvaluationMode = .compiledQuery
     private var scanFrontierMode: ScanFrontierMode = .singleDirectory
     private var scanFrontierBatchSize = 1
@@ -2885,11 +3670,11 @@ public final class FileIndex: @unchecked Sendable {
     private var lastScanFrontierMetrics = ScanFrontierMetrics()
     private var generation: UInt64 = 0
     private var persistRevision: UInt64 = 0
-    private var pendingRefreshPaths = Set<String>()
+    private var pendingRefreshPaths: [String: PendingRefreshWork] = [:]
     private var isRefreshDrainScheduled = false
     private var pendingReconciliationPaths = Set<String>()
     private var pendingReconciliationIncludesAllRoots = false
-    private var pendingReconciliationPresentation: IndexActivityPresentation = .foreground
+    private var pendingReconciliationPresentation: IndexActivityPresentation = .backgroundCatchUp
     private var activeReconciliationPaths = Set<String>()
     private var activeReconciliationIncludesAllRoots = false
     private var isReconciliationDrainScheduled = false
@@ -2901,6 +3686,12 @@ public final class FileIndex: @unchecked Sendable {
     private var activeIndexJobs = 0
     private var activePathGramBuildGeneration: UInt64?
     private var usageMetrics = IndexUsageMetrics()
+    private var lastMaintenanceOperation: IndexMaintenanceOperationMetric?
+    private var lastBackgroundMaintenanceSlice: IndexMaintenanceOperationMetric?
+    private var deferredOptimizationReason: String?
+    private var deferredOptimizationDelay: TimeInterval?
+    private var deferredCheckpointReason: String?
+    private var deferredCheckpointDelay: TimeInterval?
     private var snapshotLoadState = SnapshotLoadState.notStarted
     private var indexing = false
     private var reconciling = false
@@ -2931,9 +3722,16 @@ public final class FileIndex: @unchecked Sendable {
         self.largeOverlayPersistDelayOverride = nil
         self.largeOverlayChangedPathThresholdOverride = nil
         self.largeOverlayDrainBackoffDelayOverride = nil
+        self.backgroundRefreshBatchLimitOverride = nil
+        self.backgroundRefreshDrainBackoffDelayOverride = nil
+        self.backgroundDirectoryScanBudgetOverride = nil
+        self.backgroundDirectoryMaxDeferralOverride = nil
+        self.backgroundOptimizationPersistDelayOverride = nil
         self.metadataOverlayPersistDelayOverride = nil
         self.metadataOverlayCheckpointDelayOverride = nil
         self.metadataOverlayPersistLimitOverride = nil
+        self.usageMetricsMaintenanceSaveDelayOverride = nil
+        self.exactEmptyQuerySortLimitOverride = nil
 
         let supportRoot = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
@@ -2969,6 +3767,11 @@ public final class FileIndex: @unchecked Sendable {
         largeOverlayPersistDelay: TimeInterval?,
         largeOverlayChangedPathThreshold: Int? = nil,
         largeOverlayDrainBackoffDelay: TimeInterval? = nil,
+        backgroundRefreshBatchLimit: Int? = nil,
+        backgroundRefreshDrainBackoffDelay: TimeInterval? = nil,
+        backgroundDirectoryScanBudget: TimeInterval? = nil,
+        backgroundDirectoryMaxDeferral: TimeInterval? = nil,
+        backgroundOptimizationPersistDelay: TimeInterval? = nil,
         metadataOverlayPersistDelay: TimeInterval? = nil,
         metadataOverlayCheckpointDelay: TimeInterval? = nil,
         metadataOverlayPersistLimit: Int? = nil
@@ -2984,6 +3787,11 @@ public final class FileIndex: @unchecked Sendable {
         self.largeOverlayPersistDelayOverride = largeOverlayPersistDelay.map { max(0, $0) }
         self.largeOverlayChangedPathThresholdOverride = largeOverlayChangedPathThreshold.map { max(0, $0) }
         self.largeOverlayDrainBackoffDelayOverride = largeOverlayDrainBackoffDelay.map { max(0, $0) }
+        self.backgroundRefreshBatchLimitOverride = backgroundRefreshBatchLimit.map { max(1, $0) }
+        self.backgroundRefreshDrainBackoffDelayOverride = backgroundRefreshDrainBackoffDelay.map { max(0, $0) }
+        self.backgroundDirectoryScanBudgetOverride = backgroundDirectoryScanBudget.map { max(0, $0) }
+        self.backgroundDirectoryMaxDeferralOverride = backgroundDirectoryMaxDeferral.map { max(0, $0) }
+        self.backgroundOptimizationPersistDelayOverride = backgroundOptimizationPersistDelay.map { max(0, $0) }
         self.metadataOverlayPersistDelayOverride = metadataOverlayPersistDelay.map { max(0, $0) }
         self.metadataOverlayCheckpointDelayOverride = metadataOverlayCheckpointDelay.map { max(0, $0) }
         self.metadataOverlayPersistLimitOverride = metadataOverlayPersistLimit.map { max(0, $0) }
@@ -3015,6 +3823,25 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
+    public func recordEnergySample(
+        completedAt: Date = Date(),
+        duration: TimeInterval,
+        cpuTime: TimeInterval,
+        wakeups: UInt64,
+        mode: EnergyUsageMode
+    ) {
+        guard duration > 0, cpuTime >= 0 else { return }
+        updateUsageMetricsDeferred { metrics in
+            _ = metrics.recordEnergySample(
+                completedAt: completedAt,
+                duration: duration,
+                cpuTime: cpuTime,
+                wakeups: wakeups,
+                mode: mode
+            )
+        }
+    }
+
     public func recordRecursiveRescan() {
         updateUsageMetrics { metrics in
             metrics.recordRecursiveRescan()
@@ -3033,10 +3860,143 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
+    public func allOptimizedSortColumns() -> Set<SortColumn> {
+        lock.withLock {
+            optimizedSortColumns
+        }
+    }
+
+    private func currentOptimizedSortColumns() -> Set<SortColumn> {
+        lock.withLock {
+            optimizedSortColumns
+        }
+    }
+
     public func updateExclusionPatterns(_ patterns: [String]) {
         let rules = FileExclusionRules(patterns: patterns)
         lock.withLock {
             exclusionRules = rules
+        }
+    }
+
+    public func updateOptimizedSortColumns(_ columns: Set<SortColumn>) {
+        let sanitized = columns.intersection(Set(SortColumn.optimizedIndexColumns))
+        let shouldRebuild = lock.withLock { () -> Bool in
+            guard optimizedSortColumns != sanitized else { return false }
+            optimizedSortColumns = sanitized
+            DiagnosticLogger.shared.log(
+                category: "index",
+                event: "index.optimizedSortColumnsChanged",
+                fields: [
+                    "columnCount": .publicInt(sanitized.count),
+                    "columns": .publicStringArray(
+                        SortColumn.optimizedIndexColumns
+                            .filter { sanitized.contains($0) }
+                            .map(\.rawValue)
+                    )
+                ]
+            )
+            return searchSnapshot.resultCount > 0
+        }
+
+        guard shouldRebuild else { return }
+        indexQueue.async { [weak self] in
+            self?.rebuildEnabledSortOrdersIfPossible()
+        }
+    }
+
+    private func rebuildEnabledSortOrdersIfPossible() {
+        let state = lock.withLock {
+            (
+                snapshot: searchSnapshot,
+                revision: searchSnapshotRevision,
+                columns: optimizedSortColumns,
+                canRebuild: !indexing && !reconciling && !updating && !isRefreshDrainScheduled
+            )
+        }
+        guard state.canRebuild, state.snapshot.resultCount > 0 else { return }
+
+        let optimizedSnapshot = state.snapshot.addingOptimizedSortOrders(state.columns)
+        let installed = lock.withLock { () -> Bool in
+            guard searchSnapshot === state.snapshot, searchSnapshotRevision == state.revision else {
+                return false
+            }
+            guard optimizedSnapshot !== state.snapshot else {
+                return true
+            }
+            searchSnapshot = optimizedSnapshot
+            searchSnapshotRevision &+= 1
+            lastUpdated = Date()
+            return true
+        }
+
+        guard installed else { return }
+        publishStats()
+        schedulePersist(delay: 0)
+    }
+
+    private func rebuildOptimizedSortOrderIfPossible(for column: SortColumn) {
+        let state = lock.withLock {
+            (
+                snapshot: searchSnapshot,
+                revision: searchSnapshotRevision,
+                columns: optimizedSortColumns,
+                canRebuild: !indexing && !reconciling && !updating && !isRefreshDrainScheduled
+            )
+        }
+        guard state.canRebuild, state.snapshot.resultCount > 0 else { return }
+
+        let optimizedSnapshot = state.snapshot.addingOptimizedSortOrder(
+            for: column,
+            optimizedSortColumns: state.columns
+        )
+        let installed = lock.withLock { () -> Bool in
+            guard searchSnapshot === state.snapshot, searchSnapshotRevision == state.revision else {
+                return false
+            }
+            guard optimizedSnapshot !== state.snapshot else {
+                return true
+            }
+            searchSnapshot = optimizedSnapshot
+            searchSnapshotRevision &+= 1
+            lastUpdated = Date()
+            return true
+        }
+
+        guard installed else { return }
+        publishStats()
+        persistOptimizedSortOrderSidecarIfPossible(for: column, snapshot: optimizedSnapshot)
+    }
+
+    private func persistOptimizedSortOrderSidecarIfPossible(for column: SortColumn, snapshot: SearchSnapshot) {
+        guard snapshot.store.kind == .mapped else { return }
+        guard let fileName = Self.sortOrderFileName(for: column) else { return }
+        guard fileManager.fileExists(atPath: snapshotURL.path) else { return }
+        guard let order = snapshot.persistedSortOrderAscending(for: column), order.count == snapshot.resultCount else {
+            return
+        }
+
+        let sidecarURL = snapshotURL.appendingPathComponent(fileName, isDirectory: false)
+        do {
+            try CompactSearchStructureFiles.writeModifiedOrder(order, to: sidecarURL)
+            invalidateStorageInsightsCache()
+            DiagnosticLogger.shared.log(
+                category: "index",
+                event: "index.optimizedSortOrderSidecarPersisted",
+                fields: [
+                    "sortColumn": .publicString(column.rawValue),
+                    "recordCount": .publicInt(order.count)
+                ]
+            )
+        } catch {
+            DiagnosticLogger.shared.log(
+                category: "index",
+                event: "index.optimizedSortOrderSidecarPersistFailed",
+                fields: [
+                    "sortColumn": .publicString(column.rawValue),
+                    "error": .privateString(error.localizedDescription)
+                ]
+            )
         }
     }
 
@@ -3067,6 +4027,10 @@ public final class FileIndex: @unchecked Sendable {
             lifetime: state.usage.lifetime,
             health: state.health
         )
+    }
+
+    public func flushUsageMetrics() {
+        savePendingUsageMetricsIfNeeded()
     }
 
     public func currentRootInsights() -> [IndexRootInsight] {
@@ -3107,6 +4071,7 @@ public final class FileIndex: @unchecked Sendable {
             invalidateStorageInsightsCache()
             lock.withLock {
                 recordsByPath.removeAll(keepingCapacity: false)
+                clearOptimizedSearchFallbackWithoutLock()
                 searchSnapshot = .empty
                 searchSnapshotRevision &+= 1
                 discoveredCount = 0
@@ -3145,6 +4110,7 @@ public final class FileIndex: @unchecked Sendable {
             generation &+= 1
             activePathGramBuildGeneration = nil
             snapshotLoadState = .finished
+            clearOptimizedSearchFallbackWithoutLock()
             roots = canonicalRoots.map(\.path)
             indexing = true
             reconciling = false
@@ -3306,28 +4272,110 @@ public final class FileIndex: @unchecked Sendable {
         return .started
     }
 
-    public func update(paths rawPaths: [String]) {
+    public func update(paths rawPaths: [String], priority: IndexWorkPriority = .interactive) {
         let paths = Set(rawPaths.map { URL(fileURLWithPath: $0).standardizedFileURL.path })
         guard !paths.isEmpty else { return }
         DiagnosticLogger.shared.log(
             category: "index",
             event: "index.updateQueued",
             fields: [
-                "pathCount": .publicInt(paths.count)
+                "pathCount": .publicInt(paths.count),
+                "priority": .publicString(priority.rawValue)
             ],
             diagnosticFields: [
                 "paths": .pathArray(Array(paths))
             ]
         )
 
+        let queuedAt = Date()
         lock.withLock {
-            pendingRefreshPaths.formUnion(paths)
+            queuePendingRefreshPathsWithoutLock(paths, priority: priority, queuedAt: queuedAt)
         }
         scheduleUpdateDrainIfNeeded(delay: .milliseconds(150))
     }
 
     public func refresh(paths rawPaths: [String]) {
         update(paths: rawPaths)
+    }
+
+    public func promoteBackgroundMaintenance() {
+        let promoted = lock.withLock { () -> (
+            pendingPathCount: Int,
+            hasPendingRefreshes: Bool,
+            shouldOptimizeSnapshot: Bool
+        ) in
+            var promotedCount = 0
+            for path in pendingRefreshPaths.keys {
+                guard var work = pendingRefreshPaths[path], work.priority == .background else { continue }
+                work.promote()
+                pendingRefreshPaths[path] = work
+                promotedCount += 1
+            }
+
+            let shouldOptimizeSnapshot = !indexing
+                && searchSnapshot.store.kind == .overlay
+                && !searchSnapshot.isOptimizedForSearch
+
+            return (promotedCount, !pendingRefreshPaths.isEmpty, shouldOptimizeSnapshot)
+        }
+
+        guard promoted.pendingPathCount > 0 || promoted.shouldOptimizeSnapshot else { return }
+        DiagnosticLogger.shared.log(
+            category: "index",
+            event: "index.backgroundMaintenancePromoted",
+            fields: [
+                "pendingPathCount": .publicInt(promoted.pendingPathCount),
+                "schedulesRefreshDrain": .publicBool(promoted.hasPendingRefreshes),
+                "schedulesOptimization": .publicBool(promoted.shouldOptimizeSnapshot)
+            ]
+        )
+
+        if promoted.hasPendingRefreshes {
+            indexQueue.async { [weak self] in
+                self?.drainUpdateQueue()
+            }
+        } else if promoted.shouldOptimizeSnapshot {
+            schedulePersist(delay: 0)
+        }
+    }
+
+    public func prioritizeSearchOptimization(for sortColumn: SortColumn) {
+        let state = lock.withLock {
+            (
+                shouldSchedulePersist: !indexing
+                    && !reconciling
+                    && !updating
+                    && searchSnapshot.store.kind != .mapped
+                    && !searchSnapshot.isOptimizedForSearch
+                    && searchSnapshot.resultCount > 0,
+                shouldBuildSortOrder: !indexing
+                    && !reconciling
+                    && !updating
+                    && searchSnapshot.isOptimizedForSearch
+                    && searchSnapshot.resultCount > 0
+                    && !searchSnapshot.hasOptimizedSortOrder(
+                        for: sortColumn,
+                        optimizedSortColumns: optimizedSortColumns
+                    )
+            )
+        }
+        guard state.shouldSchedulePersist || state.shouldBuildSortOrder else { return }
+
+        DiagnosticLogger.shared.log(
+            category: "index",
+            event: "index.searchOptimizationPrioritized",
+            fields: [
+                "sortColumn": .publicString(sortColumn.rawValue),
+                "buildsSortOrder": .publicBool(state.shouldBuildSortOrder)
+            ]
+        )
+        if state.shouldBuildSortOrder {
+            indexQueue.async { [weak self] in
+                self?.rebuildOptimizedSortOrderIfPossible(for: sortColumn)
+            }
+        } else {
+            schedulePersist(delay: 0)
+        }
     }
 
     private func requestBackgroundReconciliation() {
@@ -3390,6 +4438,15 @@ public final class FileIndex: @unchecked Sendable {
         activeReconciliationIncludesAllRoots = false
     }
 
+    private func rememberOptimizedSearchFallbackWithoutLock(_ snapshot: SearchSnapshot) {
+        guard snapshot.resultCount > 0, snapshot.isOptimizedForSearch else { return }
+        optimizedSearchFallbackSnapshot = snapshot
+    }
+
+    private func clearOptimizedSearchFallbackWithoutLock() {
+        optimizedSearchFallbackSnapshot = nil
+    }
+
     private func queuePendingReconciliationWithoutLock(
         scopePaths: [String],
         reconcilesAllRoots: Bool,
@@ -3423,7 +4480,7 @@ public final class FileIndex: @unchecked Sendable {
             let presentation = pendingReconciliationPresentation
             pendingReconciliationIncludesAllRoots = false
             pendingReconciliationPaths.removeAll(keepingCapacity: false)
-            pendingReconciliationPresentation = .foreground
+            pendingReconciliationPresentation = .backgroundCatchUp
 
             let urls = Self.reconciliationScopeURLs(for: requestedPaths, within: roots)
             guard !urls.isEmpty else { return nil }
@@ -3453,9 +4510,13 @@ public final class FileIndex: @unchecked Sendable {
         request: SearchRequest,
         parsedQuery: FuzzyMatcher.ParsedQuery,
         maxResults: Int,
-        canPromoteSortedOrder: Bool
+        canPromoteSortedOrder: Bool,
+        optimizedSortColumns: Set<SortColumn>
     ) -> Bool {
         guard canPromoteSortedOrder, parsedQuery.isEmpty, maxResults > 0 else {
+            return false
+        }
+        guard optimizedSortColumns.contains(request.sort.column) || request.sort.column == .relevance else {
             return false
         }
 
@@ -3495,11 +4556,24 @@ public final class FileIndex: @unchecked Sendable {
             }
         }
 
+        let trimmedQuery = request.query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parsedQuery = FuzzyMatcher.parse(trimmedQuery)
+        let boundedMaxResults = max(maxResults, 0)
+
         let snapshotData = lock.withLock {
-            (
-                snapshot: searchSnapshot,
+            let currentSnapshot = searchSnapshot
+            let fallbackSnapshot = optimizedSearchFallbackSnapshot
+            let shouldUseOptimizedFallback = !trimmedQuery.isEmpty
+                && request.mode == .interactivePreview
+                && !currentSnapshot.isOptimizedForSearch
+                && fallbackSnapshot?.isOptimizedForSearch == true
+                && (fallbackSnapshot?.resultCount ?? 0) > 0
+            return (
+                snapshot: shouldUseOptimizedFallback ? (fallbackSnapshot ?? currentSnapshot) : currentSnapshot,
                 revision: searchSnapshotRevision,
+                optimizedSortColumns: optimizedSortColumns,
                 canPromoteSortedOrder: !indexing && !reconciling && !updating && !isRefreshDrainScheduled && pendingRefreshPaths.isEmpty,
+                hasDeferredOptimization: deferredOptimizationReason != nil,
                 isRefreshActive: reconciling || updating || isRefreshDrainScheduled || !pendingRefreshPaths.isEmpty
             )
         }
@@ -3508,24 +4582,35 @@ public final class FileIndex: @unchecked Sendable {
 
         guard !shouldCancel() else { return nil }
 
-        let trimmedQuery = request.query.trimmingCharacters(in: .whitespacesAndNewlines)
-        let parsedQuery = FuzzyMatcher.parse(trimmedQuery)
-        let boundedMaxResults = max(maxResults, 0)
         let usesDegradedSearch = Self.shouldUseDegradedSearch(
             snapshot: snapshot,
             isRefreshActive: snapshotData.isRefreshActive
         )
+        let exactEmptyQuerySortLimit = lock.withLock { exactEmptyQuerySortLimitOverride }
+            ?? Self.exactEmptyQuerySortLimit
 
         if Self.shouldPromoteSortedOrderForEmptyQuery(
             snapshot: snapshot,
             request: request,
             parsedQuery: parsedQuery,
             maxResults: boundedMaxResults,
-            canPromoteSortedOrder: snapshotData.canPromoteSortedOrder && !usesDegradedSearch
+            canPromoteSortedOrder: snapshotData.canPromoteSortedOrder
+                && !snapshotData.hasDeferredOptimization
+                && !usesDegradedSearch,
+            optimizedSortColumns: snapshotData.optimizedSortColumns
         ) {
-            let promotedSnapshot = request.sort.column == .name
-                ? snapshot.addingModifiedSortOrder()
-                : snapshot.addingModifiedSortOrderOnly()
+            let promotedSnapshot: SearchSnapshot
+            switch request.sort.column {
+            case .name:
+                promotedSnapshot = snapshot.addingModifiedSortOrder()
+            case .modified, .relevance:
+                promotedSnapshot = snapshot.addingModifiedSortOrderOnly()
+            case .path, .created, .size, .fileExtension, .kind, .volume, .root:
+                promotedSnapshot = snapshot.addingOptimizedSortOrder(
+                    for: request.sort.column,
+                    optimizedSortColumns: snapshotData.optimizedSortColumns
+                )
+            }
             let installedRevision = lock.withLock { () -> UInt64? in
                 guard searchSnapshot === snapshot, searchSnapshotRevision == snapshotRevision else {
                     return nil
@@ -3561,6 +4646,7 @@ public final class FileIndex: @unchecked Sendable {
         var total = 0
         var shouldSortMatches = true
         var emptyQueryScannedRowCount: Int?
+        var fallbackScannedRowCount: Int?
 
         func sortAndLimitMatches() {
             guard boundedMaxResults > 0 else { return }
@@ -3592,7 +4678,8 @@ public final class FileIndex: @unchecked Sendable {
             if let orderedRecords = snapshot.orderedIndices(
                 for: request.sort,
                 queryIsEmpty: true,
-                includeHidden: request.includeHidden
+                includeHidden: request.includeHidden,
+                optimizedSortColumns: snapshotData.optimizedSortColumns
             ) {
                 let knownTotal: Int?
                 if request.includeHidden {
@@ -3635,7 +4722,7 @@ public final class FileIndex: @unchecked Sendable {
                         appendMatch(rowID: index, score: 0)
                     }
                 }
-            } else if snapshot.count > Self.exactEmptyQuerySortLimit, boundedMaxResults > 0, request.sort.column != .root {
+            } else if snapshot.count > exactEmptyQuerySortLimit, boundedMaxResults > 0 {
                 shouldSortMatches = false
                 let visibleResultCount = snapshot.visibleResultCount
                 let canStopAtResultLimit = request.includeHidden || visibleResultCount != nil
@@ -3694,6 +4781,31 @@ public final class FileIndex: @unchecked Sendable {
                 ) {
                     return finish(degradedResponse)
                 }
+            }
+
+            if let fastResponse = Self.fastExactExtensionSearch(
+                snapshot: snapshot,
+                request: request,
+                parsedQuery: parsedQuery,
+                maxResults: boundedMaxResults,
+                started: started,
+                snapshotRevision: snapshotRevision,
+                shouldCancel: shouldCancel
+            ) {
+                return finish(fastResponse)
+            }
+
+            if let sortedResponse = Self.optimizedSortedUnifiedSearch(
+                snapshot: snapshot,
+                request: request,
+                parsedQuery: parsedQuery,
+                maxResults: boundedMaxResults,
+                started: started,
+                snapshotRevision: snapshotRevision,
+                optimizedSortColumns: snapshotData.optimizedSortColumns,
+                shouldCancel: shouldCancel
+            ) {
+                return finish(sortedResponse)
             }
 
             if let fastResponse = Self.fastModifiedInteractivePreviewSearch(
@@ -3780,6 +4892,57 @@ public final class FileIndex: @unchecked Sendable {
                 return finish(fastResponse)
             }
 
+            if let fastResponse = Self.fastExactExtensionSearch(
+                snapshot: snapshot,
+                request: request,
+                parsedQuery: parsedQuery,
+                maxResults: boundedMaxResults,
+                started: started,
+                snapshotRevision: snapshotRevision,
+                shouldCancel: shouldCancel
+            ) {
+                return finish(fastResponse)
+            }
+
+            if let sortedNamePreviewResponse = Self.optimizedSortedNamePreviewSearch(
+                snapshot: snapshot,
+                request: request,
+                parsedQuery: parsedQuery,
+                maxResults: boundedMaxResults,
+                started: started,
+                snapshotRevision: snapshotRevision,
+                optimizedSortColumns: snapshotData.optimizedSortColumns,
+                shouldCancel: shouldCancel
+            ) {
+                return finish(sortedNamePreviewResponse)
+            }
+
+            if let sortedPreviewResponse = Self.optimizedSortedCandidateSearch(
+                snapshot: snapshot,
+                request: request,
+                parsedQuery: parsedQuery,
+                maxResults: boundedMaxResults,
+                started: started,
+                snapshotRevision: snapshotRevision,
+                optimizedSortColumns: snapshotData.optimizedSortColumns,
+                shouldCancel: shouldCancel
+            ) {
+                return finish(sortedPreviewResponse)
+            }
+
+            if Self.shouldUseBoundedPreviewCandidateSearch(request: request),
+               let cheapIndexedResponse = Self.cheapIndexedCandidateSearch(
+                snapshot: snapshot,
+                request: request,
+                parsedQuery: parsedQuery,
+                maxResults: boundedMaxResults,
+                started: started,
+                snapshotRevision: snapshotRevision,
+                shouldCancel: shouldCancel
+               ) {
+                return finish(cheapIndexedResponse)
+            }
+
             if let fastResponse = Self.fastLargePathSubstringSearch(
                 snapshot: snapshot,
                 request: request,
@@ -3792,7 +4955,7 @@ public final class FileIndex: @unchecked Sendable {
                 return finish(fastResponse)
             }
 
-            if let fastResponse = Self.fastExactExtensionSearch(
+            if let cheapIndexedResponse = Self.cheapIndexedCandidateSearch(
                 snapshot: snapshot,
                 request: request,
                 parsedQuery: parsedQuery,
@@ -3801,7 +4964,7 @@ public final class FileIndex: @unchecked Sendable {
                 snapshotRevision: snapshotRevision,
                 shouldCancel: shouldCancel
             ) {
-                return finish(fastResponse)
+                return finish(cheapIndexedResponse)
             }
 
             if let indexedResponse = Self.indexedCandidateSearch(
@@ -3828,11 +4991,18 @@ public final class FileIndex: @unchecked Sendable {
                 return finish(degradedResponse)
             }
 
+            let fallbackScanLimit = Self.fallbackScanLimit(
+                for: request,
+                maxResults: boundedMaxResults,
+                snapshotCount: snapshot.count
+            )
+            let scannedRows = min(snapshot.count, fallbackScanLimit)
+            fallbackScannedRowCount = scannedRows
             lock.withLock {
                 fallbackScanCount &+= 1
-                scannedRowCount &+= UInt64(snapshot.count)
+                scannedRowCount &+= UInt64(scannedRows)
             }
-            for index in 0..<snapshot.count {
+            for index in 0..<scannedRows {
                 if index.isMultiple(of: 64), shouldCancel() {
                     return nil
                 }
@@ -3855,9 +5025,15 @@ public final class FileIndex: @unchecked Sendable {
         let elapsed = Date().timeIntervalSince(started)
         let profile: SearchExecutionProfile
         if parsedQuery.isEmpty {
+            var indexesUsed: Set<SearchIndexUse> = request.sort.column == .modified || request.sort.column == .relevance
+                ? [.modifiedOrder]
+                : [.sortOrder]
+            if !request.includeHidden {
+                indexesUsed.insert(.visibleBitset)
+            }
             profile = SearchExecutionProfile(
                 executionPath: .emptyQuerySortedOrder,
-                indexesUsed: request.includeHidden ? [.modifiedOrder] : [.modifiedOrder, .visibleBitset],
+                indexesUsed: indexesUsed,
                 candidateCount: total,
                 scannedRowCount: emptyQueryScannedRowCount ?? min(snapshot.count, total),
                 elapsed: elapsed
@@ -3865,7 +5041,7 @@ public final class FileIndex: @unchecked Sendable {
         } else {
             profile = SearchExecutionProfile(
                 executionPath: .fullFallbackScan,
-                scannedRowCount: snapshot.count,
+                scannedRowCount: fallbackScannedRowCount ?? snapshot.count,
                 didFallbackToFullScan: true,
                 elapsed: elapsed
             )
@@ -3879,6 +5055,703 @@ public final class FileIndex: @unchecked Sendable {
             usesIndexedCandidates: parsedQuery.isEmpty,
             executionProfile: profile
         ))
+    }
+
+    private static func shouldUseBoundedPreviewCandidateSearch(request: SearchRequest) -> Bool {
+        guard request.mode == .interactivePreview else { return false }
+        switch request.sort.column {
+        case .path, .created, .size, .fileExtension, .kind, .volume, .root:
+            return true
+        case .relevance, .name, .modified:
+            return false
+        }
+    }
+
+    private static func usesAdditionalSortOrder(_ column: SortColumn) -> Bool {
+        switch column {
+        case .path, .created, .size, .fileExtension, .kind, .volume, .root:
+            return true
+        case .relevance, .name, .modified:
+            return false
+        }
+    }
+
+    private static func optimizedSortedUnifiedSearch(
+        snapshot: SearchSnapshot,
+        request: SearchRequest,
+        parsedQuery: FuzzyMatcher.ParsedQuery,
+        maxResults: Int,
+        started: Date,
+        snapshotRevision: UInt64,
+        optimizedSortColumns: Set<SortColumn>,
+        shouldCancel: @Sendable () -> Bool
+    ) -> SearchResponse? {
+        guard
+            maxResults > 0,
+            !parsedQuery.isEmpty,
+            usesAdditionalSortOrder(request.sort.column)
+                || (request.sort.column == .modified && request.mode == .interactivePreview)
+        else {
+            return nil
+        }
+
+        let simpleNameQuery = request.mode == .interactivePreview
+            ? simpleNamePreviewQuery(parsedQuery)
+            : nil
+
+        let candidateIndices: [Int32]
+        var indexesUsed: Set<SearchIndexUse>
+        if let simpleNameQuery {
+            guard let nameCandidates = snapshot.candidateNameIndices(containing: Array(simpleNameQuery.token.utf8)) else {
+                return nil
+            }
+            candidateIndices = nameCandidates
+            indexesUsed = [.nameGrams]
+        } else {
+            guard let candidates = Self.candidateIndices(
+                snapshot: snapshot,
+                parsedQuery: parsedQuery,
+                shouldCancel: shouldCancel
+            ) else {
+                return nil
+            }
+            candidateIndices = candidates
+            indexesUsed = indexUses(for: parsedQuery)
+        }
+
+        indexesUsed.insert(request.sort.column == .modified ? .modifiedOrder : .sortOrder)
+        if !request.includeHidden {
+            indexesUsed.insert(.visibleBitset)
+        }
+
+        if candidateIndices.isEmpty {
+            let elapsed = Date().timeIntervalSince(started)
+            return SearchResponse(
+                results: [],
+                totalMatches: 0,
+                elapsed: elapsed,
+                snapshotRevision: snapshotRevision,
+                usesIndexedCandidates: true,
+                executionProfile: SearchExecutionProfile(
+                    executionPath: .optimizedSortedFastPath,
+                    indexesUsed: indexesUsed,
+                    candidateCount: 0,
+                    scannedRowCount: 0,
+                    elapsed: elapsed
+                )
+            )
+        }
+
+        if request.mode == .interactivePreview,
+           candidateIndices.count > max(1_000, maxResults * 50),
+           let orderedResponse = optimizedSortedOrderScanSearch(
+               snapshot: snapshot,
+               request: request,
+               parsedQuery: parsedQuery,
+               simpleNameQuery: simpleNameQuery,
+               candidateIndices: candidateIndices,
+               indexesUsed: indexesUsed,
+               maxResults: maxResults,
+               started: started,
+               snapshotRevision: snapshotRevision,
+               optimizedSortColumns: optimizedSortColumns,
+               shouldCancel: shouldCancel
+           ) {
+            return orderedResponse
+        }
+
+        guard let rankMap = snapshot.sortRankMap(
+            for: request.sort,
+            includeHidden: request.includeHidden,
+            optimizedSortColumns: optimizedSortColumns
+        ) else {
+            return nil
+        }
+
+        var matches: [RankedSearchMatch] = []
+        matches.reserveCapacity(min(maxResults, candidateIndices.count))
+        let trimThreshold = max(maxResults * 8, 256)
+        var total = 0
+        var scannedRows = 0
+        var pathContainsCache: [Int: Bool] = [:]
+
+        func sortAndLimitMatches() {
+            matches.sort { lhs, rhs in
+                lhs.rank < rhs.rank
+            }
+            if matches.count > maxResults {
+                matches.removeSubrange(maxResults..<matches.count)
+            }
+        }
+
+        for (offset, candidate) in candidateIndices.enumerated() {
+            if offset.isMultiple(of: 512), shouldCancel() {
+                return nil
+            }
+
+            let rowID = Int(candidate)
+            guard rowID >= 0, rowID < snapshot.count, rowID < rankMap.count else { continue }
+            let rank = rankMap[rowID]
+            guard rank >= 0 else { continue }
+            scannedRows += 1
+            guard snapshot.store.isResultRow(at: rowID) else { continue }
+            guard request.includeHidden || snapshot.isVisible(at: rowID) else { continue }
+
+            let explanation: MatchExplanation?
+            if let simpleNameQuery {
+                explanation = cheapIndexedNameExplanation(
+                    snapshot: snapshot,
+                    rowID: rowID,
+                    token: simpleNameQuery.token,
+                    mode: simpleNameQuery.mode
+                )
+            } else if request.mode == .interactivePreview {
+                explanation = cheapDegradedExplanation(
+                    snapshot: snapshot,
+                    rowID: rowID,
+                    parsedQuery: parsedQuery,
+                    pathContainsCache: &pathContainsCache
+                )
+            } else {
+                explanation = FuzzyMatcher.explain(record: snapshot.view(at: rowID), parsedQuery: parsedQuery)
+            }
+
+            guard let explanation else { continue }
+            total += 1
+            matches.append(RankedSearchMatch(
+                rank: rank,
+                match: SearchMatch(rowID: rowID, score: explanation.score, match: explanation)
+            ))
+            if matches.count > trimThreshold {
+                sortAndLimitMatches()
+            }
+        }
+
+        guard !shouldCancel() else { return nil }
+        sortAndLimitMatches()
+
+        let elapsed = Date().timeIntervalSince(started)
+        return SearchResponse(
+            results: materialize(matches.map(\.match), from: snapshot),
+            totalMatches: total,
+            elapsed: elapsed,
+            snapshotRevision: snapshotRevision,
+            usesIndexedCandidates: true,
+            executionProfile: SearchExecutionProfile(
+                executionPath: .optimizedSortedFastPath,
+                indexesUsed: indexesUsed,
+                candidateCount: candidateIndices.count,
+                scannedRowCount: scannedRows,
+                elapsed: elapsed
+            )
+        )
+    }
+
+    private static func optimizedSortedOrderScanSearch(
+        snapshot: SearchSnapshot,
+        request: SearchRequest,
+        parsedQuery: FuzzyMatcher.ParsedQuery,
+        simpleNameQuery: (token: String, mode: FuzzyMatcher.MatchMode)?,
+        candidateIndices: [Int32],
+        indexesUsed: Set<SearchIndexUse>,
+        maxResults: Int,
+        started: Date,
+        snapshotRevision: UInt64,
+        optimizedSortColumns: Set<SortColumn>,
+        shouldCancel: @Sendable () -> Bool
+    ) -> SearchResponse? {
+        var included = Array(repeating: UInt8(0), count: snapshot.count)
+        var markedCandidateCount = 0
+        for (offset, candidate) in candidateIndices.enumerated() {
+            if offset.isMultiple(of: 512), shouldCancel() {
+                return nil
+            }
+
+            let rowID = Int(candidate)
+            guard rowID >= 0, rowID < included.count else { continue }
+            guard included[rowID] == 0 else { continue }
+            guard snapshot.store.isResultRow(at: rowID) else { continue }
+            guard request.includeHidden || snapshot.isVisible(at: rowID) else { continue }
+            included[rowID] = 1
+            markedCandidateCount += 1
+        }
+
+        guard markedCandidateCount > 0 else {
+            let elapsed = Date().timeIntervalSince(started)
+            return SearchResponse(
+                results: [],
+                totalMatches: 0,
+                elapsed: elapsed,
+                snapshotRevision: snapshotRevision,
+                usesIndexedCandidates: true,
+                executionProfile: SearchExecutionProfile(
+                    executionPath: .optimizedSortedFastPath,
+                    indexesUsed: indexesUsed,
+                    candidateCount: candidateIndices.count,
+                    scannedRowCount: 0,
+                    elapsed: elapsed
+                )
+            )
+        }
+
+        var pathContainsCache: [Int: Bool] = [:]
+        let scanLimit = max(Self.previewOrderedCandidateScanLimit, maxResults * 500)
+        guard let selected = orderedCandidatePreviewSelection(
+            snapshot: snapshot,
+            request: request,
+            maxResults: maxResults,
+            total: markedCandidateCount,
+            scanLimit: scanLimit,
+            requiresFilledResults: true,
+            optimizedSortColumns: optimizedSortColumns,
+            shouldCancel: shouldCancel,
+            candidateContains: { rowID in
+                included[rowID] != 0
+            },
+            explanation: { rowID in
+                if let simpleNameQuery {
+                    return cheapIndexedNameExplanation(
+                        snapshot: snapshot,
+                        rowID: rowID,
+                        token: simpleNameQuery.token,
+                        mode: simpleNameQuery.mode
+                    )
+                }
+
+                return cheapDegradedExplanation(
+                    snapshot: snapshot,
+                    rowID: rowID,
+                    parsedQuery: parsedQuery,
+                    pathContainsCache: &pathContainsCache
+                )
+            }
+        ) else {
+            return nil
+        }
+
+        let elapsed = Date().timeIntervalSince(started)
+        return SearchResponse(
+            results: materialize(selected.matches, from: snapshot),
+            totalMatches: selected.matches.count,
+            elapsed: elapsed,
+            snapshotRevision: snapshotRevision,
+            usesIndexedCandidates: true,
+            executionProfile: SearchExecutionProfile(
+                executionPath: .optimizedSortedFastPath,
+                indexesUsed: indexesUsed,
+                candidateCount: candidateIndices.count,
+                scannedRowCount: selected.scannedRowCount,
+                elapsed: elapsed
+            )
+        )
+    }
+
+    private static func simpleNamePreviewQuery(
+        _ parsedQuery: FuzzyMatcher.ParsedQuery
+    ) -> (token: String, mode: FuzzyMatcher.MatchMode)? {
+        guard
+            parsedQuery.negative.isEmpty,
+            parsedQuery.positive.count == 1,
+            let clause = parsedQuery.positive.first,
+            clause.alternatives.count == 1,
+            let part = clause.alternatives.first,
+            case .text(let field, let pattern, let mode) = part,
+            field != .path,
+            mode == .fuzzy || mode == .exact,
+            !pattern.token.isEmpty,
+            !tokenContainsPathSeparator(pattern.token)
+        else {
+            return nil
+        }
+
+        return (pattern.token, mode)
+    }
+
+    private static func optimizedSortedNamePreviewSearch(
+        snapshot: SearchSnapshot,
+        request: SearchRequest,
+        parsedQuery: FuzzyMatcher.ParsedQuery,
+        maxResults: Int,
+        started: Date,
+        snapshotRevision: UInt64,
+        optimizedSortColumns: Set<SortColumn>,
+        shouldCancel: @Sendable () -> Bool
+    ) -> SearchResponse? {
+        guard
+            request.mode == .interactivePreview,
+            maxResults > 0,
+            !parsedQuery.isEmpty,
+            parsedQuery.negative.isEmpty,
+            parsedQuery.positive.count == 1,
+            let clause = parsedQuery.positive.first,
+            clause.alternatives.count == 1,
+            let part = clause.alternatives.first,
+            case .text(let field, let pattern, let mode) = part,
+            field != .path,
+            mode == .fuzzy || mode == .exact,
+            !pattern.token.isEmpty,
+            !tokenContainsPathSeparator(pattern.token),
+            let nameCandidates = snapshot.candidateNameIndices(containing: Array(pattern.token.utf8))
+        else {
+            return nil
+        }
+
+        var indexesUsed: Set<SearchIndexUse> = [.nameGrams]
+        indexesUsed.insert(request.sort.column == .modified ? .modifiedOrder : .sortOrder)
+        if !request.includeHidden {
+            indexesUsed.insert(.visibleBitset)
+        }
+
+        if nameCandidates.isEmpty {
+            let elapsed = Date().timeIntervalSince(started)
+            return SearchResponse(
+                results: [],
+                totalMatches: 0,
+                elapsed: elapsed,
+                snapshotRevision: snapshotRevision,
+                usesIndexedCandidates: true,
+                executionProfile: SearchExecutionProfile(
+                    executionPath: .optimizedSortedFastPath,
+                    indexesUsed: indexesUsed,
+                    candidateCount: 0,
+                    scannedRowCount: 0,
+                    elapsed: elapsed
+                )
+            )
+        }
+
+        var nameRows = Array(repeating: UInt8(0), count: snapshot.count)
+        var visibleNameCandidateCount = 0
+        for (offset, candidate) in nameCandidates.enumerated() {
+            if offset.isMultiple(of: 512), shouldCancel() {
+                return nil
+            }
+
+            let rowID = Int(candidate)
+            guard rowID >= 0, rowID < snapshot.count else { continue }
+            guard snapshot.store.isResultRow(at: rowID) else { continue }
+            guard request.includeHidden || snapshot.isVisible(at: rowID) else { continue }
+            nameRows[rowID] = 1
+            visibleNameCandidateCount += 1
+        }
+
+        guard visibleNameCandidateCount > 0 else {
+            let elapsed = Date().timeIntervalSince(started)
+            return SearchResponse(
+                results: [],
+                totalMatches: 0,
+                elapsed: elapsed,
+                snapshotRevision: snapshotRevision,
+                usesIndexedCandidates: true,
+                executionProfile: SearchExecutionProfile(
+                    executionPath: .optimizedSortedFastPath,
+                    indexesUsed: indexesUsed,
+                    candidateCount: nameCandidates.count,
+                    scannedRowCount: 0,
+                    elapsed: elapsed
+                )
+            )
+        }
+
+        guard let selected = orderedCandidatePreviewSelection(
+            snapshot: snapshot,
+            request: request,
+            maxResults: maxResults,
+            total: visibleNameCandidateCount,
+            optimizedSortColumns: optimizedSortColumns,
+            shouldCancel: shouldCancel,
+            candidateContains: { rowID in
+                nameRows[rowID] != 0
+            },
+            explanation: { rowID in
+                cheapIndexedNameExplanation(
+                    snapshot: snapshot,
+                    rowID: rowID,
+                    token: pattern.token,
+                    mode: mode
+                )
+            }
+        ) else {
+            return nil
+        }
+
+        let elapsed = Date().timeIntervalSince(started)
+        return SearchResponse(
+            results: materialize(selected.matches, from: snapshot),
+            totalMatches: visibleNameCandidateCount,
+            elapsed: elapsed,
+            snapshotRevision: snapshotRevision,
+            usesIndexedCandidates: true,
+            executionProfile: SearchExecutionProfile(
+                executionPath: .optimizedSortedFastPath,
+                indexesUsed: indexesUsed,
+                candidateCount: nameCandidates.count,
+                scannedRowCount: selected.scannedRowCount,
+                elapsed: elapsed
+            )
+        )
+    }
+
+    private static func optimizedSortedCandidateSearch(
+        snapshot: SearchSnapshot,
+        request: SearchRequest,
+        parsedQuery: FuzzyMatcher.ParsedQuery,
+        maxResults: Int,
+        started: Date,
+        snapshotRevision: UInt64,
+        optimizedSortColumns: Set<SortColumn>,
+        shouldCancel: @Sendable () -> Bool
+    ) -> SearchResponse? {
+        guard
+            maxResults > 0,
+            !parsedQuery.isEmpty,
+            request.mode == .interactivePreview || usesAdditionalSortOrder(request.sort.column),
+            let orderedRows = snapshot.orderedIndices(
+                for: request.sort,
+                queryIsEmpty: false,
+                includeHidden: request.includeHidden,
+                optimizedSortColumns: optimizedSortColumns
+            ),
+            let candidateIndices = candidateIndices(
+                snapshot: snapshot,
+                parsedQuery: parsedQuery,
+                shouldCancel: shouldCancel
+            )
+        else {
+            return nil
+        }
+
+        if request.mode == .interactivePreview, candidateIndices.count <= max(1_000, maxResults * 50) {
+            return nil
+        }
+
+        if candidateIndices.isEmpty {
+            let elapsed = Date().timeIntervalSince(started)
+            return SearchResponse(
+                results: [],
+                totalMatches: 0,
+                elapsed: elapsed,
+                snapshotRevision: snapshotRevision,
+                usesIndexedCandidates: true,
+                executionProfile: SearchExecutionProfile(
+                    executionPath: executionPath(forIndexedCandidateQuery: parsedQuery),
+                    indexesUsed: indexUses(for: parsedQuery),
+                    candidateCount: 0,
+                    scannedRowCount: 0,
+                    elapsed: elapsed
+                )
+            )
+        }
+
+        var included = Array(repeating: UInt8(0), count: snapshot.count)
+        var markedCandidateCount = 0
+        for (offset, candidate) in candidateIndices.enumerated() {
+            if offset.isMultiple(of: 512), shouldCancel() {
+                return nil
+            }
+
+            let rowID = Int(candidate)
+            guard rowID >= 0, rowID < snapshot.count else { continue }
+            guard included[rowID] == 0 else { continue }
+            guard snapshot.store.isResultRow(at: rowID) else { continue }
+            guard request.includeHidden || snapshot.isVisible(at: rowID) else { continue }
+            included[rowID] = 1
+            markedCandidateCount += 1
+        }
+
+        guard markedCandidateCount > 0 else {
+            let elapsed = Date().timeIntervalSince(started)
+            return SearchResponse(
+                results: [],
+                totalMatches: 0,
+                elapsed: elapsed,
+                snapshotRevision: snapshotRevision,
+                usesIndexedCandidates: true,
+                executionProfile: SearchExecutionProfile(
+                    executionPath: .optimizedSortedFastPath,
+                    indexesUsed: indexUses(for: parsedQuery).union([.sortOrder]),
+                    candidateCount: candidateIndices.count,
+                    scannedRowCount: 0,
+                    elapsed: elapsed
+                )
+            )
+        }
+
+        var matches: [SearchMatch] = []
+        matches.reserveCapacity(min(maxResults, markedCandidateCount))
+        var pathContainsCache: [Int: Bool] = [:]
+        var scannedRows = 0
+        var totalMatches = 0
+        let scanLimit: Int
+        switch request.mode {
+        case .interactivePreview:
+            scanLimit = min(orderedRows.count, max(Self.previewOrderedCandidateScanLimit, maxResults * 500))
+        case .complete:
+            scanLimit = orderedRows.count
+        }
+
+        for (offset, rowID) in orderedRows.prefix(scanLimit).enumerated() {
+            if offset.isMultiple(of: 512), shouldCancel() {
+                return nil
+            }
+
+            scannedRows += 1
+            guard rowID >= 0, rowID < snapshot.count else { continue }
+            guard included[rowID] != 0 else { continue }
+            guard let explanation = cheapDegradedExplanation(
+                snapshot: snapshot,
+                rowID: rowID,
+                parsedQuery: parsedQuery,
+                pathContainsCache: &pathContainsCache
+            ) else {
+                continue
+            }
+
+            totalMatches += 1
+            if matches.count < maxResults {
+                matches.append(SearchMatch(rowID: rowID, score: explanation.score, match: explanation))
+            }
+            if request.mode == .interactivePreview, matches.count == maxResults {
+                break
+            }
+        }
+
+        guard !shouldCancel() else { return nil }
+        let elapsed = Date().timeIntervalSince(started)
+        var indexesUsed = indexUses(for: parsedQuery)
+        indexesUsed.insert(request.sort.column == .modified ? .modifiedOrder : .sortOrder)
+        if !request.includeHidden {
+            indexesUsed.insert(.visibleBitset)
+        }
+        return SearchResponse(
+            results: materialize(matches, from: snapshot),
+            totalMatches: request.mode == .interactivePreview ? markedCandidateCount : totalMatches,
+            elapsed: elapsed,
+            snapshotRevision: snapshotRevision,
+            usesIndexedCandidates: true,
+            executionProfile: SearchExecutionProfile(
+                executionPath: .optimizedSortedFastPath,
+                indexesUsed: indexesUsed,
+                candidateCount: candidateIndices.count,
+                scannedRowCount: scannedRows,
+                elapsed: elapsed
+            )
+        )
+    }
+
+    private static func fallbackScanLimit(for request: SearchRequest, maxResults: Int, snapshotCount: Int) -> Int {
+        switch request.mode {
+        case .interactivePreview:
+            return min(snapshotCount, max(Self.previewIndexedCandidateScanLimit, maxResults * 500))
+        case .complete:
+            return snapshotCount
+        }
+    }
+
+    private static func cheapIndexedCandidateSearch(
+        snapshot: SearchSnapshot,
+        request: SearchRequest,
+        parsedQuery: FuzzyMatcher.ParsedQuery,
+        maxResults: Int,
+        started: Date,
+        snapshotRevision: UInt64,
+        shouldCancel: @Sendable () -> Bool
+    ) -> SearchResponse? {
+        guard let candidateIndices = candidateIndices(
+            snapshot: snapshot,
+            parsedQuery: parsedQuery,
+            shouldCancel: shouldCancel
+        ) else {
+            return nil
+        }
+
+        let indexesUsed = indexUses(for: parsedQuery)
+        guard request.mode == .interactivePreview else {
+            return nil
+        }
+
+        if candidateIndices.isEmpty {
+            let elapsed = Date().timeIntervalSince(started)
+            return SearchResponse(
+                results: [],
+                totalMatches: 0,
+                elapsed: elapsed,
+                snapshotRevision: snapshotRevision,
+                usesIndexedCandidates: true,
+                executionProfile: SearchExecutionProfile(
+                    executionPath: executionPath(forIndexedCandidateQuery: parsedQuery),
+                    indexesUsed: indexesUsed,
+                    candidateCount: 0,
+                    scannedRowCount: 0,
+                    elapsed: elapsed
+                )
+            )
+        }
+
+        let scanLimit = min(candidateIndices.count, max(Self.previewIndexedCandidateScanLimit, maxResults * 500))
+
+        var matches: [SearchMatch] = []
+        matches.reserveCapacity(min(maxResults, scanLimit))
+        let trimThreshold = maxResults > 0 ? maxResults * 5 : 0
+        var total = 0
+        var scannedRows = 0
+        var pathContainsCache: [Int: Bool] = [:]
+
+        func sortAndLimitMatches() {
+            guard maxResults > 0 else { return }
+            matches.sort {
+                compare($0, $1, snapshot: snapshot, sort: request.sort, queryIsEmpty: false)
+            }
+            if matches.count > maxResults {
+                matches.removeSubrange(maxResults..<matches.count)
+            }
+        }
+
+        for (offset, candidate) in candidateIndices.prefix(scanLimit).enumerated() {
+            if offset.isMultiple(of: 512), shouldCancel() {
+                return nil
+            }
+
+            let rowID = Int(candidate)
+            guard rowID >= 0, rowID < snapshot.count else { continue }
+            scannedRows += 1
+            guard snapshot.store.isResultRow(at: rowID) else { continue }
+            guard request.includeHidden || snapshot.isVisible(at: rowID) else { continue }
+            guard let explanation = cheapDegradedExplanation(
+                snapshot: snapshot,
+                rowID: rowID,
+                parsedQuery: parsedQuery,
+                pathContainsCache: &pathContainsCache
+            ) else {
+                continue
+            }
+
+            total += 1
+            guard maxResults > 0 else { continue }
+            matches.append(SearchMatch(rowID: rowID, score: explanation.score, match: explanation))
+            if matches.count > trimThreshold {
+                sortAndLimitMatches()
+            }
+        }
+
+        guard !shouldCancel() else { return nil }
+        sortAndLimitMatches()
+
+        let elapsed = Date().timeIntervalSince(started)
+        return SearchResponse(
+            results: materialize(matches, from: snapshot),
+            totalMatches: total,
+            elapsed: elapsed,
+            snapshotRevision: snapshotRevision,
+            usesIndexedCandidates: true,
+            executionProfile: SearchExecutionProfile(
+                executionPath: executionPath(forIndexedCandidateQuery: parsedQuery),
+                indexesUsed: indexesUsed,
+                candidateCount: candidateIndices.count,
+                scannedRowCount: scannedRows,
+                elapsed: elapsed
+            )
+        )
     }
 
     private static func degradedSearch(
@@ -4157,7 +6030,7 @@ public final class FileIndex: @unchecked Sendable {
             usedNameGrams = true
             directNameCandidateCount = nameCandidates.count
             let pathAccelerationUnavailable = snapshot.gramIndex == nil && snapshot.pathGramShards.isEmpty
-            if field == .name || (field == .any && pathAccelerationUnavailable) {
+            if field == .name || nameCandidates.count <= maxResults || (field == .any && pathAccelerationUnavailable) {
                 return modifiedPreviewResponseFromNameCandidates(
                     snapshot: snapshot,
                     request: request,
@@ -5131,32 +7004,40 @@ public final class FileIndex: @unchecked Sendable {
 
         let lowerBound = lowerBoundName(in: snapshot.nameAscending, snapshot: snapshot, key: token)
         if lowerBound < snapshot.nameAscending.count {
-            var prefixRows: [Int] = []
-            prefixRows.reserveCapacity(maxResults)
-            var cursor = lowerBound
-            while cursor < snapshot.nameAscending.count {
-                if cursor.isMultiple(of: 512), shouldCancel() {
+            let upperBound = lowerBoundName(
+                in: snapshot.nameAscending,
+                snapshot: snapshot,
+                key: token + "\u{10FFFF}"
+            )
+            var exactEnd = lowerBound
+            while exactEnd < upperBound,
+                  snapshot.store.normalizedName(at: snapshot.nameAscending[exactEnd]) == token {
+                if exactEnd.isMultiple(of: 512), shouldCancel() {
                     return nil
                 }
-                let rowID = snapshot.nameAscending[cursor]
-                let normalizedName = snapshot.store.normalizedName(at: rowID)
-                guard normalizedName.hasPrefix(token) else { break }
+                let rowID = snapshot.nameAscending[exactEnd]
                 scannedRows += 1
-                prefixRows.append(rowID)
-                cursor += 1
-            }
-
-            for rowID in prefixRows where snapshot.store.normalizedName(at: rowID) == token {
                 appendNameMatch(rowID: rowID, requiresCandidateMembership: false)
                 if matches.count == maxResults {
                     break
                 }
+                exactEnd += 1
             }
 
             if matches.count < maxResults {
-                let prefixRemainder = prefixRows.filter { snapshot.store.normalizedName(at: $0) != token }
-                let orderedPrefixRows = request.sort.ascending ? prefixRemainder : prefixRemainder.reversed()
-                for rowID in orderedPrefixRows {
+                let prefixRange = exactEnd..<upperBound
+                let prefixRows: AnySequence<Int>
+                if request.sort.ascending {
+                    prefixRows = AnySequence(prefixRange.lazy.map { snapshot.nameAscending[$0] })
+                } else {
+                    prefixRows = AnySequence(prefixRange.reversed().lazy.map { snapshot.nameAscending[$0] })
+                }
+
+                for rowID in prefixRows {
+                    if scannedRows.isMultiple(of: 512), shouldCancel() {
+                        return nil
+                    }
+                    scannedRows += 1
                     appendNameMatch(rowID: rowID, requiresCandidateMembership: false)
                     if matches.count == maxResults {
                         break
@@ -5185,7 +7066,7 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         let elapsed = Date().timeIntervalSince(started)
-        var indexesUsed: Set<SearchIndexUse> = []
+        var indexesUsed: Set<SearchIndexUse> = [.sortOrder]
         if nameCandidates != nil {
             indexesUsed.insert(.nameGrams)
         }
@@ -5719,7 +7600,6 @@ public final class FileIndex: @unchecked Sendable {
         shouldCancel: @Sendable () -> Bool
     ) -> SearchResponse? {
         guard
-            request.sort.column != .path,
             snapshot.nameGramIndex != nil,
             parsedQuery.negative.isEmpty,
             parsedQuery.positive.count == 1,
@@ -5821,66 +7701,6 @@ public final class FileIndex: @unchecked Sendable {
             }
         }
 
-        if request.sort.column == .modified, snapshot.hasModifiedSortOrder {
-            let orderedRows: [Int]
-            if request.includeHidden {
-                orderedRows = request.sort.ascending ? snapshot.modifiedAscending : snapshot.modifiedDescending
-            } else {
-                orderedRows = request.sort.ascending ? snapshot.visibleModifiedAscending : snapshot.visibleModifiedDescending
-            }
-            var matches: [SearchMatch] = []
-            let total = candidateRows.count
-            let targetResultCount = maxResults > 0 ? min(maxResults, total) : 0
-            matches.reserveCapacity(targetResultCount)
-            var scannedRows = 0
-
-            if targetResultCount > 0 {
-                for (offset, rowID) in orderedRows.enumerated() {
-                    if offset.isMultiple(of: 512), shouldCancel() {
-                        return nil
-                    }
-                    scannedRows += 1
-                    guard rowMarkers[rowID] & candidateMask != 0 else { continue }
-
-                    guard let explanation = cheapExactPathSubstringExplanation(
-                        snapshot: snapshot,
-                        rowID: rowID,
-                        token: pattern.token,
-                        mode: mode,
-                        field: field,
-                        rowMarkers: rowMarkers,
-                        directNameMask: directNameMask
-                    ) else {
-                        continue
-                    }
-
-                    matches.append(SearchMatch(rowID: rowID, score: explanation.score, match: explanation))
-                    if matches.count == targetResultCount {
-                        break
-                    }
-                }
-            }
-
-            guard !shouldCancel() else { return nil }
-            let elapsed = Date().timeIntervalSince(started)
-            var modifiedIndexesUsed = indexesUsed
-            modifiedIndexesUsed.insert(.modifiedOrder)
-            return SearchResponse(
-                results: materialize(matches, from: snapshot),
-                totalMatches: total,
-                elapsed: elapsed,
-                snapshotRevision: snapshotRevision,
-                usesIndexedCandidates: true,
-                executionProfile: SearchExecutionProfile(
-                    executionPath: .pathGramIndex,
-                    indexesUsed: modifiedIndexesUsed,
-                    candidateCount: exactPathCandidates.count,
-                    scannedRowCount: scannedRows,
-                    elapsed: elapsed
-                )
-            )
-        }
-
         if request.sort.column == .relevance {
             guard let selected = relevanceExactPathSubstringMatches(
                 snapshot: snapshot,
@@ -5915,21 +7735,30 @@ public final class FileIndex: @unchecked Sendable {
             )
         }
 
-        if request.sort.column == .name, maxResults > 0 {
-            guard let selected = nameSortedExactPathSubstringMatches(
+        if let sortIndexUse = sortedOrderIndexUse(for: request.sort.column),
+           let selected = orderedCandidatePreviewSelection(
                 snapshot: snapshot,
-                candidateRows: candidateRows,
-                rowMarkers: rowMarkers,
-                directNameMask: directNameMask,
-                token: pattern.token,
-                mode: mode,
-                field: field,
                 request: request,
                 maxResults: maxResults,
-                shouldCancel: shouldCancel
-            ) else {
-                return nil
-            }
+                total: candidateRows.count,
+                shouldCancel: shouldCancel,
+                candidateContains: { rowID in
+                    rowMarkers[rowID] & candidateMask != 0
+                },
+                explanation: { rowID in
+                    cheapExactPathSubstringExplanation(
+                        snapshot: snapshot,
+                        rowID: rowID,
+                        token: pattern.token,
+                        mode: mode,
+                        field: field,
+                        rowMarkers: rowMarkers,
+                        directNameMask: directNameMask
+                    )
+                }
+           ) {
+            var sortedIndexesUsed = indexesUsed
+            sortedIndexesUsed.insert(sortIndexUse)
 
             let elapsed = Date().timeIntervalSince(started)
             return SearchResponse(
@@ -5940,8 +7769,9 @@ public final class FileIndex: @unchecked Sendable {
                 usesIndexedCandidates: true,
                 executionProfile: SearchExecutionProfile(
                     executionPath: .pathGramIndex,
-                    indexesUsed: indexesUsed,
+                    indexesUsed: sortedIndexesUsed,
                     candidateCount: exactPathCandidates.count,
+                    scannedRowCount: selected.scannedRowCount,
                     elapsed: elapsed
                 )
             )
@@ -5991,7 +7821,7 @@ public final class FileIndex: @unchecked Sendable {
             return nil
         }
 
-        guard let selected = nameSortedExactExtensionMatches(
+        guard let selected = exactExtensionMatches(
             snapshot: snapshot,
             candidates: candidates,
             parsedQuery: parsedQuery,
@@ -6004,6 +7834,9 @@ public final class FileIndex: @unchecked Sendable {
 
         let elapsed = Date().timeIntervalSince(started)
         var indexesUsed: Set<SearchIndexUse> = [.extensionPostings]
+        if let sortIndexUse = sortedOrderIndexUse(for: request.sort.column) {
+            indexesUsed.insert(sortIndexUse)
+        }
         if !request.includeHidden {
             indexesUsed.insert(.visibleBitset)
         }
@@ -6017,6 +7850,7 @@ public final class FileIndex: @unchecked Sendable {
                 executionPath: .extensionCandidateIntersection,
                 indexesUsed: indexesUsed,
                 candidateCount: candidates.count,
+                scannedRowCount: selected.scannedRowCount,
                 elapsed: elapsed
             )
         )
@@ -6072,6 +7906,75 @@ public final class FileIndex: @unchecked Sendable {
             self.total = total
             self.scannedRowCount = scannedRowCount
         }
+    }
+
+    private static func sortedOrderIndexUse(for column: SortColumn) -> SearchIndexUse? {
+        switch column {
+        case .modified:
+            return .modifiedOrder
+        case .name, .path, .created, .size, .fileExtension, .kind, .volume, .root:
+            return .sortOrder
+        case .relevance:
+            return nil
+        }
+    }
+
+    private static func orderedCandidatePreviewSelection(
+        snapshot: SearchSnapshot,
+        request: SearchRequest,
+        maxResults: Int,
+        total: Int,
+        scanLimit: Int? = nil,
+        requiresFilledResults: Bool = false,
+        optimizedSortColumns: Set<SortColumn> = Set(SortColumn.optimizedIndexColumns),
+        shouldCancel: @Sendable () -> Bool,
+        candidateContains: (Int) -> Bool,
+        explanation: (Int) -> MatchExplanation?
+    ) -> NameSortedSelection? {
+        guard total > 0 else {
+            return NameSortedSelection(matches: [], total: 0)
+        }
+        guard maxResults > 0 else {
+            return NameSortedSelection(matches: [], total: total)
+        }
+        guard let orderedRows = snapshot.orderedIndices(
+            for: request.sort,
+            queryIsEmpty: false,
+            includeHidden: request.includeHidden,
+            optimizedSortColumns: optimizedSortColumns
+        ) else {
+            return nil
+        }
+
+        let targetResultCount = min(maxResults, total)
+        let boundedScanLimit = min(orderedRows.count, scanLimit ?? orderedRows.count)
+        var matches: [SearchMatch] = []
+        matches.reserveCapacity(targetResultCount)
+        var scannedRows = 0
+
+        for (offset, rowID) in orderedRows.prefix(boundedScanLimit).enumerated() {
+            if offset.isMultiple(of: 512), shouldCancel() {
+                return nil
+            }
+
+            scannedRows += 1
+            guard rowID >= 0, rowID < snapshot.count else { continue }
+            guard candidateContains(rowID) else { continue }
+            guard snapshot.store.isResultRow(at: rowID) else { continue }
+            guard request.includeHidden || snapshot.isVisible(at: rowID) else { continue }
+            guard let explanation = explanation(rowID) else { continue }
+
+            matches.append(SearchMatch(rowID: rowID, score: explanation.score, match: explanation))
+            if matches.count == targetResultCount {
+                break
+            }
+        }
+
+        guard !shouldCancel() else { return nil }
+        if requiresFilledResults, matches.count < targetResultCount {
+            return nil
+        }
+        return NameSortedSelection(matches: matches, total: total, scannedRowCount: scannedRows)
     }
 
     private static func countResultRows(
@@ -6378,7 +8281,7 @@ public final class FileIndex: @unchecked Sendable {
         return NameSortedSelection(matches: matches, total: total)
     }
 
-    private static func nameSortedExactExtensionMatches(
+    private static func exactExtensionMatches(
         snapshot: SearchSnapshot,
         candidates: [Int32],
         parsedQuery: FuzzyMatcher.ParsedQuery,
@@ -6387,16 +8290,6 @@ public final class FileIndex: @unchecked Sendable {
         shouldCancel: @Sendable () -> Bool
     ) -> NameSortedSelection? {
         guard snapshot.hasSortedOrder, !snapshot.nameAscending.isEmpty || candidates.isEmpty else {
-            return nil
-        }
-
-        let order: [Int]
-        switch request.sort.column {
-        case .relevance, .fileExtension:
-            order = snapshot.nameAscending
-        case .name:
-            order = request.sort.ascending ? snapshot.nameAscending : snapshot.nameDescending
-        case .path, .modified, .created, .size, .kind, .volume, .root:
             return nil
         }
 
@@ -6420,74 +8313,63 @@ public final class FileIndex: @unchecked Sendable {
             return NameSortedSelection(matches: [], total: total)
         }
 
+        guard request.sort.column == .relevance else {
+            let scanLimit = request.mode == .interactivePreview
+                ? max(Self.previewOrderedCandidateScanLimit, maxResults * 500)
+                : nil
+            return orderedCandidatePreviewSelection(
+                snapshot: snapshot,
+                request: request,
+                maxResults: maxResults,
+                total: total,
+                scanLimit: scanLimit,
+                requiresFilledResults: request.mode == .interactivePreview,
+                shouldCancel: shouldCancel,
+                candidateContains: { rowID in
+                    included[rowID] != 0
+                },
+                explanation: { rowID in
+                    FuzzyMatcher.explain(record: snapshot.view(at: rowID), parsedQuery: parsedQuery)
+                }
+            )
+        }
+
         var matches: [SearchMatch] = []
         matches.reserveCapacity(min(maxResults, total))
-        for (offset, rowID) in order.enumerated() {
+        let trimThreshold = max(maxResults * 5, 128)
+        var scannedRows = 0
+
+        func sortAndLimitMatches() {
+            matches.sort {
+                compare($0, $1, snapshot: snapshot, sort: request.sort, queryIsEmpty: false)
+            }
+            if matches.count > maxResults {
+                matches.removeSubrange(maxResults..<matches.count)
+            }
+        }
+
+        for (offset, candidate) in candidates.enumerated() {
             if offset.isMultiple(of: 512), shouldCancel() {
                 return nil
             }
+
+            let rowID = Int(candidate)
+            guard rowID >= 0, rowID < snapshot.count else { continue }
             guard included[rowID] != 0 else { continue }
+            included[rowID] = 0
+            scannedRows += 1
             guard let explanation = FuzzyMatcher.explain(record: snapshot.view(at: rowID), parsedQuery: parsedQuery) else {
                 continue
             }
             matches.append(SearchMatch(rowID: rowID, score: explanation.score, match: explanation))
-            if matches.count == maxResults {
-                break
+            if matches.count > trimThreshold {
+                sortAndLimitMatches()
             }
         }
 
-        return NameSortedSelection(matches: matches, total: total)
-    }
-
-    private static func nameSortedExactPathSubstringMatches(
-        snapshot: SearchSnapshot,
-        candidateRows: [Int],
-        rowMarkers: [UInt8],
-        directNameMask: UInt8,
-        token: String,
-        mode: FuzzyMatcher.MatchMode,
-        field: FuzzyMatcher.QueryField,
-        request: SearchRequest,
-        maxResults: Int,
-        shouldCancel: @Sendable () -> Bool
-    ) -> NameSortedSelection? {
-        guard snapshot.hasSortedOrder, !snapshot.nameAscending.isEmpty || candidateRows.isEmpty else {
-            return nil
-        }
-
-        let total = candidateRows.count
-        guard maxResults > 0, total > 0 else {
-            return NameSortedSelection(matches: [], total: total)
-        }
-
-        let candidateMask: UInt8 = 1
-        let order = request.sort.ascending ? snapshot.nameAscending : snapshot.nameDescending
-        var matches: [SearchMatch] = []
-        matches.reserveCapacity(min(maxResults, total))
-
-        for (offset, rowID) in order.enumerated() {
-            if offset.isMultiple(of: 512), shouldCancel() {
-                return nil
-            }
-            guard rowMarkers[rowID] & candidateMask != 0 else { continue }
-            guard let explanation = cheapExactPathSubstringExplanation(
-                snapshot: snapshot,
-                rowID: rowID,
-                token: token,
-                mode: mode,
-                field: field,
-                rowMarkers: rowMarkers,
-                directNameMask: directNameMask
-            ) else {
-                continue
-            }
-            matches.append(SearchMatch(rowID: rowID, score: explanation.score, match: explanation))
-            if matches.count == maxResults {
-                break
-            }
-        }
-
-        return NameSortedSelection(matches: matches, total: total)
+        guard !shouldCancel() else { return nil }
+        sortAndLimitMatches()
+        return NameSortedSelection(matches: matches, total: total, scannedRowCount: scannedRows)
     }
 
     private struct NameSortCandidate {
@@ -7694,6 +9576,7 @@ public final class FileIndex: @unchecked Sendable {
     public func deleteSnapshot() {
         lock.withLock {
             recordsByPath.removeAll(keepingCapacity: true)
+            clearOptimizedSearchFallbackWithoutLock()
             searchSnapshot = .empty
             searchSnapshotRevision &+= 1
             status = "Index deleted"
@@ -7787,7 +9670,11 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         let metrics = RecordCollectionMetrics(recordCount: persisted.store.count, totalPathBytes: 0, maxPathBytes: 0)
-        let baseSnapshot = SearchSnapshot(store: persisted.store, persistedStructures: persisted.searchStructures)
+        let baseSnapshot = SearchSnapshot(
+            store: persisted.store,
+            persistedStructures: persisted.searchStructures,
+            optimizedSortColumns: currentOptimizedSortColumns()
+        )
         let currentExclusionPatterns = lock.withLock { exclusionRules.patterns }
         let snapshot: SearchSnapshot
         if persisted.manifest.exclusionPatterns == currentExclusionPatterns {
@@ -7893,6 +9780,7 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     private func rebuild(roots rootURLs: [URL], mode: RebuildMode, generation currentGeneration: UInt64, started: Date) {
+        let maintenanceMeasurement = MaintenanceMeasurement(startedAt: started)
         let jobID = beginIndexJob("rebuild")
         defer { endIndexJob("rebuild", jobID: jobID) }
 
@@ -7973,6 +9861,14 @@ public final class FileIndex: @unchecked Sendable {
         )
         guard isCurrentGeneration(currentGeneration) else { return }
         recordFullRebuild(duration: Date().timeIntervalSince(started))
+        recordMaintenance(maintenanceMeasurement.operation(
+            kind: .fullRebuild,
+            priority: .interactive,
+            paths: rootURLs.count,
+            records: scanResult.records.count,
+            visited: scanResult.visited,
+            exclusionInstrumentation: scanResult.exclusionInstrumentation
+        ))
         DiagnosticLogger.shared.log(
             category: "index",
             event: "index.rebuildFinished",
@@ -7993,6 +9889,7 @@ public final class FileIndex: @unchecked Sendable {
         started: Date,
         activityPresentation: IndexActivityPresentation
     ) {
+        let maintenanceMeasurement = MaintenanceMeasurement(startedAt: started)
         let jobID = beginIndexJob("reconcile")
         defer { endIndexJob("reconcile", jobID: jobID) }
 
@@ -8107,6 +10004,14 @@ public final class FileIndex: @unchecked Sendable {
         guard isCurrentGeneration(currentGeneration) else { return }
         recordFullRebuild(duration: Date().timeIntervalSince(started))
         let finalRecordCount = lock.withLock { searchSnapshot.resultCount }
+        recordMaintenance(maintenanceMeasurement.operation(
+            kind: .reconcile,
+            priority: activityPresentation == .backgroundCatchUp ? .background : .interactive,
+            paths: rootURLs.count,
+            records: finalRecordCount,
+            visited: scanResult.visited,
+            exclusionInstrumentation: scanResult.exclusionInstrumentation
+        ))
         DiagnosticLogger.shared.log(
             category: "index",
             event: "index.reconcileFinished",
@@ -8147,6 +10052,7 @@ public final class FileIndex: @unchecked Sendable {
             rootPaths: ruleRootPaths,
             evaluationMode: scanConfiguration.evaluationMode
         )
+        let exclusionInstrumentationAccumulator = ExclusionInstrumentationAccumulator()
         let claimBatchSize = scanConfiguration.frontierMode.usesBatchedClaim
             ? max(scanConfiguration.frontierBatchSize, 1)
             : 1
@@ -8201,6 +10107,7 @@ public final class FileIndex: @unchecked Sendable {
 
         if checkpoint == nil {
             let rootVolumeNameCache = ScanVolumeNameCache()
+            var rootInstrumentation = FileExclusionQuery.Instrumentation()
             for root in rootURLs {
                 var isDirectory: ObjCBool = false
                 guard fileManager.fileExists(atPath: root.path, isDirectory: &isDirectory) else {
@@ -8227,7 +10134,8 @@ public final class FileIndex: @unchecked Sendable {
                     exclusions: exclusions,
                     rootPaths: ruleRootPaths,
                     query: rootPreflightExclusionQuery,
-                    isDirectory: rootCandidate.isDirectory
+                    isDirectory: rootCandidate.isDirectory,
+                    instrumentation: &rootInstrumentation
                 )
                 guard rootDecision != .prune else {
                     logSkippedRoot(root, reason: "excluded")
@@ -8240,6 +10148,7 @@ public final class FileIndex: @unchecked Sendable {
                     state.enqueue(root)
                 }
             }
+            exclusionInstrumentationAccumulator.add(rootInstrumentation)
         }
 
         let workers = DispatchGroup()
@@ -8258,6 +10167,10 @@ public final class FileIndex: @unchecked Sendable {
                     rootPaths: ruleRootPaths,
                     evaluationMode: scanConfiguration.evaluationMode
                 )
+                var workerInstrumentation = FileExclusionQuery.Instrumentation()
+                defer {
+                    exclusionInstrumentationAccumulator.add(workerInstrumentation)
+                }
                 let volumeNameCache = ScanVolumeNameCache()
 
                 var batch: [FileRecord] = []
@@ -8283,7 +10196,16 @@ public final class FileIndex: @unchecked Sendable {
                             childDirectories.reserveCapacity(32)
                         }
 
-                        _ = self.enumerateShallowChildURLs(in: directory) { child in
+                        _ = self.enumerateShallowChildURLs(
+                            in: directory,
+                            prunesDirectoryNamed: { name in
+                                let prunes = exclusions.canPruneDirectoryComponentBeforeStat(name)
+                                if prunes {
+                                    workerInstrumentation.fastPruneDirectoryCount += 1
+                                }
+                                return prunes
+                            }
+                        ) { child in
                             if !self.isCurrentGeneration(currentGeneration) {
                                 state.markStopped()
                                 return false
@@ -8301,7 +10223,8 @@ public final class FileIndex: @unchecked Sendable {
                                     exclusions: exclusions,
                                     rootPaths: ruleRootPaths,
                                     query: workerExclusionQuery,
-                                    isDirectory: candidate.isDirectory
+                                    isDirectory: candidate.isDirectory,
+                                    instrumentation: &workerInstrumentation
                                 )
                                 guard decision != .prune else { return }
                                 guard !(candidate.isDirectory && candidate.isSymlink) else {
@@ -8355,7 +10278,9 @@ public final class FileIndex: @unchecked Sendable {
         publishStatus(state.statusIfNeeded(force: true))
         publishSearchableSnapshot(true)
 
-        let (result, wasStopped) = state.result()
+        let (result, wasStopped) = state.result(
+            exclusionInstrumentation: exclusionInstrumentationAccumulator.snapshot()
+        )
         return wasStopped && !isCurrentGeneration(currentGeneration) ? nil : result
     }
 
@@ -8483,6 +10408,7 @@ public final class FileIndex: @unchecked Sendable {
         if snapshotSettings.shouldReconcileAfterFinish {
             requestBackgroundReconciliation()
         }
+        recordDeferredOptimization(reason: "largeRebuild", delay: 0)
         optimizeAndPersistSnapshotInBackground(
             records: records,
             roots: snapshotSettings.roots,
@@ -8507,6 +10433,7 @@ public final class FileIndex: @unchecked Sendable {
             defer { self.endIndexJob("deferredOptimize", jobID: jobID) }
 
             let started = Date()
+            let maintenanceMeasurement = MaintenanceMeasurement(startedAt: started)
             func logCancellation(reason: String) {
                 let generationMatches = self.isCurrentGeneration(currentGeneration)
                 let snapshotRevisionMatches = self.isSnapshotRevisionCurrent(baseSnapshotRevision)
@@ -8689,6 +10616,12 @@ public final class FileIndex: @unchecked Sendable {
 
                 if didApply {
                     self.publishStats()
+                    self.clearDeferredOptimizationMarker()
+                    self.recordMaintenance(maintenanceMeasurement.operation(
+                        kind: .optimization,
+                        priority: .interactive,
+                        records: optimizedSnapshot.resultCount
+                    ))
                     let appliedRevision = self.lock.withLock { self.searchSnapshotRevision }
                     self.startPathGramBuildIfNeeded(
                         snapshot: optimizedSnapshot,
@@ -9199,6 +11132,8 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     private func optimizeLoadedSnapshot(generation currentGeneration: UInt64) {
+        let started = Date()
+        let maintenanceMeasurement = MaintenanceMeasurement(startedAt: started)
         let jobID = beginIndexJob("optimizeLoadedSnapshot")
         defer { endIndexJob("optimizeLoadedSnapshot", jobID: jobID) }
 
@@ -9270,6 +11205,12 @@ public final class FileIndex: @unchecked Sendable {
 
         if didFinish {
             publishStats()
+            clearDeferredOptimizationMarker()
+            recordMaintenance(maintenanceMeasurement.operation(
+                kind: .optimization,
+                priority: .interactive,
+                records: snapshot.resultCount
+            ))
             let revision = lock.withLock { searchSnapshotRevision }
             startPathGramBuildIfNeeded(
                 snapshot: snapshot,
@@ -9346,6 +11287,7 @@ public final class FileIndex: @unchecked Sendable {
         baseSnapshotRevision: UInt64
     ) {
         let started = Date()
+        let maintenanceMeasurement = MaintenanceMeasurement(startedAt: started)
         let rowCount = snapshot.count
         let schemaVersion = snapshot.store.schemaVersion
         var expectedRevision = baseSnapshotRevision
@@ -9466,6 +11408,11 @@ public final class FileIndex: @unchecked Sendable {
                     "durationSeconds": .publicDouble(Date().timeIntervalSince(started))
                 ]
             )
+            recordMaintenance(maintenanceMeasurement.operation(
+                kind: .pathGramBuild,
+                priority: .interactive,
+                records: rowCount
+            ))
         }
     }
 
@@ -9552,6 +11499,7 @@ public final class FileIndex: @unchecked Sendable {
         lock.withLock {
             generation &+= 1
             activePathGramBuildGeneration = nil
+            clearOptimizedSearchFallbackWithoutLock()
             indexing = false
             reconciling = false
             updating = false
@@ -9740,6 +11688,26 @@ public final class FileIndex: @unchecked Sendable {
         largeOverlayDrainBackoffDelayOverride ?? Self.largeOverlayDrainBackoffDefaultDelay
     }
 
+    private func backgroundRefreshBatchLimit() -> Int {
+        backgroundRefreshBatchLimitOverride ?? Self.backgroundRefreshBatchDefaultLimit
+    }
+
+    private func backgroundRefreshDrainBackoffDelay() -> TimeInterval {
+        backgroundRefreshDrainBackoffDelayOverride ?? Self.backgroundRefreshDrainBackoffDefaultDelay
+    }
+
+    private func backgroundDirectoryScanBudget() -> TimeInterval {
+        backgroundDirectoryScanBudgetOverride ?? Self.backgroundDirectoryScanBudgetDefault
+    }
+
+    private func backgroundDirectoryMaxDeferral() -> TimeInterval {
+        backgroundDirectoryMaxDeferralOverride ?? Self.backgroundDirectoryMaxDeferralDefault
+    }
+
+    private func backgroundOptimizationPersistDelay() -> TimeInterval {
+        backgroundOptimizationPersistDelayOverride ?? Self.backgroundOptimizationPersistDefaultDelay
+    }
+
     private func metadataOverlayPersistDelay() -> TimeInterval {
         metadataOverlayPersistDelayOverride ?? Self.configuredMetadataOverlayPersistDelay()
     }
@@ -9752,24 +11720,73 @@ public final class FileIndex: @unchecked Sendable {
         metadataOverlayPersistLimitOverride ?? Self.metadataOverlayPersistDefaultLimit
     }
 
+    private func usageMetricsMaintenanceSaveDelay() -> TimeInterval {
+        usageMetricsMaintenanceSaveDelayOverride ?? Self.usageMetricsMaintenanceSaveDefaultDelay
+    }
+
+    private func queuePendingRefreshPathsWithoutLock(
+        _ paths: Set<String>,
+        priority: IndexWorkPriority,
+        queuedAt: Date
+    ) {
+        for path in paths {
+            queuePendingRefreshWorkWithoutLock(
+                PendingRefreshWork(
+                    path: path,
+                    priority: priority,
+                    firstQueuedAt: queuedAt,
+                    lastQueuedAt: queuedAt
+                )
+            )
+        }
+    }
+
+    private func queuePendingRefreshWorksWithoutLock(_ works: [PendingRefreshWork], queuedAt: Date = Date()) {
+        for work in works {
+            var queuedWork = work
+            queuedWork.lastQueuedAt = queuedAt
+            queuePendingRefreshWorkWithoutLock(queuedWork)
+        }
+    }
+
+    private func queuePendingRefreshWorkWithoutLock(_ work: PendingRefreshWork) {
+        if var existing = pendingRefreshPaths[work.path] {
+            existing.merge(priority: work.priority, queuedAt: work.lastQueuedAt)
+            pendingRefreshPaths[work.path] = existing
+        } else {
+            pendingRefreshPaths[work.path] = work
+        }
+    }
+
+    private static func refreshBatchPriority(_ works: [PendingRefreshWork]) -> IndexWorkPriority {
+        works.contains { $0.priority == .interactive } ? .interactive : .background
+    }
+
+    private static func hasInteractiveRefreshWork(_ works: Dictionary<String, PendingRefreshWork>.Values) -> Bool {
+        works.contains { $0.priority == .interactive }
+    }
+
     private func scheduleUpdateDrainIfNeeded(delay: DispatchTimeInterval) {
-        let scheduled = lock.withLock { () -> (shouldSchedule: Bool, pendingPathCount: Int) in
+        let scheduled = lock.withLock { () -> (shouldSchedule: Bool, pendingPathCount: Int, maximumBatchPathCount: Int) in
             guard !pendingRefreshPaths.isEmpty, !isRefreshDrainScheduled else {
-                return (false, pendingRefreshPaths.count)
+                return (false, pendingRefreshPaths.count, Self.maximumRefreshBatchPaths)
             }
             isRefreshDrainScheduled = true
-            return (true, pendingRefreshPaths.count)
+            let maximumBatchPathCount = Self.hasInteractiveRefreshWork(pendingRefreshPaths.values)
+                ? Self.maximumRefreshBatchPaths
+                : backgroundRefreshBatchLimit()
+            return (true, pendingRefreshPaths.count, maximumBatchPathCount)
         }
 
         guard scheduled.shouldSchedule else { return }
 
-        if scheduled.pendingPathCount > Self.maximumRefreshBatchPaths {
+        if scheduled.pendingPathCount > scheduled.maximumBatchPathCount {
             DiagnosticLogger.shared.log(
                 category: "index",
                 event: "index.updateDrainScheduled",
                 fields: [
                     "pendingPathCount": .publicInt(scheduled.pendingPathCount),
-                    "maximumBatchPathCount": .publicInt(Self.maximumRefreshBatchPaths),
+                    "maximumBatchPathCount": .publicInt(scheduled.maximumBatchPathCount),
                     "delaySeconds": .publicDouble(Self.seconds(for: delay))
                 ]
             )
@@ -9782,7 +11799,8 @@ public final class FileIndex: @unchecked Sendable {
 
     private func drainUpdateQueue() {
         let drain = lock.withLock { () -> (
-            paths: [String],
+            works: [PendingRefreshWork],
+            priority: IndexWorkPriority,
             pendingPathCountAfterBatch: Int,
             deferredByIndexing: Bool,
             reconciling: Bool,
@@ -9791,19 +11809,30 @@ public final class FileIndex: @unchecked Sendable {
         ) in
             guard !indexing else {
                 isRefreshDrainScheduled = false
-                return ([], pendingRefreshPaths.count, true, reconciling, updating, phase)
+                return ([], .interactive, pendingRefreshPaths.count, true, reconciling, updating, phase)
             }
 
-            let batch = Array(pendingRefreshPaths.prefix(Self.maximumRefreshBatchPaths))
-            for path in batch {
-                pendingRefreshPaths.remove(path)
+            let batchLimit = Self.hasInteractiveRefreshWork(pendingRefreshPaths.values)
+                ? Self.maximumRefreshBatchPaths
+                : backgroundRefreshBatchLimit()
+            let batch = Array(pendingRefreshPaths.values.prefix(batchLimit))
+            for work in batch {
+                pendingRefreshPaths.removeValue(forKey: work.path)
             }
             let pendingPathCountAfterBatch = pendingRefreshPaths.count
             if pendingRefreshPaths.isEmpty {
                 pendingRefreshPaths.removeAll(keepingCapacity: false)
             }
             isRefreshDrainScheduled = false
-            return (batch, pendingPathCountAfterBatch, false, reconciling, updating, phase)
+            return (
+                batch,
+                Self.refreshBatchPriority(batch),
+                pendingPathCountAfterBatch,
+                false,
+                reconciling,
+                updating,
+                phase
+            )
         }
 
         if drain.deferredByIndexing {
@@ -9822,19 +11851,40 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         var updateResult = RefreshUpdateResult.none
-        if !drain.paths.isEmpty {
+        if !drain.works.isEmpty {
             if drain.pendingPathCountAfterBatch > 0 {
                 DiagnosticLogger.shared.log(
                     category: "index",
                     event: "index.updateDrainContinuing",
                     fields: [
-                        "batchPathCount": .publicInt(drain.paths.count),
+                        "batchPathCount": .publicInt(drain.works.count),
                         "remainingPathCount": .publicInt(drain.pendingPathCountAfterBatch),
-                        "maximumBatchPathCount": .publicInt(Self.maximumRefreshBatchPaths)
+                        "maximumBatchPathCount": .publicInt(
+                            drain.priority == .background ? backgroundRefreshBatchLimit() : Self.maximumRefreshBatchPaths
+                        ),
+                        "priority": .publicString(drain.priority.rawValue)
                     ]
                 )
             }
-            updateResult = updateNow(paths: drain.paths)
+            updateResult = updateNow(requests: drain.works)
+        }
+
+        if !updateResult.deferredRefreshes.isEmpty {
+            lock.withLock {
+                queuePendingRefreshWorksWithoutLock(updateResult.deferredRefreshes)
+            }
+            DiagnosticLogger.shared.log(
+                category: "index",
+                event: "index.backgroundMaintenanceDeferred",
+                fields: [
+                    "deferredPathCount": .publicInt(updateResult.deferredRefreshes.count),
+                    "visitedCount": .publicInt(updateResult.deferredDirectoryVisitCount),
+                    "priority": .publicString(updateResult.priority.rawValue)
+                ],
+                diagnosticFields: [
+                    "paths": .pathArray(updateResult.deferredRefreshes.map(\.path))
+                ]
+            )
         }
 
         if updateResult.largeOverlay, !updateResult.reconciledDirectoryPrefixes.isEmpty {
@@ -9844,7 +11894,27 @@ public final class FileIndex: @unchecked Sendable {
         let remainingPathCount = lock.withLock { pendingRefreshPaths.count }
         if remainingPathCount > 0 {
             let delay: DispatchTimeInterval
-            if updateResult.largeOverlay {
+            if updateResult.priority == .background {
+                let backoff = backgroundRefreshDrainBackoffDelay()
+                recordMaintenance(IndexMaintenanceOperationMetric(
+                    kind: .backgroundSlice,
+                    priority: .background,
+                    yieldedSlices: 1,
+                    deferredPaths: UInt64(max(updateResult.deferredRefreshes.count, 0))
+                ))
+                DiagnosticLogger.shared.log(
+                    category: "index",
+                    event: "index.backgroundMaintenanceSlice",
+                    fields: [
+                        "batchPathCount": .publicInt(updateResult.batchPathCount),
+                        "remainingPathCount": .publicInt(remainingPathCount),
+                        "changedPathCount": .publicInt(updateResult.changedPathCount),
+                        "deferredPathCount": .publicInt(updateResult.deferredRefreshes.count),
+                        "delaySeconds": .publicDouble(backoff)
+                    ]
+                )
+                delay = .milliseconds(Int((backoff * 1_000).rounded(.up)))
+            } else if updateResult.largeOverlay {
                 let backoff = largeOverlayDrainBackoffDelay()
                 DiagnosticLogger.shared.log(
                     category: "index",
@@ -9867,7 +11937,11 @@ public final class FileIndex: @unchecked Sendable {
     private func prunePendingRefreshPaths(coveredBy directoryPrefixes: [String]) -> Int {
         return lock.withLock {
             let before = pendingRefreshPaths.count
-            pendingRefreshPaths = Self.prunedPendingRefreshPaths(pendingRefreshPaths, coveredBy: directoryPrefixes)
+            let prunedPaths = Self.prunedPendingRefreshPaths(
+                Set(pendingRefreshPaths.keys),
+                coveredBy: directoryPrefixes
+            )
+            pendingRefreshPaths = pendingRefreshPaths.filter { prunedPaths.contains($0.key) }
             if pendingRefreshPaths.isEmpty {
                 pendingRefreshPaths.removeAll(keepingCapacity: false)
             }
@@ -9892,7 +11966,23 @@ public final class FileIndex: @unchecked Sendable {
         })
     }
 
-    private func updateNow(paths: [String]) -> RefreshUpdateResult {
+    private func backgroundDirectoryScanDeadline(
+        for request: PendingRefreshWork,
+        startedAt: Date
+    ) -> Date? {
+        guard request.priority == .background else { return nil }
+        let maximumDeferral = backgroundDirectoryMaxDeferral()
+        if maximumDeferral <= 0 || startedAt.timeIntervalSince(request.firstQueuedAt) >= maximumDeferral {
+            return nil
+        }
+
+        let budget = backgroundDirectoryScanBudget()
+        return startedAt.addingTimeInterval(budget)
+    }
+
+    private func updateNow(requests: [PendingRefreshWork]) -> RefreshUpdateResult {
+        let paths = requests.map(\.path)
+        let updatePriority = Self.refreshBatchPriority(requests)
         let updateStarted = Date()
         let updateContext = lock.withLock { () -> (generation: UInt64, preservedReadyStatus: String?)? in
             guard !indexing else { return nil }
@@ -9904,10 +11994,10 @@ public final class FileIndex: @unchecked Sendable {
             indexing = true
             reconciling = false
             updating = true
-            activityPresentation = .foreground
+            activityPresentation = updatePriority == .background ? .backgroundCatchUp : .foreground
             clearActiveReconciliationWithoutLock()
             phase = .scanning
-            status = "Updating changed paths"
+            status = updatePriority == .background ? "Catching up changed paths" : "Updating changed paths"
             activeOperationStartedAt = updateStarted
             resumedFromCheckpoint = false
             lastUpdated = Date()
@@ -9915,12 +12005,13 @@ public final class FileIndex: @unchecked Sendable {
         }
         guard let updateContext else {
             lock.withLock {
-                pendingRefreshPaths.formUnion(paths)
+                queuePendingRefreshWorksWithoutLock(requests)
             }
             scheduleUpdateDrainIfNeeded(delay: .milliseconds(0))
             return .none
         }
         let currentGeneration = updateContext.generation
+        let maintenanceMeasurement = MaintenanceMeasurement(startedAt: updateStarted)
         recordScanFrontierMetrics(ScanFrontierMetrics(), generation: currentGeneration)
         publishStats()
 
@@ -9936,7 +12027,8 @@ public final class FileIndex: @unchecked Sendable {
             category: "index",
             event: "index.updateBegin",
             fields: [
-                "pathCount": .publicInt(paths.count)
+                "pathCount": .publicInt(paths.count),
+                "priority": .publicString(updatePriority.rawValue)
             ],
             diagnosticFields: [
                 "paths": .pathArray(paths)
@@ -9959,10 +12051,54 @@ public final class FileIndex: @unchecked Sendable {
         var upserts: [String: FileRecord] = [:]
         var deletedPrefixes: [String] = []
         var reconciledDirectoryPrefixes: [String] = []
+        var deferredRefreshes: [PendingRefreshWork] = []
+        var deferredDirectoryVisitCount = 0
+        var visitedCount = 0
+        var requestedDirectoryRefresh = false
+        var exclusionInstrumentation = FileExclusionQuery.Instrumentation()
         var requiresDirectoryReconciliation = false
         let updateVolumeNameCache = ScanVolumeNameCache()
 
-        for path in paths {
+        func makeUpdateResult(
+            applied: Bool,
+            largeOverlay: Bool,
+            changedPathCount: Int
+        ) -> RefreshUpdateResult {
+            if applied {
+                let operationKind: IndexMaintenanceOperationKind = (requestedDirectoryRefresh || visitedCount > 0 || requiresDirectoryReconciliation)
+                    ? .directoryRefresh
+                    : .exactRefresh
+                recordMaintenance(
+                    maintenanceMeasurement.operation(
+                        kind: operationKind,
+                        priority: updatePriority.maintenancePriority,
+                        paths: paths.count,
+                        records: changedPathCount,
+                        visited: visitedCount,
+                        yieldedSlices: deferredRefreshes.isEmpty ? 0 : 1,
+                        deferredPaths: deferredRefreshes.count,
+                        largeOverlays: largeOverlay ? 1 : 0,
+                        exclusionInstrumentation: exclusionInstrumentation
+                    )
+                )
+            }
+
+            return RefreshUpdateResult(
+                applied: applied,
+                largeOverlay: largeOverlay,
+                priority: updatePriority,
+                batchPathCount: paths.count,
+                changedPathCount: changedPathCount,
+                visitedCount: visitedCount,
+                exclusionInstrumentation: exclusionInstrumentation,
+                reconciledDirectoryPrefixes: reconciledDirectoryPrefixes,
+                deferredRefreshes: deferredRefreshes,
+                deferredDirectoryVisitCount: deferredDirectoryVisitCount
+            )
+        }
+
+        for request in requests {
+            let path = request.path
             autoreleasepool {
                 let url = URL(fileURLWithPath: path).standardizedFileURL
                 if fileManager.fileExists(atPath: url.path) {
@@ -9977,7 +12113,8 @@ public final class FileIndex: @unchecked Sendable {
                         exclusions: indexState.exclusions,
                         rootPaths: indexState.rootPaths,
                         query: exclusionQuery,
-                        isDirectory: candidate.isDirectory
+                        isDirectory: candidate.isDirectory,
+                        instrumentation: &exclusionInstrumentation
                     )
                     guard decision != .prune else { return }
 
@@ -9986,16 +12123,34 @@ public final class FileIndex: @unchecked Sendable {
                     }
 
                     if candidate.isDirectory, !candidate.isSymlink, decision.shouldDescend {
-                        requiresDirectoryReconciliation = true
+                        requestedDirectoryRefresh = true
+                        let deadline = backgroundDirectoryScanDeadline(
+                            for: request,
+                            startedAt: updateStarted
+                        )
                         let scannedRecords: [String: FileRecord]?
                         if indexState.frontierMode == .singleDirectory {
-                            scannedRecords = scanDirectoryForUpdate(
+                            let scanResult = scanDirectoryForUpdate(
                                 root: candidate.url,
                                 exclusions: indexState.exclusions,
                                 rootPaths: indexState.rootPaths,
                                 query: exclusionQuery,
+                                deadline: deadline,
                                 generation: currentGeneration
                             )
+                            if let scanResult {
+                                exclusionInstrumentation.add(scanResult.exclusionInstrumentation)
+                                visitedCount += scanResult.visitedCount
+                                deferredDirectoryVisitCount += scanResult.visitedCount
+                                if scanResult.completed {
+                                    scannedRecords = scanResult.records
+                                } else {
+                                    deferredRefreshes.append(request)
+                                    scannedRecords = nil
+                                }
+                            } else {
+                                scannedRecords = nil
+                            }
                         } else {
                             let scanResult = scanConcurrently(
                                 roots: [url],
@@ -10013,10 +12168,13 @@ public final class FileIndex: @unchecked Sendable {
                             )
                             if let scanResult {
                                 recordScanFrontierMetrics(scanResult.frontierMetrics, generation: currentGeneration)
+                                exclusionInstrumentation.add(scanResult.exclusionInstrumentation)
+                                visitedCount += scanResult.visited
                             }
                             scannedRecords = scanResult?.records
                         }
                         if let scannedRecords {
+                            requiresDirectoryReconciliation = true
                             reconciledDirectoryPrefixes.append(url.path)
                             for (path, record) in scannedRecords {
                                 upserts[path] = record
@@ -10029,14 +12187,16 @@ public final class FileIndex: @unchecked Sendable {
                         exclusions: indexState.exclusions,
                         rootPaths: indexState.rootPaths,
                         query: exclusionQuery,
-                        isDirectory: false
+                        isDirectory: false,
+                        instrumentation: &exclusionInstrumentation
                     )
                     let directoryDecision = exclusionDecision(
                         for: url,
                         exclusions: indexState.exclusions,
                         rootPaths: indexState.rootPaths,
                         query: exclusionQuery,
-                        isDirectory: true
+                        isDirectory: true,
+                        instrumentation: &exclusionInstrumentation
                     )
                     guard fileDecision != .prune || directoryDecision != .prune else { return }
                     deletedPrefixes.append(url.path)
@@ -10080,12 +12240,10 @@ public final class FileIndex: @unchecked Sendable {
                     "durationSeconds": .publicDouble(Date().timeIntervalSince(updateStarted))
                 ]
             )
-            return RefreshUpdateResult(
+            return makeUpdateResult(
                 applied: true,
                 largeOverlay: false,
-                batchPathCount: paths.count,
-                changedPathCount: 0,
-                reconciledDirectoryPrefixes: []
+                changedPathCount: 0
             )
         }
 
@@ -10123,7 +12281,8 @@ public final class FileIndex: @unchecked Sendable {
             publishStats()
             scheduleMetadataOverlayPersistIfReasonable(
                 updatedSnapshot,
-                changedPathCount: changedPathCount
+                changedPathCount: changedPathCount,
+                priority: updatePriority
             )
             MemoryTelemetry.log(
                 "update.metadataApplied",
@@ -10143,12 +12302,10 @@ public final class FileIndex: @unchecked Sendable {
                     "durationSeconds": .publicDouble(Date().timeIntervalSince(updateStarted))
                 ]
             )
-            return RefreshUpdateResult(
+            return makeUpdateResult(
                 applied: true,
                 largeOverlay: false,
-                batchPathCount: paths.count,
-                changedPathCount: changedPathCount,
-                reconciledDirectoryPrefixes: reconciledDirectoryPrefixes
+                changedPathCount: changedPathCount
             )
         }
 
@@ -10207,12 +12364,16 @@ public final class FileIndex: @unchecked Sendable {
             upserts: Array(upserts.values),
             deletedRows: deletedRows
         )
-        let shouldOptimizeOverlay = previousSnapshot.isOptimizedForSearch && !isLargeOverlayUpdate
+        let shouldOptimizeOverlay = previousSnapshot.isOptimizedForSearch
+            && !isLargeOverlayUpdate
+            && updatePriority == .interactive
         let snapshot = SearchSnapshot(
             store: overlayStore,
             buildsSearchStructures: shouldOptimizeOverlay,
             buildsPathGramIndex: false,
-            prefersDegradedSearch: isLargeOverlayUpdate && !shouldOptimizeOverlay
+            optimizedSortColumns: currentOptimizedSortColumns(),
+            prefersDegradedSearch: !shouldOptimizeOverlay
+                && (isLargeOverlayUpdate || updatePriority == .background)
         )
 
         let didApply = lock.withLock { () -> Bool in
@@ -10238,7 +12399,11 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         publishStats()
-        scheduleRefreshPersistIfReasonable(snapshot, immediateLargeOverlay: isLargeOverlayUpdate)
+        scheduleRefreshPersistIfReasonable(
+            snapshot,
+            immediateLargeOverlay: isLargeOverlayUpdate,
+            priority: updatePriority
+        )
         MemoryTelemetry.log(
             "update.overlayApplied",
             records: RecordCollectionMetrics(recordCount: snapshot.count, totalPathBytes: 0, maxPathBytes: 0),
@@ -10259,15 +12424,15 @@ public final class FileIndex: @unchecked Sendable {
                 "requiresDirectoryReconciliation": .publicBool(requiresDirectoryReconciliation),
                 "largeOverlay": .publicBool(isLargeOverlayUpdate),
                 "optimizedOverlay": .publicBool(snapshot.isOptimizedForSearch),
+                "priority": .publicString(updatePriority.rawValue),
+                "deferredPathCount": .publicInt(deferredRefreshes.count),
                 "durationSeconds": .publicDouble(Date().timeIntervalSince(updateStarted))
             ]
         )
-        return RefreshUpdateResult(
+        return makeUpdateResult(
             applied: true,
             largeOverlay: isLargeOverlayUpdate,
-            batchPathCount: paths.count,
-            changedPathCount: changedPathCount,
-            reconciledDirectoryPrefixes: reconciledDirectoryPrefixes
+            changedPathCount: changedPathCount
         )
     }
 
@@ -10276,13 +12441,22 @@ public final class FileIndex: @unchecked Sendable {
         exclusions: FileExclusionRules,
         rootPaths: [String],
         query: FileExclusionQuery?,
+        deadline: Date?,
         generation currentGeneration: UInt64
-    ) -> [String: FileRecord]? {
+    ) -> DirectoryUpdateScanResult? {
         var records: [String: FileRecord] = [:]
         let volumeNameCache = ScanVolumeNameCache()
+        var visitedCount = 0
+        var stoppedForBudget = false
+        var exclusionInstrumentation = FileExclusionQuery.Instrumentation()
 
         func visit(_ url: URL) -> Bool {
             guard isCurrentGeneration(currentGeneration) else { return false }
+            if let deadline, Date() >= deadline {
+                stoppedForBudget = true
+                return false
+            }
+            visitedCount += 1
 
             guard let candidate = fileSystemRecordCandidate(
                 for: url,
@@ -10295,7 +12469,8 @@ public final class FileIndex: @unchecked Sendable {
                 exclusions: exclusions,
                 rootPaths: rootPaths,
                 query: query,
-                isDirectory: candidate.isDirectory
+                isDirectory: candidate.isDirectory,
+                instrumentation: &exclusionInstrumentation
             )
             guard decision != .prune else { return true }
 
@@ -10307,17 +12482,43 @@ public final class FileIndex: @unchecked Sendable {
                 return true
             }
 
-            return enumerateShallowChildURLs(in: candidate.url) { child in
+            return enumerateShallowChildURLs(
+                in: candidate.url,
+                prunesDirectoryNamed: { name in
+                    let prunes = exclusions.canPruneDirectoryComponentBeforeStat(name)
+                    if prunes {
+                        exclusionInstrumentation.fastPruneDirectoryCount += 1
+                    }
+                    return prunes
+                }
+            ) { child in
                 visit(child)
             }
         }
 
-        guard visit(root) else { return nil }
-        return records
+        guard visit(root) else {
+            guard stoppedForBudget else { return nil }
+            return DirectoryUpdateScanResult(
+                records: records,
+                completed: false,
+                visitedCount: visitedCount,
+                exclusionInstrumentation: exclusionInstrumentation
+            )
+        }
+        return DirectoryUpdateScanResult(
+            records: records,
+            completed: true,
+            visitedCount: visitedCount,
+            exclusionInstrumentation: exclusionInstrumentation
+        )
     }
 
     @discardableResult
-    private func enumerateShallowChildURLs(in directory: URL, _ body: (URL) -> Bool) -> Bool {
+    private func enumerateShallowChildURLs(
+        in directory: URL,
+        prunesDirectoryNamed: ((String) -> Bool)? = nil,
+        _ body: (URL) -> Bool
+    ) -> Bool {
         guard let stream = openDirectoryStream(directory) else {
             return false
         }
@@ -10327,6 +12528,9 @@ public final class FileIndex: @unchecked Sendable {
             guard let entryInfo = Self.directoryEntryInfo(entry) else { continue }
             let name = entryInfo.name
             guard name != "." && name != ".." else { continue }
+            if entryInfo.isDirectory, prunesDirectoryNamed?(name) == true {
+                continue
+            }
 
             let child = directory.appendingPathComponent(name, isDirectory: entryInfo.isDirectory)
             guard body(child) else { return false }
@@ -10433,7 +12637,12 @@ public final class FileIndex: @unchecked Sendable {
         )
 
         let rootPaths = lock.withLock { roots }
-        let snapshot = SearchSnapshot(records: Array(records.values), roots: rootPaths, buildsSearchStructures: !isIndexing)
+        let snapshot = SearchSnapshot(
+            records: Array(records.values),
+            roots: rootPaths,
+            buildsSearchStructures: !isIndexing,
+            optimizedSortColumns: currentOptimizedSortColumns()
+        )
         lock.withLock {
             recordsByPath = records
             searchSnapshot = snapshot
@@ -10463,7 +12672,29 @@ public final class FileIndex: @unchecked Sendable {
         )
     }
 
-    private func scheduleRefreshPersistIfReasonable(_ snapshot: SearchSnapshot, immediateLargeOverlay: Bool = false) {
+    private func scheduleRefreshPersistIfReasonable(
+        _ snapshot: SearchSnapshot,
+        immediateLargeOverlay: Bool = false,
+        priority: IndexWorkPriority = .interactive
+    ) {
+        if priority == .background, snapshot.store.kind == .overlay {
+            let delay = backgroundOptimizationPersistDelay()
+            recordDeferredOptimization(reason: "background", delay: delay)
+            DiagnosticLogger.shared.log(
+                category: "index",
+                event: "index.optimizationDeferred",
+                fields: [
+                    "recordCount": .publicInt(snapshot.count),
+                    "storeKind": .publicString(snapshot.store.kind.rawValue),
+                    "optimizedForSearch": .publicBool(snapshot.isOptimizedForSearch),
+                    "delaySeconds": .publicDouble(delay),
+                    "reason": .publicString("background")
+                ]
+            )
+            schedulePersist(delay: delay, priority: .background)
+            return
+        }
+
         if snapshot.store.kind == .overlay, snapshot.count > largeOverlayPersistRecordLimit() {
             let delay = largeOverlayPersistDelay(immediateLargeOverlay: immediateLargeOverlay)
             MemoryTelemetry.log(
@@ -10481,11 +12712,11 @@ public final class FileIndex: @unchecked Sendable {
                     "delaySeconds": .publicDouble(delay)
                 ]
             )
-            schedulePersist(delay: delay)
+            schedulePersist(delay: delay, priority: priority.maintenancePriority)
             return
         }
 
-        schedulePersist()
+        schedulePersist(priority: priority.maintenancePriority)
     }
 
     private enum PersistMode {
@@ -10495,24 +12726,27 @@ public final class FileIndex: @unchecked Sendable {
 
     private func scheduleMetadataOverlayPersistIfReasonable(
         _ snapshot: SearchSnapshot,
-        changedPathCount: Int
+        changedPathCount: Int,
+        priority: IndexWorkPriority = .interactive
     ) {
         guard
             let replacingStore = snapshot.store as? ReplacingRecordStore,
             replacingStore.metadataBaseStoreKind == .mapped
         else {
-            scheduleRefreshPersistIfReasonable(snapshot)
+            scheduleRefreshPersistIfReasonable(snapshot, priority: priority)
             return
         }
 
         let replacementCount = replacingStore.metadataReplacementCount
         guard replacementCount <= metadataOverlayPersistLimit() else {
+            let checkpointDelay = priority == .background ? backgroundOptimizationPersistDelay() : largeOverlayPersistDelay()
             scheduleMetadataOverlayCheckpoint(
                 snapshot,
                 replacementCount: replacementCount,
                 changedPathCount: changedPathCount,
                 reason: "replacementLimit",
-                delay: largeOverlayPersistDelay()
+                delay: checkpointDelay,
+                priority: priority.maintenancePriority
             )
             return
         }
@@ -10535,7 +12769,7 @@ public final class FileIndex: @unchecked Sendable {
                 "delaySeconds": .publicDouble(delay)
             ]
         )
-        schedulePersist(delay: delay)
+        schedulePersist(delay: delay, priority: priority.maintenancePriority)
     }
 
     private func scheduleMetadataOverlayCheckpoint(
@@ -10543,8 +12777,10 @@ public final class FileIndex: @unchecked Sendable {
         replacementCount: Int,
         changedPathCount: Int,
         reason: String,
-        delay: TimeInterval
+        delay: TimeInterval,
+        priority: IndexMaintenancePriority = .interactive
     ) {
+        recordDeferredCheckpoint(reason: reason, delay: delay)
         MemoryTelemetry.log(
             "metadataOverlay.checkpoint.scheduled",
             records: Self.countOnlyMetrics(for: snapshot.store),
@@ -10563,10 +12799,14 @@ public final class FileIndex: @unchecked Sendable {
                 "delaySeconds": .publicDouble(delay)
             ]
         )
-        schedulePersist(delay: delay, mode: .metadataOverlayCheckpoint)
+        schedulePersist(delay: delay, mode: .metadataOverlayCheckpoint, priority: priority)
     }
 
-    private func schedulePersist(delay: TimeInterval = 1.5, mode: PersistMode = .automatic) {
+    private func schedulePersist(
+        delay: TimeInterval = 1.5,
+        mode: PersistMode = .automatic,
+        priority: IndexMaintenancePriority = .interactive
+    ) {
         let revision = lock.withLock { () -> UInt64 in
             persistRevision &+= 1
             return persistRevision
@@ -10574,16 +12814,21 @@ public final class FileIndex: @unchecked Sendable {
 
         indexQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self, self.isPersistRevisionCurrent(revision) else { return }
-            self.persistSnapshot(forceMappedCheckpoint: mode == .metadataOverlayCheckpoint)
+            self.persistSnapshot(
+                forceMappedCheckpoint: mode == .metadataOverlayCheckpoint,
+                priority: priority
+            )
         }
     }
 
     @discardableResult
     private func persistSnapshot(
         schedulesPathGramBuild: Bool = true,
-        forceMappedCheckpoint: Bool = false
+        forceMappedCheckpoint: Bool = false,
+        priority: IndexMaintenancePriority = .interactive
     ) -> Bool {
         let started = Date()
+        let maintenanceMeasurement = MaintenanceMeasurement(startedAt: started)
         let jobID = beginIndexJob("persist")
         let persistenceGeneration = beginPersistenceStatus(startedAt: started)
         defer {
@@ -10595,7 +12840,8 @@ public final class FileIndex: @unchecked Sendable {
             (
                 roots: roots,
                 exclusionPatterns: exclusionRules.patterns,
-                snapshot: searchSnapshot
+                snapshot: searchSnapshot,
+                optimizedSortColumns: optimizedSortColumns
             )
         }
 
@@ -10626,8 +12872,14 @@ public final class FileIndex: @unchecked Sendable {
                 try persistMetadataOverlay(
                     replacingStore: replacingStore,
                     snapshot: snapshotData.snapshot,
-                    started: started
+                    started: started,
+                    priority: priority
                 )
+                recordMaintenance(maintenanceMeasurement.operation(
+                    kind: .metadataOverlayPersist,
+                    priority: priority,
+                    records: replacingStore.metadataReplacementCount
+                ))
                 return true
             }
 
@@ -10637,14 +12889,14 @@ public final class FileIndex: @unchecked Sendable {
                 exclusionPatterns: snapshotData.exclusionPatterns,
                 store: snapshotData.snapshot.store
             ) { mappedStore, packageURL in
-                var snapshot = SearchSnapshot(
+                let existingPathGramIndex = snapshotData.snapshot.store.kind == .mapped
+                    ? snapshotData.snapshot.gramIndex
+                    : nil
+                let snapshot = snapshotData.snapshot.rebasedForMappedPersistence(
                     store: mappedStore,
-                    buildsSearchStructures: true,
-                    buildsPathGramIndex: false
+                    completePathGramIndex: existingPathGramIndex,
+                    optimizedSortColumns: snapshotData.optimizedSortColumns
                 )
-                if snapshotData.snapshot.store.kind == .mapped, let existingPathGramIndex = snapshotData.snapshot.gramIndex {
-                    snapshot = snapshot.addingCompletePathGramIndex(existingPathGramIndex)
-                }
                 try persistSearchStructures(for: snapshot, packageURL: packageURL)
                 persistedSnapshot = snapshot
             }
@@ -10696,6 +12948,12 @@ public final class FileIndex: @unchecked Sendable {
                     baseSnapshotRevision: pathBuildRequest.2
                 )
             }
+            clearDeferredMaintenanceMarkers()
+            recordMaintenance(maintenanceMeasurement.operation(
+                kind: .snapshotPersist,
+                priority: priority,
+                records: metrics.recordCount
+            ))
             return true
         } catch {
             lock.withLock {
@@ -10758,7 +13016,8 @@ public final class FileIndex: @unchecked Sendable {
     private func persistMetadataOverlay(
         replacingStore: ReplacingRecordStore,
         snapshot: SearchSnapshot,
-        started: Date
+        started: Date,
+        priority: IndexMaintenancePriority
     ) throws {
         guard fileManager.fileExists(atPath: snapshotURL.path) else {
             throw CocoaError(.fileNoSuchFile)
@@ -10809,7 +13068,8 @@ public final class FileIndex: @unchecked Sendable {
             replacementCount: replacements.count,
             changedPathCount: 0,
             reason: "age",
-            delay: metadataOverlayCheckpointDelay()
+            delay: metadataOverlayCheckpointDelay(),
+            priority: priority
         )
     }
 
@@ -10995,6 +13255,21 @@ public final class FileIndex: @unchecked Sendable {
             )
         } else {
             try Data().write(to: visibleModifiedOrderURL, options: .atomic)
+        }
+
+        let enabledSortColumns = lock.withLock { optimizedSortColumns }
+        for column in SortColumn.optimizedIndexColumns where column != .modified {
+            guard let fileName = Self.sortOrderFileName(for: column) else { continue }
+            let sortOrderURL = packageURL.appendingPathComponent(fileName, isDirectory: false)
+            if
+                enabledSortColumns.contains(column),
+                let order = snapshot.persistedSortOrderAscending(for: column),
+                order.count == snapshot.resultCount
+            {
+                try CompactSearchStructureFiles.writeModifiedOrder(order, to: sortOrderURL)
+            } else {
+                try Data().write(to: sortOrderURL, options: .atomic)
+            }
         }
 
         let namePostingsURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.namePostings, isDirectory: false)
@@ -11255,7 +13530,11 @@ public final class FileIndex: @unchecked Sendable {
 
     private func applyLoadedScanCheckpoint(_ checkpoint: LoadedScanCheckpoint, generation currentGeneration: UInt64) {
         let snapshot = shouldPublishSearchableSnapshotsDuringScan()
-            ? SearchSnapshot(store: checkpoint.store, persistedStructures: checkpoint.searchStructures)
+            ? SearchSnapshot(
+                store: checkpoint.store,
+                persistedStructures: checkpoint.searchStructures,
+                optimizedSortColumns: currentOptimizedSortColumns()
+            )
             : nil
         let didApply = lock.withLock { () -> Bool in
             guard generation == currentGeneration else { return false }
@@ -11347,9 +13626,24 @@ public final class FileIndex: @unchecked Sendable {
             from: packageURL.appendingPathComponent(SnapshotLayout.FileName.componentPostings, isDirectory: false),
             fileManager: fileManager
         )
+        let enabledSortColumns = lock.withLock { optimizedSortColumns }
+        var sortOrdersAscending: [SortColumn: [Int]] = [:]
+        for column in enabledSortColumns where column != .modified {
+            guard let fileName = Self.sortOrderFileName(for: column) else { continue }
+            guard let order = CompactSearchStructureFiles.loadModifiedOrder(
+                from: packageURL.appendingPathComponent(fileName, isDirectory: false),
+                expectedCount: store.storedResultCount ?? store.count,
+                rowIDUpperBound: store.count,
+                fileManager: fileManager
+            ) else {
+                continue
+            }
+            sortOrdersAscending[column] = order
+        }
         return PersistedSearchStructures(
             modifiedDescending: modifiedDescending,
             visibleModifiedDescending: visibleModifiedDescending,
+            sortOrdersAscending: sortOrdersAscending,
             nameGramIndex: nameGramIndex ?? nil,
             componentGramIndex: componentGramIndex ?? nameGramIndex ?? nil,
             pathGramIndex: pathGramIndex ?? nil
@@ -11531,6 +13825,8 @@ public final class FileIndex: @unchecked Sendable {
             componentGramPostingCount: searchSnapshot.diagnostics.componentGramPostingCount,
             extensionKeyCount: searchSnapshot.diagnostics.extensionKeyCount,
             extensionPostingCount: searchSnapshot.diagnostics.extensionPostingCount,
+            pendingRefreshPathCount: pendingRefreshPaths.count,
+            pendingBackgroundRefreshPathCount: pendingRefreshPaths.values.filter { $0.priority == .background }.count,
             completedRefreshBatches: completedRefreshBatches,
             completedSnapshotRebuilds: completedSnapshotRebuilds,
             activeIndexJobs: activeIndexJobs,
@@ -11572,7 +13868,23 @@ public final class FileIndex: @unchecked Sendable {
             fallbackScanCount: fallbackScanCount,
             scannedRowCount: scannedRowCount,
             pathMaterializationCount: pathMaterializationCount,
-            canClearCachedIndex: activeIndexJobs == 0 && !indexing && snapshotLoadState != .loading
+            canClearCachedIndex: activeIndexJobs == 0 && !indexing && snapshotLoadState != .loading,
+            maintenance: currentMaintenanceDiagnosticsWithoutLock()
+        )
+    }
+
+    private func currentMaintenanceDiagnosticsWithoutLock() -> IndexMaintenanceLiveDiagnostics {
+        IndexMaintenanceLiveDiagnostics(
+            pendingRefreshPathCount: pendingRefreshPaths.count,
+            pendingBackgroundRefreshPathCount: pendingRefreshPaths.values.filter { $0.priority == .background }.count,
+            pendingReconciliationScopeCount: pendingReconciliationIncludesAllRoots ? roots.count : pendingReconciliationPaths.count,
+            isFullReconciliationPending: pendingReconciliationIncludesAllRoots,
+            lastOperation: lastMaintenanceOperation,
+            lastBackgroundSlice: lastBackgroundMaintenanceSlice,
+            deferredOptimizationReason: deferredOptimizationReason,
+            deferredOptimizationDelay: deferredOptimizationDelay,
+            deferredCheckpointReason: deferredCheckpointReason,
+            deferredCheckpointDelay: deferredCheckpointDelay
         )
     }
 
@@ -11591,9 +13903,11 @@ public final class FileIndex: @unchecked Sendable {
                 records: records,
                 roots: canonicalRoots,
                 buildsSearchStructures: buildsSearchStructures,
+                optimizedSortColumns: currentOptimizedSortColumns(),
                 prefersDegradedSearch: prefersDegradedSearch
             )
             lock.withLock {
+                clearOptimizedSearchFallbackWithoutLock()
                 roots = canonicalRoots
                 self.recordsByPath = recordsByPath
                 searchSnapshot = snapshot
@@ -11636,6 +13950,12 @@ public final class FileIndex: @unchecked Sendable {
     func setDeferredOptimizationRecordThresholdForTesting(_ threshold: Int) {
         lock.withLock {
             deferredOptimizationRecordThreshold = max(threshold, 0)
+        }
+    }
+
+    func setExactEmptyQuerySortLimitForTesting(_ limit: Int?) {
+        lock.withLock {
+            exactEmptyQuerySortLimitOverride = limit.map { max($0, 0) }
         }
     }
 
@@ -11716,6 +14036,10 @@ public final class FileIndex: @unchecked Sendable {
         _ = indexQueue.sync {
             persistSnapshot(schedulesPathGramBuild: false)
         }
+    }
+
+    func recordMaintenanceForTesting(_ metric: IndexMaintenanceOperationMetric) {
+        recordMaintenance(metric)
     }
 
     func persistCheckpointForTesting(
@@ -11905,18 +14229,128 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
+    private func recordMaintenance(_ metric: IndexMaintenanceOperationMetric) {
+        let shouldScheduleSave = lock.withLock { () -> Bool in
+            usageMetrics.recordMaintenance(metric)
+            usageMetrics.schemaVersion = IndexUsageMetrics.currentSchemaVersion
+            lastMaintenanceOperation = metric
+            if metric.priority == .background || metric.kind == .backgroundSlice {
+                lastBackgroundMaintenanceSlice = metric
+            }
+            markUsageMetricsDirtyWithoutLock()
+            guard !usageMetricsSaveScheduled else { return false }
+            usageMetricsSaveScheduled = true
+            return true
+        }
+        if shouldScheduleSave {
+            scheduleDeferredUsageMetricsSave()
+        }
+    }
+
+    private func clearDeferredMaintenanceMarkers() {
+        lock.withLock {
+            deferredOptimizationReason = nil
+            deferredOptimizationDelay = nil
+            deferredCheckpointReason = nil
+            deferredCheckpointDelay = nil
+        }
+    }
+
+    private func clearDeferredOptimizationMarker() {
+        lock.withLock {
+            deferredOptimizationReason = nil
+            deferredOptimizationDelay = nil
+        }
+    }
+
+    private func clearDeferredCheckpointMarker() {
+        lock.withLock {
+            deferredCheckpointReason = nil
+            deferredCheckpointDelay = nil
+        }
+    }
+
+    private func recordDeferredOptimization(reason: String, delay: TimeInterval) {
+        lock.withLock {
+            deferredOptimizationReason = reason
+            deferredOptimizationDelay = max(delay, 0)
+        }
+        recordMaintenance(IndexMaintenanceOperationMetric(
+            kind: .optimization,
+            priority: .background,
+            optimizationDeferrals: 1
+        ))
+    }
+
+    private func recordDeferredCheckpoint(reason: String, delay: TimeInterval) {
+        lock.withLock {
+            deferredCheckpointReason = reason
+            deferredCheckpointDelay = max(delay, 0)
+        }
+    }
+
     private func updateUsageMetrics(_ body: (inout IndexUsageMetrics) -> Void) {
         let metrics = lock.withLock { () -> IndexUsageMetrics in
             body(&usageMetrics)
             usageMetrics.schemaVersion = IndexUsageMetrics.currentSchemaVersion
+            markUsageMetricsSavedWithoutLock()
             return usageMetrics
         }
         Self.saveUsageMetrics(metrics, to: metricsURL, fileManager: fileManager)
     }
 
+    private func updateUsageMetricsDeferred(_ body: (inout IndexUsageMetrics) -> Void) {
+        let shouldScheduleSave = lock.withLock { () -> Bool in
+            body(&usageMetrics)
+            usageMetrics.schemaVersion = IndexUsageMetrics.currentSchemaVersion
+            markUsageMetricsDirtyWithoutLock()
+            guard !usageMetricsSaveScheduled else { return false }
+            usageMetricsSaveScheduled = true
+            return true
+        }
+        if shouldScheduleSave {
+            scheduleDeferredUsageMetricsSave()
+        }
+    }
+
     private func saveUsageMetricsSnapshot() {
-        let metrics = lock.withLock { usageMetrics }
+        let metrics = lock.withLock { () -> IndexUsageMetrics in
+            markUsageMetricsSavedWithoutLock()
+            return usageMetrics
+        }
         Self.saveUsageMetrics(metrics, to: metricsURL, fileManager: fileManager)
+    }
+
+    private func scheduleDeferredUsageMetricsSave() {
+        let delay = usageMetricsMaintenanceSaveDelay()
+        metricsSaveQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.savePendingUsageMetricsIfNeeded()
+        }
+    }
+
+    private func savePendingUsageMetricsIfNeeded() {
+        let metrics = lock.withLock { () -> IndexUsageMetrics? in
+            guard usageMetricsSavedGeneration != usageMetricsDirtyGeneration else {
+                usageMetricsSaveScheduled = false
+                return nil
+            }
+            markUsageMetricsSavedWithoutLock()
+            return usageMetrics
+        }
+        guard let metrics else { return }
+        Self.saveUsageMetrics(metrics, to: metricsURL, fileManager: fileManager)
+    }
+
+    private func markUsageMetricsDirtyWithoutLock() {
+        usageMetricsDirtyGeneration &+= 1
+    }
+
+    private func markUsageMetricsSavedWithoutLock() {
+        if usageMetricsSavedGeneration == usageMetricsDirtyGeneration {
+            usageMetricsDirtyGeneration &+= 1
+        }
+        usageMetricsSavedGeneration = usageMetricsDirtyGeneration
+        usageMetricsSaveScheduled = false
     }
 
     private static func loadUsageMetrics(from url: URL, fileManager: FileManager) -> IndexUsageMetrics {
@@ -11939,11 +14373,16 @@ public final class FileIndex: @unchecked Sendable {
                 metrics.dailyBuckets[index].initialSearches = SearchUsageCounters()
                 metrics.dailyBuckets[index].refinedSearches = SearchUsageCounters()
             }
+        case 2:
+            metrics.schemaVersion = IndexUsageMetrics.currentSchemaVersion
+        case 3:
+            metrics.schemaVersion = IndexUsageMetrics.currentSchemaVersion
         default:
             return IndexUsageMetrics(schemaVersion: IndexUsageMetrics.currentSchemaVersion)
         }
 
         metrics.pruneDailyBuckets()
+        metrics.pruneEnergyHistory()
         return metrics
     }
 
@@ -12307,8 +14746,27 @@ public final class FileIndex: @unchecked Sendable {
         query: FileExclusionQuery?,
         isDirectory: Bool? = nil
     ) -> FileExclusionRules.Decision {
+        var instrumentation = FileExclusionQuery.Instrumentation()
+        return exclusionDecision(
+            for: url,
+            exclusions: exclusions,
+            rootPaths: rootPaths,
+            query: query,
+            isDirectory: isDirectory,
+            instrumentation: &instrumentation
+        )
+    }
+
+    private func exclusionDecision(
+        for url: URL,
+        exclusions: FileExclusionRules,
+        rootPaths: [String],
+        query: FileExclusionQuery?,
+        isDirectory: Bool? = nil,
+        instrumentation: inout FileExclusionQuery.Instrumentation
+    ) -> FileExclusionRules.Decision {
         if let query, let isDirectory {
-            return query.decision(path: url.path, isDirectory: isDirectory)
+            return query.decision(path: url.path, isDirectory: isDirectory, instrumentation: &instrumentation)
         }
         return exclusions.decision(url: url, roots: rootPaths, isDirectory: isDirectory)
     }

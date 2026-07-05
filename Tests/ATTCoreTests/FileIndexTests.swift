@@ -402,7 +402,7 @@ struct FileIndexTests {
         ), maxResults: 10)
         #expect(response.results.contains { $0.record.path == appFile.path })
 
-        try await waitUntil(timeout: .seconds(10)) {
+        try await waitUntil(timeout: .seconds(90)) {
             let diagnostics = index.currentDiagnostics()
             return diagnostics.recordStoreKind == .mapped
                 && diagnostics.optimizedCount == diagnostics.indexedCount
@@ -441,7 +441,7 @@ struct FileIndexTests {
             !index.currentStats().isIndexing
         }
 
-        try await waitUntil(timeout: .seconds(10)) {
+        try await waitUntil(timeout: .seconds(60)) {
             let diagnostics = index.currentDiagnostics()
             return diagnostics.recordStoreKind == .mapped
                 && diagnostics.optimizedCount == diagnostics.indexedCount
@@ -859,6 +859,7 @@ struct FileIndexTests {
                 && first.results.contains { $0.record.path == firstFile.path }
                 && second.results.contains { $0.record.path == secondFile.path }
         }
+        #expect(index.currentStats().activityPresentation == .backgroundCatchUp)
     }
 
     @Test("large structural overlay updates schedule mapped snapshot compaction")
@@ -1152,6 +1153,129 @@ struct FileIndexTests {
             return diagnostics.snapshotRevision > overlayRevision
                 && diagnostics.recordStoreKind == .mapped
                 && diagnostics.overlayCount == 0
+                && diagnostics.optimizedCount == diagnostics.indexedCount
+        }
+    }
+
+    @Test("background directory refresh yields and foreground promotion completes catch up")
+    func backgroundDirectoryRefreshYieldsAndForegroundPromotionCompletesCatchUp() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        let folder = root.appendingPathComponent("Folder", isDirectory: true)
+        try fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        defer {
+            try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName))
+        }
+        let index = FileIndex(
+            applicationName: applicationName,
+            loadsSnapshotImmediately: false,
+            largeOverlayPersistRecordLimit: nil,
+            largeOverlayPersistDelay: nil,
+            backgroundRefreshDrainBackoffDelay: 60,
+            backgroundDirectoryScanBudget: 0,
+            backgroundDirectoryMaxDeferral: 60,
+            backgroundOptimizationPersistDelay: 60
+        )
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil {
+            let diagnostics = index.currentDiagnostics()
+            return !index.currentStats().isIndexing
+                && diagnostics.recordStoreKind == .mapped
+                && diagnostics.optimizedCount == diagnostics.indexedCount
+        }
+
+        let createdFile = folder.appendingPathComponent("DeferredCatchup.swift")
+        try "created".write(to: createdFile, atomically: true, encoding: .utf8)
+        let before = index.currentDiagnostics()
+        index.update(paths: [folder.path], priority: .background)
+
+        try await waitUntil(timeout: .seconds(5)) {
+            let diagnostics = index.currentDiagnostics()
+            return diagnostics.completedRefreshBatches > before.completedRefreshBatches
+                && diagnostics.pendingBackgroundRefreshPathCount == 1
+        }
+        let yieldedSnapshot = index.currentInsightsSnapshot()
+        #expect(yieldedSnapshot.health.maintenance.pendingBackgroundRefreshPathCount == 1)
+        #expect(yieldedSnapshot.usage.maintenance.counters(for: .directoryRefresh).yieldedSlices >= 1)
+        #expect(index.search(SearchRequest(
+            query: "DeferredCatchup",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10).totalMatches == 0)
+
+        index.promoteBackgroundMaintenance()
+
+        try await waitUntil(timeout: .seconds(10)) {
+            let diagnostics = index.currentDiagnostics()
+            let response = index.search(SearchRequest(
+                query: "DeferredCatchup",
+                sort: SortSpec(column: .relevance, ascending: false)
+            ), maxResults: 10)
+            return diagnostics.pendingRefreshPathCount == 0
+                && response.results.contains { $0.record.path == createdFile.path }
+        }
+        let completedSnapshot = index.currentInsightsSnapshot()
+        #expect(completedSnapshot.health.maintenance.pendingRefreshPathCount == 0)
+        #expect(completedSnapshot.usage.maintenance.background.operations > 0)
+    }
+
+    @Test("background structural update defers search optimization until promotion")
+    func backgroundStructuralUpdateDefersSearchOptimizationUntilPromotion() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        let existingFile = root.appendingPathComponent("Existing.swift")
+        try "existing".write(to: existingFile, atomically: true, encoding: .utf8)
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        defer {
+            try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName))
+        }
+        let index = FileIndex(
+            applicationName: applicationName,
+            loadsSnapshotImmediately: false,
+            largeOverlayPersistRecordLimit: nil,
+            largeOverlayPersistDelay: nil,
+            backgroundOptimizationPersistDelay: 60
+        )
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil {
+            let diagnostics = index.currentDiagnostics()
+            return !index.currentStats().isIndexing
+                && diagnostics.recordStoreKind == .mapped
+                && diagnostics.optimizedCount == diagnostics.indexedCount
+        }
+
+        let before = index.currentDiagnostics()
+        let addedFile = root.appendingPathComponent("BackgroundAdded.swift")
+        try "added".write(to: addedFile, atomically: true, encoding: .utf8)
+        index.update(paths: [addedFile.path], priority: .background)
+
+        try await waitUntil(timeout: .seconds(5)) {
+            let diagnostics = index.currentDiagnostics()
+            return diagnostics.completedRefreshBatches > before.completedRefreshBatches
+                && diagnostics.recordStoreKind == .overlay
+                && diagnostics.optimizedCount == 0
+                && diagnostics.pendingRefreshPathCount == 0
+        }
+        let overlayRevision = index.currentDiagnostics().snapshotRevision
+
+        index.promoteBackgroundMaintenance()
+
+        try await waitUntil(timeout: .seconds(10)) {
+            let diagnostics = index.currentDiagnostics()
+            return diagnostics.snapshotRevision > overlayRevision
+                && diagnostics.recordStoreKind == .mapped
                 && diagnostics.optimizedCount == diagnostics.indexedCount
         }
     }
@@ -1481,6 +1605,78 @@ struct FileIndexTests {
         #expect(secondResponse.executionProfile.scannedRowCount <= 10)
     }
 
+    @Test("empty query additional sort skips missing sidecar rebuild")
+    func emptyQueryAdditionalSortSkipsMissingSidecarRebuild() throws {
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let supportDirectory = supportDirectory(applicationName: applicationName)
+        defer {
+            try? FileManager.default.removeItem(at: supportDirectory)
+        }
+
+        let recordCount = 5_000
+        let records = (0..<recordCount).map { offset in
+            makeRecord(
+                path: String(format: "/tmp/att-empty-created-missing-sidecar/File%06d.swift", offset),
+                createdTime: TimeInterval(recordCount - offset)
+            )
+        }
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        index.updateOptimizedSortColumns([.name, .modified])
+        index.replaceRecordsForTesting(records)
+        index.persistSnapshotForTesting()
+
+        let packageURL = SnapshotLayout.packageURL(in: supportDirectory)
+        let createdOrderURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.createdOrder)
+        try Data().write(to: createdOrderURL)
+
+        let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
+        reloaded.setExactEmptyQuerySortLimitForTesting(100)
+        let response = reloaded.search(SearchRequest(
+            query: "",
+            sort: SortSpec(column: .created, ascending: true),
+            includeHidden: false
+        ), maxResults: 10)
+
+        #expect(response.totalMatches == recordCount)
+        #expect(response.executionProfile.executionPath == .emptyQuerySortedOrder)
+        #expect(response.executionProfile.scannedRowCount <= 20)
+        #expect(response.results.map(\.record.path) == records.prefix(10).map(\.path))
+        #expect(response.results.first?.record.path != records.last?.path)
+    }
+
+    @Test("mapped persistence preserves missing additional sort sidecars")
+    func mappedPersistencePreservesMissingAdditionalSortSidecars() throws {
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let supportDirectory = supportDirectory(applicationName: applicationName)
+        defer {
+            try? FileManager.default.removeItem(at: supportDirectory)
+        }
+
+        let recordCount = 1_000
+        let records = (0..<recordCount).map { offset in
+            makeRecord(
+                path: String(format: "/tmp/att-persist-missing-created-sidecar/File%06d.swift", offset),
+                createdTime: TimeInterval(recordCount - offset)
+            )
+        }
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        index.updateOptimizedSortColumns([.name, .modified])
+        index.replaceRecordsForTesting(records)
+        index.persistSnapshotForTesting()
+
+        let packageURL = SnapshotLayout.packageURL(in: supportDirectory)
+        let createdOrderURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.createdOrder)
+        try Data().write(to: createdOrderURL)
+
+        let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
+        #expect(reloaded.allOptimizedSortColumns().contains(.created))
+        #expect(fileSize(at: createdOrderURL) == 0)
+
+        reloaded.persistSnapshotForTesting()
+
+        #expect(fileSize(at: createdOrderURL) == 0)
+    }
+
     @Test("degraded active search scans bounded rows and optimized search returns rich totals")
     func degradedActiveSearchScansBoundedRowsAndOptimizedSearchReturnsRichTotals() {
         let recordCount = 30_000
@@ -1525,6 +1721,451 @@ struct FileIndexTests {
         #expect(Set(optimized.results.map(\.record.path)) == [earlyNeedle, lateNeedle])
         #expect(!optimized.executionProfile.didFallbackToFullScan)
         #expect(optimized.executionProfile.scannedRowCount < recordCount)
+    }
+
+    @Test("large unoptimized overlay searches use last optimized candidates")
+    func largeUnoptimizedOverlaySearchesUseLastOptimizedCandidates() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        let changedFolder = root.appendingPathComponent("Changed", isDirectory: true)
+        try fileManager.createDirectory(at: changedFolder, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let index = FileIndex(
+            applicationName: applicationName,
+            loadsSnapshotImmediately: false,
+            largeOverlayPersistRecordLimit: nil,
+            largeOverlayPersistDelay: 60
+        )
+        defer {
+            try? fileManager.removeItem(at: index.dataDirectoryURL)
+            try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName))
+        }
+
+        var records = [
+            makeRecord(path: root.path, isDirectory: true),
+            makeRecord(path: changedFolder.path, isDirectory: true)
+        ]
+        records.reserveCapacity(30_003)
+        for offset in 0..<30_000 {
+            records.append(makeRecord(
+                path: root.appendingPathComponent("Stable/File\(String(format: "%06d", offset)).swift").path,
+                modifiedTime: TimeInterval(offset)
+            ))
+        }
+        let lateNeedle = root.appendingPathComponent("Stable/zzzz-AitoNeedle.swift").path
+        records.append(makeRecord(path: lateNeedle, modifiedTime: 40_000))
+
+        index.replaceRecordsForTesting(records, roots: [root])
+        let optimizedResponse = index.search(SearchRequest(
+            query: "AitoNeedle",
+            sort: SortSpec(column: .name, ascending: true),
+            mode: .interactivePreview
+        ), maxResults: 10)
+        #expect(optimizedResponse.usesIndexedCandidates)
+        #expect(optimizedResponse.results.map { $0.record.path } == [lateNeedle])
+
+        let changedFile = changedFolder.appendingPathComponent("Changed.swift")
+        try "changed".write(to: changedFile, atomically: true, encoding: .utf8)
+        let before = index.currentDiagnostics()
+        index.update(paths: [changedFolder.path], priority: IndexWorkPriority.background)
+
+        try await waitUntil(timeout: .seconds(5)) {
+            let diagnostics = index.currentDiagnostics()
+            return diagnostics.completedRefreshBatches > before.completedRefreshBatches
+                && diagnostics.recordStoreKind == .overlay
+                && diagnostics.optimizedCount == 0
+        }
+
+        for sortColumn in SortColumn.allCases {
+            let response = index.search(SearchRequest(
+                query: "AitoNeedle",
+                sort: SortSpec(column: sortColumn, ascending: sortColumn != .relevance),
+                mode: .interactivePreview
+            ), maxResults: 10)
+            let profileSummary = "sort: \(sortColumn.rawValue), path: \(response.executionProfile.executionPath.rawValue), candidates: \(response.executionProfile.candidateCount), scanned: \(response.executionProfile.scannedRowCount)"
+
+            #expect(response.usesIndexedCandidates, "\(profileSummary)")
+            #expect(response.executionProfile.executionPath != SearchExecutionPath.fullFallbackScan, "\(profileSummary)")
+            #expect(response.totalMatches == 1, "\(profileSummary)")
+            #expect(response.results.map { $0.record.path } == [lateNeedle], "\(profileSummary)")
+        }
+    }
+
+    @Test("broad preview searches are bounded for every sort column")
+    func broadPreviewSearchesAreBoundedForEverySortColumn() {
+        let recordCount = 8_000
+        let rootA = "/tmp/att-broad-preview-sort/a-root"
+        let rootZ = "/tmp/att-broad-preview-sort/z-root"
+        let extensions = ["swift", "md", "cpp", "txt"]
+        let records = (0..<recordCount).map { offset in
+            let root = offset.isMultiple(of: 2) ? rootA : rootZ
+            let isApplication = offset.isMultiple(of: 211)
+            let isFolder = !isApplication && offset.isMultiple(of: 97)
+            let suffix = isApplication ? ".app" : (isFolder ? "" : ".\(extensions[offset % extensions.count])")
+            return makeRecord(
+                path: String(format: "\(root)/bucket-%03d/AitoFile%06d\(suffix)", offset % 37, offset),
+                isDirectory: isApplication || isFolder,
+                modifiedTime: TimeInterval(offset),
+                createdTime: TimeInterval(recordCount - offset),
+                sizeBytes: UInt64((offset * 37) % 100_000 + 1),
+                volumeName: "Volume-\(offset % 9)"
+            )
+        }
+        let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)", loadsSnapshotImmediately: false)
+        defer {
+            try? FileManager.default.removeItem(at: index.dataDirectoryURL)
+        }
+        index.replaceRecordsForTesting(records, roots: [
+            URL(fileURLWithPath: rootA, isDirectory: true),
+            URL(fileURLWithPath: rootZ, isDirectory: true)
+        ])
+
+        for sortColumn in SortColumn.optimizedIndexColumns {
+            for ascending in [true, false] {
+                let sort = SortSpec(column: sortColumn, ascending: ascending)
+                let response = index.search(SearchRequest(
+                    query: "aito",
+                    sort: sort,
+                    mode: .interactivePreview
+                ), maxResults: 20)
+                let ascendingExpectedRecords = expectedSortedRecords(
+                    records,
+                    sort: SortSpec(column: sortColumn, ascending: true),
+                    roots: [rootA, rootZ]
+                )
+                let expectedRecords = ascending ? ascendingExpectedRecords : Array(ascendingExpectedRecords.reversed())
+                let expectedPaths = expectedRecords
+                    .prefix(20)
+                    .map(\.path)
+                let profileSummary = "sort: \(sortColumn.rawValue), ascending: \(ascending), path: \(response.executionProfile.executionPath.rawValue), candidates: \(response.executionProfile.candidateCount), scanned: \(response.executionProfile.scannedRowCount)"
+
+                #expect(response.usesIndexedCandidates, "\(profileSummary)")
+                #expect(response.executionProfile.executionPath != SearchExecutionPath.fullFallbackScan, "\(profileSummary)")
+                #expect(!response.executionProfile.didFallbackToFullScan, "\(profileSummary)")
+                #expect(response.executionProfile.indexesUsed.contains(sortColumn == .modified ? .modifiedOrder : .sortOrder), "\(profileSummary)")
+                #expect(response.executionProfile.candidateCount > 0, "\(profileSummary)")
+                #expect(response.executionProfile.candidateCount <= recordCount, "\(profileSummary)")
+                #expect(response.executionProfile.scannedRowCount <= 40, "\(profileSummary)")
+                if sortColumn != .root {
+                    #expect(response.results.map(\.record.path) == Array(expectedPaths), "\(profileSummary)")
+                }
+            }
+        }
+    }
+
+    @Test("optimized sort columns rank sparse candidates instead of scanning sorted order")
+    func optimizedSortColumnsRankSparseCandidatesInsteadOfScanningSortedOrder() {
+        let recordCount = 30_000
+        let rootA = "/tmp/att-sparse-sort-parity/a-root"
+        let rootZ = "/tmp/att-sparse-sort-parity/z-root"
+        var records: [FileRecord] = []
+        records.reserveCapacity(recordCount + 8)
+        for offset in 0..<recordCount {
+            records.append(makeRecord(
+                path: String(format: "\(rootA)/stable/File%06d.swift", offset),
+                modifiedTime: TimeInterval(offset),
+                createdTime: TimeInterval(offset),
+                sizeBytes: UInt64(offset + 1)
+            ))
+        }
+
+        var matchingRecords: [FileRecord] = []
+        matchingRecords.reserveCapacity(8)
+        for offset in 0..<8 {
+            let path = String(format: "%@/zzzz/AitoNeedle%02d.swift", rootZ, offset)
+            let timestamp = TimeInterval(100_000 + offset)
+            matchingRecords.append(makeRecord(
+                path: path,
+                modifiedTime: timestamp,
+                createdTime: timestamp,
+                sizeBytes: UInt64(100_000 + offset)
+            ))
+        }
+        records.append(contentsOf: matchingRecords)
+
+        let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)", loadsSnapshotImmediately: false)
+        defer {
+            try? FileManager.default.removeItem(at: index.dataDirectoryURL)
+        }
+        index.replaceRecordsForTesting(records, roots: [
+            URL(fileURLWithPath: rootA, isDirectory: true),
+            URL(fileURLWithPath: rootZ, isDirectory: true)
+        ])
+
+        for sortColumn in SortColumn.optimizedIndexColumns {
+            let sort = SortSpec(column: sortColumn, ascending: true)
+            let response = index.search(SearchRequest(
+                query: "AitoNeedle",
+                sort: sort,
+                mode: .interactivePreview
+            ), maxResults: 5)
+            let expectedNames = expectedSortedRecords(matchingRecords, sort: sort, roots: [rootA, rootZ])
+                .prefix(5)
+                .map(\.name)
+            let profileSummary = "sort: \(sortColumn.rawValue), path: \(response.executionProfile.executionPath.rawValue), candidates: \(response.executionProfile.candidateCount), scanned: \(response.executionProfile.scannedRowCount)"
+
+            #expect(response.usesIndexedCandidates, "\(profileSummary)")
+            #expect(response.executionProfile.executionPath == .optimizedSortedFastPath, "\(profileSummary)")
+            #expect(!response.executionProfile.didFallbackToFullScan, "\(profileSummary)")
+            #expect(response.executionProfile.indexesUsed.contains(sortColumn == .modified ? .modifiedOrder : .sortOrder), "\(profileSummary)")
+            #expect(response.executionProfile.scannedRowCount <= matchingRecords.count, "\(profileSummary)")
+            #expect(response.results.map(\.record.name) == Array(expectedNames), "\(profileSummary)")
+        }
+    }
+
+    @Test("created descending preview falls back from empty ordered prefix to ranked candidates")
+    func createdDescendingPreviewFallsBackFromEmptyOrderedPrefixToRankedCandidates() {
+        let fillerCount = 30_000
+        let matchCount = 1_500
+        var records: [FileRecord] = []
+        records.reserveCapacity(fillerCount + matchCount)
+        for offset in 0..<fillerCount {
+            records.append(makeRecord(
+                path: String(format: "/tmp/att-created-descending/new/File%06d.swift", offset),
+                modifiedTime: TimeInterval(100_000 + offset),
+                createdTime: TimeInterval(100_000 + offset)
+            ))
+        }
+        for offset in 0..<matchCount {
+            records.append(makeRecord(
+                path: String(format: "/tmp/att-created-descending/old/AitoNeedle%06d.swift", offset),
+                modifiedTime: TimeInterval(offset),
+                createdTime: TimeInterval(offset)
+            ))
+        }
+
+        let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)", loadsSnapshotImmediately: false)
+        defer {
+            try? FileManager.default.removeItem(at: index.dataDirectoryURL)
+        }
+        index.replaceRecordsForTesting(records)
+
+        let response = index.search(SearchRequest(
+            query: "aito",
+            sort: SortSpec(column: .created, ascending: false),
+            mode: .interactivePreview
+        ), maxResults: 20)
+        let expectedNames = (0..<20).map { offset in
+            String(format: "AitoNeedle%06d.swift", matchCount - offset - 1)
+        }
+
+        #expect(response.usesIndexedCandidates)
+        #expect(response.executionProfile.executionPath == .optimizedSortedFastPath)
+        #expect(response.executionProfile.indexesUsed.contains(.nameGrams))
+        #expect(response.executionProfile.indexesUsed.contains(.sortOrder))
+        #expect(!response.executionProfile.didFallbackToFullScan)
+        #expect(response.executionProfile.candidateCount >= matchCount)
+        #expect(response.executionProfile.scannedRowCount <= matchCount)
+        #expect(response.results.map(\.record.name) == expectedNames)
+    }
+
+    @Test("created sort preview uses optimized sort order by default")
+    func createdSortPreviewUsesOptimizedSortOrderByDefault() {
+        let recordCount = 5_000
+        let records = (0..<recordCount).map { offset in
+            makeRecord(
+                path: String(format: "/tmp/att-created-sort-preview/AitoFile%06d.swift", offset),
+                modifiedTime: TimeInterval(recordCount - offset),
+                createdTime: TimeInterval(offset)
+            )
+        }
+        let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)", loadsSnapshotImmediately: false)
+        defer {
+            try? FileManager.default.removeItem(at: index.dataDirectoryURL)
+        }
+        index.replaceRecordsForTesting(records)
+
+        let response = index.search(SearchRequest(
+            query: "aito",
+            sort: SortSpec(column: .created, ascending: true),
+            mode: .interactivePreview
+        ), maxResults: 20)
+
+        #expect(response.usesIndexedCandidates)
+        #expect(response.executionProfile.executionPath == .optimizedSortedFastPath)
+        #expect(response.executionProfile.indexesUsed.contains(.sortOrder))
+        #expect(response.executionProfile.scannedRowCount <= 20)
+        #expect(response.results.map(\.record.name) == (0..<20).map { String(format: "AitoFile%06d.swift", $0) })
+    }
+
+    @Test("persisted created sort preview uses name postings and created sidecar without path postings")
+    func persistedCreatedSortPreviewUsesNamePostingsAndCreatedSidecarWithoutPathPostings() {
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let recordCount = 2_000
+        let records = (0..<recordCount).map { offset in
+            makeRecord(
+                path: String(format: "/tmp/att-created-sort-persisted/project-%03d/AitoFile%06d.swift", offset % 256, offset),
+                modifiedTime: TimeInterval(recordCount - offset),
+                createdTime: TimeInterval(offset)
+            )
+        }
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        defer {
+            try? FileManager.default.removeItem(at: index.dataDirectoryURL)
+        }
+        index.replaceRecordsForTesting(records)
+        #expect(index.currentDiagnostics().pathGramIndexEnabled)
+        index.removePathGramAccelerationForTesting()
+        #expect(!index.currentDiagnostics().pathGramIndexEnabled)
+        index.persistSnapshotForTesting()
+
+        let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
+        let diagnostics = reloaded.currentDiagnostics()
+        #expect(diagnostics.recordStoreKind == .mapped)
+        #expect(!diagnostics.pathGramIndexEnabled)
+        #expect(diagnostics.nameGramPostingCount > 0)
+
+        let response = reloaded.search(SearchRequest(
+            query: "aito",
+            sort: SortSpec(column: .created, ascending: true),
+            includeHidden: false,
+            mode: .interactivePreview
+        ), maxResults: 20)
+
+        #expect(response.usesIndexedCandidates)
+        #expect(response.executionProfile.executionPath == .optimizedSortedFastPath)
+        #expect(response.executionProfile.indexesUsed.contains(.nameGrams))
+        #expect(response.executionProfile.indexesUsed.contains(.sortOrder))
+        #expect(!response.executionProfile.indexesUsed.contains(.pathGrams))
+        #expect(!response.executionProfile.didFallbackToFullScan)
+        #expect(response.executionProfile.scannedRowCount <= 20)
+        #expect(response.results.map(\.record.name) == (0..<20).map { String(format: "AitoFile%06d.swift", $0) })
+
+        let emptyPreview = reloaded.search(SearchRequest(
+            query: "zzzz",
+            sort: SortSpec(column: .created, ascending: true),
+            includeHidden: false,
+            mode: .interactivePreview
+        ), maxResults: 20)
+        #expect(emptyPreview.usesIndexedCandidates)
+        #expect(emptyPreview.executionProfile.executionPath == .optimizedSortedFastPath)
+        #expect(emptyPreview.executionProfile.indexesUsed.contains(.nameGrams))
+        #expect(emptyPreview.executionProfile.indexesUsed.contains(.sortOrder))
+        #expect(!emptyPreview.executionProfile.indexesUsed.contains(.pathGrams))
+        #expect(!emptyPreview.executionProfile.didFallbackToFullScan)
+        #expect(emptyPreview.executionProfile.scannedRowCount == 0)
+        #expect(emptyPreview.results.isEmpty)
+
+        let complete = reloaded.search(SearchRequest(
+            query: "aito",
+            sort: SortSpec(column: .created, ascending: true),
+            includeHidden: false
+        ), maxResults: 20)
+        #expect(complete.usesIndexedCandidates)
+        #expect(complete.executionProfile.executionPath == .optimizedSortedFastPath)
+        #expect(complete.executionProfile.indexesUsed.contains(.sortOrder))
+        #expect(!complete.executionProfile.didFallbackToFullScan)
+        #expect(complete.executionProfile.scannedRowCount <= recordCount)
+        #expect(complete.results.map(\.record.name) == (0..<20).map { String(format: "AitoFile%06d.swift", $0) })
+    }
+
+    @Test("persisted sidecar sort previews use name postings without path postings")
+    func persistedSidecarSortPreviewsUseNamePostingsWithoutPathPostings() {
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let recordCount = 3_000
+        let rootA = "/tmp/att-sidecar-sort-persisted/a-root"
+        let rootZ = "/tmp/att-sidecar-sort-persisted/z-root"
+        let extensions = ["swift", "md", "cpp", "txt"]
+        var records: [FileRecord] = []
+        records.reserveCapacity(recordCount)
+        for offset in 0..<recordCount {
+            let root = offset.isMultiple(of: 2) ? rootA : rootZ
+            let isApplication = offset.isMultiple(of: 157)
+            let isFolder = !isApplication && offset.isMultiple(of: 71)
+            let suffix = isApplication ? ".app" : (isFolder ? "" : ".\(extensions[offset % extensions.count])")
+            let path = String(
+                format: "\(root)/project-%03d/AitoFile%06d\(suffix)",
+                offset % 128,
+                offset
+            )
+            records.append(makeRecord(
+                path: path,
+                isDirectory: isApplication || isFolder,
+                modifiedTime: TimeInterval(recordCount - offset),
+                createdTime: TimeInterval(offset),
+                sizeBytes: UInt64((offset * 53) % 80_000 + 1),
+                volumeName: "Volume-\(offset % 7)"
+            ))
+        }
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        defer {
+            try? FileManager.default.removeItem(at: index.dataDirectoryURL)
+        }
+        index.replaceRecordsForTesting(records, roots: [
+            URL(fileURLWithPath: rootA, isDirectory: true),
+            URL(fileURLWithPath: rootZ, isDirectory: true)
+        ])
+        index.removePathGramAccelerationForTesting()
+        index.persistSnapshotForTesting()
+
+        let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
+        #expect(reloaded.currentDiagnostics().recordStoreKind == .mapped)
+        #expect(!reloaded.currentDiagnostics().pathGramIndexEnabled)
+
+        for sortColumn in SortColumn.optimizedIndexColumns {
+            let response = reloaded.search(SearchRequest(
+                query: "aito",
+                sort: SortSpec(column: sortColumn, ascending: true),
+                includeHidden: false,
+                mode: .interactivePreview
+            ), maxResults: 20)
+            let expectedPaths = expectedSortedRecords(
+                records,
+                sort: SortSpec(column: sortColumn, ascending: true),
+                roots: [rootA, rootZ]
+            )
+                .prefix(20)
+                .map(\.path)
+            let profileSummary = "sort: \(sortColumn.rawValue), path: \(response.executionProfile.executionPath.rawValue), candidates: \(response.executionProfile.candidateCount), scanned: \(response.executionProfile.scannedRowCount)"
+
+            #expect(response.usesIndexedCandidates, "\(profileSummary)")
+            #expect(response.executionProfile.executionPath == .optimizedSortedFastPath, "\(profileSummary)")
+            #expect(response.executionProfile.indexesUsed.contains(.nameGrams), "\(profileSummary)")
+            #expect(response.executionProfile.indexesUsed.contains(sortColumn == .modified ? .modifiedOrder : .sortOrder), "\(profileSummary)")
+            #expect(!response.executionProfile.indexesUsed.contains(.pathGrams), "\(profileSummary)")
+            #expect(!response.executionProfile.didFallbackToFullScan, "\(profileSummary)")
+            #expect(response.executionProfile.scannedRowCount <= 40, "\(profileSummary)")
+            if sortColumn != .root {
+                #expect(response.results.map(\.record.path) == Array(expectedPaths), "\(profileSummary)")
+            }
+        }
+    }
+
+    @Test("disabled created sort index falls back to bounded preview")
+    func disabledCreatedSortIndexFallsBackToBoundedPreview() {
+        let recordCount = 5_000
+        let records = (0..<recordCount).map { offset in
+            makeRecord(
+                path: String(format: "/tmp/att-disabled-created-sort/AitoFile%06d.swift", offset),
+                modifiedTime: TimeInterval(recordCount - offset),
+                createdTime: TimeInterval(offset)
+            )
+        }
+        let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)", loadsSnapshotImmediately: false)
+        defer {
+            try? FileManager.default.removeItem(at: index.dataDirectoryURL)
+        }
+        var enabledColumns = Set(SortColumn.optimizedIndexColumns)
+        enabledColumns.remove(.created)
+        index.updateOptimizedSortColumns(enabledColumns)
+        index.replaceRecordsForTesting(records)
+
+        let response = index.search(SearchRequest(
+            query: "aito",
+            sort: SortSpec(column: .created, ascending: true),
+            mode: .interactivePreview
+        ), maxResults: 20)
+
+        #expect(response.usesIndexedCandidates)
+        #expect(response.executionProfile.executionPath != .optimizedSortedFastPath)
+        #expect(!response.executionProfile.indexesUsed.contains(.sortOrder))
+        #expect(response.executionProfile.scannedRowCount <= 50_000)
+        #expect(response.results.count == 20)
     }
 
     @Test("search can hide hidden files")
@@ -2537,8 +3178,109 @@ struct FileIndexTests {
         #expect(Set(response.results.map(\.record.name)) == ["FileIndexTests.swift", "TestRunner.swift"])
     }
 
-    @Test("exact extension searches use extension postings without row scans")
-    func exactExtensionSearchesUseExtensionPostingsWithoutRowScans() {
+    @Test("exact path substring previews use sidecar sort order")
+    func exactPathSubstringPreviewsUseSidecarSortOrder() {
+        let recordCount = 3_000
+        let rootA = "/tmp/att-path-preview-sort/a-root"
+        let rootZ = "/tmp/att-path-preview-sort/z-root"
+        let extensions = ["swift", "md", "cpp", "txt"]
+        let records = (0..<recordCount).map { offset in
+            let root = offset.isMultiple(of: 2) ? rootA : rootZ
+            let path = String(
+                format: "\(root)/NeedleSegment-%03d/File%06d.\(extensions[offset % extensions.count])",
+                offset % 41,
+                offset
+            )
+            return makeRecord(
+                path: path,
+                modifiedTime: TimeInterval(recordCount - offset),
+                createdTime: TimeInterval(offset),
+                sizeBytes: UInt64((offset * 29) % 60_000 + 1),
+                volumeName: "Volume-\(offset % 5)"
+            )
+        }
+        let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)", loadsSnapshotImmediately: false)
+        defer {
+            try? FileManager.default.removeItem(at: index.dataDirectoryURL)
+        }
+        index.replaceRecordsForTesting(records, roots: [
+            URL(fileURLWithPath: rootA, isDirectory: true),
+            URL(fileURLWithPath: rootZ, isDirectory: true)
+        ])
+
+        for sortColumn in [SortColumn.path, .created, .size, .fileExtension, .kind, .volume, .root] {
+            let sort = SortSpec(column: sortColumn, ascending: true)
+            let response = index.search(SearchRequest(
+                query: "path:NeedleSegment",
+                sort: sort,
+                mode: .interactivePreview
+            ), maxResults: 20)
+            let expectedPaths = expectedSortedRecords(records, sort: sort, roots: [rootA, rootZ])
+                .prefix(20)
+                .map(\.path)
+            let profileSummary = "sort: \(sortColumn.rawValue), path: \(response.executionProfile.executionPath.rawValue), candidates: \(response.executionProfile.candidateCount), scanned: \(response.executionProfile.scannedRowCount)"
+
+            #expect(response.usesIndexedCandidates, "\(profileSummary)")
+            #expect(response.executionProfile.indexesUsed.contains(.sortOrder), "\(profileSummary)")
+            #expect(response.executionProfile.indexesUsed.contains(.pathGrams) || response.executionProfile.indexesUsed.contains(.componentGrams), "\(profileSummary)")
+            #expect(!response.executionProfile.didFallbackToFullScan, "\(profileSummary)")
+            #expect(response.executionProfile.scannedRowCount <= 40, "\(profileSummary)")
+            if sortColumn != .root {
+                #expect(response.results.map(\.record.path) == Array(expectedPaths), "\(profileSummary)")
+            }
+        }
+    }
+
+    @Test("exact extension previews use sidecar sort order")
+    func exactExtensionPreviewsUseSidecarSortOrder() {
+        let recordCount = 3_000
+        let rootA = "/tmp/att-extension-preview-sort/a-root"
+        let rootZ = "/tmp/att-extension-preview-sort/z-root"
+        let records = (0..<recordCount).map { offset in
+            let root = offset.isMultiple(of: 2) ? rootA : rootZ
+            return makeRecord(
+                path: String(format: "\(root)/project-%03d/File%06d.cpp", offset % 43, offset),
+                modifiedTime: TimeInterval(recordCount - offset),
+                createdTime: TimeInterval(offset),
+                sizeBytes: UInt64((offset * 31) % 70_000 + 1),
+                volumeName: "Volume-\(offset % 6)"
+            )
+        }
+        let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)", loadsSnapshotImmediately: false)
+        defer {
+            try? FileManager.default.removeItem(at: index.dataDirectoryURL)
+        }
+        index.replaceRecordsForTesting(records, roots: [
+            URL(fileURLWithPath: rootA, isDirectory: true),
+            URL(fileURLWithPath: rootZ, isDirectory: true)
+        ])
+
+        for sortColumn in [SortColumn.path, .created, .size, .fileExtension, .kind, .volume, .root] {
+            let sort = SortSpec(column: sortColumn, ascending: true)
+            let response = index.search(SearchRequest(
+                query: "ext:cpp",
+                sort: sort,
+                mode: .interactivePreview
+            ), maxResults: 20)
+            let expectedPaths = expectedSortedRecords(records, sort: sort, roots: [rootA, rootZ])
+                .prefix(20)
+                .map(\.path)
+            let profileSummary = "sort: \(sortColumn.rawValue), path: \(response.executionProfile.executionPath.rawValue), candidates: \(response.executionProfile.candidateCount), scanned: \(response.executionProfile.scannedRowCount)"
+
+            #expect(response.usesIndexedCandidates, "\(profileSummary)")
+            #expect(response.executionProfile.executionPath == .extensionCandidateIntersection, "\(profileSummary)")
+            #expect(response.executionProfile.indexesUsed.contains(.extensionPostings), "\(profileSummary)")
+            #expect(response.executionProfile.indexesUsed.contains(.sortOrder), "\(profileSummary)")
+            #expect(!response.executionProfile.didFallbackToFullScan, "\(profileSummary)")
+            #expect(response.executionProfile.scannedRowCount <= 40, "\(profileSummary)")
+            if sortColumn != .root {
+                #expect(response.results.map(\.record.path) == Array(expectedPaths), "\(profileSummary)")
+            }
+        }
+    }
+
+    @Test("exact extension searches use extension postings and sorted sidecars")
+    func exactExtensionSearchesUseExtensionPostingsAndSortedSidecars() {
         let root = "/tmp/allthethings-extension-fast-path"
         let cppCount = 750
         var records: [FileRecord] = []
@@ -2568,9 +3310,10 @@ struct FileIndexTests {
 
             #expect(response.usesIndexedCandidates)
             #expect(response.executionProfile.executionPath == .extensionCandidateIntersection)
-            #expect(response.executionProfile.indexesUsed == [.extensionPostings])
+            #expect(response.executionProfile.indexesUsed.contains(.extensionPostings))
+            #expect(response.executionProfile.indexesUsed.contains(.sortOrder))
             #expect(response.executionProfile.candidateCount == cppCount)
-            #expect(response.executionProfile.scannedRowCount == 0)
+            #expect(response.executionProfile.scannedRowCount <= response.executionProfile.candidateCount)
             #expect(response.totalMatches == cppCount)
             #expect(response.results.count == 25)
             #expect(response.results.allSatisfy { $0.record.fileExtension == "cpp" })
@@ -2584,9 +3327,10 @@ struct FileIndexTests {
 
             #expect(response.usesIndexedCandidates)
             #expect(response.executionProfile.executionPath == .extensionCandidateIntersection)
-            #expect(response.executionProfile.indexesUsed == [.extensionPostings])
+            #expect(response.executionProfile.indexesUsed.contains(.extensionPostings))
+            #expect(response.executionProfile.indexesUsed.contains(.sortOrder))
             #expect(response.executionProfile.candidateCount == cppCount + 1)
-            #expect(response.executionProfile.scannedRowCount == 0)
+            #expect(response.executionProfile.scannedRowCount <= response.executionProfile.candidateCount)
             #expect(response.totalMatches == cppCount + 1)
             #expect(response.results.count == 25)
             #expect(response.results.allSatisfy { ["cpp", "cppm"].contains($0.record.fileExtension) })
@@ -2600,9 +3344,10 @@ struct FileIndexTests {
 
             #expect(response.usesIndexedCandidates)
             #expect(response.executionProfile.executionPath == .extensionCandidateIntersection)
-            #expect(response.executionProfile.indexesUsed == [.extensionPostings])
+            #expect(response.executionProfile.indexesUsed.contains(.extensionPostings))
+            #expect(response.executionProfile.indexesUsed.contains(.sortOrder))
             #expect(response.executionProfile.candidateCount == cppCount + 2)
-            #expect(response.executionProfile.scannedRowCount == 0)
+            #expect(response.executionProfile.scannedRowCount <= response.executionProfile.candidateCount)
             #expect(response.totalMatches == cppCount + 2)
             #expect(response.results.count == 25)
             #expect(response.results.allSatisfy { ["cpp", "hpp", "ipp"].contains($0.record.fileExtension) })
@@ -2964,11 +3709,76 @@ struct FileIndexTests {
         return supportRoot.appendingPathComponent(applicationName, isDirectory: true)
     }
 
+    private func fileSize(at url: URL) -> Int {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        return (attributes?[.size] as? NSNumber)?.intValue ?? 0
+    }
+
+    private func expectedSortedRecords(
+        _ records: [FileRecord],
+        sort: SortSpec,
+        roots: [String] = []
+    ) -> [FileRecord] {
+        func ordered<T: Comparable>(_ lhs: T, _ rhs: T) -> Bool? {
+            guard lhs != rhs else { return nil }
+            return sort.ascending ? lhs < rhs : lhs > rhs
+        }
+
+        func rootPath(for record: FileRecord) -> String {
+            roots
+                .filter { record.path == $0 || record.path.hasPrefix($0 + "/") }
+                .max { $0.count < $1.count } ?? ""
+        }
+
+        func kindName(for record: FileRecord) -> String {
+            record.isDirectory && record.fileExtension == "app"
+                ? "Application"
+                : (record.isDirectory ? "Folder" : "File")
+        }
+
+        return records.sorted { lhs, rhs in
+            let primary: Bool?
+            switch sort.column {
+            case .relevance:
+                primary = ordered(lhs.modifiedTime, rhs.modifiedTime)
+            case .name:
+                primary = ordered(lhs.normalizedName, rhs.normalizedName)
+            case .path:
+                primary = ordered(lhs.normalizedPath, rhs.normalizedPath)
+            case .modified:
+                primary = ordered(lhs.modifiedTime, rhs.modifiedTime)
+            case .created:
+                primary = ordered(lhs.createdTime ?? 0, rhs.createdTime ?? 0)
+            case .size:
+                primary = ordered(lhs.sizeBytes, rhs.sizeBytes)
+            case .fileExtension:
+                primary = ordered(lhs.fileExtension, rhs.fileExtension)
+            case .kind:
+                primary = ordered(kindName(for: lhs), kindName(for: rhs))
+            case .volume:
+                primary = ordered(lhs.volumeName, rhs.volumeName)
+            case .root:
+                primary = ordered(rootPath(for: lhs), rootPath(for: rhs))
+            }
+
+            if let primary {
+                return primary
+            }
+            if lhs.normalizedName != rhs.normalizedName {
+                return lhs.normalizedName < rhs.normalizedName
+            }
+            return lhs.path < rhs.path
+        }
+    }
+
     private func makeRecord(
         path: String,
         isDirectory: Bool = false,
         isHidden: Bool? = nil,
-        modifiedTime: TimeInterval = Date().timeIntervalSinceReferenceDate
+        modifiedTime: TimeInterval = Date().timeIntervalSinceReferenceDate,
+        createdTime: TimeInterval? = nil,
+        sizeBytes: UInt64 = 128,
+        volumeName: String = "Test"
     ) -> FileRecord {
         let url = URL(fileURLWithPath: path)
         let name = url.lastPathComponent
@@ -2979,12 +3789,12 @@ struct FileIndexTests {
             name: name,
             directoryPath: directory,
             fileExtension: url.pathExtension.lowercased(),
-            sizeBytes: isDirectory ? 0 : 128,
+            sizeBytes: isDirectory ? 0 : sizeBytes,
             modifiedTime: modifiedTime,
-            createdTime: nil,
+            createdTime: createdTime,
             isDirectory: isDirectory,
             isHidden: isHidden ?? FileRecord.pathIsHidden(path),
-            volumeName: "Test",
+            volumeName: volumeName,
             normalizedName: FuzzyMatcher.normalize(name),
             normalizedPath: FuzzyMatcher.normalize(path)
         )

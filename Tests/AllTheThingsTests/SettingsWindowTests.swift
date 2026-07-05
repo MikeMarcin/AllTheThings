@@ -29,6 +29,7 @@ struct SettingsWindowTests {
         #expect(generalStrings.contains("Diagnostics"))
         #expect(generalStrings.contains("Diagnostic detail"))
         #expect(generalStrings.contains("Status footer"))
+        #expect(generalStrings.contains("Remember table sort between launches"))
         #expect(!generalStrings.contains("Global search hotkey"))
         #expect(!generalStrings.contains("Global app search hotkey"))
         #expect(!generalStrings.contains { $0.contains("Full Disk Access") })
@@ -45,6 +46,9 @@ struct SettingsWindowTests {
 
         controller.selectSection(.indexedFolders)
         let indexedFolderStrings = visibleStrings(in: controller.window?.contentView)
+        #expect(indexedFolderStrings.contains("Search Performance"))
+        #expect(indexedFolderStrings.contains("Created"))
+        #expect(indexedFolderStrings.contains("Root"))
         #expect(indexedFolderStrings.contains("Folder Access"))
         #expect(indexedFolderStrings.contains { $0.contains("Full Disk Access") })
         #expect(indexedFolderStrings.contains("Open Full Disk Access Settings"))
@@ -87,6 +91,41 @@ struct SettingsWindowTests {
         preview.selectPreference(.light, sendsAction: true)
         #expect(AppSettings.themePreference(defaults: defaults) == .light)
         #expect(preview.selectedPreference == .light)
+    }
+
+    @MainActor
+    @Test("general page toggles remember table sort between launches")
+    func generalPageTogglesRememberTableSortBetweenLaunches() throws {
+        let suiteName = "AllTheThingsSettingsTests-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        AppSettings.registerDefaults(defaults)
+        let index = FileIndex(applicationName: "AllTheThingsSettingsTests-\(UUID().uuidString)", loadsSnapshotImmediately: false)
+        let controller = SettingsWindowController(defaults: defaults, index: index, reindexHandler: {})
+        controller.loadWindow()
+        defer {
+            controller.close()
+        }
+
+        controller.selectSection(.general)
+        controller.window?.contentView?.layoutSubtreeIfNeeded()
+        let rememberSwitch = try #require(
+            firstView(withIdentifier: "rememberSortBetweenLaunchesSwitch", in: controller.window?.contentView) as? NSSwitch
+        )
+        #expect(rememberSwitch.state == .off)
+        #expect(!AppSettings.rememberSortBetweenLaunches(defaults: defaults))
+
+        rememberSwitch.state = .on
+        _ = rememberSwitch.sendAction(rememberSwitch.action, to: rememberSwitch.target)
+        #expect(AppSettings.rememberSortBetweenLaunches(defaults: defaults))
+
+        rememberSwitch.state = .off
+        _ = rememberSwitch.sendAction(rememberSwitch.action, to: rememberSwitch.target)
+        #expect(!AppSettings.rememberSortBetweenLaunches(defaults: defaults))
     }
 
     @MainActor

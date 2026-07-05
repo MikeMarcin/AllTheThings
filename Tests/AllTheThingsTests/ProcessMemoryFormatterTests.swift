@@ -1,4 +1,5 @@
 @testable import AllTheThings
+import Foundation
 import Testing
 
 @Suite("Process memory formatter")
@@ -28,5 +29,39 @@ struct ProcessMemoryFormatterTests {
         )
 
         #expect(ProcessMemoryFormatter.label(for: usage) == "Memory 120 MB")
+    }
+
+    @Test("process resource deltas compute CPU load and wakeups")
+    func processResourceDeltasComputeCPULoadAndWakeups() {
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+        let previous = ProcessResourceUsage(sampledAt: start, cpuTime: 10, wakeups: 100)
+        let current = ProcessResourceUsage(sampledAt: start.addingTimeInterval(30), cpuTime: 16, wakeups: 160)
+
+        let delta = ProcessResourceSampler.delta(from: previous, to: current)
+
+        #expect(delta?.duration == 30)
+        #expect(delta?.cpuTime == 6)
+        #expect(delta?.wakeups == 60)
+        #expect(delta?.cpuLoad == 0.2)
+        #expect(delta?.wakeupsPerMinute == 120)
+    }
+
+    @Test("process resource deltas drop counter resets")
+    func processResourceDeltasDropCounterResets() {
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+        let previous = ProcessResourceUsage(sampledAt: start, cpuTime: 10, wakeups: 100)
+
+        #expect(ProcessResourceSampler.delta(
+            from: previous,
+            to: ProcessResourceUsage(sampledAt: start.addingTimeInterval(30), cpuTime: 9, wakeups: 160)
+        ) == nil)
+        #expect(ProcessResourceSampler.delta(
+            from: previous,
+            to: ProcessResourceUsage(sampledAt: start.addingTimeInterval(30), cpuTime: 16, wakeups: 90)
+        ) == nil)
+        #expect(ProcessResourceSampler.delta(
+            from: previous,
+            to: ProcessResourceUsage(sampledAt: start, cpuTime: 16, wakeups: 160)
+        ) == nil)
     }
 }

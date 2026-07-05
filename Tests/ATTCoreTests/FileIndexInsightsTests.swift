@@ -73,6 +73,29 @@ struct FileIndexInsightsTests {
         #expect(createdAt <= Date())
     }
 
+    @Test("storage insights reports package sidecars sorted by allocated size")
+    func storageInsightsReportsPackageSidecarsSortedByAllocatedSize() throws {
+        let fileManager = FileManager.default
+        let applicationName = "AllTheThingsInsights-\(UUID().uuidString)"
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        defer {
+            try? fileManager.removeItem(at: index.dataDirectoryURL)
+        }
+
+        index.replaceRecordsForTesting([
+            makeRecord(path: "/tmp/AllTheThingsInsights/alpha.txt", size: 12),
+            makeRecord(path: "/tmp/AllTheThingsInsights/beta.txt", size: 34)
+        ])
+        index.persistSnapshotForTesting()
+
+        let sidecars = index.currentInsightsSnapshot().storage.sidecars
+        #expect(!sidecars.isEmpty)
+        #expect(sidecars.map(\.name).contains(SnapshotLayout.FileName.manifest))
+        #expect(sidecars.map(\.name).contains(SnapshotLayout.FileName.records))
+        #expect(sidecars.map(\.allocatedBytes) == sidecars.map(\.allocatedBytes).sorted(by: >))
+        #expect(sidecars.reduce(UInt64(0)) { $0 + $1.allocatedBytes } == index.currentInsightsSnapshot().storage.indexPackageBytes)
+    }
+
     @Test("nested roots attribute descendants to deepest configured root")
     func nestedRootsAttributeDescendantsToDeepestConfiguredRoot() async throws {
         let fileManager = FileManager.default
@@ -253,6 +276,11 @@ struct FileIndexInsightsTests {
                 elapsed: 2
             ),
             SearchExecutionProfile(
+                executionPath: .optimizedSortedFastPath,
+                indexesUsed: [.nameGrams, .sortOrder, .visibleBitset],
+                elapsed: 2.5
+            ),
+            SearchExecutionProfile(
                 executionPath: .fullFallbackScan,
                 indexesUsed: [.visibleBitset],
                 didFallbackToFullScan: true,
@@ -269,13 +297,13 @@ struct FileIndexInsightsTests {
         }
 
         let refined = metrics.refinedSearches
-        #expect(refined.completed == 4)
+        #expect(refined.completed == 5)
         #expect(refined.routeCounts[.mappedIndex] == 1)
-        #expect(refined.routeCounts[.sidecar] == 1)
+        #expect(refined.routeCounts[.sidecar] == 2)
         #expect(refined.routeCounts[.fullScan] == 1)
         #expect(refined.routeCounts[.applicationCatalog] == 1)
         #expect(refined.averageLatency(for: .mappedIndex) == 1)
-        #expect(refined.averageLatency(for: .sidecar) == 2)
+        #expect(refined.averageLatency(for: .sidecar) == 2.25)
         #expect(refined.averageLatency(for: .fullScan) == 3)
         #expect(refined.averageLatency(for: .applicationCatalog) == 4)
     }
@@ -385,6 +413,397 @@ struct FileIndexInsightsTests {
         #expect(counters.averageLatency(for: .mappedIndex) == 3.5)
         #expect(!counters.hasAverageLatency(for: .applicationCatalog))
         #expect(counters.averageLatency(for: .applicationCatalog) == 0)
+    }
+
+    @Test("maintenance metrics clamp and aggregate by priority kind and day")
+    func maintenanceMetricsClampAndAggregateByPriorityKindAndDay() {
+        var metrics = IndexUsageMetrics()
+        let completedAt = Date(timeIntervalSince1970: 1_800_000_000)
+        metrics.recordMaintenance(IndexMaintenanceOperationMetric(
+            kind: .directoryRefresh,
+            priority: .background,
+            completedAt: completedAt,
+            wallTime: -1,
+            approximateCPUTime: -2,
+            paths: 3,
+            records: 4,
+            visited: 5,
+            yieldedSlices: 1,
+            deferredPaths: 2,
+            largeOverlays: 1,
+            exclusionDecisions: 7,
+            exclusionRegexMatches: 8,
+            exclusionFastPathDecisions: 9,
+            exclusionFastPrunes: 10
+        ))
+        metrics.recordMaintenance(IndexMaintenanceOperationMetric(
+            kind: .snapshotPersist,
+            priority: .interactive,
+            completedAt: completedAt,
+            wallTime: 1.25,
+            approximateCPUTime: 0.75,
+            records: 11
+        ))
+
+        #expect(metrics.maintenance.total.operations == 2)
+        #expect(metrics.maintenance.total.wallTime == 1.25)
+        #expect(metrics.maintenance.total.approximateCPUTime == 0.75)
+        #expect(metrics.maintenance.background.operations == 1)
+        #expect(metrics.maintenance.interactive.operations == 1)
+        #expect(metrics.maintenance.counters(for: .directoryRefresh).visited == 5)
+        #expect(metrics.maintenance.counters(for: .directoryRefresh).exclusionFastPrunes == 10)
+        #expect(metrics.maintenance.counters(for: .snapshotPersist).records == 11)
+        #expect(metrics.dailyBuckets.count == 1)
+        #expect(metrics.dailyBuckets[0].maintenance.total.operations == 2)
+        #expect(metrics.dailyBuckets[0].day == IndexUsageMetrics.dayKey(for: completedAt))
+    }
+
+    @Test("maintenance metrics are visible immediately but saved on flush")
+    func maintenanceMetricsAreVisibleImmediatelyButSavedOnFlush() throws {
+        let fileManager = FileManager.default
+        let applicationName = "AllTheThingsInsights-\(UUID().uuidString)"
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        defer {
+            index.flushUsageMetrics()
+            try? fileManager.removeItem(at: index.dataDirectoryURL)
+        }
+
+        let metricsURL = index.dataDirectoryURL.appendingPathComponent("index-metrics.json", isDirectory: false)
+        try? fileManager.removeItem(at: metricsURL)
+
+        index.recordMaintenanceForTesting(IndexMaintenanceOperationMetric(
+            kind: .exactRefresh,
+            priority: .background,
+            wallTime: 0.25,
+            approximateCPUTime: 0.1,
+            paths: 2
+        ))
+
+        let liveUsage = index.currentInsightsSnapshot().usage
+        #expect(liveUsage.maintenance.counters(for: .exactRefresh).operations == 1)
+        #expect(liveUsage.maintenance.background.operations == 1)
+        #expect(!fileManager.fileExists(atPath: metricsURL.path))
+
+        index.flushUsageMetrics()
+
+        let data = try Data(contentsOf: metricsURL)
+        let persisted = try JSONDecoder().decode(IndexUsageMetrics.self, from: data)
+        #expect(persisted.maintenance.counters(for: .exactRefresh).operations == 1)
+        #expect(persisted.maintenance.background.operations == 1)
+    }
+
+    @Test("energy samples aggregate by mode rollup and day")
+    func energySamplesAggregateByModeRollupAndDay() {
+        var metrics = IndexUsageMetrics()
+        let completedAt = Date(timeIntervalSince1970: 1_800_000_000)
+
+        let foregroundRecorded = metrics.recordEnergySample(
+            completedAt: completedAt,
+            duration: 30,
+            cpuTime: 3,
+            wakeups: 12,
+            mode: .foreground
+        )
+        let backgroundRecorded = metrics.recordEnergySample(
+            completedAt: completedAt.addingTimeInterval(60),
+            duration: 60,
+            cpuTime: 12,
+            wakeups: 30,
+            mode: .background
+        )
+
+        #expect(foregroundRecorded)
+        #expect(backgroundRecorded)
+        #expect(metrics.recentEnergySamples.count == 2)
+        #expect(metrics.energyRollups.count == 1)
+        #expect(metrics.energyRollups[0].energy.foreground.cpuTime == 3)
+        #expect(metrics.energyRollups[0].energy.background.cpuTime == 12)
+        #expect(metrics.energyRollups[0].energy.total.cpuTime == 15)
+        #expect(metrics.energyRollups[0].energy.total.wakeups == 42)
+        #expect(metrics.energyRollups[0].energy.total.peakCPULoad == 0.2)
+        #expect(metrics.dailyBuckets.count == 1)
+        #expect(metrics.dailyBuckets[0].energy.foreground.cpuTime == 3)
+        #expect(metrics.dailyBuckets[0].energy.background.cpuTime == 12)
+        #expect(metrics.dailyBuckets[0].energy.total.samples == 2)
+    }
+
+    @Test("calendar activity score uses existing search maintenance and refresh counters")
+    func calendarActivityScoreUsesExistingSearchMaintenanceAndRefreshCounters() {
+        let bucket = DailyUsageBucket(
+            day: "2026-07-04",
+            searches: SearchUsageCounters(
+                completed: 2,
+                cancelled: 1,
+                candidateRowsExamined: 9,
+                scannedRowsExamined: 4
+            ),
+            health: IndexHealthCounters(
+                fullRebuilds: 1,
+                incrementalRefreshBatches: 2,
+                recursiveRescans: 1
+            ),
+            maintenance: IndexMaintenanceCostCounters(
+                total: IndexMaintenanceOperationCounters(
+                    operations: 1,
+                    paths: 3,
+                    records: 4,
+                    visited: 5,
+                    yieldedSlices: 1,
+                    deferredPaths: 2
+                )
+            )
+        )
+
+        let components = bucket.calendarActivityScoreComponents
+        let expectedSearch = log1p(Double(3)) + log1p(Double(13))
+        let expectedIndex = log1p(Double(1)) + log1p(Double(12)) + log1p(Double(3))
+        let expectedRefresh = log1p(Double(4))
+
+        #expect(abs(components.search - expectedSearch) < 0.000_001)
+        #expect(abs(components.index - expectedIndex) < 0.000_001)
+        #expect(abs(components.refresh - expectedRefresh) < 0.000_001)
+        #expect(abs(bucket.calendarActivityScore - (expectedSearch + expectedIndex + expectedRefresh)) < 0.000_001)
+    }
+
+    @Test("background energy impact uses only background CPU and wakeups")
+    func backgroundEnergyImpactUsesOnlyBackgroundCPUAndWakeups() {
+        let bucket = DailyUsageBucket(
+            day: "2026-07-04",
+            energy: EnergyUsageBreakdown(
+                foreground: EnergyUsageCounters(cpuTime: 100, wakeups: 100_000),
+                background: EnergyUsageCounters(cpuTime: 2, wakeups: 30_000)
+            )
+        )
+
+        #expect(bucket.backgroundEnergyImpactScore == 5)
+    }
+
+    @Test("energy samples build five minute rollups")
+    func energySamplesBuildFiveMinuteRollups() {
+        var metrics = IndexUsageMetrics()
+        let completedAt = Date(timeIntervalSince1970: 1_800_000_000)
+
+        _ = metrics.recordEnergySample(completedAt: completedAt, duration: 30, cpuTime: 3, wakeups: 1, mode: .foreground)
+        _ = metrics.recordEnergySample(
+            completedAt: completedAt.addingTimeInterval(IndexUsageMetrics.energyRollupInterval + 1),
+            duration: 30,
+            cpuTime: 6,
+            wakeups: 2,
+            mode: .background
+        )
+
+        #expect(metrics.energyRollups.count == 2)
+        #expect(metrics.energyRollups.map(\.bucketStart) == [
+            IndexUsageMetrics.energyRollupStart(for: completedAt),
+            IndexUsageMetrics.energyRollupStart(for: completedAt.addingTimeInterval(IndexUsageMetrics.energyRollupInterval + 1))
+        ])
+    }
+
+    @Test("energy samples drop invalid deltas")
+    func energySamplesDropInvalidDeltas() {
+        var metrics = IndexUsageMetrics()
+        let completedAt = Date(timeIntervalSince1970: 1_800_000_000)
+
+        let zeroDurationRecorded = metrics.recordEnergySample(
+            completedAt: completedAt,
+            duration: 0,
+            cpuTime: 1,
+            wakeups: 0,
+            mode: .foreground
+        )
+        let negativeCPURecorded = metrics.recordEnergySample(
+            completedAt: completedAt,
+            duration: 30,
+            cpuTime: -1,
+            wakeups: 0,
+            mode: .background
+        )
+
+        #expect(!zeroDurationRecorded)
+        #expect(!negativeCPURecorded)
+        #expect(metrics.recentEnergySamples.isEmpty)
+        #expect(metrics.energyRollups.isEmpty)
+        #expect(metrics.dailyBuckets.isEmpty)
+    }
+
+    @Test("energy history retention keeps recent intervals and two day rollups")
+    func energyHistoryRetentionKeepsRecentIntervalsAndTwoDayRollups() {
+        var metrics = IndexUsageMetrics()
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+        _ = metrics.recordEnergySample(
+            completedAt: now.addingTimeInterval(-3 * 60 * 60),
+            duration: 30,
+            cpuTime: 1,
+            wakeups: 1,
+            mode: .background
+        )
+        _ = metrics.recordEnergySample(
+            completedAt: now.addingTimeInterval(-49 * 60 * 60),
+            duration: 30,
+            cpuTime: 1,
+            wakeups: 1,
+            mode: .background
+        )
+        _ = metrics.recordEnergySample(completedAt: now, duration: 30, cpuTime: 2, wakeups: 2, mode: .foreground)
+
+        #expect(metrics.recentEnergySamples.map(\.completedAt) == [now])
+        #expect(metrics.energyRollups.allSatisfy { $0.bucketStart >= now.addingTimeInterval(-IndexUsageMetrics.retainedEnergyRollupInterval) })
+        #expect(metrics.energyRollups.contains { $0.energy.foreground.cpuTime == 2 })
+    }
+
+    @Test("legacy v3 metrics migrate with empty energy history")
+    func legacyV3MetricsMigrateWithEmptyEnergyHistory() throws {
+        let fileManager = FileManager.default
+        let applicationName = "AllTheThingsInsights-\(UUID().uuidString)"
+        let supportDirectory = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent(applicationName, isDirectory: true)
+        try? fileManager.removeItem(at: supportDirectory)
+        try fileManager.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: supportDirectory)
+        }
+
+        let metricsURL = supportDirectory.appendingPathComponent("index-metrics.json", isDirectory: false)
+        let legacyJSON = """
+        {
+          "schemaVersion": 3,
+          "dailyBuckets": [
+            {
+              "day": "2026-06-14"
+            }
+          ]
+        }
+        """
+        try Data(legacyJSON.utf8).write(to: metricsURL)
+
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        let usage = index.currentInsightsSnapshot().usage
+        #expect(usage.schemaVersion == IndexUsageMetrics.currentSchemaVersion)
+        #expect(usage.recentEnergySamples.isEmpty)
+        #expect(usage.energyRollups.isEmpty)
+        #expect(usage.dailyBuckets.first?.energy.total.cpuTime == 0)
+    }
+
+    @Test("legacy v2 metrics migrate with empty maintenance counters")
+    func legacyV2MetricsMigrateWithEmptyMaintenanceCounters() throws {
+        let fileManager = FileManager.default
+        let applicationName = "AllTheThingsInsights-\(UUID().uuidString)"
+        let supportDirectory = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent(applicationName, isDirectory: true)
+        try? fileManager.removeItem(at: supportDirectory)
+        try fileManager.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: supportDirectory)
+        }
+
+        let metricsURL = supportDirectory.appendingPathComponent("index-metrics.json", isDirectory: false)
+        let legacyJSON = """
+        {
+          "schemaVersion": 2,
+          "allTimeSearches": {
+            "started": 3,
+            "completed": 2
+          },
+          "dailyBuckets": [
+            {
+              "day": "2026-06-14",
+              "searches": {
+                "started": 3,
+                "completed": 2
+              }
+            }
+          ]
+        }
+        """
+        try Data(legacyJSON.utf8).write(to: metricsURL)
+
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        let usage = index.currentInsightsSnapshot().usage
+        #expect(usage.schemaVersion == IndexUsageMetrics.currentSchemaVersion)
+        #expect(usage.allTimeSearches.started == 3)
+        #expect(usage.maintenance.total.operations == 0)
+        #expect(usage.dailyBuckets.first?.maintenance.total.operations == 0)
+    }
+
+    @Test("incremental refresh records exact maintenance cost")
+    func incrementalRefreshRecordsExactMaintenanceCost() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsMaintenance-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        let file = root.appendingPathComponent("Exact.swift")
+        try "before".write(to: file, atomically: true, encoding: .utf8)
+
+        let applicationName = "AllTheThingsInsights-\(UUID().uuidString)"
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        defer {
+            try? fileManager.removeItem(at: index.dataDirectoryURL)
+        }
+
+        index.replaceRootsAndRebuild([root])
+        try await waitUntil {
+            !index.currentStats().isIndexing
+        }
+
+        let before = index.currentInsightsSnapshot().usage.maintenance.counters(for: .exactRefresh).operations
+        try "after".write(to: file, atomically: true, encoding: .utf8)
+        index.update(paths: [file.path])
+
+        try await waitUntil(timeout: .seconds(5)) {
+            index.currentInsightsSnapshot().usage.maintenance.counters(for: .exactRefresh).operations > before
+        }
+
+        let snapshot = index.currentInsightsSnapshot()
+        let exact = snapshot.usage.maintenance.counters(for: .exactRefresh)
+        #expect(exact.paths >= 1)
+        #expect(exact.records >= 1)
+        #expect(snapshot.health.maintenance.lastOperation?.kind == .exactRefresh)
+    }
+
+    @Test("rebuild maintenance counts fast-pruned generated directories")
+    func rebuildMaintenanceCountsFastPrunedGeneratedDirectories() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsMaintenance-\(UUID().uuidString)", isDirectory: true)
+        let source = root.appendingPathComponent("Sources", isDirectory: true)
+        let buckOut = root.appendingPathComponent("buck-out", isDirectory: true)
+        try fileManager.createDirectory(at: source, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: buckOut, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        try "source".write(to: source.appendingPathComponent("Kept.swift"), atomically: true, encoding: .utf8)
+        try "generated".write(to: buckOut.appendingPathComponent("Generated.swift"), atomically: true, encoding: .utf8)
+
+        let applicationName = "AllTheThingsInsights-\(UUID().uuidString)"
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        defer {
+            try? fileManager.removeItem(at: index.dataDirectoryURL)
+        }
+
+        index.replaceRootsAndRebuild([root])
+        try await waitUntil {
+            !index.currentStats().isIndexing
+                && index.currentInsightsSnapshot()
+                    .usage
+                    .maintenance
+                    .counters(for: .fullRebuild)
+                    .operations >= 1
+        }
+
+        let snapshot = index.currentInsightsSnapshot()
+        let rebuild = snapshot.usage.maintenance.counters(for: .fullRebuild)
+        #expect(rebuild.exclusionFastPrunes >= 1)
+        #expect(index.search(SearchRequest(
+            query: "Generated",
+            sort: SortSpec(column: .name, ascending: true)
+        )).totalMatches == 0)
     }
 
     @Test("legacy v1 metrics migrate without backfilling phase counters")

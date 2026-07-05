@@ -353,6 +353,24 @@ struct FileExclusionRulesTests {
         )
     }
 
+    @Test("directory component fast prune covers generated folders without overriding reincludes")
+    func directoryComponentFastPruneCoversGeneratedFoldersWithoutOverridingReincludes() {
+        let defaults = FileExclusionRules(patterns: FileExclusionRules.defaultPatterns)
+
+        #expect(defaults.canPruneDirectoryComponentBeforeStat("buck-out"))
+        #expect(defaults.canPruneDirectoryComponentBeforeStat("bazel-out"))
+        #expect(defaults.canPruneDirectoryComponentBeforeStat(".buckd"))
+        #expect(defaults.canPruneDirectoryComponentBeforeStat("__pycache__"))
+        #expect(!defaults.canPruneDirectoryComponentBeforeStat(".build"))
+        #expect(!defaults.canPruneDirectoryComponentBeforeStat(".git"))
+
+        let withReinclude = FileExclusionRules(patterns: [
+            "buck-out/",
+            "!buck-out/keep/**"
+        ])
+        #expect(!withReinclude.canPruneDirectoryComponentBeforeStat("buck-out"))
+    }
+
     private func assertCompiledQueryParity(
         patterns: [String],
         roots: [String],

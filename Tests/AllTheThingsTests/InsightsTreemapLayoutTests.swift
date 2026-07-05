@@ -121,6 +121,47 @@ struct InsightsTreemapLayoutTests {
         #expect(!InsightsRootDisplay.isUnrepresented(exactEmptyRoot))
     }
 
+    @Test("index file display adds package overhead and sorts by size")
+    func indexFileDisplayAddsPackageOverheadAndSortsBySize() {
+        let items = InsightsIndexFileDisplay.items(
+            sidecars: [
+                IndexSidecarInsight(name: "manifest.json", allocatedBytes: 100),
+                IndexSidecarInsight(name: "records.bin", allocatedBytes: 700)
+            ],
+            packageBytes: 1_000
+        )
+
+        #expect(items.map(\.name) == ["records.bin", "Package overhead", "manifest.json"])
+        #expect(items.map(\.bytes) == [700, 200, 100])
+        #expect(items[1].isPackageOverhead)
+        #expect(items.allSatisfy { $0.packageBytes == 1_000 })
+    }
+
+    @Test("index files chart groups extra files and hit-tests the donut")
+    func indexFilesChartGroupsExtraFilesAndHitTestsTheDonut() {
+        let items = (0..<10).map { index in
+            InsightsIndexFileDisplayItem(
+                name: "file\(index).bin",
+                bytes: UInt64(1_000 - index * 50),
+                packageBytes: 10_000,
+                isPackageOverhead: false
+            )
+        }
+        let bounds = NSRect(x: 0, y: 0, width: 320, height: 126)
+        let rect = InsightsIndexFilesChartLayout.chartRect(in: bounds)
+        let firstSlicePoint = NSPoint(
+            x: rect.midX,
+            y: rect.midY - InsightsIndexFilesChartLayout.outerRadius(in: bounds) * 0.8
+        )
+
+        let slices = InsightsIndexFilesChartLayout.slices(from: items)
+        #expect(slices.count == InsightsIndexFilesChartLayout.maximumVisibleSlices)
+        #expect(slices.last?.name == "Other files")
+        #expect(slices.last?.itemCount == 3)
+        #expect(InsightsIndexFilesChartLayout.sliceIndex(at: firstSlicePoint, items: items, in: bounds) == 0)
+        #expect(InsightsIndexFilesChartLayout.sliceIndex(at: NSPoint(x: rect.midX, y: rect.midY), items: items, in: bounds) == nil)
+    }
+
     @Test("root access status identifies readable missing and non-folder roots")
     func rootAccessStatusIdentifiesReadableMissingAndNonFolderRoots() throws {
         let fileManager = FileManager.default
@@ -219,7 +260,7 @@ struct InsightsTreemapLayoutTests {
         #expect(window.contentView?.subviews.contains { $0 is NSScrollView } == false)
         #expect(contentRoot.fittingSize.height <= contentRoot.bounds.height + 1)
         #expect(contentRoot.fittingSize.width <= contentRoot.bounds.width + 1)
-        #expect(tabControl.segmentCount == 3)
+        #expect(tabControl.segmentCount == 4)
         #expect(tabControl.selectedSegment == 0)
         #expect(tabControl.segmentStyle == .separated)
         #expect(window.titleVisibility == .hidden)
@@ -276,15 +317,18 @@ struct InsightsTreemapLayoutTests {
         let pageIdentifiers = [
             "Insights.SummaryPage",
             "Insights.IndexPage",
-            "Insights.ActivityPage"
+            "Insights.ActivityPage",
+            "Insights.EnergyPage"
         ]
         let expectedTables = [
             "Insights.SummaryPage": "Insights.HealthFactsTable",
             "Insights.IndexPage": "Insights.StorageFactsTable",
-            "Insights.ActivityPage": "Insights.ActivityFactsTable"
+            "Insights.ActivityPage": "Insights.ActivityFactsTable",
+            "Insights.EnergyPage": "Insights.EnergyFactsTable"
         ]
         let expectedNestedViews = [
-            "Insights.ActivityPage": "Insights.QueryPanel"
+            "Insights.ActivityPage": "Insights.QueryPanel",
+            "Insights.EnergyPage": "Insights.EnergyChart"
         ]
 
         for (index, identifier) in pageIdentifiers.enumerated() {
@@ -308,10 +352,27 @@ struct InsightsTreemapLayoutTests {
                 let storageCard = try #require(findView(accessibilityIdentifier: "Insights.StorageCard", in: page))
                 let storageTreemap = try #require(findView(accessibilityIdentifier: "Insights.StorageTreemap", in: page))
                 let storageFactsTable = try #require(findView(accessibilityIdentifier: "Insights.StorageFactsTable", in: page))
+                let rootsLabel = try #require(findView(accessibilityIdentifier: "Insights.RootsLabel", in: page))
+                let indexFilesLabel = try #require(findView(accessibilityIdentifier: "Insights.IndexFilesLabel", in: page))
                 let rootsCard = try #require(findView(accessibilityIdentifier: "Insights.RootsCard", in: page))
-                #expect(storageTreemap.frame.height >= 205)
+                let indexFilesCard = try #require(findView(accessibilityIdentifier: "Insights.IndexFilesCard", in: page))
+                let indexFilesChart = try #require(findView(accessibilityIdentifier: "Insights.IndexFilesChart", in: page))
+                let storageTreemapFrame = storageTreemap.convert(storageTreemap.bounds, to: page)
+                let storageFactsFrame = storageFactsTable.convert(storageFactsTable.bounds, to: page)
+                let chartFrame = indexFilesChart.convert(indexFilesChart.bounds, to: page)
+                #expect(storageTreemap.frame.height >= 170)
                 #expect(storageFactsTable.frame.height <= 150)
-                #expect(storageCard.frame.height >= rootsCard.frame.height)
+                #expect(abs(storageFactsFrame.maxY - storageTreemapFrame.maxY) <= 1)
+                #expect(storageCard.frame.maxY <= page.bounds.maxY + 1)
+                #expect(rootsCard.frame.height >= 136)
+                #expect(indexFilesCard.frame.minX >= rootsCard.frame.maxX + 10)
+                #expect(abs(indexFilesCard.frame.minY - rootsCard.frame.minY) <= 1)
+                #expect(abs(indexFilesCard.frame.maxY - rootsCard.frame.maxY) <= 1)
+                #expect(indexFilesChart.frame.height >= 132)
+                #expect(abs(rootsLabel.frame.minX - (rootsCard.frame.minX + 10)) <= 2)
+                #expect(abs(indexFilesLabel.frame.minX - chartFrame.minX) <= 2)
+                #expect(abs(chartFrame.midX - indexFilesCard.frame.midX) <= 1)
+                #expect(findView(accessibilityIdentifier: "Insights.IndexFilesTable", in: page) == nil)
             }
 
             if identifier == "Insights.ActivityPage" {
@@ -319,6 +380,8 @@ struct InsightsTreemapLayoutTests {
                 let queryTitleLabel = try #require(findView(accessibilityIdentifier: "Insights.QueryTitleLabel", in: page))
                 let queryRouteChart = try #require(findView(accessibilityIdentifier: "Insights.QueryRouteChart", in: page))
                 let queryFactsTable = try #require(findView(accessibilityIdentifier: "Insights.QueryRouteFactsTable", in: page))
+                let activityCard = try #require(findView(accessibilityIdentifier: "Insights.ActivityCard", in: page))
+                let activityChart = try #require(findView(accessibilityIdentifier: "Insights.ActivityChart", in: page))
                 let routeMatrixHeader = try #require(findView(accessibilityIdentifier: "Insights.RouteMatrixHeader", in: page))
                 let previewRouteGroup = try #require(findView(accessibilityIdentifier: "Insights.PreviewRouteGroup", in: page))
                 let finalRouteGroup = try #require(findView(accessibilityIdentifier: "Insights.FinalRouteGroup", in: page))
@@ -330,6 +393,10 @@ struct InsightsTreemapLayoutTests {
                 let previewFrame = previewRouteGroup.convert(previewRouteGroup.bounds, to: page)
                 let finalFrame = finalRouteGroup.convert(finalRouteGroup.bounds, to: page)
 
+                #expect(findView(accessibilityIdentifier: "Insights.EnergyCard", in: page) == nil)
+                #expect(queryPanel.frame.maxY <= page.bounds.maxY + 1)
+                #expect(activityCard.frame.minY >= page.bounds.minY - 1)
+                #expect(activityChart.frame.height >= 150)
                 #expect(queryFactsTable.frame.width >= 600)
                 #expect(queryFactsTable.frame.width <= page.bounds.width * 0.75)
                 #expect(queryFactsTable.frame.height <= 150)
@@ -350,6 +417,29 @@ struct InsightsTreemapLayoutTests {
                 #expect(routeMatrixHeader.frame.height <= 32)
                 #expect(previewRouteGroup.frame.height <= 58)
                 #expect(finalRouteGroup.frame.height <= 58)
+            }
+
+            if identifier == "Insights.EnergyPage" {
+                let energyCard = try #require(findView(accessibilityIdentifier: "Insights.EnergyCard", in: page))
+                let energyTiles = try #require(findView(accessibilityIdentifier: "Insights.EnergyTiles", in: page))
+                let energyRange = try #require(findView(accessibilityIdentifier: "Insights.EnergyRangeControl", in: page) as? NSSegmentedControl)
+                let energyChart = try #require(findView(accessibilityIdentifier: "Insights.EnergyChart", in: page))
+                let energyFactsTable = try #require(findView(accessibilityIdentifier: "Insights.EnergyFactsTable", in: page))
+
+                #expect(findView(accessibilityIdentifier: "Insights.MaintenanceCard", in: page) == nil)
+                #expect(findView(accessibilityIdentifier: "Insights.MaintenanceCostChart", in: page) == nil)
+                #expect(energyCard.frame.maxY <= page.bounds.maxY + 1)
+                #expect(energyCard.frame.minY >= page.bounds.minY - 1)
+                #expect(abs(energyCard.frame.height - page.bounds.height) <= 1)
+                #expect(energyCard.frame.height >= 430)
+                #expect(energyTiles.frame.height >= 150)
+                #expect((0..<energyRange.segmentCount).map { energyRange.label(forSegment: $0) } == ["1h", "1d", "3m"])
+                #expect(energyRange.frame.maxY <= energyTiles.frame.minY - 8)
+                #expect(abs(energyRange.frame.midX - energyChart.frame.midX) <= 1)
+                #expect(energyChart.frame.height >= 210)
+                #expect(energyFactsTable.frame.width >= 280)
+                #expect(energyFactsTable.frame.minY >= energyChart.frame.minY - 1)
+                #expect(energyFactsTable.frame.maxY <= energyChart.frame.maxY + 1)
             }
         }
     }
@@ -446,6 +536,156 @@ struct InsightsTreemapLayoutTests {
         #expect(InsightsActivityChartLayout.bucketIndex(at: NSPoint(x: 1, y: bounds.maxY - 1), bucketCount: 4, in: bounds) == nil)
     }
 
+    @Test("energy timeline reserves space for legend and hit-tests line slots")
+    func energyTimelineReservesSpaceForLegendAndHitTestsLineSlots() {
+        let bounds = NSRect(x: 0, y: 0, width: 420, height: 120)
+        let completedAt = Date(timeIntervalSince1970: 1_800_000_000)
+        let samples = [
+            EnergyUsageIntervalSample(completedAt: completedAt.addingTimeInterval(-30), duration: 30, cpuTime: 3, wakeups: 5, mode: .foreground),
+            EnergyUsageIntervalSample(completedAt: completedAt, duration: 30, cpuTime: 6, wakeups: 8, mode: .background)
+        ]
+
+        let plot = InsightsEnergyTimelineLayout.plotRect(in: bounds)
+        let legend = InsightsEnergyTimelineLayout.legendRect(in: bounds)
+        let rects = InsightsEnergyTimelineLayout.sampleRects(samples: samples, in: bounds)
+
+        #expect(plot.minY >= bounds.minY)
+        #expect(plot.maxY <= legend.minY)
+        #expect(legend.maxY <= bounds.maxY)
+        #expect(rects.count == 2)
+        #expect(InsightsEnergyTimelineLayout.sampleIndex(at: center(of: rects[1]), samples: samples, in: bounds) == 1)
+        #expect(InsightsEnergyTimelineLayout.sampleIndex(at: NSPoint(x: 1, y: bounds.maxY - 1), samples: samples, in: bounds) == nil)
+    }
+
+    @Test("energy calendar lays out three month weekday grid with sparse buckets")
+    func energyCalendarLaysOutThreeMonthWeekdayGridWithSparseBuckets() throws {
+        let bounds = NSRect(x: 0, y: 0, width: 350, height: 140)
+        let buckets = (1...14).map { day in
+            DailyUsageBucket(day: String(format: "2026-06-%02d", day))
+        }
+
+        let referenceDate = try #require(Calendar(identifier: .gregorian).date(from: DateComponents(
+            year: 2026,
+            month: 7,
+            day: 4
+        )))
+        let grid = InsightsEnergyCalendarLayout.layout(buckets: buckets, in: bounds, referenceDate: referenceDate)
+        let items = grid.items
+        let firstBucket = try #require(items.first { $0.bucketIndex == 0 })
+        let seventhBucket = try #require(items.first { $0.bucketIndex == 6 })
+        let eighthBucket = try #require(items.first { $0.bucketIndex == 7 })
+
+        #expect(items.count == 92)
+        #expect(firstBucket.center.x == seventhBucket.center.x)
+        #expect(eighthBucket.center.x > firstBucket.center.x)
+        #expect(items.allSatisfy { bounds.contains($0.center) })
+        #expect(items.allSatisfy { bounds.contains($0.cellRect.origin) })
+        #expect(grid.weekdayLabels.map(\.title) == ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])
+        #expect(grid.monthLabels.map(\.title) == ["May", "Jun", "Jul"])
+        #expect(grid.monthSeparators.count == 2)
+        #expect(grid.monthSeparators[0].start.x < grid.monthSeparators[1].start.x)
+        #expect(grid.monthSeparators.allSatisfy { separator in
+            separator.start.x == separator.end.x
+                && separator.start.y < separator.end.y
+                && separator.start.x >= bounds.minX
+                && separator.start.x <= bounds.maxX
+                && separator.start.y >= bounds.minY
+                && separator.end.y <= bounds.maxY
+        })
+        #expect(items.filter { $0.bucketIndex != nil }.count == 14)
+        #expect(InsightsEnergyCalendarLayout.itemIndex(at: firstBucket.center, in: items) == 0)
+    }
+
+    @Test("energy calendar color does not turn red without comparison history")
+    func energyCalendarColorDoesNotTurnRedWithoutComparisonHistory() throws {
+        let baseline = try #require(
+            InsightsEnergyChartView.calendarColor(
+                backgroundImpact: 10,
+                maxBackgroundImpact: 10,
+                comparisonCount: 1
+            )
+                .usingColorSpace(.sRGB)
+        )
+        let maturePeak = try #require(
+            InsightsEnergyChartView.calendarColor(
+                backgroundImpact: 10,
+                maxBackgroundImpact: 10,
+                comparisonCount: 7
+            )
+                .usingColorSpace(.sRGB)
+        )
+
+        #expect(baseline.greenComponent > baseline.redComponent)
+        #expect(maturePeak.redComponent >= maturePeak.greenComponent)
+    }
+
+    @Test("energy calendar size uses activity while color uses background impact")
+    func energyCalendarSizeUsesActivityWhileColorUsesBackgroundImpact() throws {
+        let lowActivityHighBackground = DailyUsageBucket(
+            day: "2026-07-01",
+            searches: SearchUsageCounters(completed: 1),
+            energy: EnergyUsageBreakdown(
+                background: EnergyUsageCounters(cpuTime: 4, wakeups: 20_000)
+            )
+        )
+        let highActivityLowBackground = DailyUsageBucket(
+            day: "2026-07-02",
+            searches: SearchUsageCounters(
+                completed: 8,
+                candidateRowsExamined: 4_000,
+                scannedRowsExamined: 2_000
+            ),
+            health: IndexHealthCounters(incrementalRefreshBatches: 3),
+            maintenance: IndexMaintenanceCostCounters(
+                total: IndexMaintenanceOperationCounters(
+                    operations: 2,
+                    paths: 20,
+                    records: 500,
+                    visited: 1_500
+                )
+            )
+        )
+
+        let baseline = InsightsEnergyChartView.calendarActivityBaseline(scores: [
+            InsightsEnergyChartView.calendarActivityScore(lowActivityHighBackground),
+            InsightsEnergyChartView.calendarActivityScore(highActivityLowBackground)
+        ])
+        let lowActivityRadius = InsightsEnergyChartView.calendarRadiusScale(
+            activity: InsightsEnergyChartView.calendarActivityScore(lowActivityHighBackground),
+            baseline: baseline
+        )
+        let highActivityRadius = InsightsEnergyChartView.calendarRadiusScale(
+            activity: InsightsEnergyChartView.calendarActivityScore(highActivityLowBackground),
+            baseline: baseline
+        )
+
+        #expect(highActivityRadius > lowActivityRadius)
+        #expect(
+            InsightsEnergyChartView.backgroundEnergyImpactScore(lowActivityHighBackground)
+                > InsightsEnergyChartView.backgroundEnergyImpactScore(highActivityLowBackground)
+        )
+
+        let noBackgroundColor = try #require(
+            InsightsEnergyChartView.calendarColor(
+                backgroundImpact: InsightsEnergyChartView.backgroundEnergyImpactScore(highActivityLowBackground),
+                maxBackgroundImpact: InsightsEnergyChartView.backgroundEnergyImpactScore(lowActivityHighBackground),
+                comparisonCount: 3
+            )
+                .usingColorSpace(.sRGB)
+        )
+        let highBackgroundColor = try #require(
+            InsightsEnergyChartView.calendarColor(
+                backgroundImpact: InsightsEnergyChartView.backgroundEnergyImpactScore(lowActivityHighBackground),
+                maxBackgroundImpact: InsightsEnergyChartView.backgroundEnergyImpactScore(lowActivityHighBackground),
+                comparisonCount: 3
+            )
+                .usingColorSpace(.sRGB)
+        )
+
+        #expect(noBackgroundColor.greenComponent > noBackgroundColor.redComponent)
+        #expect(highBackgroundColor.redComponent >= highBackgroundColor.greenComponent)
+    }
+
     @Test("route mix layout hit testing follows visible route segments")
     func routeMixLayoutHitTestingFollowsVisibleRouteSegments() {
         let bounds = NSRect(x: 0, y: 0, width: 620, height: 76)
@@ -492,6 +732,33 @@ struct InsightsTreemapLayoutTests {
         #expect(rect.maxX > sourceSection.maxX)
         #expect(rect.maxX <= contentBounds.maxX - 8)
         #expect(rect.minY >= contentBounds.minY + 8)
+    }
+
+    @Test("hover placards support structured label value rows")
+    func hoverPlacardsSupportStructuredLabelValueRows() {
+        let rows = [
+            HoverLine(index: 0, rawValue: "2026-07-04"),
+            HoverLine(index: 1, rawValue: "Activity\t64.8"),
+            HoverLine(index: 2, rawValue: ""),
+            HoverLine(index: 3, rawValue: "Background CPU\t242.48 s")
+        ]
+        let size = InsightsHoverCardLayout.measuredSize(for: rows)
+        let rect = InsightsHoverCardLayout.placardRect(
+            lines: [
+                "2026-07-04",
+                "Activity\t64.8",
+                "",
+                "Background CPU\t242.48 s"
+            ],
+            near: NSPoint(x: 780, y: 580),
+            in: NSRect(x: 0, y: 0, width: 800, height: 600)
+        )
+
+        #expect(rows[1] == .row(label: "Activity", value: "64.8"))
+        #expect(rows[2] == .separator)
+        #expect(size.height == InsightsHoverCardLayout.lineHeight * 3 + InsightsHoverCardLayout.separatorHeight)
+        #expect(rect.maxX <= 792)
+        #expect(rect.maxY <= 592)
     }
 
     @Test("Insights panel palette keeps light panels lighter than dark panels")
