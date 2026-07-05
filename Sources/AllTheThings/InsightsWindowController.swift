@@ -3370,6 +3370,7 @@ private final class InsightsIndexFilesChartView: NSView {
     }
 
     override var isFlipped: Bool { true }
+    override var isOpaque: Bool { false }
 
     private var trackingArea: NSTrackingArea?
     private var hoveredSliceIndex: Int?
@@ -3462,8 +3463,6 @@ private final class InsightsIndexFilesChartView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         let isDark = InsightsPanelPalette.isDarkAppearance(effectiveAppearance)
-        InsightsPanelPalette.chartBackgroundColor(isDark: isDark).setFill()
-        bounds.fill()
 
         let spans = InsightsIndexFilesChartLayout.spans(from: items)
         guard !items.isEmpty else {
@@ -3479,16 +3478,33 @@ private final class InsightsIndexFilesChartView: NSView {
         let center = NSPoint(x: rect.midX, y: rect.midY)
         let outerRadius = InsightsIndexFilesChartLayout.outerRadius(in: bounds)
         let innerRadius = InsightsIndexFilesChartLayout.innerRadius(in: bounds)
+        func point(radius: CGFloat, angleDegrees: CGFloat) -> NSPoint {
+            let radians = angleDegrees * .pi / 180
+            return NSPoint(
+                x: center.x + cos(radians) * radius,
+                y: center.y + sin(radians) * radius
+            )
+        }
 
         for (index, span) in spans.enumerated() {
+            let startAngle = span.startAngle - 90
+            let endAngle = span.endAngle - 90
             let path = NSBezierPath()
-            path.move(to: center)
+            path.move(to: point(radius: outerRadius, angleDegrees: startAngle))
             path.appendArc(
                 withCenter: center,
                 radius: outerRadius,
-                startAngle: span.startAngle - 90,
-                endAngle: span.endAngle - 90,
+                startAngle: startAngle,
+                endAngle: endAngle,
                 clockwise: false
+            )
+            path.line(to: point(radius: innerRadius, angleDegrees: endAngle))
+            path.appendArc(
+                withCenter: center,
+                radius: innerRadius,
+                startAngle: endAngle,
+                endAngle: startAngle,
+                clockwise: true
             )
             path.close()
             Self.palette[index % Self.palette.count].withAlphaComponent(0.78).setFill()
@@ -3501,13 +3517,6 @@ private final class InsightsIndexFilesChartView: NSView {
             }
         }
 
-        InsightsPanelPalette.chartBackgroundColor(isDark: isDark).setFill()
-        NSBezierPath(ovalIn: NSRect(
-            x: center.x - innerRadius,
-            y: center.y - innerRadius,
-            width: innerRadius * 2,
-            height: innerRadius * 2
-        )).fill()
         drawCenterLabel(total: items.first?.packageBytes ?? 0, in: rect)
     }
 
