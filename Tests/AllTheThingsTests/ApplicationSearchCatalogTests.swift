@@ -187,6 +187,40 @@ struct ApplicationSearchCatalogTests {
         #expect(response.results.map(\.record.name) == ["Direct.app"])
         #expect(response.results.first?.rootPath == app.path)
     }
+
+    @Test("cancelled recursive scan does not publish app cache")
+    func cancelledRecursiveScanDoesNotPublishAppCache() throws {
+        let fixture = try AppCatalogFixture()
+        defer { fixture.remove() }
+
+        for index in 0..<8 {
+            try fixture.makeDirectory("Folder\(index)/Nested\(index)")
+        }
+
+        let catalog = ApplicationSearchCatalog()
+        var cancelChecks = 0
+        let cancelled = catalog.search(
+            queryText: "",
+            roots: [fixture.root],
+            sort: SortSpec(column: .name, ascending: true),
+            maxResults: 100
+        ) {
+            cancelChecks += 1
+            return cancelChecks >= 3
+        }
+
+        #expect(cancelled == nil)
+        #expect(cancelChecks >= 3)
+
+        _ = try fixture.makeApp("Later.app")
+        let response = try #require(catalog.search(
+            queryText: "",
+            roots: [fixture.root],
+            sort: SortSpec(column: .name, ascending: true),
+            maxResults: 100
+        ))
+        #expect(response.results.map(\.record.name) == ["Later.app"])
+    }
 }
 
 private struct AppCatalogFixture {

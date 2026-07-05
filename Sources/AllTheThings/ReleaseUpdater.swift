@@ -476,25 +476,39 @@ final class ReleaseUpdater {
     }
 
     private nonisolated static func download(asset: GitHubAsset) async throws -> DownloadedAsset {
+        try await download(asset: asset) { request in
+            try await URLSession.shared.download(for: request)
+        }
+    }
+
+    private nonisolated static func download(
+        asset: GitHubAsset,
+        using downloadHandler: (URLRequest) async throws -> (URL, URLResponse)
+    ) async throws -> DownloadedAsset {
         let fileManager = FileManager.default
         let workDirectory = fileManager.temporaryDirectory
             .appendingPathComponent("\(appName)-Update-\(UUID().uuidString)", isDirectory: true)
         try fileManager.createDirectory(at: workDirectory, withIntermediateDirectories: true)
 
-        var request = URLRequest(url: asset.browserDownloadURL)
-        request.setValue("AllTheThings update installer", forHTTPHeaderField: "User-Agent")
+        do {
+            var request = URLRequest(url: asset.browserDownloadURL)
+            request.setValue("AllTheThings update installer", forHTTPHeaderField: "User-Agent")
 
-        let (temporaryURL, response) = try await URLSession.shared.download(for: request)
-        if let httpResponse = response as? HTTPURLResponse,
-           !(200..<300).contains(httpResponse.statusCode) {
-            throw UpdateError.downloadFailed(httpResponse.statusCode)
+            let (temporaryURL, response) = try await downloadHandler(request)
+            if let httpResponse = response as? HTTPURLResponse,
+               !(200..<300).contains(httpResponse.statusCode) {
+                throw UpdateError.downloadFailed(httpResponse.statusCode)
+            }
+
+            let destination = workDirectory.appendingPathComponent(sanitizedFileName(asset.name), isDirectory: false)
+            try? fileManager.removeItem(at: destination)
+            try fileManager.moveItem(at: temporaryURL, to: destination)
+
+            return DownloadedAsset(archiveURL: destination, workDirectory: workDirectory)
+        } catch {
+            try? fileManager.removeItem(at: workDirectory)
+            throw error
         }
-
-        let destination = workDirectory.appendingPathComponent(sanitizedFileName(asset.name), isDirectory: false)
-        try? fileManager.removeItem(at: destination)
-        try fileManager.moveItem(at: temporaryURL, to: destination)
-
-        return DownloadedAsset(archiveURL: destination, workDirectory: workDirectory)
     }
 
     private nonisolated static func prepareDownloadedApp(
@@ -762,14 +776,34 @@ final class ReleaseUpdater {
 
         let outputPipe = Pipe()
         let errorPipe = Pipe()
+        let outputBuffer = CommandOutputBuffer()
+        let errorBuffer = CommandOutputBuffer()
         process.standardOutput = outputPipe
         process.standardError = errorPipe
 
-        try process.run()
+        outputPipe.fileHandleForReading.readabilityHandler = { handle in
+            outputBuffer.append(handle.availableData)
+        }
+        errorPipe.fileHandleForReading.readabilityHandler = { handle in
+            errorBuffer.append(handle.availableData)
+        }
+
+        do {
+            try process.run()
+        } catch {
+            outputPipe.fileHandleForReading.readabilityHandler = nil
+            errorPipe.fileHandleForReading.readabilityHandler = nil
+            throw error
+        }
         process.waitUntilExit()
 
-        let output = String(data: outputPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        let error = String(data: errorPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        outputPipe.fileHandleForReading.readabilityHandler = nil
+        errorPipe.fileHandleForReading.readabilityHandler = nil
+        outputBuffer.append(outputPipe.fileHandleForReading.readDataToEndOfFile())
+        errorBuffer.append(errorPipe.fileHandleForReading.readDataToEndOfFile())
+
+        let output = outputBuffer.string()
+        let error = errorBuffer.string()
         let combinedOutput = [output, error].joined(separator: "\n")
         guard process.terminationStatus == 0 else {
             throw UpdateError.commandFailed(
@@ -781,6 +815,46 @@ final class ReleaseUpdater {
 
         return combinedOutput
     }
+
+    private final class CommandOutputBuffer: @unchecked Sendable {
+        private let lock = NSLock()
+        private var data = Data()
+
+        func append(_ chunk: Data) {
+            guard !chunk.isEmpty else { return }
+            lock.withLock {
+                data.append(chunk)
+            }
+        }
+
+        func string() -> String {
+            let snapshot = lock.withLock { data }
+            return String(data: snapshot, encoding: .utf8) ?? ""
+        }
+    }
+
+#if DEBUG
+    nonisolated static func runCommandForTesting(_ executablePath: String, arguments: [String]) throws -> String {
+        try runCommand(executablePath, arguments: arguments)
+    }
+
+    nonisolated static func downloadForTesting(
+        assetName: String,
+        downloadURL: URL,
+        contentType: String? = nil,
+        using downloadHandler: (URLRequest) async throws -> (URL, URLResponse)
+    ) async throws -> URL {
+        let downloaded = try await download(
+            asset: GitHubAsset(
+                name: assetName,
+                contentType: contentType,
+                browserDownloadURL: downloadURL
+            ),
+            using: downloadHandler
+        )
+        return downloaded.workDirectory
+    }
+#endif
 
     private nonisolated static func sanitizedFileName(_ name: String) -> String {
         let invalidCharacters = CharacterSet(charactersIn: "/:")

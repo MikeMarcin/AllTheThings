@@ -53,8 +53,7 @@ final class ApplicationSearchCatalog: @unchecked Sendable {
         shouldCancel: () -> Bool = { false }
     ) -> SearchResponse? {
         let startedAt = Date()
-        let entries = appEntries(for: roots)
-        guard !shouldCancel() else { return nil }
+        guard let entries = appEntries(for: roots, shouldCancel: shouldCancel) else { return nil }
 
         let trimmedQuery = queryText.trimmingCharacters(in: .whitespacesAndNewlines)
         let queryIsEmpty = trimmedQuery.isEmpty
@@ -115,20 +114,24 @@ final class ApplicationSearchCatalog: @unchecked Sendable {
         )
     }
 
-    private func appEntries(for roots: [URL]) -> [AppEntry] {
-        lock.lock()
-        defer { lock.unlock() }
-
+    private func appEntries(for roots: [URL], shouldCancel: () -> Bool) -> [AppEntry]? {
         let standardizedRoots = roots.map(\.standardizedFileURL)
         let rootPaths = standardizedRoots.map(\.path)
-        guard rootPaths != cachedRootPaths else {
+
+        if let cachedEntries = cachedEntries(for: rootPaths) {
             return cachedEntries
         }
+
+        guard !shouldCancel() else { return nil }
 
         var entries: [AppEntry] = []
         var seenAppPaths = Set<String>()
 
         for root in standardizedRoots {
+            if shouldCancel() {
+                return nil
+            }
+
             if root.pathExtension.lowercased() == "app" {
                 guard seenAppPaths.insert(root.path).inserted else { continue }
                 if let record = FileRecord(url: root) {
@@ -141,7 +144,15 @@ final class ApplicationSearchCatalog: @unchecked Sendable {
                 continue
             }
 
-            scan(root, rootPath: root.path, entries: &entries, seenAppPaths: &seenAppPaths)
+            guard scan(
+                root,
+                rootPath: root.path,
+                entries: &entries,
+                seenAppPaths: &seenAppPaths,
+                shouldCancel: shouldCancel
+            ) else {
+                return nil
+            }
         }
 
         entries.sort { lhs, rhs in
@@ -150,17 +161,38 @@ final class ApplicationSearchCatalog: @unchecked Sendable {
             }
             return lhs.record.path < rhs.record.path
         }
+        guard !shouldCancel() else { return nil }
+        return publish(entries, for: rootPaths)
+    }
+
+    private func cachedEntries(for rootPaths: [String]) -> [AppEntry]? {
+        lock.lock()
+        defer { lock.unlock() }
+        return rootPaths == cachedRootPaths ? cachedEntries : nil
+    }
+
+    private func publish(_ entries: [AppEntry], for rootPaths: [String]) -> [AppEntry] {
+        lock.lock()
+        defer { lock.unlock() }
+
+        if rootPaths == cachedRootPaths {
+            return cachedEntries
+        }
+
         cachedRootPaths = rootPaths
         cachedEntries = entries
         return entries
     }
 
+    @discardableResult
     private func scan(
         _ directory: URL,
         rootPath: String,
         entries: inout [AppEntry],
-        seenAppPaths: inout Set<String>
-    ) {
+        seenAppPaths: inout Set<String>,
+        shouldCancel: () -> Bool
+    ) -> Bool {
+        guard !shouldCancel() else { return false }
         let children = (try? fileManager.contentsOfDirectory(
             at: directory,
             includingPropertiesForKeys: Array(FileRecord.resourceKeys),
@@ -168,6 +200,10 @@ final class ApplicationSearchCatalog: @unchecked Sendable {
         )) ?? []
 
         for child in children.sorted(by: { $0.path < $1.path }) {
+            if shouldCancel() {
+                return false
+            }
+
             guard let values = try? child.resourceValues(forKeys: FileRecord.resourceKeys) else { continue }
             let isDirectory = values.isDirectory ?? false
             guard isDirectory else { continue }
@@ -185,8 +221,18 @@ final class ApplicationSearchCatalog: @unchecked Sendable {
                 continue
             }
 
-            scan(standardized, rootPath: rootPath, entries: &entries, seenAppPaths: &seenAppPaths)
+            guard scan(
+                standardized,
+                rootPath: rootPath,
+                entries: &entries,
+                seenAppPaths: &seenAppPaths,
+                shouldCancel: shouldCancel
+            ) else {
+                return false
+            }
         }
+
+        return true
     }
 
     private static func compare(_ lhs: SearchResult, _ rhs: SearchResult, sort: SortSpec, queryIsEmpty: Bool) -> Bool {

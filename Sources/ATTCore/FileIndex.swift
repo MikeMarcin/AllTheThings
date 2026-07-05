@@ -1051,6 +1051,7 @@ public final class FileIndex: @unchecked Sendable {
 
     private struct RefreshUpdateResult {
         let applied: Bool
+        let completionReady: Bool
         let largeOverlay: Bool
         let priority: IndexWorkPriority
         let batchPathCount: Int
@@ -1063,6 +1064,7 @@ public final class FileIndex: @unchecked Sendable {
 
         static let none = RefreshUpdateResult(
             applied: false,
+            completionReady: false,
             largeOverlay: false,
             priority: .interactive,
             batchPathCount: 0,
@@ -1075,15 +1077,47 @@ public final class FileIndex: @unchecked Sendable {
         )
     }
 
+    private final class PendingRefreshCompletion: @unchecked Sendable {
+        private let lock = NSLock()
+        private var remainingPathCount: Int
+        private var didComplete = false
+        private let completion: @Sendable () -> Void
+
+        init(pathCount: Int, completion: @escaping @Sendable () -> Void) {
+            remainingPathCount = max(pathCount, 0)
+            self.completion = completion
+        }
+
+        func completeOnePath() {
+            let shouldComplete = lock.withLock { () -> Bool in
+                guard !didComplete else { return false }
+                remainingPathCount -= 1
+                guard remainingPathCount <= 0 else { return false }
+                didComplete = true
+                return true
+            }
+
+            if shouldComplete {
+                completion()
+            }
+        }
+    }
+
     private struct PendingRefreshWork: Sendable {
         let path: String
         var priority: IndexWorkPriority
         var firstQueuedAt: Date
         var lastQueuedAt: Date
+        var completions: [PendingRefreshCompletion]
 
-        mutating func merge(priority newPriority: IndexWorkPriority, queuedAt: Date) {
+        mutating func merge(
+            priority newPriority: IndexWorkPriority,
+            queuedAt: Date,
+            completions newCompletions: [PendingRefreshCompletion]
+        ) {
             priority = IndexWorkPriority.merged(priority, newPriority)
             lastQueuedAt = queuedAt
+            completions.append(contentsOf: newCompletions)
         }
 
         mutating func promote() {
@@ -4272,9 +4306,16 @@ public final class FileIndex: @unchecked Sendable {
         return .started
     }
 
-    public func update(paths rawPaths: [String], priority: IndexWorkPriority = .interactive) {
+    public func update(
+        paths rawPaths: [String],
+        priority: IndexWorkPriority = .interactive,
+        completion: (@Sendable () -> Void)? = nil
+    ) {
         let paths = Set(rawPaths.map { URL(fileURLWithPath: $0).standardizedFileURL.path })
-        guard !paths.isEmpty else { return }
+        guard !paths.isEmpty else {
+            completion?()
+            return
+        }
         DiagnosticLogger.shared.log(
             category: "index",
             event: "index.updateQueued",
@@ -4288,8 +4329,16 @@ public final class FileIndex: @unchecked Sendable {
         )
 
         let queuedAt = Date()
+        let completionTracker = completion.map {
+            PendingRefreshCompletion(pathCount: paths.count, completion: $0)
+        }
         lock.withLock {
-            queuePendingRefreshPathsWithoutLock(paths, priority: priority, queuedAt: queuedAt)
+            queuePendingRefreshPathsWithoutLock(
+                paths,
+                priority: priority,
+                queuedAt: queuedAt,
+                completion: completionTracker
+            )
         }
         scheduleUpdateDrainIfNeeded(delay: .milliseconds(150))
     }
@@ -11727,7 +11776,8 @@ public final class FileIndex: @unchecked Sendable {
     private func queuePendingRefreshPathsWithoutLock(
         _ paths: Set<String>,
         priority: IndexWorkPriority,
-        queuedAt: Date
+        queuedAt: Date,
+        completion: PendingRefreshCompletion? = nil
     ) {
         for path in paths {
             queuePendingRefreshWorkWithoutLock(
@@ -11735,7 +11785,8 @@ public final class FileIndex: @unchecked Sendable {
                     path: path,
                     priority: priority,
                     firstQueuedAt: queuedAt,
-                    lastQueuedAt: queuedAt
+                    lastQueuedAt: queuedAt,
+                    completions: completion.map { [$0] } ?? []
                 )
             )
         }
@@ -11751,7 +11802,11 @@ public final class FileIndex: @unchecked Sendable {
 
     private func queuePendingRefreshWorkWithoutLock(_ work: PendingRefreshWork) {
         if var existing = pendingRefreshPaths[work.path] {
-            existing.merge(priority: work.priority, queuedAt: work.lastQueuedAt)
+            existing.merge(
+                priority: work.priority,
+                queuedAt: work.lastQueuedAt,
+                completions: work.completions
+            )
             pendingRefreshPaths[work.path] = existing
         } else {
             pendingRefreshPaths[work.path] = work
@@ -11887,9 +11942,16 @@ public final class FileIndex: @unchecked Sendable {
             )
         }
 
-        if updateResult.largeOverlay, !updateResult.reconciledDirectoryPrefixes.isEmpty {
-            _ = prunePendingRefreshPaths(coveredBy: updateResult.reconciledDirectoryPrefixes)
+        var completedWorks: [PendingRefreshWork] = []
+        if updateResult.applied, updateResult.completionReady {
+            let deferredPaths = Set(updateResult.deferredRefreshes.map(\.path))
+            completedWorks = drain.works.filter { !deferredPaths.contains($0.path) }
         }
+
+        if updateResult.completionReady, updateResult.largeOverlay, !updateResult.reconciledDirectoryPrefixes.isEmpty {
+            completedWorks.append(contentsOf: prunePendingRefreshPaths(coveredBy: updateResult.reconciledDirectoryPrefixes))
+        }
+        Self.completePendingRefreshWorks(completedWorks)
 
         let remainingPathCount = lock.withLock { pendingRefreshPaths.count }
         if remainingPathCount > 0 {
@@ -11934,18 +11996,26 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
-    private func prunePendingRefreshPaths(coveredBy directoryPrefixes: [String]) -> Int {
+    private func prunePendingRefreshPaths(coveredBy directoryPrefixes: [String]) -> [PendingRefreshWork] {
         return lock.withLock {
-            let before = pendingRefreshPaths.count
             let prunedPaths = Self.prunedPendingRefreshPaths(
                 Set(pendingRefreshPaths.keys),
                 coveredBy: directoryPrefixes
             )
+            let removedWorks = pendingRefreshPaths.values.filter { !prunedPaths.contains($0.path) }
             pendingRefreshPaths = pendingRefreshPaths.filter { prunedPaths.contains($0.key) }
             if pendingRefreshPaths.isEmpty {
                 pendingRefreshPaths.removeAll(keepingCapacity: false)
             }
-            return before - pendingRefreshPaths.count
+            return removedWorks
+        }
+    }
+
+    private static func completePendingRefreshWorks(_ works: [PendingRefreshWork]) {
+        for work in works {
+            for completion in work.completions {
+                completion.completeOnePath()
+            }
         }
     }
 
@@ -11983,6 +12053,7 @@ public final class FileIndex: @unchecked Sendable {
     private func updateNow(requests: [PendingRefreshWork]) -> RefreshUpdateResult {
         let paths = requests.map(\.path)
         let updatePriority = Self.refreshBatchPriority(requests)
+        let requiresDurableCompletion = requests.contains { !$0.completions.isEmpty }
         let updateStarted = Date()
         let updateContext = lock.withLock { () -> (generation: UInt64, preservedReadyStatus: String?)? in
             guard !indexing else { return nil }
@@ -12062,7 +12133,8 @@ public final class FileIndex: @unchecked Sendable {
         func makeUpdateResult(
             applied: Bool,
             largeOverlay: Bool,
-            changedPathCount: Int
+            changedPathCount: Int,
+            completionReady: Bool? = nil
         ) -> RefreshUpdateResult {
             if applied {
                 let operationKind: IndexMaintenanceOperationKind = (requestedDirectoryRefresh || visitedCount > 0 || requiresDirectoryReconciliation)
@@ -12085,6 +12157,7 @@ public final class FileIndex: @unchecked Sendable {
 
             return RefreshUpdateResult(
                 applied: applied,
+                completionReady: completionReady ?? applied,
                 largeOverlay: largeOverlay,
                 priority: updatePriority,
                 batchPathCount: paths.count,
@@ -12279,11 +12352,20 @@ public final class FileIndex: @unchecked Sendable {
             }
 
             publishStats()
-            scheduleMetadataOverlayPersistIfReasonable(
-                updatedSnapshot,
-                changedPathCount: changedPathCount,
-                priority: updatePriority
-            )
+            let completionReady: Bool
+            if requiresDurableCompletion {
+                completionReady = persistSnapshot(
+                    schedulesPathGramBuild: false,
+                    priority: updatePriority.maintenancePriority
+                )
+            } else {
+                scheduleMetadataOverlayPersistIfReasonable(
+                    updatedSnapshot,
+                    changedPathCount: changedPathCount,
+                    priority: updatePriority
+                )
+                completionReady = true
+            }
             MemoryTelemetry.log(
                 "update.metadataApplied",
                 records: RecordCollectionMetrics(recordCount: updatedSnapshot.count, totalPathBytes: 0, maxPathBytes: 0),
@@ -12305,7 +12387,8 @@ public final class FileIndex: @unchecked Sendable {
             return makeUpdateResult(
                 applied: true,
                 largeOverlay: false,
-                changedPathCount: changedPathCount
+                changedPathCount: changedPathCount,
+                completionReady: completionReady
             )
         }
 
@@ -12399,11 +12482,20 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         publishStats()
-        scheduleRefreshPersistIfReasonable(
-            snapshot,
-            immediateLargeOverlay: isLargeOverlayUpdate,
-            priority: updatePriority
-        )
+        let completionReady: Bool
+        if requiresDurableCompletion {
+            completionReady = persistSnapshot(
+                schedulesPathGramBuild: false,
+                priority: updatePriority.maintenancePriority
+            )
+        } else {
+            scheduleRefreshPersistIfReasonable(
+                snapshot,
+                immediateLargeOverlay: isLargeOverlayUpdate,
+                priority: updatePriority
+            )
+            completionReady = true
+        }
         MemoryTelemetry.log(
             "update.overlayApplied",
             records: RecordCollectionMetrics(recordCount: snapshot.count, totalPathBytes: 0, maxPathBytes: 0),
@@ -12432,7 +12524,8 @@ public final class FileIndex: @unchecked Sendable {
         return makeUpdateResult(
             applied: true,
             largeOverlay: isLargeOverlayUpdate,
-            changedPathCount: changedPathCount
+            changedPathCount: changedPathCount,
+            completionReady: completionReady
         )
     }
 
