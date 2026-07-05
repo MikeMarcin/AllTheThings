@@ -987,6 +987,49 @@ struct FileIndexTests {
         #expect(result.record.sizeBytes == UInt64(newContents.utf8.count))
     }
 
+    @Test("update completion fires after exact refresh persists")
+    func updateCompletionFiresAfterExactRefreshPersists() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        let rootRecord = try #require(FileRecord(url: root))
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        defer {
+            try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName))
+        }
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        index.replaceRecordsForTesting([rootRecord], roots: [root])
+
+        let changedFile = root.appendingPathComponent("ExactRefreshCompletion.txt", isDirectory: false)
+        try "changed".write(to: changedFile, atomically: true, encoding: .utf8)
+
+        let before = index.currentDiagnostics()
+        let completion = CompletionFlag()
+        index.update(paths: [changedFile.path]) {
+            completion.mark()
+        }
+
+        try await waitUntil(timeout: .seconds(5)) {
+            completion.isMarked
+        }
+
+        let response = index.search(SearchRequest(
+            query: "ExactRefreshCompletion",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10)
+        #expect(response.results.contains { $0.record.path == changedFile.path })
+        #expect(index.currentDiagnostics().completedRefreshBatches > before.completedRefreshBatches)
+        #expect(index.currentDiagnostics().recordStoreKind == .mapped)
+        #expect(fileManager.fileExists(atPath: SnapshotLayout.packageURL(
+            in: supportDirectory(applicationName: applicationName)
+        ).path))
+    }
+
     @Test("metadata overlay checkpoints into mapped snapshot after quiet interval")
     func metadataOverlayCheckpointsIntoMappedSnapshotAfterQuietInterval() async throws {
         let fileManager = FileManager.default
@@ -3845,6 +3888,21 @@ private final class StatsRecorder: @unchecked Sendable {
     func snapshot() -> [IndexStats] {
         lock.withLock {
             stats
+        }
+    }
+}
+
+private final class CompletionFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var marked = false
+
+    var isMarked: Bool {
+        lock.withLock { marked }
+    }
+
+    func mark() {
+        lock.withLock {
+            marked = true
         }
     }
 }

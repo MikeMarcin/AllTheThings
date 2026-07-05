@@ -4211,6 +4211,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             case let .reconcile(paths, baselineEventID):
                 let paths = self.pathsIncludingReadableZeroRowRecoveryCandidates(paths)
                 let routedScopes = FSEventReconciliationScopeRouter.route(paths: paths)
+                let rootPaths = self.rootPaths(roots)
                 DiagnosticLogger.shared.log(
                     category: "fsevents",
                     event: "fsevents.reconciliationReconcile",
@@ -4225,15 +4226,21 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                         "updatePaths": .pathArray(routedScopes.updatePaths)
                     ]
                 )
-                if !routedScopes.updatePaths.isEmpty {
-                    self.index.update(paths: routedScopes.updatePaths)
-                }
                 if routedScopes.directoryPaths.isEmpty {
-                    self.fseventCursorStore.markBaseline(for: self.rootPaths(roots), eventID: baselineEventID)
+                    if routedScopes.updatePaths.isEmpty {
+                        self.fseventCursorStore.markBaseline(for: rootPaths, eventID: baselineEventID)
+                    } else {
+                        self.index.update(paths: routedScopes.updatePaths, priority: .background) { [fseventCursorStore = self.fseventCursorStore] in
+                            fseventCursorStore.markBaseline(for: rootPaths, eventID: baselineEventID)
+                        }
+                    }
                     self.startWatchingIfNeeded()
                     self.updateStatus()
                     self.scheduleZeroRowRootRecoveryIfNeeded()
                 } else {
+                    if !routedScopes.updatePaths.isEmpty {
+                        self.index.update(paths: routedScopes.updatePaths, priority: .background)
+                    }
                     let result = self.index.reconcileIndexedRootsInBackground(
                         rootURLs: routedScopes.directoryPaths.map { URL(fileURLWithPath: $0, isDirectory: true) },
                         activityPresentation: .backgroundCatchUp
