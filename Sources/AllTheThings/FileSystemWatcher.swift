@@ -31,6 +31,18 @@ struct FileSystemEvent: Sendable {
         flags & FSEventStreamEventFlags(kFSEventStreamEventFlagItemRemoved) != 0
             || flags & FSEventStreamEventFlags(kFSEventStreamEventFlagItemRenamed) != 0
     }
+
+    var requiresDirectoryRefreshScope: Bool {
+        itemIsDirectory || requiresRecursiveRescan || itemChangeRequiresDirectoryScope
+    }
+
+    func merging(_ other: FileSystemEvent) -> FileSystemEvent {
+        FileSystemEvent(
+            path: path,
+            flags: flags | other.flags,
+            eventID: max(eventID, other.eventID)
+        )
+    }
 }
 
 enum FSEventIndexFilter {
@@ -94,11 +106,7 @@ enum FSEventIndexFilter {
         for event in events {
             if let existingIndex = indexesByPath[event.path] {
                 let existing = coalescedEvents[existingIndex]
-                coalescedEvents[existingIndex] = FileSystemEvent(
-                    path: existing.path,
-                    flags: existing.flags | event.flags,
-                    eventID: max(existing.eventID, event.eventID)
-                )
+                coalescedEvents[existingIndex] = existing.merging(event)
             } else {
                 indexesByPath[event.path] = coalescedEvents.count
                 coalescedEvents.append(event)
@@ -318,6 +326,82 @@ struct FSEventReconciliationScopeRouting: Equatable, Sendable {
 
     var isEmpty: Bool {
         directoryPaths.isEmpty && updatePaths.isEmpty
+    }
+}
+
+struct FSEventLiveRefreshScopeRouting: Equatable, Sendable {
+    let exactPaths: [String]
+    let directoryPaths: [String]
+    let recursivePaths: [String]
+
+    var isEmpty: Bool {
+        exactPaths.isEmpty && directoryPaths.isEmpty
+    }
+}
+
+enum FSEventLiveRefreshScopeRouter {
+    static func route(events: [FileSystemEvent], rootPaths: [String]) -> FSEventLiveRefreshScopeRouting {
+        var exactPaths = Set<String>()
+        var directoryScopes = Set<String>()
+        var recursivePaths = Set<String>()
+
+        for event in events {
+            let path = URL(fileURLWithPath: event.path).standardizedFileURL.path
+            if event.requiresRecursiveRescan {
+                recursivePaths.insert(path)
+            }
+
+            if event.requiresDirectoryRefreshScope {
+                directoryScopes.insert(directoryScope(for: event, standardizedPath: path, rootPaths: rootPaths))
+            } else {
+                exactPaths.insert(path)
+            }
+        }
+
+        if !directoryScopes.isEmpty {
+            exactPaths = exactPaths.filter { exactPath in
+                directoryScopes.contains { scope in
+                    exactPath == scope || exactPath.hasPrefix(scope + "/")
+                } == false
+            }
+        }
+
+        return FSEventLiveRefreshScopeRouting(
+            exactPaths: exactPaths.sorted(),
+            directoryPaths: collapsedPaths(directoryScopes),
+            recursivePaths: recursivePaths.sorted()
+        )
+    }
+
+    private static func directoryScope(
+        for event: FileSystemEvent,
+        standardizedPath: String,
+        rootPaths: [String]
+    ) -> String {
+        guard let root = rootPaths.first(where: { standardizedPath == $0 || standardizedPath.hasPrefix($0 + "/") }) else {
+            return standardizedPath
+        }
+        guard standardizedPath != root else { return root }
+        if event.itemIsDirectory {
+            return standardizedPath
+        }
+
+        let parent = URL(fileURLWithPath: standardizedPath).deletingLastPathComponent().standardizedFileURL.path
+        guard parent != "/", parent == root || parent.hasPrefix(root + "/") else {
+            return root
+        }
+        return parent
+    }
+
+    private static func collapsedPaths(_ paths: Set<String>) -> [String] {
+        var collapsed: [String] = []
+        for path in paths.sorted(by: { $0.count < $1.count }) {
+            guard !collapsed.contains(where: { path == $0 || path.hasPrefix($0 + "/") }) else {
+                continue
+            }
+            collapsed.append(path)
+        }
+        return collapsed
     }
 }
 

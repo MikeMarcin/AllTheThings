@@ -133,6 +133,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         target: nil,
         action: nil
     )
+    private let rememberSortBetweenLaunchesSwitch = NSSwitch()
     private let highlightSearchTextSwitch = NSSwitch()
     private let showHiddenFilesSwitch = NSSwitch()
     private let allowMultipleInstancesSwitch = NSSwitch()
@@ -159,6 +160,8 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     private let indexSizeValueLabel = NSTextField(labelWithString: "")
     private let indexCreatedValueLabel = NSTextField(labelWithString: "")
     private let reindexButton = NSButton()
+    private let resetOptimizedSortColumnsButton = NSButton()
+    private var optimizedSortColumnButtons: [SortColumn: NSButton] = [:]
     private let exclusionsTableView = NSTableView()
     private let addExclusionButton = NSButton()
     private let resetExclusionsButton = NSButton()
@@ -470,6 +473,8 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         configureSwitch(launchAtLoginSwitch, action: #selector(toggleLaunchAtLogin(_:)))
         configureSwitch(menuBarIconSwitch, action: #selector(toggleMenuBarIcon(_:)))
         configureStatusFooterModeControl()
+        configureSwitch(rememberSortBetweenLaunchesSwitch, action: #selector(toggleRememberSortBetweenLaunches(_:)))
+        rememberSortBetweenLaunchesSwitch.identifier = NSUserInterfaceItemIdentifier("rememberSortBetweenLaunchesSwitch")
         configureSwitch(highlightSearchTextSwitch, action: #selector(toggleHighlightSearchText(_:)))
         configureSwitch(showHiddenFilesSwitch, action: #selector(toggleShowHiddenFiles(_:)))
         configureSwitch(allowMultipleInstancesSwitch, action: #selector(toggleAllowMultipleInstances(_:)))
@@ -491,6 +496,11 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
                 title: "Status footer",
                 detail: "Choose how much runtime detail appears below results.",
                 control: statusFooterModeSegmentedControl
+            ),
+            makeControlRow(
+                title: "Remember table sort between launches",
+                detail: "Restore the last selected table sort when the app opens.",
+                control: rememberSortBetweenLaunchesSwitch
             ),
             makeControlRow(
                 title: "Highlight search text",
@@ -597,6 +607,9 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         let indexLabel = makeSectionLabel("Index")
         configureIndexSummaryControls()
         let indexCard = makeIndexSummaryCard()
+        let optimizedSortLabel = makeSectionLabel("Search Performance")
+        configureOptimizedSortColumnControls()
+        let optimizedSortCard = makeOptimizedSortColumnsCard()
         let accessLabel = makeSectionLabel("Folder Access")
         configureFullDiskAccessButtons()
         let fullDiskAccessCard = makeFullDiskAccessCard()
@@ -707,6 +720,8 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
 
         contentView.addSubview(indexLabel)
         contentView.addSubview(indexCard)
+        contentView.addSubview(optimizedSortLabel)
+        contentView.addSubview(optimizedSortCard)
         contentView.addSubview(accessLabel)
         contentView.addSubview(fullDiskAccessCard)
         contentView.addSubview(rootsHeader)
@@ -726,7 +741,15 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
             indexCard.leadingAnchor.constraint(equalTo: indexLabel.leadingAnchor),
             indexCard.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -36),
 
-            accessLabel.topAnchor.constraint(equalTo: indexCard.bottomAnchor, constant: 28),
+            optimizedSortLabel.topAnchor.constraint(equalTo: indexCard.bottomAnchor, constant: 28),
+            optimizedSortLabel.leadingAnchor.constraint(equalTo: indexCard.leadingAnchor),
+            optimizedSortLabel.trailingAnchor.constraint(lessThanOrEqualTo: indexCard.trailingAnchor),
+
+            optimizedSortCard.topAnchor.constraint(equalTo: optimizedSortLabel.bottomAnchor, constant: 12),
+            optimizedSortCard.leadingAnchor.constraint(equalTo: indexCard.leadingAnchor),
+            optimizedSortCard.trailingAnchor.constraint(equalTo: indexCard.trailingAnchor),
+
+            accessLabel.topAnchor.constraint(equalTo: optimizedSortCard.bottomAnchor, constant: 28),
             accessLabel.leadingAnchor.constraint(equalTo: indexCard.leadingAnchor),
             accessLabel.trailingAnchor.constraint(lessThanOrEqualTo: indexCard.trailingAnchor),
 
@@ -822,6 +845,111 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
             indexSizeValueLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 150),
             indexCreatedValueLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 150)
         ])
+    }
+
+    private static func optimizedSortColumnTitle(_ column: SortColumn) -> String {
+        switch column {
+        case .relevance:
+            return "Relevance"
+        case .name:
+            return "Name"
+        case .path:
+            return "Path"
+        case .modified:
+            return "Modified"
+        case .created:
+            return "Created"
+        case .size:
+            return "Size"
+        case .fileExtension:
+            return "Extension"
+        case .kind:
+            return "Kind"
+        case .volume:
+            return "Volume"
+        case .root:
+            return "Root"
+        }
+    }
+
+    private func configureOptimizedSortColumnControls() {
+        configureIconButton(
+            resetOptimizedSortColumnsButton,
+            symbol: "arrow.counterclockwise",
+            tooltip: "Reset optimized sort columns",
+            action: #selector(resetOptimizedSortColumns(_:))
+        )
+
+        for (index, column) in SortColumn.optimizedIndexColumns.enumerated() {
+            let button = NSButton(
+                checkboxWithTitle: Self.optimizedSortColumnTitle(column),
+                target: self,
+                action: #selector(toggleOptimizedSortColumn(_:))
+            )
+            button.translatesAutoresizingMaskIntoConstraints = false
+            button.identifier = NSUserInterfaceItemIdentifier("optimizedSortColumn.\(column.rawValue)")
+            button.tag = index
+            button.font = AppSettings.appFont(defaults: defaults)
+            button.setContentHuggingPriority(.required, for: .horizontal)
+            optimizedSortColumnButtons[column] = button
+        }
+        updateOptimizedSortColumnControls()
+    }
+
+    private func updateOptimizedSortColumnControls() {
+        let enabledColumns = AppSettings.optimizedSortColumns(defaults: defaults)
+        for column in SortColumn.optimizedIndexColumns {
+            optimizedSortColumnButtons[column]?.state = enabledColumns.contains(column) ? .on : .off
+        }
+    }
+
+    private func makeOptimizedSortColumnsCard() -> NSView {
+        let card = makeCard()
+
+        let detailLabel = NSTextField(labelWithString: "Prebuild row-order indexes for sorted searches. Disable columns to reduce index sidecars and optimization work.")
+        detailLabel.translatesAutoresizingMaskIntoConstraints = false
+        detailLabel.font = AppSettings.appFont(defaults: defaults)
+        detailLabel.textColor = .secondaryLabelColor
+        detailLabel.lineBreakMode = .byWordWrapping
+        detailLabel.maximumNumberOfLines = 2
+
+        let grid = NSGridView()
+        grid.translatesAutoresizingMaskIntoConstraints = false
+        grid.rowSpacing = 8
+        grid.columnSpacing = 16
+        let columns = SortColumn.optimizedIndexColumns
+        for rowStart in stride(from: 0, to: columns.count, by: 3) {
+            let rowColumns = columns[rowStart..<min(rowStart + 3, columns.count)]
+            var views = rowColumns.compactMap { optimizedSortColumnButtons[$0] as NSView? }
+            while views.count < 3 {
+                let spacer = NSView()
+                spacer.translatesAutoresizingMaskIntoConstraints = false
+                views.append(spacer)
+            }
+            grid.addRow(with: views)
+        }
+
+        card.addSubview(detailLabel)
+        card.addSubview(grid)
+        card.addSubview(resetOptimizedSortColumnsButton)
+
+        NSLayoutConstraint.activate([
+            detailLabel.topAnchor.constraint(equalTo: card.topAnchor, constant: 16),
+            detailLabel.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 20),
+            detailLabel.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -20),
+
+            grid.topAnchor.constraint(equalTo: detailLabel.bottomAnchor, constant: 14),
+            grid.leadingAnchor.constraint(equalTo: detailLabel.leadingAnchor),
+            grid.trailingAnchor.constraint(lessThanOrEqualTo: resetOptimizedSortColumnsButton.leadingAnchor, constant: -16),
+            grid.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -16),
+
+            resetOptimizedSortColumnsButton.topAnchor.constraint(equalTo: grid.topAnchor),
+            resetOptimizedSortColumnsButton.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -20),
+            resetOptimizedSortColumnsButton.widthAnchor.constraint(equalToConstant: 28),
+            resetOptimizedSortColumnsButton.heightAnchor.constraint(equalToConstant: 24)
+        ])
+
+        return card
     }
 
     private func makeThemePreviewRow() -> NSView {
@@ -1743,6 +1871,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         statusFooterModeSegmentedControl.selectedSegment = AppStatusFooterMode.allCases.firstIndex(
             of: AppSettings.statusFooterMode(defaults: defaults)
         ) ?? 0
+        rememberSortBetweenLaunchesSwitch.state = AppSettings.rememberSortBetweenLaunches(defaults: defaults) ? .on : .off
         highlightSearchTextSwitch.state = defaults.bool(forKey: AppSettings.highlightSearchTextKey) ? .on : .off
         showHiddenFilesSwitch.state = defaults.bool(forKey: AppSettings.showHiddenFilesKey) ? .on : .off
         allowMultipleInstancesSwitch.state = defaults.bool(forKey: AppSettings.allowMultipleInstancesKey) ? .on : .off
@@ -1750,6 +1879,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         diagnosticLogLevelSegmentedControl.selectedSegment = Self.diagnosticDetailLevels.firstIndex(
             of: AppSettings.diagnosticLogLevel(defaults: defaults)
         ) ?? 0
+        updateOptimizedSortColumnControls()
         updateFullDiskAccessStatus()
         updateIndexedFoldersAccessWarning()
     }
@@ -2121,6 +2251,10 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         defaults.synchronize()
     }
 
+    @objc private func toggleRememberSortBetweenLaunches(_ sender: NSSwitch) {
+        AppSettings.saveRememberSortBetweenLaunches(sender.state == .on, defaults: defaults)
+    }
+
     @objc private func toggleMenuBarIcon(_ sender: NSSwitch) {
         AppSettings.saveMenuBarIconEnabled(sender.state == .on, defaults: defaults)
     }
@@ -2138,6 +2272,28 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     @objc private func toggleAutomaticallyCheckForUpdates(_ sender: NSSwitch) {
         ReleaseUpdater.shared.automaticallyChecksForUpdates = sender.state == .on
         defaults.synchronize()
+    }
+
+    @objc private func toggleOptimizedSortColumn(_ sender: NSButton) {
+        var columns = AppSettings.optimizedSortColumns(defaults: defaults)
+        guard sender.tag >= 0, sender.tag < SortColumn.optimizedIndexColumns.count else {
+            updateOptimizedSortColumnControls()
+            return
+        }
+        let column = SortColumn.optimizedIndexColumns[sender.tag]
+
+        if sender.state == .on {
+            columns.insert(column)
+        } else {
+            columns.remove(column)
+        }
+        AppSettings.saveOptimizedSortColumns(columns, defaults: defaults)
+        updateOptimizedSortColumnControls()
+    }
+
+    @objc private func resetOptimizedSortColumns(_ sender: NSButton) {
+        AppSettings.resetOptimizedSortColumns(defaults: defaults)
+        updateOptimizedSortColumnControls()
     }
 
     @objc private func addIndexedRoot(_ sender: NSButton) {

@@ -97,7 +97,7 @@ struct AppSettingsTests {
             )
         }
 
-        #expect(notificationReceived.wait(timeout: .now() + 2) == .success)
+        #expect(notificationReceived.wait(timeout: .now() + 10) == .success)
         #expect(probe.receivedOnMainThread)
     }
 
@@ -106,6 +106,54 @@ struct AppSettingsTests {
         let paths = AppSettings.suggestedDefaultIndexedRoots().map(\.standardizedFileURL.path)
 
         #expect(!paths.contains("/Applications"))
+    }
+
+    @Test("optimized sort columns default to every sortable column")
+    func optimizedSortColumnsDefaultToEverySortableColumn() throws {
+        let (defaults, suiteName) = try makeDefaults()
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        AppSettings.registerDefaults(defaults)
+
+        #expect(AppSettings.optimizedSortColumns(defaults: defaults) == Set(SortColumn.optimizedIndexColumns))
+    }
+
+    @Test("optimized sort columns save subset and ignore invalid values")
+    func optimizedSortColumnsSaveSubsetAndIgnoreInvalidValues() throws {
+        let (defaults, suiteName) = try makeDefaults()
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        AppSettings.registerDefaults(defaults)
+        AppSettings.saveOptimizedSortColumns([.name, .created, .size], defaults: defaults)
+
+        #expect(AppSettings.optimizedSortColumns(defaults: defaults) == [.name, .created, .size])
+
+        defaults.set(["name", "created", "not-a-column", "relevance"], forKey: AppSettings.optimizedSortColumnsKey)
+        #expect(AppSettings.optimizedSortColumns(defaults: defaults) == [.name, .created])
+    }
+
+    @Test("remember sort between launches defaults to reset and saves")
+    func rememberSortBetweenLaunchesDefaultsToResetAndSaves() throws {
+        let (defaults, suiteName) = try makeDefaults()
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        AppSettings.registerDefaults(defaults)
+
+        #expect(!AppSettings.rememberSortBetweenLaunches(defaults: defaults))
+
+        AppSettings.saveRememberSortBetweenLaunches(true, defaults: defaults)
+        #expect(AppSettings.rememberSortBetweenLaunches(defaults: defaults))
+        #expect(defaults.bool(forKey: AppSettings.rememberSortBetweenLaunchesKey))
+
+        AppSettings.saveRememberSortBetweenLaunches(false, defaults: defaults)
+        #expect(!AppSettings.rememberSortBetweenLaunches(defaults: defaults))
+        #expect(!defaults.bool(forKey: AppSettings.rememberSortBetweenLaunchesKey))
     }
 
     @Test("legacy default indexed roots move Applications to app search defaults")

@@ -1154,7 +1154,19 @@ public final class DiagnosticLogExporter: @unchecked Sendable {
                 "fullRebuilds": .publicUInt64(snapshot.usage.health.fullRebuilds),
                 "incrementalRefreshBatches": .publicUInt64(snapshot.usage.health.incrementalRefreshBatches),
                 "indexingFailures": .publicUInt64(snapshot.usage.health.indexingFailures),
-                "persistFailures": .publicUInt64(snapshot.usage.health.persistFailures)
+                "persistFailures": .publicUInt64(snapshot.usage.health.persistFailures),
+                "maintenanceOperations": .publicUInt64(snapshot.usage.maintenance.total.operations),
+                "maintenanceWallSeconds": .publicDouble(snapshot.usage.maintenance.total.wallTime),
+                "maintenanceApproxCPUSeconds": .publicDouble(snapshot.usage.maintenance.total.approximateCPUTime),
+                "maintenanceBackgroundOperations": .publicUInt64(snapshot.usage.maintenance.background.operations),
+                "maintenanceYieldedSlices": .publicUInt64(snapshot.usage.maintenance.total.yieldedSlices),
+                "maintenanceDeferredPaths": .publicUInt64(snapshot.usage.maintenance.total.deferredPaths),
+                "maintenanceExclusionRegexMatches": .publicUInt64(snapshot.usage.maintenance.total.exclusionRegexMatches),
+                "maintenanceExclusionFastPrunes": .publicUInt64(snapshot.usage.maintenance.total.exclusionFastPrunes),
+                "pendingRefreshPathCount": .publicInt(snapshot.health.maintenance.pendingRefreshPathCount),
+                "pendingBackgroundRefreshPathCount": .publicInt(snapshot.health.maintenance.pendingBackgroundRefreshPathCount),
+                "pendingReconciliationScopeCount": .publicInt(snapshot.health.maintenance.pendingReconciliationScopeCount),
+                "fullReconciliationPending": .publicBool(snapshot.health.maintenance.isFullReconciliationPending)
             ]
         )
     }

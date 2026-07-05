@@ -95,6 +95,26 @@ enum DiagnosticsReportBuilder {
         lines.append("- Temp Cleanup Count: \(health.tempCleanupCount)")
         lines.append("")
 
+        lines.append("## Maintenance Costs")
+        appendMaintenanceCounters("Aggregate", snapshot.usage.maintenance.total, to: &lines)
+        appendMaintenanceCounters("Interactive", snapshot.usage.maintenance.interactive, to: &lines)
+        appendMaintenanceCounters("Background", snapshot.usage.maintenance.background, to: &lines)
+        lines.append("- Pending Refresh Paths: \(snapshot.health.maintenance.pendingRefreshPathCount)")
+        lines.append("- Pending Background Refresh Paths: \(snapshot.health.maintenance.pendingBackgroundRefreshPathCount)")
+        lines.append("- Pending Reconciliation Scopes: \(snapshot.health.maintenance.pendingReconciliationScopeCount)")
+        lines.append("- Full Reconciliation Pending: \(snapshot.health.maintenance.isFullReconciliationPending)")
+        lines.append("- Deferred Optimization: \(deferredMaintenanceString(reason: snapshot.health.maintenance.deferredOptimizationReason, delay: snapshot.health.maintenance.deferredOptimizationDelay))")
+        lines.append("- Deferred Checkpoint: \(deferredMaintenanceString(reason: snapshot.health.maintenance.deferredCheckpointReason, delay: snapshot.health.maintenance.deferredCheckpointDelay))")
+        if !snapshot.usage.maintenance.byKind.isEmpty {
+            lines.append("- By Kind:")
+            for kind in IndexMaintenanceOperationKind.allCases {
+                let counters = snapshot.usage.maintenance.counters(for: kind)
+                guard counters.operations > 0 else { continue }
+                lines.append("  - \(kind.rawValue): operations=\(counters.operations), wall=\(durationString(counters.wallTime)), approxCPU=\(durationString(counters.approximateCPUTime)), paths=\(counters.paths), records=\(counters.records), visits=\(counters.visited), yields=\(counters.yieldedSlices)")
+            }
+        }
+        lines.append("")
+
         lines.append("## File Actions")
         if snapshot.usage.allTimeFileActions.isEmpty {
             lines.append("- none")
@@ -123,11 +143,38 @@ enum DiagnosticsReportBuilder {
             lines.append("- none")
         } else {
             for bucket in recentBuckets {
-                lines.append("- \(bucket.day): searches=\(bucket.searches.completed), initial=\(bucket.initialSearches.completed), refined=\(bucket.refinedSearches.completed), fallbacks=\(bucket.searches.fallbackScans), refreshes=\(bucket.health.incrementalRefreshBatches), rebuilds=\(bucket.health.fullRebuilds), launches=\(bucket.launches), memoryLatest=\(byteString(bucket.memory.latestBytes))")
+                lines.append("- \(bucket.day): searches=\(bucket.searches.completed), initial=\(bucket.initialSearches.completed), refined=\(bucket.refinedSearches.completed), fallbacks=\(bucket.searches.fallbackScans), refreshes=\(bucket.health.incrementalRefreshBatches), rebuilds=\(bucket.health.fullRebuilds), maintenanceWall=\(durationString(bucket.maintenance.total.wallTime)), maintenanceApproxCPU=\(durationString(bucket.maintenance.total.approximateCPUTime)), launches=\(bucket.launches), memoryLatest=\(byteString(bucket.memory.latestBytes))")
             }
         }
 
         return lines.joined(separator: "\n")
+    }
+
+    private static func appendMaintenanceCounters(
+        _ title: String,
+        _ counters: IndexMaintenanceOperationCounters,
+        to lines: inout [String]
+    ) {
+        lines.append("\(title):")
+        lines.append("- Operations: \(counters.operations)")
+        lines.append("- Wall Time: \(durationString(counters.wallTime))")
+        lines.append("- Approx CPU Time: \(durationString(counters.approximateCPUTime))")
+        lines.append("- Paths: \(counters.paths)")
+        lines.append("- Records: \(counters.records)")
+        lines.append("- Visits: \(counters.visited)")
+        lines.append("- Yielded Slices: \(counters.yieldedSlices)")
+        lines.append("- Deferred Paths: \(counters.deferredPaths)")
+        lines.append("- Large Overlays: \(counters.largeOverlays)")
+        lines.append("- Optimization Deferrals: \(counters.optimizationDeferrals)")
+        lines.append("- Exclusion Decisions: \(counters.exclusionDecisions)")
+        lines.append("- Exclusion Regex Matches: \(counters.exclusionRegexMatches)")
+        lines.append("- Exclusion Fast-Path Decisions: \(counters.exclusionFastPathDecisions)")
+        lines.append("- Exclusion Fast-Prunes: \(counters.exclusionFastPrunes)")
+    }
+
+    private static func deferredMaintenanceString(reason: String?, delay: TimeInterval?) -> String {
+        guard let reason else { return "none" }
+        return "\(reason), delay \(durationString(delay ?? 0))"
     }
 
     private static func appendSearchCounters(_ counters: SearchUsageCounters, to lines: inout [String]) {

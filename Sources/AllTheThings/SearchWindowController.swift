@@ -397,13 +397,42 @@ enum SearchPreviewScheduling {
         if trimmedQuery.isEmpty {
             return "emptyQuery"
         }
-        if sortColumn != .relevance && sortColumn != .name && sortColumn != .modified {
-            return "unsupportedSort"
-        }
+        _ = sortColumn
         if signatureAlreadyDisplayed {
             return "alreadyDisplayed"
         }
         return nil
+    }
+}
+
+enum SearchSortPersistence {
+    static let sortColumnKey = "ATTSortColumn"
+    static let sortAscendingKey = "ATTSortAscending"
+    static let defaultSortSpec = SortSpec(column: .name, ascending: true)
+
+    static func initialSortSpec(defaults: UserDefaults, visibleSortColumns: Set<SortColumn>) -> SortSpec {
+        let loadedSort = AppSettings.rememberSortBetweenLaunches(defaults: defaults)
+            ? loadSortSpec(defaults: defaults)
+            : defaultSortSpec
+        return normalizedSortSpec(loadedSort, visibleSortColumns: visibleSortColumns)
+    }
+
+    static func loadSortSpec(defaults: UserDefaults) -> SortSpec {
+        guard
+            let rawColumn = defaults.string(forKey: sortColumnKey),
+            let column = SortColumn(rawValue: rawColumn)
+        else {
+            return defaultSortSpec
+        }
+
+        let ascending = defaults.object(forKey: sortAscendingKey) == nil
+            ? defaultSortSpec.ascending
+            : defaults.bool(forKey: sortAscendingKey)
+        return SortSpec(column: column, ascending: ascending)
+    }
+
+    static func normalizedSortSpec(_ spec: SortSpec, visibleSortColumns: Set<SortColumn>) -> SortSpec {
+        visibleSortColumns.contains(spec.column) ? spec : defaultSortSpec
     }
 }
 
@@ -1084,8 +1113,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var rootDisplayNames: [String: String] = [:]
     private var pendingRawFSEvents: [FileSystemEvent] = []
     private var rawFSEventFilterDebounce: DispatchWorkItem?
-    private var pendingEventPaths = Set<String>()
-    private var pendingRecursiveEventPaths = Set<String>()
+    private var pendingFSEventsByPath: [String: FileSystemEvent] = [:]
     private var eventDebounce: DispatchWorkItem?
     private var lastDroppedOnlyFSEventLogDate: Date?
     private var suppressedDroppedOnlyFSEventCount = 0
@@ -1098,7 +1126,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var queuedFSEventScopedCatchUpBaseline: (rootPaths: [String], eventID: UInt64)?
     private var memoryStatusTask: Task<Void, Never>?
     private var memoryStatusText = ProcessMemoryFormatter.label(for: ProcessMemorySampler.currentUsage())
+    private var processResourceTask: Task<Void, Never>?
+    private var processResourceBaseline: ProcessResourceUsage?
     private var energyMode: EnergyMode = .interactive
+    private var backgroundEnergyModeEnteredAt: Date?
     private var mascotCoordinator: OperationMascotCoordinator?
     private var expandedMascotPresenter: ExpandedMascotPresentationController?
     private var loadingMascotCoordinator: OperationMascotCoordinator?
@@ -1130,8 +1161,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var matchDetailsPopover: NSPopover?
 
     private enum DefaultsKey {
-        static let sortColumn = "ATTSortColumn"
-        static let sortAscending = "ATTSortAscending"
+        static let sortColumn = SearchSortPersistence.sortColumnKey
+        static let sortAscending = SearchSortPersistence.sortAscendingKey
         static let visibleColumns = "ATTVisibleColumns"
         static let visibleColumnsSchema = "ATTVisibleColumnsSchema"
     }
@@ -1184,12 +1215,19 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             }
         }
 
-        var eventDebounceDelay: TimeInterval {
+        func eventDebounceDelay(inactiveDuration: TimeInterval?) -> TimeInterval {
             switch self {
             case .interactive:
                 return 0.05
             case .background:
-                return 3.0
+                let duration = inactiveDuration ?? 0
+                if duration < 3 * 60 {
+                    return 3.0
+                }
+                if duration < 15 * 60 {
+                    return 15.0
+                }
+                return 60.0
             }
         }
 
@@ -1202,12 +1240,30 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             }
         }
 
+        var processResourcePollInterval: Duration {
+            switch self {
+            case .interactive:
+                return .seconds(30)
+            case .background:
+                return .seconds(60)
+            }
+        }
+
+        var usageMode: EnergyUsageMode {
+            switch self {
+            case .interactive:
+                return .foreground
+            case .background:
+                return .background
+            }
+        }
+
         var suspendsMascotPlayback: Bool {
             self == .background
         }
     }
 
-    private static let defaultSortSpec = SortSpec(column: .name, ascending: true)
+    private static let defaultSortSpec = SearchSortPersistence.defaultSortSpec
     private static let defaultVisibleColumns = Set(Column.allCases.filter { $0 != .root })
 
     private lazy var dateFormatter: DateFormatter = {
@@ -1229,9 +1285,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         AppSettings.registerDefaults(defaults)
         let visibleColumns = Self.loadVisibleColumns(defaults: defaults)
         self.index = index
+        index.updateOptimizedSortColumns(AppSettings.optimizedSortColumns(defaults: defaults))
         self.indexStats = index.currentStats()
         self.visibleColumns = visibleColumns
-        self.sortSpec = Self.normalizedSortSpec(Self.loadSortSpec(defaults: defaults), visibleColumns: visibleColumns)
+        self.sortSpec = Self.initialSortSpec(defaults: defaults, visibleColumns: visibleColumns)
         self.indexedRoots = AppSettings.indexedRoots(defaults: defaults)
         self.rootDisplayNames = Self.rootDisplayNames(for: self.indexedRoots.map { $0.standardizedFileURL.path })
         self.highlightsSearchText = defaults.bool(forKey: AppSettings.highlightSearchTextKey)
@@ -1247,6 +1304,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         searchStatusTimer?.invalidate()
         searchStatusTimer = nil
         memoryStatusTask?.cancel()
+        processResourceTask?.cancel()
         activeExplanationToken.cancel()
         pendingMascotExpansion?.cancel()
         pendingZeroRowRootRecoveryWorkItem?.cancel()
@@ -1320,6 +1378,12 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         )
         NotificationCenter.default.addObserver(
             self,
+            selector: #selector(optimizedSortColumnsDidChange(_:)),
+            name: AppSettings.optimizedSortColumnsDidChangeNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
             selector: #selector(applicationDidBecomeActive(_:)),
             name: NSApplication.didBecomeActiveNotification,
             object: nil
@@ -1334,6 +1398,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         applyEnergyMode(Self.currentEnergyMode(), force: true)
         startWatchingIfNeeded()
         startMemoryStatusPolling()
+        startProcessResourcePolling()
         updateScanSnapshotPublishingPreference()
         updateLoadingOverlay()
 
@@ -2618,8 +2683,12 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let appSearchQuery = ApplicationSearchQuery.parse(queryText)
         guard appSearchQuery != nil || !indexStats.isLoadingSnapshot else { return }
 
+        let trimmedQuery = queryText.trimmingCharacters(in: .whitespacesAndNewlines)
         let request = SearchRequest(query: queryText, sort: sortSpec, includeHidden: showsHiddenFiles)
         if appSearchQuery == nil {
+            if !trimmedQuery.isEmpty {
+                index.prioritizeSearchOptimization(for: request.sort.column)
+            }
             updateScanSnapshotPublishingPreference(for: request)
         }
         let signature = SearchSignature(
@@ -2688,7 +2757,6 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let generation = queryGeneration
         let index = self.index
         let budgetTimeout = SearchBudgetTimeout()
-        let trimmedQuery = request.query.trimmingCharacters(in: .whitespacesAndNewlines)
         let previewSkipReason = SearchPreviewScheduling.skipReason(
             appSearchActive: appSearchQuery != nil,
             trimmedQuery: trimmedQuery,
@@ -3343,9 +3411,16 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     nonisolated private static func shouldBudgetSearchDuringIndexing(request: SearchRequest, stats: IndexStats) -> Bool {
         let trimmedQuery = request.query.trimmingCharacters(in: .whitespacesAndNewlines)
-        return !trimmedQuery.isEmpty
-            && stats.isIndexing
+        let hasUnoptimizedSearchableSnapshot = stats.searchableCount > 0
             && stats.optimizedCount < stats.searchableCount
+        let unoptimizedWorkActive = stats.isIndexing
+            || stats.isReconciling
+            || stats.isUpdating
+            || stats.phase == .optimizing
+            || stats.phase == .saving
+        return !trimmedQuery.isEmpty
+            && hasUnoptimizedSearchableSnapshot
+            && unoptimizedWorkActive
     }
 
     private func startIndexingAfterFirstPaint() {
@@ -3766,8 +3841,15 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         rebuildIndexForCurrentSettings()
     }
 
+    @objc private func optimizedSortColumnsDidChange(_ notification: Notification) {
+        index.updateOptimizedSortColumns(AppSettings.optimizedSortColumns(defaults: defaults))
+        scheduledSearchSignature = nil
+        scheduleSearch(force: true)
+    }
+
     @objc private func applicationDidBecomeActive(_ notification: Notification) {
         if applyEnergyMode(.interactive) {
+            index.promoteBackgroundMaintenance()
             runFSEventsBackedReconciliation(roots: indexedRoots)
         }
         guard !zeroRowRootRecoveryCandidatePaths.isEmpty else { return }
@@ -3786,12 +3868,28 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private func applyEnergyMode(_ mode: EnergyMode, force: Bool = false) -> Bool {
         guard force || energyMode != mode else { return false }
 
+        if !force {
+            recordProcessResourceSample(mode: energyMode)
+        }
         energyMode = mode
+        backgroundEnergyModeEnteredAt = mode == .background ? Date() : nil
         startWatchingIfNeeded()
         reschedulePendingFSEventFlushIfNeeded()
         restartMemoryStatusPolling()
+        resetProcessResourceBaseline()
+        restartProcessResourcePolling()
         applyMascotPlaybackSuspension()
         return true
+    }
+
+    private var currentEventDebounceDelay: TimeInterval {
+        let inactiveDuration: TimeInterval?
+        if let backgroundEnergyModeEnteredAt {
+            inactiveDuration = Date().timeIntervalSince(backgroundEnergyModeEnteredAt)
+        } else {
+            inactiveDuration = nil
+        }
+        return energyMode.eventDebounceDelay(inactiveDuration: inactiveDuration)
     }
 
     private func applyMascotPlaybackSuspension() {
@@ -4052,8 +4150,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         pendingRawFSEvents.removeAll(keepingCapacity: false)
         eventDebounce?.cancel()
         eventDebounce = nil
-        pendingEventPaths.removeAll(keepingCapacity: false)
-        pendingRecursiveEventPaths.removeAll(keepingCapacity: false)
+        pendingFSEventsByPath.removeAll(keepingCapacity: false)
         cancelFSEventCatchUp()
         fseventCursorStore.markBaseline(for: rootPaths(indexedRoots))
         startWatchingIfNeeded()
@@ -4176,7 +4273,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                     .map { URL(fileURLWithPath: $0, isDirectory: true) }
                 self.index.reconcileIndexedRootsInBackground(
                     rootURLs: rootURLs,
-                    activityPresentation: .foreground
+                    activityPresentation: .backgroundCatchUp
                 )
             }
         }
@@ -4261,7 +4358,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             self?.filterPendingRawFSEvents()
         }
         rawFSEventFilterDebounce = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + energyMode.eventDebounceDelay, execute: workItem)
+        DispatchQueue.main.asyncAfter(deadline: .now() + currentEventDebounceDelay, execute: workItem)
     }
 
     private func filterPendingRawFSEvents() {
@@ -4294,8 +4391,13 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         flushSuppressedDroppedOnlyFSEventLogs()
         let recursiveEventCount = filteredEvents.filter(\.requiresRecursiveRescan).count
-        pendingEventPaths.formUnion(filteredEvents.map(\.path))
-        pendingRecursiveEventPaths.formUnion(filteredEvents.filter(\.requiresRecursiveRescan).map(\.path))
+        for event in filteredEvents {
+            if let existing = pendingFSEventsByPath[event.path] {
+                pendingFSEventsByPath[event.path] = existing.merging(event)
+            } else {
+                pendingFSEventsByPath[event.path] = event
+            }
+        }
         DiagnosticLogger.shared.log(
             category: "fsevents",
             event: "fsevents.eventsReceived",
@@ -4368,27 +4470,36 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             self?.flushCoalescedFSEvents()
         }
         eventDebounce = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + energyMode.eventDebounceDelay, execute: workItem)
+        DispatchQueue.main.asyncAfter(deadline: .now() + currentEventDebounceDelay, execute: workItem)
     }
 
     private func reschedulePendingFSEventFlushIfNeeded() {
         if rawFSEventFilterDebounce != nil, !pendingRawFSEvents.isEmpty {
             scheduleRawFSEventFiltering()
         }
-        guard eventDebounce != nil, !pendingEventPaths.isEmpty else { return }
+        guard eventDebounce != nil, !pendingFSEventsByPath.isEmpty else { return }
         scheduleCoalescedFSEventFlush()
     }
 
     private func flushCoalescedFSEvents() {
         eventDebounce = nil
-        let paths = Array(pendingEventPaths)
-        let recursivePaths = Array(pendingRecursiveEventPaths)
-        pendingEventPaths.removeAll(keepingCapacity: false)
-        pendingRecursiveEventPaths.removeAll(keepingCapacity: false)
-        guard !paths.isEmpty else { return }
+        let events = Array(pendingFSEventsByPath.values)
+        pendingFSEventsByPath.removeAll(keepingCapacity: false)
+        guard !events.isEmpty else { return }
+
+        let routedScopes = FSEventLiveRefreshScopeRouter.route(
+            events: events,
+            rootPaths: rootPaths(indexedRoots)
+        )
+        let priority: IndexWorkPriority = energyMode == .background ? .background : .interactive
         playMascotTransient(.fileChanged)
-        index.update(paths: paths)
-        if !recursivePaths.isEmpty {
+        if !routedScopes.exactPaths.isEmpty {
+            index.update(paths: routedScopes.exactPaths, priority: priority)
+        }
+        if !routedScopes.directoryPaths.isEmpty {
+            index.update(paths: routedScopes.directoryPaths, priority: priority)
+        }
+        if !routedScopes.recursivePaths.isEmpty {
             index.recordRecursiveRescan()
         }
     }
@@ -4411,6 +4522,57 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         memoryStatusTask?.cancel()
         memoryStatusTask = nil
         startMemoryStatusPolling()
+    }
+
+    private func startProcessResourcePolling() {
+        guard processResourceTask == nil else { return }
+
+        if processResourceBaseline == nil {
+            resetProcessResourceBaseline()
+        }
+        processResourceTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                try? await Task.sleep(for: self.energyMode.processResourcePollInterval)
+                guard !Task.isCancelled else { return }
+                self.recordProcessResourceSample(mode: self.energyMode)
+            }
+        }
+    }
+
+    private func restartProcessResourcePolling() {
+        processResourceTask?.cancel()
+        processResourceTask = nil
+        startProcessResourcePolling()
+    }
+
+    private func resetProcessResourceBaseline() {
+        processResourceBaseline = ProcessResourceSampler.currentUsage()
+    }
+
+    private func recordProcessResourceSample(mode: EnergyMode) {
+        guard let current = ProcessResourceSampler.currentUsage() else {
+            processResourceBaseline = nil
+            return
+        }
+        defer {
+            processResourceBaseline = current
+        }
+
+        guard
+            let previous = processResourceBaseline,
+            let delta = ProcessResourceSampler.delta(from: previous, to: current)
+        else {
+            return
+        }
+
+        index.recordEnergySample(
+            completedAt: delta.completedAt,
+            duration: delta.duration,
+            cpuTime: delta.cpuTime,
+            wakeups: delta.wakeups,
+            mode: mode.usageMode
+        )
     }
 
     private func refreshMemoryStatusAndUpdateFooter() {
@@ -5419,18 +5581,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private static func loadSortSpec(defaults: UserDefaults) -> SortSpec {
-        guard
-            let rawColumn = defaults.string(forKey: DefaultsKey.sortColumn),
-            let column = SortColumn(rawValue: rawColumn),
-            Column.column(for: column) != nil
-        else {
-            return defaultSortSpec
-        }
-
-        let ascending = defaults.object(forKey: DefaultsKey.sortAscending) == nil
-            ? defaultSortSpec.ascending
-            : defaults.bool(forKey: DefaultsKey.sortAscending)
-        return SortSpec(column: column, ascending: ascending)
+        SearchSortPersistence.loadSortSpec(defaults: defaults)
     }
 
     private static func loadVisibleColumns(defaults: UserDefaults) -> Set<Column> {
@@ -5497,10 +5648,16 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private static func normalizedSortSpec(_ spec: SortSpec, visibleColumns: Set<Column>) -> SortSpec {
-        guard let column = Column.column(for: spec.column), visibleColumns.contains(column) else {
-            return defaultSortSpec
-        }
+        SearchSortPersistence.normalizedSortSpec(
+            spec,
+            visibleSortColumns: Set(visibleColumns.map(\.sortColumn))
+        )
+    }
 
-        return spec
+    private static func initialSortSpec(defaults: UserDefaults, visibleColumns: Set<Column>) -> SortSpec {
+        SearchSortPersistence.initialSortSpec(
+            defaults: defaults,
+            visibleSortColumns: Set(visibleColumns.map(\.sortColumn))
+        )
     }
 }

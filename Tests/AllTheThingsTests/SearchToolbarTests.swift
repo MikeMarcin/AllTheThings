@@ -233,32 +233,63 @@ struct SearchToolbarTests {
         #expect(!SearchRunReconciliation.previewApplicationCompletesSearch(fullSearchAlreadyFinished: false))
     }
 
-    @Test("search preview scheduling includes relevance sort")
-    func searchPreviewSchedulingIncludesRelevanceSort() {
-        #expect(SearchPreviewScheduling.skipReason(
-            appSearchActive: false,
-            trimmedQuery: "test",
-            sortColumn: .relevance,
-            signatureAlreadyDisplayed: false
-        ) == nil)
-        #expect(SearchPreviewScheduling.skipReason(
-            appSearchActive: false,
-            trimmedQuery: "test",
-            sortColumn: .name,
-            signatureAlreadyDisplayed: false
-        ) == nil)
-        #expect(SearchPreviewScheduling.skipReason(
-            appSearchActive: false,
-            trimmedQuery: "test",
-            sortColumn: .modified,
-            signatureAlreadyDisplayed: false
-        ) == nil)
-        #expect(SearchPreviewScheduling.skipReason(
-            appSearchActive: false,
-            trimmedQuery: "test",
-            sortColumn: .path,
-            signatureAlreadyDisplayed: false
-        ) == "unsupportedSort")
+    @Test("search preview scheduling allows sortable columns")
+    func searchPreviewSchedulingAllowsSortableColumns() {
+        for sortColumn in SortColumn.allCases {
+            #expect(SearchPreviewScheduling.skipReason(
+                appSearchActive: false,
+                trimmedQuery: "test",
+                sortColumn: sortColumn,
+                signatureAlreadyDisplayed: false
+            ) == nil)
+        }
+    }
+
+    @Test("launch sort resets unless remember sort is enabled")
+    func launchSortResetsUnlessRememberSortIsEnabled() throws {
+        let (defaults, suiteName) = try makeDefaults()
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        AppSettings.registerDefaults(defaults)
+        defaults.set(SortColumn.created.rawValue, forKey: SearchSortPersistence.sortColumnKey)
+        defaults.set(false, forKey: SearchSortPersistence.sortAscendingKey)
+
+        let visibleSortColumns = Set(SortColumn.allCases)
+        #expect(SearchSortPersistence.initialSortSpec(
+            defaults: defaults,
+            visibleSortColumns: visibleSortColumns
+        ) == SearchSortPersistence.defaultSortSpec)
+
+        AppSettings.saveRememberSortBetweenLaunches(true, defaults: defaults)
+
+        #expect(SearchSortPersistence.initialSortSpec(
+            defaults: defaults,
+            visibleSortColumns: visibleSortColumns
+        ) == SortSpec(column: .created, ascending: false))
+    }
+
+    @Test("launch sort normalizes invalid and hidden saved columns")
+    func launchSortNormalizesInvalidAndHiddenSavedColumns() throws {
+        let (defaults, suiteName) = try makeDefaults()
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        AppSettings.registerDefaults(defaults)
+        AppSettings.saveRememberSortBetweenLaunches(true, defaults: defaults)
+
+        defaults.set("not-a-column", forKey: SearchSortPersistence.sortColumnKey)
+        #expect(SearchSortPersistence.initialSortSpec(
+            defaults: defaults,
+            visibleSortColumns: Set(SortColumn.allCases)
+        ) == SearchSortPersistence.defaultSortSpec)
+
+        defaults.set(SortColumn.size.rawValue, forKey: SearchSortPersistence.sortColumnKey)
+        defaults.set(false, forKey: SearchSortPersistence.sortAscendingKey)
+        #expect(SearchSortPersistence.initialSortSpec(
+            defaults: defaults,
+            visibleSortColumns: [.name, .modified]
+        ) == SearchSortPersistence.defaultSortSpec)
     }
 
     @Test("search run reconciliation rejects stale responses")
@@ -408,5 +439,12 @@ struct SearchToolbarTests {
             estimatedIndexBytes: trackedFileCount == 0 ? 0 : 256,
             attributionSource: .persistedExact
         )
+    }
+
+    private func makeDefaults() throws -> (UserDefaults, String) {
+        let suiteName = "AllTheThingsToolbarTests-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        return (defaults, suiteName)
     }
 }

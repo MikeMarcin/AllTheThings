@@ -40,6 +40,7 @@ enum AppSettings {
     static let fullDiskAccessOnboardingShownKey = "ATTFullDiskAccessOnboardingShown"
     static let highlightSearchTextKey = "ATTHighlightSearchText"
     static let menuBarIconEnabledKey = "ATTMenuBarIconEnabled"
+    static let rememberSortBetweenLaunchesKey = "ATTRememberSortBetweenLaunches"
     static let showHiddenFilesKey = "ATTShowHiddenFiles"
     static let statusFooterModeKey = "ATTStatusFooterMode"
     static let themePreferenceKey = "ATTThemePreference"
@@ -54,6 +55,7 @@ enum AppSettings {
     static let appSearchRootsInitializedKey = "ATTAppSearchRootsInitialized"
     static let indexingSetupCompletedKey = "ATTIndexingSetupCompleted"
     static let exclusionPatternsKey = "ATTExclusionPatterns"
+    static let optimizedSortColumnsKey = "ATTOptimizedSortColumns"
     static let exclusionDefaultsVersionKey = "ATTExclusionDefaultsVersion"
     static let indexedRootDefaultsVersionKey = "ATTIndexedRootDefaultsVersion"
     static let globalSearchHotKeyDidChangeNotification = Notification.Name("com.allthethings.settings.globalSearchHotKeyDidChange")
@@ -67,6 +69,7 @@ enum AppSettings {
     static let indexedRootsDidChangeNotification = Notification.Name("com.allthethings.settings.indexedRootsDidChange")
     static let appSearchRootsDidChangeNotification = Notification.Name("com.allthethings.settings.appSearchRootsDidChange")
     static let exclusionPatternsDidChangeNotification = Notification.Name("com.allthethings.settings.exclusionPatternsDidChange")
+    static let optimizedSortColumnsDidChangeNotification = Notification.Name("com.allthethings.settings.optimizedSortColumnsDidChange")
 
     private static let currentExclusionDefaultsVersion = 14
     private static let currentIndexedRootDefaultsVersion = 2
@@ -138,6 +141,7 @@ enum AppSettings {
             fullDiskAccessOnboardingShownKey: false,
             highlightSearchTextKey: true,
             menuBarIconEnabledKey: true,
+            rememberSortBetweenLaunchesKey: false,
             showHiddenFilesKey: false,
             statusFooterModeKey: AppStatusFooterMode.simple.rawValue,
             themePreferenceKey: AppThemePreference.system.rawValue,
@@ -146,7 +150,8 @@ enum AppSettings {
             diagnosticLogLevelKey: DiagnosticLogLevel.info.rawValue,
             lightMatchColorsKey: defaultMatchColorHexes(isDark: false),
             darkMatchColorsKey: defaultMatchColorHexes(isDark: true),
-            exclusionPatternsKey: FileExclusionRules.defaultPatterns
+            exclusionPatternsKey: FileExclusionRules.defaultPatterns,
+            optimizedSortColumnsKey: SortColumn.optimizedIndexColumns.map(\.rawValue)
         ])
         migrateIndexedRootDefaults(defaults)
         migrateExclusionDefaults(defaults)
@@ -301,6 +306,24 @@ enum AppSettings {
         postSettingsDidChangeNotification(statusFooterModeDidChangeNotification, defaults: defaults)
     }
 
+    static func rememberSortBetweenLaunches(defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: rememberSortBetweenLaunchesKey)
+    }
+
+    static func saveRememberSortBetweenLaunches(_ enabled: Bool, defaults: UserDefaults = .standard) {
+        guard rememberSortBetweenLaunches(defaults: defaults) != enabled else { return }
+
+        defaults.set(enabled, forKey: rememberSortBetweenLaunchesKey)
+        defaults.synchronize()
+        DiagnosticLogger.shared.log(
+            category: "settings",
+            event: "settings.rememberSortBetweenLaunchesChanged",
+            fields: [
+                "enabled": .publicBool(enabled)
+            ]
+        )
+    }
+
     static func diagnosticLogLevel(defaults: UserDefaults = .standard) -> DiagnosticLogLevel {
         guard
             let rawValue = defaults.string(forKey: diagnosticLogLevelKey),
@@ -443,6 +466,40 @@ enum AppSettings {
 
     static func resetExclusionPatterns(defaults: UserDefaults = .standard) {
         saveExclusionPatterns(FileExclusionRules.defaultPatterns, defaults: defaults)
+    }
+
+    static func optimizedSortColumns(defaults: UserDefaults = .standard) -> Set<SortColumn> {
+        guard let rawValues = defaults.array(forKey: optimizedSortColumnsKey) as? [String] else {
+            return Set(SortColumn.optimizedIndexColumns)
+        }
+
+        let columns = Set(rawValues.compactMap(SortColumn.init(rawValue:)))
+            .intersection(Set(SortColumn.optimizedIndexColumns))
+        return columns
+    }
+
+    static func saveOptimizedSortColumns(_ columns: Set<SortColumn>, defaults: UserDefaults = .standard) {
+        let sanitized = columns.intersection(Set(SortColumn.optimizedIndexColumns))
+        guard optimizedSortColumns(defaults: defaults) != sanitized else { return }
+
+        let rawValues = SortColumn.optimizedIndexColumns
+            .filter { sanitized.contains($0) }
+            .map(\.rawValue)
+        defaults.set(rawValues, forKey: optimizedSortColumnsKey)
+        defaults.synchronize()
+        DiagnosticLogger.shared.log(
+            category: "settings",
+            event: "settings.optimizedSortColumnsChanged",
+            fields: [
+                "columnCount": .publicInt(rawValues.count),
+                "columns": .publicStringArray(rawValues)
+            ]
+        )
+        postSettingsDidChangeNotification(optimizedSortColumnsDidChangeNotification, defaults: defaults)
+    }
+
+    static func resetOptimizedSortColumns(defaults: UserDefaults = .standard) {
+        saveOptimizedSortColumns(Set(SortColumn.optimizedIndexColumns), defaults: defaults)
     }
 
     static func displayPath(_ path: String) -> String {

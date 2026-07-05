@@ -19,6 +19,7 @@ public enum SearchIndexUse: String, Codable, CaseIterable, Hashable, Sendable {
     case pathGrams
     case extensionPostings
     case modifiedOrder
+    case sortOrder
     case visibleBitset
     case applicationCatalog
 }
@@ -41,6 +42,13 @@ public enum SearchRouteKind: String, Codable, CaseIterable, Hashable, Sendable {
         }
         if profile.executionPath == .applicationCatalog || profile.indexesUsed.contains(.applicationCatalog) {
             return .applicationCatalog
+        }
+
+        if profile.indexesUsed.contains(.sortOrder)
+            || profile.indexesUsed.contains(.modifiedOrder)
+            || profile.executionPath == .emptyQuerySortedOrder
+            || profile.executionPath == .optimizedSortedFastPath {
+            return .sidecar
         }
 
         let mappedUses: Set<SearchIndexUse> = [.nameGrams, .componentGrams, .pathGrams]
@@ -101,6 +109,243 @@ public enum FileActionMetric: String, Codable, CaseIterable, Sendable {
     case rename
     case moveToTrash
     case getInfo
+}
+
+public enum IndexMaintenanceOperationKind: String, Codable, CaseIterable, Hashable, Sendable {
+    case exactRefresh
+    case directoryRefresh
+    case reconcile
+    case fullRebuild
+    case snapshotPersist
+    case metadataOverlayPersist
+    case optimization
+    case pathGramBuild
+    case backgroundSlice
+}
+
+public enum IndexMaintenancePriority: String, Codable, CaseIterable, Sendable {
+    case interactive
+    case background
+}
+
+public struct IndexMaintenanceOperationCounters: Codable, Equatable, Sendable {
+    public var operations: UInt64
+    public var wallTime: TimeInterval
+    public var approximateCPUTime: TimeInterval
+    public var paths: UInt64
+    public var records: UInt64
+    public var visited: UInt64
+    public var yieldedSlices: UInt64
+    public var deferredPaths: UInt64
+    public var largeOverlays: UInt64
+    public var optimizationDeferrals: UInt64
+    public var exclusionDecisions: UInt64
+    public var exclusionRegexMatches: UInt64
+    public var exclusionFastPathDecisions: UInt64
+    public var exclusionFastPrunes: UInt64
+
+    public init(
+        operations: UInt64 = 0,
+        wallTime: TimeInterval = 0,
+        approximateCPUTime: TimeInterval = 0,
+        paths: UInt64 = 0,
+        records: UInt64 = 0,
+        visited: UInt64 = 0,
+        yieldedSlices: UInt64 = 0,
+        deferredPaths: UInt64 = 0,
+        largeOverlays: UInt64 = 0,
+        optimizationDeferrals: UInt64 = 0,
+        exclusionDecisions: UInt64 = 0,
+        exclusionRegexMatches: UInt64 = 0,
+        exclusionFastPathDecisions: UInt64 = 0,
+        exclusionFastPrunes: UInt64 = 0
+    ) {
+        self.operations = operations
+        self.wallTime = max(wallTime, 0)
+        self.approximateCPUTime = max(approximateCPUTime, 0)
+        self.paths = paths
+        self.records = records
+        self.visited = visited
+        self.yieldedSlices = yieldedSlices
+        self.deferredPaths = deferredPaths
+        self.largeOverlays = largeOverlays
+        self.optimizationDeferrals = optimizationDeferrals
+        self.exclusionDecisions = exclusionDecisions
+        self.exclusionRegexMatches = exclusionRegexMatches
+        self.exclusionFastPathDecisions = exclusionFastPathDecisions
+        self.exclusionFastPrunes = exclusionFastPrunes
+    }
+
+    public var averageWallTime: TimeInterval {
+        operations == 0 ? 0 : wallTime / Double(operations)
+    }
+
+    public var averageApproximateCPUTime: TimeInterval {
+        operations == 0 ? 0 : approximateCPUTime / Double(operations)
+    }
+
+    public mutating func add(_ other: IndexMaintenanceOperationCounters) {
+        operations &+= other.operations
+        wallTime += max(other.wallTime, 0)
+        approximateCPUTime += max(other.approximateCPUTime, 0)
+        paths &+= other.paths
+        records &+= other.records
+        visited &+= other.visited
+        yieldedSlices &+= other.yieldedSlices
+        deferredPaths &+= other.deferredPaths
+        largeOverlays &+= other.largeOverlays
+        optimizationDeferrals &+= other.optimizationDeferrals
+        exclusionDecisions &+= other.exclusionDecisions
+        exclusionRegexMatches &+= other.exclusionRegexMatches
+        exclusionFastPathDecisions &+= other.exclusionFastPathDecisions
+        exclusionFastPrunes &+= other.exclusionFastPrunes
+    }
+}
+
+public struct IndexMaintenanceOperationMetric: Codable, Equatable, Sendable {
+    public var kind: IndexMaintenanceOperationKind
+    public var priority: IndexMaintenancePriority
+    public var completedAt: Date
+    public var wallTime: TimeInterval
+    public var approximateCPUTime: TimeInterval
+    public var paths: UInt64
+    public var records: UInt64
+    public var visited: UInt64
+    public var yieldedSlices: UInt64
+    public var deferredPaths: UInt64
+    public var largeOverlays: UInt64
+    public var optimizationDeferrals: UInt64
+    public var exclusionDecisions: UInt64
+    public var exclusionRegexMatches: UInt64
+    public var exclusionFastPathDecisions: UInt64
+    public var exclusionFastPrunes: UInt64
+
+    public init(
+        kind: IndexMaintenanceOperationKind,
+        priority: IndexMaintenancePriority = .interactive,
+        completedAt: Date = Date(),
+        wallTime: TimeInterval = 0,
+        approximateCPUTime: TimeInterval = 0,
+        paths: UInt64 = 0,
+        records: UInt64 = 0,
+        visited: UInt64 = 0,
+        yieldedSlices: UInt64 = 0,
+        deferredPaths: UInt64 = 0,
+        largeOverlays: UInt64 = 0,
+        optimizationDeferrals: UInt64 = 0,
+        exclusionDecisions: UInt64 = 0,
+        exclusionRegexMatches: UInt64 = 0,
+        exclusionFastPathDecisions: UInt64 = 0,
+        exclusionFastPrunes: UInt64 = 0
+    ) {
+        self.kind = kind
+        self.priority = priority
+        self.completedAt = completedAt
+        self.wallTime = max(wallTime, 0)
+        self.approximateCPUTime = max(approximateCPUTime, 0)
+        self.paths = paths
+        self.records = records
+        self.visited = visited
+        self.yieldedSlices = yieldedSlices
+        self.deferredPaths = deferredPaths
+        self.largeOverlays = largeOverlays
+        self.optimizationDeferrals = optimizationDeferrals
+        self.exclusionDecisions = exclusionDecisions
+        self.exclusionRegexMatches = exclusionRegexMatches
+        self.exclusionFastPathDecisions = exclusionFastPathDecisions
+        self.exclusionFastPrunes = exclusionFastPrunes
+    }
+
+    public var counters: IndexMaintenanceOperationCounters {
+        IndexMaintenanceOperationCounters(
+            operations: 1,
+            wallTime: wallTime,
+            approximateCPUTime: approximateCPUTime,
+            paths: paths,
+            records: records,
+            visited: visited,
+            yieldedSlices: yieldedSlices,
+            deferredPaths: deferredPaths,
+            largeOverlays: largeOverlays,
+            optimizationDeferrals: optimizationDeferrals,
+            exclusionDecisions: exclusionDecisions,
+            exclusionRegexMatches: exclusionRegexMatches,
+            exclusionFastPathDecisions: exclusionFastPathDecisions,
+            exclusionFastPrunes: exclusionFastPrunes
+        )
+    }
+}
+
+public struct IndexMaintenanceCostCounters: Codable, Equatable, Sendable {
+    public var total: IndexMaintenanceOperationCounters
+    public var interactive: IndexMaintenanceOperationCounters
+    public var background: IndexMaintenanceOperationCounters
+    public var byKind: [IndexMaintenanceOperationKind: IndexMaintenanceOperationCounters]
+
+    public init(
+        total: IndexMaintenanceOperationCounters = IndexMaintenanceOperationCounters(),
+        interactive: IndexMaintenanceOperationCounters = IndexMaintenanceOperationCounters(),
+        background: IndexMaintenanceOperationCounters = IndexMaintenanceOperationCounters(),
+        byKind: [IndexMaintenanceOperationKind: IndexMaintenanceOperationCounters] = [:]
+    ) {
+        self.total = total
+        self.interactive = interactive
+        self.background = background
+        self.byKind = byKind
+    }
+
+    public mutating func record(_ metric: IndexMaintenanceOperationMetric) {
+        let counters = metric.counters
+        total.add(counters)
+        switch metric.priority {
+        case .interactive:
+            interactive.add(counters)
+        case .background:
+            background.add(counters)
+        }
+        byKind[metric.kind, default: IndexMaintenanceOperationCounters()].add(counters)
+    }
+
+    public func counters(for kind: IndexMaintenanceOperationKind) -> IndexMaintenanceOperationCounters {
+        byKind[kind] ?? IndexMaintenanceOperationCounters()
+    }
+}
+
+public struct IndexMaintenanceLiveDiagnostics: Codable, Equatable, Sendable {
+    public let pendingRefreshPathCount: Int
+    public let pendingBackgroundRefreshPathCount: Int
+    public let pendingReconciliationScopeCount: Int
+    public let isFullReconciliationPending: Bool
+    public let lastOperation: IndexMaintenanceOperationMetric?
+    public let lastBackgroundSlice: IndexMaintenanceOperationMetric?
+    public let deferredOptimizationReason: String?
+    public let deferredOptimizationDelay: TimeInterval?
+    public let deferredCheckpointReason: String?
+    public let deferredCheckpointDelay: TimeInterval?
+
+    public init(
+        pendingRefreshPathCount: Int = 0,
+        pendingBackgroundRefreshPathCount: Int = 0,
+        pendingReconciliationScopeCount: Int = 0,
+        isFullReconciliationPending: Bool = false,
+        lastOperation: IndexMaintenanceOperationMetric? = nil,
+        lastBackgroundSlice: IndexMaintenanceOperationMetric? = nil,
+        deferredOptimizationReason: String? = nil,
+        deferredOptimizationDelay: TimeInterval? = nil,
+        deferredCheckpointReason: String? = nil,
+        deferredCheckpointDelay: TimeInterval? = nil
+    ) {
+        self.pendingRefreshPathCount = max(pendingRefreshPathCount, 0)
+        self.pendingBackgroundRefreshPathCount = max(pendingBackgroundRefreshPathCount, 0)
+        self.pendingReconciliationScopeCount = max(pendingReconciliationScopeCount, 0)
+        self.isFullReconciliationPending = isFullReconciliationPending
+        self.lastOperation = lastOperation
+        self.lastBackgroundSlice = lastBackgroundSlice
+        self.deferredOptimizationReason = deferredOptimizationReason
+        self.deferredOptimizationDelay = deferredOptimizationDelay.map { max($0, 0) }
+        self.deferredCheckpointReason = deferredCheckpointReason
+        self.deferredCheckpointDelay = deferredCheckpointDelay.map { max($0, 0) }
+    }
 }
 
 public struct IndexStorageLocationInsight: Codable, Equatable, Sendable {
@@ -358,6 +603,132 @@ public struct MemoryUsageCounters: Codable, Equatable, Sendable {
     }
 }
 
+public enum EnergyUsageMode: String, Codable, CaseIterable, Sendable {
+    case foreground
+    case background
+}
+
+public struct EnergyUsageCounters: Codable, Equatable, Sendable {
+    public var samples: UInt64
+    public var wallTime: TimeInterval
+    public var cpuTime: TimeInterval
+    public var wakeups: UInt64
+    public var peakCPULoad: Double
+
+    public init(
+        samples: UInt64 = 0,
+        wallTime: TimeInterval = 0,
+        cpuTime: TimeInterval = 0,
+        wakeups: UInt64 = 0,
+        peakCPULoad: Double = 0
+    ) {
+        self.samples = samples
+        self.wallTime = max(wallTime, 0)
+        self.cpuTime = max(cpuTime, 0)
+        self.wakeups = wakeups
+        self.peakCPULoad = max(peakCPULoad, 0)
+    }
+
+    public var averageCPULoad: Double {
+        wallTime > 0 ? cpuTime / wallTime : 0
+    }
+
+    public var wakeupsPerMinute: Double {
+        wallTime > 0 ? Double(wakeups) / wallTime * 60 : 0
+    }
+
+    public mutating func add(_ other: EnergyUsageCounters) {
+        samples &+= other.samples
+        wallTime += max(other.wallTime, 0)
+        cpuTime += max(other.cpuTime, 0)
+        wakeups &+= other.wakeups
+        peakCPULoad = max(peakCPULoad, other.peakCPULoad)
+    }
+}
+
+public struct EnergyUsageBreakdown: Codable, Equatable, Sendable {
+    public var foreground: EnergyUsageCounters
+    public var background: EnergyUsageCounters
+
+    public init(
+        foreground: EnergyUsageCounters = EnergyUsageCounters(),
+        background: EnergyUsageCounters = EnergyUsageCounters()
+    ) {
+        self.foreground = foreground
+        self.background = background
+    }
+
+    public var total: EnergyUsageCounters {
+        var counters = foreground
+        counters.add(background)
+        return counters
+    }
+
+    public mutating func record(_ sample: EnergyUsageIntervalSample) {
+        let counters = EnergyUsageCounters(
+            samples: 1,
+            wallTime: sample.duration,
+            cpuTime: sample.cpuTime,
+            wakeups: sample.wakeups,
+            peakCPULoad: sample.cpuLoad
+        )
+        switch sample.mode {
+        case .foreground:
+            foreground.add(counters)
+        case .background:
+            background.add(counters)
+        }
+    }
+}
+
+public struct EnergyUsageIntervalSample: Codable, Equatable, Sendable, Identifiable {
+    public let completedAt: Date
+    public let duration: TimeInterval
+    public let cpuTime: TimeInterval
+    public let wakeups: UInt64
+    public let mode: EnergyUsageMode
+
+    public var id: Date { completedAt }
+
+    public init(
+        completedAt: Date = Date(),
+        duration: TimeInterval,
+        cpuTime: TimeInterval,
+        wakeups: UInt64 = 0,
+        mode: EnergyUsageMode
+    ) {
+        self.completedAt = completedAt
+        self.duration = max(duration, 0)
+        self.cpuTime = max(cpuTime, 0)
+        self.wakeups = wakeups
+        self.mode = mode
+    }
+
+    public var cpuLoad: Double {
+        duration > 0 ? cpuTime / duration : 0
+    }
+
+    public var wakeupsPerMinute: Double {
+        duration > 0 ? Double(wakeups) / duration * 60 : 0
+    }
+}
+
+public struct EnergyUsageRollup: Codable, Equatable, Sendable, Identifiable {
+    public let bucketStart: Date
+    public var energy: EnergyUsageBreakdown
+
+    public var id: Date { bucketStart }
+
+    public init(bucketStart: Date, energy: EnergyUsageBreakdown = EnergyUsageBreakdown()) {
+        self.bucketStart = bucketStart
+        self.energy = energy
+    }
+
+    public mutating func record(_ sample: EnergyUsageIntervalSample) {
+        energy.record(sample)
+    }
+}
+
 public struct DailyUsageBucket: Codable, Equatable, Sendable, Identifiable {
     public let day: String
     public var searches: SearchUsageCounters
@@ -365,8 +736,10 @@ public struct DailyUsageBucket: Codable, Equatable, Sendable, Identifiable {
     public var refinedSearches: SearchUsageCounters
     public var fileActions: [FileActionMetric: UInt64]
     public var health: IndexHealthCounters
+    public var maintenance: IndexMaintenanceCostCounters
     public var launches: UInt64
     public var memory: MemoryUsageCounters
+    public var energy: EnergyUsageBreakdown
 
     public var id: String { day }
 
@@ -377,8 +750,10 @@ public struct DailyUsageBucket: Codable, Equatable, Sendable, Identifiable {
         refinedSearches: SearchUsageCounters = SearchUsageCounters(),
         fileActions: [FileActionMetric: UInt64] = [:],
         health: IndexHealthCounters = IndexHealthCounters(),
+        maintenance: IndexMaintenanceCostCounters = IndexMaintenanceCostCounters(),
         launches: UInt64 = 0,
-        memory: MemoryUsageCounters = MemoryUsageCounters()
+        memory: MemoryUsageCounters = MemoryUsageCounters(),
+        energy: EnergyUsageBreakdown = EnergyUsageBreakdown()
     ) {
         self.day = day
         self.searches = searches
@@ -386,8 +761,10 @@ public struct DailyUsageBucket: Codable, Equatable, Sendable, Identifiable {
         self.refinedSearches = refinedSearches
         self.fileActions = fileActions
         self.health = health
+        self.maintenance = maintenance
         self.launches = launches
         self.memory = memory
+        self.energy = energy
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -397,8 +774,10 @@ public struct DailyUsageBucket: Codable, Equatable, Sendable, Identifiable {
         case refinedSearches
         case fileActions
         case health
+        case maintenance
         case launches
         case memory
+        case energy
     }
 
     public init(from decoder: Decoder) throws {
@@ -409,8 +788,63 @@ public struct DailyUsageBucket: Codable, Equatable, Sendable, Identifiable {
         refinedSearches = try container.decodeIfPresent(SearchUsageCounters.self, forKey: .refinedSearches) ?? SearchUsageCounters()
         fileActions = try container.decodeIfPresent([FileActionMetric: UInt64].self, forKey: .fileActions) ?? [:]
         health = try container.decodeIfPresent(IndexHealthCounters.self, forKey: .health) ?? IndexHealthCounters()
+        maintenance = try container.decodeIfPresent(IndexMaintenanceCostCounters.self, forKey: .maintenance) ?? IndexMaintenanceCostCounters()
         launches = try container.decodeIfPresent(UInt64.self, forKey: .launches) ?? 0
         memory = try container.decodeIfPresent(MemoryUsageCounters.self, forKey: .memory) ?? MemoryUsageCounters()
+        energy = try container.decodeIfPresent(EnergyUsageBreakdown.self, forKey: .energy) ?? EnergyUsageBreakdown()
+    }
+}
+
+public struct DailyActivityScoreComponents: Equatable, Sendable {
+    public let search: Double
+    public let index: Double
+    public let refresh: Double
+
+    public init(search: Double = 0, index: Double = 0, refresh: Double = 0) {
+        self.search = max(search, 0)
+        self.index = max(index, 0)
+        self.refresh = max(refresh, 0)
+    }
+
+    public var total: Double {
+        search + index + refresh
+    }
+}
+
+public extension DailyUsageBucket {
+    var calendarActivityScoreComponents: DailyActivityScoreComponents {
+        let searchCount = Double(searches.completed) + Double(searches.cancelled)
+        let searchRows = Double(searches.candidateRowsExamined) + Double(searches.scannedRowsExamined)
+        let searchScore = log1p(searchCount) + log1p(searchRows)
+
+        let maintenanceOperations = Double(maintenance.total.operations)
+        let maintenanceWork = Double(maintenance.total.paths)
+            + Double(maintenance.total.records)
+            + Double(maintenance.total.visited)
+        let maintenanceSlices = Double(maintenance.total.yieldedSlices)
+            + Double(maintenance.total.deferredPaths)
+        let indexScore = log1p(maintenanceOperations)
+            + log1p(maintenanceWork)
+            + log1p(maintenanceSlices)
+
+        let refreshWork = Double(health.incrementalRefreshBatches)
+            + Double(health.recursiveRescans)
+            + Double(health.fullRebuilds)
+        let refreshScore = log1p(refreshWork)
+
+        return DailyActivityScoreComponents(
+            search: searchScore,
+            index: indexScore,
+            refresh: refreshScore
+        )
+    }
+
+    var calendarActivityScore: Double {
+        calendarActivityScoreComponents.total
+    }
+
+    var backgroundEnergyImpactScore: Double {
+        energy.background.cpuTime + Double(energy.background.wakeups) / 10_000
     }
 }
 
@@ -441,17 +875,23 @@ public struct IndexUsageMetrics: Codable, Equatable, Sendable {
     public var refinedSearches: SearchUsageCounters
     public var allTimeFileActions: [FileActionMetric: UInt64]
     public var health: IndexHealthCounters
+    public var maintenance: IndexMaintenanceCostCounters
     public var dailyBuckets: [DailyUsageBucket]
+    public var recentEnergySamples: [EnergyUsageIntervalSample]
+    public var energyRollups: [EnergyUsageRollup]
 
     public init(
-        schemaVersion: Int = 2,
+        schemaVersion: Int = 4,
         lifetime: AppLifetimeMetrics = AppLifetimeMetrics(),
         allTimeSearches: SearchUsageCounters = SearchUsageCounters(),
         initialSearches: SearchUsageCounters = SearchUsageCounters(),
         refinedSearches: SearchUsageCounters = SearchUsageCounters(),
         allTimeFileActions: [FileActionMetric: UInt64] = [:],
         health: IndexHealthCounters = IndexHealthCounters(),
-        dailyBuckets: [DailyUsageBucket] = []
+        maintenance: IndexMaintenanceCostCounters = IndexMaintenanceCostCounters(),
+        dailyBuckets: [DailyUsageBucket] = [],
+        recentEnergySamples: [EnergyUsageIntervalSample] = [],
+        energyRollups: [EnergyUsageRollup] = []
     ) {
         self.schemaVersion = schemaVersion
         self.lifetime = lifetime
@@ -460,7 +900,10 @@ public struct IndexUsageMetrics: Codable, Equatable, Sendable {
         self.refinedSearches = refinedSearches
         self.allTimeFileActions = allTimeFileActions
         self.health = health
+        self.maintenance = maintenance
         self.dailyBuckets = dailyBuckets
+        self.recentEnergySamples = recentEnergySamples
+        self.energyRollups = energyRollups
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -471,7 +914,10 @@ public struct IndexUsageMetrics: Codable, Equatable, Sendable {
         case refinedSearches
         case allTimeFileActions
         case health
+        case maintenance
         case dailyBuckets
+        case recentEnergySamples
+        case energyRollups
     }
 
     public init(from decoder: Decoder) throws {
@@ -483,7 +929,10 @@ public struct IndexUsageMetrics: Codable, Equatable, Sendable {
         refinedSearches = try container.decodeIfPresent(SearchUsageCounters.self, forKey: .refinedSearches) ?? SearchUsageCounters()
         allTimeFileActions = try container.decodeIfPresent([FileActionMetric: UInt64].self, forKey: .allTimeFileActions) ?? [:]
         health = try container.decodeIfPresent(IndexHealthCounters.self, forKey: .health) ?? IndexHealthCounters()
+        maintenance = try container.decodeIfPresent(IndexMaintenanceCostCounters.self, forKey: .maintenance) ?? IndexMaintenanceCostCounters()
         dailyBuckets = try container.decodeIfPresent([DailyUsageBucket].self, forKey: .dailyBuckets) ?? []
+        recentEnergySamples = try container.decodeIfPresent([EnergyUsageIntervalSample].self, forKey: .recentEnergySamples) ?? []
+        energyRollups = try container.decodeIfPresent([EnergyUsageRollup].self, forKey: .energyRollups) ?? []
     }
 }
 
@@ -513,6 +962,7 @@ public struct IndexHealthDiagnostics: Codable, Equatable, Sendable {
     public let scannedRowCount: UInt64
     public let pathMaterializationCount: UInt64
     public let canClearCachedIndex: Bool
+    public let maintenance: IndexMaintenanceLiveDiagnostics
 
     public init(
         phase: IndexPhase,
@@ -539,7 +989,8 @@ public struct IndexHealthDiagnostics: Codable, Equatable, Sendable {
         fallbackScanCount: UInt64,
         scannedRowCount: UInt64,
         pathMaterializationCount: UInt64,
-        canClearCachedIndex: Bool
+        canClearCachedIndex: Bool,
+        maintenance: IndexMaintenanceLiveDiagnostics = IndexMaintenanceLiveDiagnostics()
     ) {
         self.phase = phase
         self.status = status
@@ -566,6 +1017,7 @@ public struct IndexHealthDiagnostics: Codable, Equatable, Sendable {
         self.scannedRowCount = scannedRowCount
         self.pathMaterializationCount = pathMaterializationCount
         self.canClearCachedIndex = canClearCachedIndex
+        self.maintenance = maintenance
     }
 }
 
@@ -598,8 +1050,11 @@ public struct IndexInsightsSnapshot: Codable, Equatable, Sendable {
 }
 
 extension IndexUsageMetrics {
-    static let currentSchemaVersion = 2
-    static let retainedDailyBucketCount = 365
+    static let currentSchemaVersion = 4
+    static let retainedDailyBucketCount = 93
+    public static let retainedEnergySampleInterval: TimeInterval = 2 * 60 * 60
+    public static let retainedEnergyRollupInterval: TimeInterval = 48 * 60 * 60
+    public static let energyRollupInterval: TimeInterval = 5 * 60
 
     mutating func recordAppLaunch(appVersion: String?, at date: Date = Date()) {
         if lifetime.firstLaunchDate == nil {
@@ -739,6 +1194,14 @@ extension IndexUsageMetrics {
         pruneDailyBuckets()
     }
 
+    mutating func recordMaintenance(_ metric: IndexMaintenanceOperationMetric) {
+        maintenance.record(metric)
+        mutateDailyBucket(for: metric.completedAt) { bucket in
+            bucket.maintenance.record(metric)
+        }
+        pruneDailyBuckets()
+    }
+
     mutating func recordActiveJobHighWaterMark(_ value: Int) {
         health.activeJobHighWaterMark = max(health.activeJobHighWaterMark, value)
     }
@@ -755,10 +1218,46 @@ extension IndexUsageMetrics {
         pruneDailyBuckets()
     }
 
+    @discardableResult
+    mutating func recordEnergySample(
+        completedAt: Date = Date(),
+        duration: TimeInterval,
+        cpuTime: TimeInterval,
+        wakeups: UInt64,
+        mode: EnergyUsageMode
+    ) -> Bool {
+        guard duration > 0, cpuTime >= 0 else { return false }
+        let sample = EnergyUsageIntervalSample(
+            completedAt: completedAt,
+            duration: duration,
+            cpuTime: cpuTime,
+            wakeups: wakeups,
+            mode: mode
+        )
+
+        recentEnergySamples.append(sample)
+        recordEnergyRollup(sample)
+        mutateDailyBucket(for: completedAt) { bucket in
+            bucket.energy.record(sample)
+        }
+        pruneEnergyHistory(referenceDate: completedAt)
+        pruneDailyBuckets()
+        return true
+    }
+
     mutating func pruneDailyBuckets(limit: Int = retainedDailyBucketCount) {
         guard dailyBuckets.count > limit else { return }
         dailyBuckets.sort { $0.day < $1.day }
         dailyBuckets.removeFirst(dailyBuckets.count - limit)
+    }
+
+    mutating func pruneEnergyHistory(referenceDate: Date = Date()) {
+        let recentCutoff = referenceDate.addingTimeInterval(-Self.retainedEnergySampleInterval)
+        recentEnergySamples.removeAll { $0.completedAt < recentCutoff }
+
+        let rollupCutoff = referenceDate.addingTimeInterval(-Self.retainedEnergyRollupInterval)
+        energyRollups.removeAll { $0.bucketStart < rollupCutoff }
+        energyRollups.sort { $0.bucketStart < $1.bucketStart }
     }
 
     static func dayKey(for date: Date, calendar: Calendar = .current) -> String {
@@ -793,6 +1292,24 @@ extension IndexUsageMetrics {
         var bucket = dailyBucket(for: date)
         body(&bucket)
         replaceDailyBucket(bucket)
+    }
+
+    private mutating func recordEnergyRollup(_ sample: EnergyUsageIntervalSample) {
+        let bucketStart = Self.energyRollupStart(for: sample.completedAt)
+        if let index = energyRollups.firstIndex(where: { $0.bucketStart == bucketStart }) {
+            energyRollups[index].record(sample)
+        } else {
+            var rollup = EnergyUsageRollup(bucketStart: bucketStart)
+            rollup.record(sample)
+            energyRollups.append(rollup)
+            energyRollups.sort { $0.bucketStart < $1.bucketStart }
+        }
+    }
+
+    static func energyRollupStart(for date: Date, interval: TimeInterval = energyRollupInterval) -> Date {
+        guard interval > 0 else { return date }
+        let bucket = floor(date.timeIntervalSince1970 / interval) * interval
+        return Date(timeIntervalSince1970: bucket)
     }
 
     private mutating func incrementSearchStarted(phase: SearchMetricPhase) {

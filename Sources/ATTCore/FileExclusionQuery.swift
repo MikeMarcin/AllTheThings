@@ -11,6 +11,7 @@ final class FileExclusionQuery {
         var ancestorMatchCheckCount = 0
         var regexMatchCount = 0
         var fastPathDecisionCount = 0
+        var fastPruneDirectoryCount = 0
 
         init() {}
 
@@ -20,6 +21,7 @@ final class FileExclusionQuery {
             ancestorMatchCheckCount += other.ancestorMatchCheckCount
             regexMatchCount += other.regexMatchCount
             fastPathDecisionCount += other.fastPathDecisionCount
+            fastPruneDirectoryCount += other.fastPruneDirectoryCount
         }
     }
 

@@ -26,6 +26,10 @@ struct DiagnosticsReportBuilderTests {
         #expect(report.contains("Measurement: measured"))
         #expect(report.contains("Initial Results:"))
         #expect(report.contains("Refined Results:"))
+        #expect(report.contains("## Maintenance Costs"))
+        #expect(report.contains("Approx CPU Time"))
+        #expect(report.contains("directoryRefresh"))
+        #expect(report.contains("Pending Refresh Paths: 2"))
         #expect(report.contains("mappedIndex: 1"))
         #expect(report.contains("mappedIndex: 1, avg"))
         #expect(report.contains("sidecar: 1"))
@@ -73,6 +77,25 @@ struct DiagnosticsReportBuilderTests {
         usage.refinedSearches.completed = 1
         usage.refinedSearches.routeCounts[.sidecar] = 1
         usage.refinedSearches.routeLatencyTotals[.sidecar] = 0.01
+        let maintenanceMetric = IndexMaintenanceOperationMetric(
+            kind: .directoryRefresh,
+            priority: .background,
+            completedAt: Date(timeIntervalSince1970: 1_700_000_100),
+            wallTime: 1.5,
+            approximateCPUTime: 0.8,
+            paths: 4,
+            records: 3,
+            visited: 9,
+            yieldedSlices: 1,
+            deferredPaths: 2,
+            largeOverlays: 1,
+            optimizationDeferrals: 1,
+            exclusionDecisions: 12,
+            exclusionRegexMatches: 5,
+            exclusionFastPathDecisions: 7,
+            exclusionFastPrunes: 2
+        )
+        usage.maintenance.record(maintenanceMetric)
         usage.dailyBuckets = [
             DailyUsageBucket(
                 day: "2026-05-30",
@@ -81,6 +104,7 @@ struct DiagnosticsReportBuilderTests {
                 refinedSearches: usage.refinedSearches,
                 fileActions: [.open: 2],
                 health: IndexHealthCounters(incrementalRefreshBatches: 1),
+                maintenance: usage.maintenance,
                 launches: 1,
                 memory: MemoryUsageCounters(latestBytes: 42_000_000, dailyMinimumBytes: 40_000_000, dailyMaximumBytes: 45_000_000)
             )
@@ -120,7 +144,16 @@ struct DiagnosticsReportBuilderTests {
             fallbackScanCount: 1,
             scannedRowCount: 10,
             pathMaterializationCount: 2,
-            canClearCachedIndex: true
+            canClearCachedIndex: true,
+            maintenance: IndexMaintenanceLiveDiagnostics(
+                pendingRefreshPathCount: 2,
+                pendingBackgroundRefreshPathCount: 1,
+                pendingReconciliationScopeCount: 1,
+                lastOperation: maintenanceMetric,
+                lastBackgroundSlice: maintenanceMetric,
+                deferredOptimizationReason: "background",
+                deferredOptimizationDelay: 5
+            )
         )
 
         return IndexInsightsSnapshot(
