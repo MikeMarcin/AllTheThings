@@ -157,7 +157,7 @@ final class InsightsEnergyChartView: NSView {
         }
 
         let plot = InsightsEnergyTimelineLayout.plotRect(in: bounds)
-        let maxLoad = max(samples.map(\.cpuLoad).max() ?? 0, 0.01)
+        let maxLoad = Self.cpuLoadScaleMaximum(samples.map(\.cpuLoad))
         let maxWakeups = maxWakeupsPerMinute(samples: samples)
         let rects = InsightsEnergyTimelineLayout.sampleRects(samples: samples, in: bounds)
         drawTimelineBackground(plot: plot)
@@ -187,7 +187,14 @@ final class InsightsEnergyChartView: NSView {
         }
 
         let plot = InsightsEnergyTimelineLayout.plotRect(in: bounds)
-        let maxLoad = max(rollups.map { $0.energy.total.averageCPULoad }.max() ?? 0, 0.01)
+        let cpuLoads = rollups.flatMap { rollup in
+            [
+                rollup.energy.total.averageCPULoad,
+                rollup.energy.foreground.averageCPULoad,
+                rollup.energy.background.averageCPULoad
+            ]
+        }
+        let maxLoad = Self.cpuLoadScaleMaximum(cpuLoads)
         let maxWakeups = maxWakeupsPerMinute(rollups: rollups)
         let rects = InsightsEnergyTimelineLayout.rollupRects(rollups: rollups, in: bounds)
         drawTimelineBackground(plot: plot)
@@ -559,6 +566,10 @@ final class InsightsEnergyChartView: NSView {
 
     nonisolated static func backgroundEnergyImpactScore(_ bucket: DailyUsageBucket) -> Double {
         bucket.backgroundEnergyImpactScore
+    }
+
+    nonisolated static func cpuLoadScaleMaximum(_ values: [Double]) -> Double {
+        max(values.filter { $0.isFinite && $0 > 0 }.max() ?? 0, 1)
     }
 
     nonisolated static func calendarActivityBaseline(scores: [Double]) -> Double {
