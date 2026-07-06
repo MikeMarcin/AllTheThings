@@ -557,6 +557,13 @@ struct InsightsTreemapLayoutTests {
         #expect(InsightsEnergyTimelineLayout.sampleIndex(at: NSPoint(x: 1, y: bounds.maxY - 1), samples: samples, in: bounds) == nil)
     }
 
+    @Test("energy CPU timeline uses one-core scale floor before autoscaling above it")
+    func energyCPUTimelineUsesOneCoreScaleFloorBeforeAutoscalingAboveIt() {
+        #expect(InsightsEnergyChartView.cpuLoadScaleMaximum([0.021, 0.002]) == 1)
+        #expect(InsightsEnergyChartView.cpuLoadScaleMaximum([0, .nan, -.infinity]) == 1)
+        #expect(InsightsEnergyChartView.cpuLoadScaleMaximum([0.5, 1.4]) == 1.4)
+    }
+
     @Test("energy calendar lays out three month weekday grid with sparse buckets")
     func energyCalendarLaysOutThreeMonthWeekdayGridWithSparseBuckets() throws {
         let bounds = NSRect(x: 0, y: 0, width: 350, height: 140)
