@@ -249,6 +249,12 @@ final class ApplicationSearchCatalog: @unchecked Sendable {
             if lhsQuality != rhsQuality {
                 return lhsQuality > rhsQuality
             }
+
+            let lhsAliasDerived = lhs.match?.isAliasDerived ?? false
+            let rhsAliasDerived = rhs.match?.isAliasDerived ?? false
+            if lhsAliasDerived != rhsAliasDerived {
+                return !lhsAliasDerived
+            }
         }
 
         let primary: Bool?

@@ -171,6 +171,33 @@ struct ApplicationSearchCatalogTests {
         #expect(steamIndex < previewIndex)
     }
 
+    @Test("exact app name matches beat exact metadata alias matches")
+    func exactAppNameMatchesBeatExactMetadataAliasMatches() throws {
+        let fixture = try AppCatalogFixture()
+        defer { fixture.remove() }
+
+        _ = try fixture.makeApp("Claude Code Link Helper.app", infoPlist: [
+            "CFBundleIdentifier": "com.anthropic.claude-code-link-helper",
+            "CFBundleName": "Claude Code Link Helper",
+            "CFBundleExecutable": "Claude Code Link Helper"
+        ])
+        _ = try fixture.makeApp("Claude.app")
+
+        let response = try #require(ApplicationSearchCatalog().search(
+            queryText: "claude",
+            roots: [fixture.root],
+            sort: SortSpec(column: .name, ascending: true),
+            maxResults: 100
+        ))
+
+        #expect(response.results.first?.record.name == "Claude.app")
+        #expect(response.results.first?.match?.matchClass == .exact)
+        #expect(response.results.first?.match?.isAliasDerived == false)
+        let helperResult = try #require(response.results.first { $0.record.name == "Claude Code Link Helper.app" })
+        #expect(helperResult.match?.matchClass == .exact)
+        #expect(helperResult.match?.isAliasDerived == true)
+    }
+
     @Test("configured app bundle root is searchable")
     func configuredAppBundleRootIsSearchable() throws {
         let fixture = try AppCatalogFixture()
