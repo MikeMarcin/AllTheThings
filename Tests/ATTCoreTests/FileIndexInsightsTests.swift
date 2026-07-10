@@ -685,6 +685,69 @@ struct FileIndexInsightsTests {
         #expect(usage.dailyBuckets.first?.energy.total.cpuTime == 0)
     }
 
+    @Test("legacy v4 metrics discard incorrectly scaled energy history")
+    func legacyV4MetricsDiscardIncorrectlyScaledEnergyHistory() throws {
+        let fileManager = FileManager.default
+        let applicationName = "AllTheThingsInsights-\(UUID().uuidString)"
+        let supportDirectory = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent(applicationName, isDirectory: true)
+        try? fileManager.removeItem(at: supportDirectory)
+        try fileManager.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: supportDirectory)
+        }
+
+        let metricsURL = supportDirectory.appendingPathComponent("index-metrics.json", isDirectory: false)
+        let legacyJSON = """
+        {
+          "schemaVersion": 4,
+          "allTimeSearches": {
+            "started": 3,
+            "completed": 2
+          },
+          "dailyBuckets": [
+            {
+              "day": "2026-07-09",
+              "energy": {
+                "foreground": {
+                  "samples": 0,
+                  "wallTime": 0,
+                  "cpuTime": 0,
+                  "wakeups": 0,
+                  "peakCPULoad": 0
+                },
+                "background": {
+                  "samples": 1,
+                  "wallTime": 60,
+                  "cpuTime": 1,
+                  "wakeups": 36,
+                  "peakCPULoad": 0.0167
+                }
+              }
+            }
+          ],
+          "recentEnergySamples": [
+            {
+              "completedAt": 805300000,
+              "duration": 60,
+              "cpuTime": 1,
+              "wakeups": 36,
+              "mode": "background"
+            }
+          ]
+        }
+        """
+        try Data(legacyJSON.utf8).write(to: metricsURL)
+
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        let usage = index.currentInsightsSnapshot().usage
+        #expect(usage.schemaVersion == IndexUsageMetrics.currentSchemaVersion)
+        #expect(usage.allTimeSearches.completed == 2)
+        #expect(usage.recentEnergySamples.isEmpty)
+        #expect(usage.energyRollups.isEmpty)
+        #expect(usage.dailyBuckets.first?.energy == EnergyUsageBreakdown())
+    }
+
     @Test("legacy v2 metrics migrate with empty maintenance counters")
     func legacyV2MetricsMigrateWithEmptyMaintenanceCounters() throws {
         let fileManager = FileManager.default

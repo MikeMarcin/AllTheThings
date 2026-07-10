@@ -881,7 +881,7 @@ public struct IndexUsageMetrics: Codable, Equatable, Sendable {
     public var energyRollups: [EnergyUsageRollup]
 
     public init(
-        schemaVersion: Int = 4,
+        schemaVersion: Int = 5,
         lifetime: AppLifetimeMetrics = AppLifetimeMetrics(),
         allTimeSearches: SearchUsageCounters = SearchUsageCounters(),
         initialSearches: SearchUsageCounters = SearchUsageCounters(),
@@ -1050,7 +1050,7 @@ public struct IndexInsightsSnapshot: Codable, Equatable, Sendable {
 }
 
 extension IndexUsageMetrics {
-    static let currentSchemaVersion = 4
+    static let currentSchemaVersion = 5
     static let retainedDailyBucketCount = 93
     public static let retainedEnergySampleInterval: TimeInterval = 2 * 60 * 60
     public static let retainedEnergyRollupInterval: TimeInterval = 48 * 60 * 60
