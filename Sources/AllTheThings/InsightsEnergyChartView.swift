@@ -184,7 +184,12 @@ final class InsightsEnergyChartView: NSView {
         )
 
         drawLegend(in: InsightsEnergyTimelineLayout.legendRect(in: bounds))
-        drawHoverGuide(rects: rects)
+        drawHoverMarker(
+            rects: rects,
+            values: samples.map(\.cpuLoad),
+            maxValue: maxLoad,
+            plot: cpuPlot
+        )
     }
 
     private func drawDay() {
@@ -230,7 +235,12 @@ final class InsightsEnergyChartView: NSView {
         )
 
         drawLegend(in: InsightsEnergyTimelineLayout.legendRect(in: bounds))
-        drawHoverGuide(rects: rects)
+        drawHoverMarker(
+            rects: rects,
+            values: rollups.map { $0.energy.total.averageCPULoad },
+            maxValue: maxLoad,
+            plot: cpuPlot
+        )
     }
 
     private func drawCalendar() {
@@ -496,7 +506,7 @@ final class InsightsEnergyChartView: NSView {
         path.stroke()
     }
 
-    private func drawHoverGuide(rects: [NSRect]) {
+    private func drawHoverMarker(rects: [NSRect], values: [Double], maxValue: Double, plot: NSRect) {
         let index: Int?
         switch hoveredTarget {
         case let .sample(value):
@@ -506,14 +516,34 @@ final class InsightsEnergyChartView: NSView {
         case .day, nil:
             index = nil
         }
-        guard let index, index < rects.count else { return }
-        let rect = rects[index]
-        NSColor.labelColor.withAlphaComponent(0.18).setStroke()
-        let path = NSBezierPath()
-        path.lineWidth = 1
-        path.move(to: NSPoint(x: rect.midX, y: rect.minY))
-        path.line(to: NSPoint(x: rect.midX, y: rect.maxY))
-        path.stroke()
+        guard
+            let index,
+            index < rects.count,
+            index < values.count,
+            let point = timelinePoint(
+                x: rects[index].midX,
+                value: values[index],
+                maxValue: maxValue,
+                plot: plot
+            )
+        else {
+            return
+        }
+
+        let radius: CGFloat = 3.5
+        let marker = NSBezierPath(ovalIn: NSRect(
+            x: point.x - radius,
+            y: point.y - radius,
+            width: radius * 2,
+            height: radius * 2
+        ))
+        InsightsPanelPalette.chartBackgroundColor(
+            isDark: InsightsPanelPalette.isDarkAppearance(effectiveAppearance)
+        ).setFill()
+        NSColor.labelColor.withAlphaComponent(0.82).setStroke()
+        marker.lineWidth = 1.5
+        marker.fill()
+        marker.stroke()
     }
 
     private func drawLegend(in rect: NSRect) {
