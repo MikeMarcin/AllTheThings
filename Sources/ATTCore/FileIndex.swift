@@ -1716,6 +1716,7 @@ public final class FileIndex: @unchecked Sendable {
             buildsSearchStructures: Bool = true,
             buildsPathGramIndex: Bool = true,
             optimizedSortColumns: Set<SortColumn> = Set(SortColumn.optimizedIndexColumns),
+            buildsAdditionalSortOrders: Bool = true,
             prefersDegradedSearch: Bool = false
         ) {
             self.store = store
@@ -1749,7 +1750,8 @@ public final class FileIndex: @unchecked Sendable {
                 self.sortOrdersAscending = Self.makeAdditionalSortOrdersAscending(
                     store: store,
                     optimizedSortColumns: optimizedSortColumns,
-                    persistedOrders: [:]
+                    persistedOrders: [:],
+                    buildsMissingOrders: buildsAdditionalSortOrders
                 )
                 self.visibleSortOrdersAscending = [:]
                 self.hasSortedOrder = true
@@ -12455,6 +12457,7 @@ public final class FileIndex: @unchecked Sendable {
             buildsSearchStructures: shouldOptimizeOverlay,
             buildsPathGramIndex: false,
             optimizedSortColumns: currentOptimizedSortColumns(),
+            buildsAdditionalSortOrders: false,
             prefersDegradedSearch: !shouldOptimizeOverlay
                 && (isLargeOverlayUpdate || updatePriority == .background)
         )
@@ -14024,6 +14027,15 @@ public final class FileIndex: @unchecked Sendable {
                 }
             }
             publishStats()
+        }
+    }
+
+    func hasOptimizedSortOrderForTesting(_ column: SortColumn) -> Bool {
+        lock.withLock {
+            searchSnapshot.hasOptimizedSortOrder(
+                for: column,
+                optimizedSortColumns: optimizedSortColumns
+            )
         }
     }
 
