@@ -51,6 +51,14 @@ enum ProcessMemorySampler {
 }
 
 enum ProcessResourceSampler {
+    private static let machTimebase: (numerator: UInt32, denominator: UInt32) = {
+        var info = mach_timebase_info_data_t()
+        guard mach_timebase_info(&info) == KERN_SUCCESS, info.denom > 0 else {
+            return (1, 1)
+        }
+        return (info.numer, info.denom)
+    }()
+
     static func currentUsage(sampledAt: Date = Date()) -> ProcessResourceUsage? {
         if let usage = currentRusageInfo(sampledAt: sampledAt) {
             return usage
@@ -90,9 +98,14 @@ enum ProcessResourceSampler {
         }
 
         guard result == 0 else { return nil }
+        let processorTime = info.ri_user_time + info.ri_system_time
         return ProcessResourceUsage(
             sampledAt: sampledAt,
-            cpuTime: nanosecondsToSeconds(info.ri_user_time + info.ri_system_time),
+            cpuTime: machTimeToSeconds(
+                processorTime,
+                numerator: machTimebase.numerator,
+                denominator: machTimebase.denominator
+            ),
             wakeups: info.ri_pkg_idle_wkups + info.ri_interrupt_wkups
         )
     }
@@ -107,8 +120,13 @@ enum ProcessResourceSampler {
         )
     }
 
-    private static func nanosecondsToSeconds(_ value: UInt64) -> TimeInterval {
-        TimeInterval(value) / 1_000_000_000
+    static func machTimeToSeconds(
+        _ value: UInt64,
+        numerator: UInt32,
+        denominator: UInt32
+    ) -> TimeInterval {
+        guard denominator > 0 else { return 0 }
+        return TimeInterval(value) * TimeInterval(numerator) / TimeInterval(denominator) / 1_000_000_000
     }
 
     private static func timeInterval(_ value: timeval) -> TimeInterval {

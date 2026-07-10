@@ -46,6 +46,20 @@ struct ProcessMemoryFormatterTests {
         #expect(delta?.wakeupsPerMinute == 120)
     }
 
+    @Test("process CPU time converts Mach ticks through the platform timebase")
+    func processCPUTimeConvertsMachTicksThroughPlatformTimebase() {
+        #expect(ProcessResourceSampler.machTimeToSeconds(
+            24_000_000,
+            numerator: 125,
+            denominator: 3
+        ) == 1)
+        #expect(ProcessResourceSampler.machTimeToSeconds(
+            1_000_000_000,
+            numerator: 1,
+            denominator: 0
+        ) == 0)
+    }
+
     @Test("process resource deltas drop counter resets")
     func processResourceDeltasDropCounterResets() {
         let start = Date(timeIntervalSince1970: 1_800_000_000)

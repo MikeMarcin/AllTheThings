@@ -14470,6 +14470,13 @@ public final class FileIndex: @unchecked Sendable {
             metrics.schemaVersion = IndexUsageMetrics.currentSchemaVersion
         case 3:
             metrics.schemaVersion = IndexUsageMetrics.currentSchemaVersion
+        case 4:
+            metrics.schemaVersion = IndexUsageMetrics.currentSchemaVersion
+            metrics.recentEnergySamples.removeAll()
+            metrics.energyRollups.removeAll()
+            for index in metrics.dailyBuckets.indices {
+                metrics.dailyBuckets[index].energy = EnergyUsageBreakdown()
+            }
         default:
             return IndexUsageMetrics(schemaVersion: IndexUsageMetrics.currentSchemaVersion)
         }
