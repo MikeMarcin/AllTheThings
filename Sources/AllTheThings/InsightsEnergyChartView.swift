@@ -173,7 +173,7 @@ final class InsightsEnergyChartView: NSView {
         )
 
         drawLegend(in: InsightsEnergyTimelineLayout.legendRect(in: bounds))
-        drawHoverHighlight(rects: rects)
+        drawHoverGuide(rects: rects)
     }
 
     private func drawDay() {
@@ -219,7 +219,7 @@ final class InsightsEnergyChartView: NSView {
         )
 
         drawLegend(in: InsightsEnergyTimelineLayout.legendRect(in: bounds))
-        drawHoverHighlight(rects: rects)
+        drawHoverGuide(rects: rects)
     }
 
     private func drawCalendar() {
@@ -485,7 +485,7 @@ final class InsightsEnergyChartView: NSView {
         path.stroke()
     }
 
-    private func drawHoverHighlight(rects: [NSRect]) {
+    private func drawHoverGuide(rects: [NSRect]) {
         let index: Int?
         switch hoveredTarget {
         case let .sample(value):
@@ -864,8 +864,12 @@ enum InsightsEnergyTimelineLayout {
     }
 
     static func sampleIndex(at point: NSPoint, samples: [EnergyUsageIntervalSample], in bounds: NSRect) -> Int? {
-        sampleRects(samples: samples, in: bounds)
-            .lastIndex { $0.insetBy(dx: -2, dy: 0).contains(point) }
+        let plot = plotRect(in: bounds)
+        guard plot.contains(point) else { return nil }
+        let rects = sampleRects(samples: samples, in: bounds)
+        return rects.indices.min { lhs, rhs in
+            abs(rects[lhs].midX - point.x) < abs(rects[rhs].midX - point.x)
+        }
     }
 
     static func rollupIndex(at point: NSPoint, rollups: [EnergyUsageRollup], in bounds: NSRect) -> Int? {
