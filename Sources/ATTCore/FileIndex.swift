@@ -12055,7 +12055,7 @@ public final class FileIndex: @unchecked Sendable {
         let budget = backgroundDirectoryScanBudget()
         let maximumDeferral = backgroundDirectoryMaxDeferral()
         guard maximumDeferral > 0, startedAt.timeIntervalSince(request.firstQueuedAt) < maximumDeferral else {
-            let acceleratedBudget = min(max(budget * 4, budget), 5)
+            let acceleratedBudget = max(budget, min(budget * 4, 5))
             return startedAt.addingTimeInterval(acceleratedBudget)
         }
         return startedAt.addingTimeInterval(budget)
