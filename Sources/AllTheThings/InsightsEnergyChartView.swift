@@ -85,7 +85,18 @@ final class InsightsEnergyChartView: NSView {
         switch range {
         case .hour:
             let samples = recentSamples()
-            hoveredTarget = InsightsEnergyTimelineLayout.sampleIndex(at: point, samples: samples, in: bounds)
+            let currentIndex: Int?
+            if case let .sample(index) = hoveredTarget {
+                currentIndex = index
+            } else {
+                currentIndex = nil
+            }
+            hoveredTarget = InsightsEnergyTimelineLayout.sampleIndex(
+                at: point,
+                samples: samples,
+                in: bounds,
+                currentIndex: currentIndex
+            )
                 .map(InsightsEnergyHoverTarget.sample)
         case .day:
             let rollups = recentRollups()
@@ -863,11 +874,23 @@ enum InsightsEnergyTimelineLayout {
         }
     }
 
-    static func sampleIndex(at point: NSPoint, samples: [EnergyUsageIntervalSample], in bounds: NSRect) -> Int? {
+    static func sampleIndex(
+        at point: NSPoint,
+        samples: [EnergyUsageIntervalSample],
+        in bounds: NSRect,
+        currentIndex: Int? = nil
+    ) -> Int? {
         let plot = plotRect(in: bounds)
         guard plot.contains(point) else { return nil }
         let rects = sampleRects(samples: samples, in: bounds)
-        return rects.lastIndex { $0.midX <= point.x }
+        guard let currentIndex, rects.indices.contains(currentIndex) else {
+            return rects.lastIndex { $0.midX <= point.x }
+        }
+
+        if point.x >= rects[currentIndex].midX {
+            return rects.lastIndex { $0.midX <= point.x } ?? currentIndex
+        }
+        return rects.firstIndex { $0.midX >= point.x } ?? currentIndex
     }
 
     static func rollupIndex(at point: NSPoint, rollups: [EnergyUsageRollup], in bounds: NSRect) -> Int? {
