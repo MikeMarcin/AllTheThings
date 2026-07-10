@@ -1103,21 +1103,33 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
+    private final class DirectoryUpdateScanProgress: @unchecked Sendable {
+        var pendingURLs: [URL]
+        var records: [String: FileRecord] = [:]
+
+        init(root: URL) {
+            pendingURLs = [root]
+        }
+    }
+
     private struct PendingRefreshWork: Sendable {
         let path: String
         var priority: IndexWorkPriority
         var firstQueuedAt: Date
         var lastQueuedAt: Date
         var completions: [PendingRefreshCompletion]
+        var directoryScanProgress: DirectoryUpdateScanProgress?
 
-        mutating func merge(
-            priority newPriority: IndexWorkPriority,
-            queuedAt: Date,
-            completions newCompletions: [PendingRefreshCompletion]
-        ) {
-            priority = IndexWorkPriority.merged(priority, newPriority)
-            lastQueuedAt = queuedAt
-            completions.append(contentsOf: newCompletions)
+        mutating func merge(_ incoming: PendingRefreshWork) {
+            let incomingPredatesCurrentWork = incoming.firstQueuedAt < firstQueuedAt
+            priority = IndexWorkPriority.merged(priority, incoming.priority)
+            firstQueuedAt = min(firstQueuedAt, incoming.firstQueuedAt)
+            lastQueuedAt = max(lastQueuedAt, incoming.lastQueuedAt)
+            completions.append(contentsOf: incoming.completions)
+
+            if !incomingPredatesCurrentWork {
+                directoryScanProgress = incoming.directoryScanProgress
+            }
         }
 
         mutating func promote() {
@@ -11788,7 +11800,8 @@ public final class FileIndex: @unchecked Sendable {
                     priority: priority,
                     firstQueuedAt: queuedAt,
                     lastQueuedAt: queuedAt,
-                    completions: completion.map { [$0] } ?? []
+                    completions: completion.map { [$0] } ?? [],
+                    directoryScanProgress: nil
                 )
             )
         }
@@ -11804,11 +11817,7 @@ public final class FileIndex: @unchecked Sendable {
 
     private func queuePendingRefreshWorkWithoutLock(_ work: PendingRefreshWork) {
         if var existing = pendingRefreshPaths[work.path] {
-            existing.merge(
-                priority: work.priority,
-                queuedAt: work.lastQueuedAt,
-                completions: work.completions
-            )
+            existing.merge(work)
             pendingRefreshPaths[work.path] = existing
         } else {
             pendingRefreshPaths[work.path] = work
@@ -12043,12 +12052,12 @@ public final class FileIndex: @unchecked Sendable {
         startedAt: Date
     ) -> Date? {
         guard request.priority == .background else { return nil }
-        let maximumDeferral = backgroundDirectoryMaxDeferral()
-        if maximumDeferral <= 0 || startedAt.timeIntervalSince(request.firstQueuedAt) >= maximumDeferral {
-            return nil
-        }
-
         let budget = backgroundDirectoryScanBudget()
+        let maximumDeferral = backgroundDirectoryMaxDeferral()
+        guard maximumDeferral > 0, startedAt.timeIntervalSince(request.firstQueuedAt) < maximumDeferral else {
+            let acceleratedBudget = min(max(budget * 4, budget), 5)
+            return startedAt.addingTimeInterval(acceleratedBudget)
+        }
         return startedAt.addingTimeInterval(budget)
     }
 
@@ -12172,7 +12181,7 @@ public final class FileIndex: @unchecked Sendable {
             )
         }
 
-        for request in requests {
+        for var request in requests {
             let path = request.path
             autoreleasepool {
                 let url = URL(fileURLWithPath: path).standardizedFileURL
@@ -12205,8 +12214,10 @@ public final class FileIndex: @unchecked Sendable {
                         )
                         let scannedRecords: [String: FileRecord]?
                         if indexState.frontierMode == .singleDirectory {
+                            let progress = request.directoryScanProgress
+                                ?? DirectoryUpdateScanProgress(root: candidate.url)
                             let scanResult = scanDirectoryForUpdate(
-                                root: candidate.url,
+                                progress: progress,
                                 exclusions: indexState.exclusions,
                                 rootPaths: indexState.rootPaths,
                                 query: exclusionQuery,
@@ -12220,6 +12231,8 @@ public final class FileIndex: @unchecked Sendable {
                                 if scanResult.completed {
                                     scannedRecords = scanResult.records
                                 } else {
+                                    upserts.removeValue(forKey: candidate.record.path)
+                                    request.directoryScanProgress = progress
                                     deferredRefreshes.append(request)
                                     scannedRecords = nil
                                 }
@@ -12533,32 +12546,35 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     private func scanDirectoryForUpdate(
-        root: URL,
+        progress: DirectoryUpdateScanProgress,
         exclusions: FileExclusionRules,
         rootPaths: [String],
         query: FileExclusionQuery?,
         deadline: Date?,
         generation currentGeneration: UInt64
     ) -> DirectoryUpdateScanResult? {
-        var records: [String: FileRecord] = [:]
         let volumeNameCache = ScanVolumeNameCache()
         var visitedCount = 0
-        var stoppedForBudget = false
         var exclusionInstrumentation = FileExclusionQuery.Instrumentation()
 
-        func visit(_ url: URL) -> Bool {
-            guard isCurrentGeneration(currentGeneration) else { return false }
+        while let url = progress.pendingURLs.last {
+            guard isCurrentGeneration(currentGeneration) else { return nil }
             if let deadline, Date() >= deadline {
-                stoppedForBudget = true
-                return false
+                return DirectoryUpdateScanResult(
+                    records: progress.records,
+                    completed: false,
+                    visitedCount: visitedCount,
+                    exclusionInstrumentation: exclusionInstrumentation
+                )
             }
+            progress.pendingURLs.removeLast()
             visitedCount += 1
 
             guard let candidate = fileSystemRecordCandidate(
                 for: url,
                 volumeNameCache: volumeNameCache
             ) else {
-                return true
+                continue
             }
             let decision = exclusionDecision(
                 for: candidate.url,
@@ -12568,17 +12584,18 @@ public final class FileIndex: @unchecked Sendable {
                 isDirectory: candidate.isDirectory,
                 instrumentation: &exclusionInstrumentation
             )
-            guard decision != .prune else { return true }
+            guard decision != .prune else { continue }
 
             if decision.shouldIndex {
-                records[candidate.record.path] = candidate.record
+                progress.records[candidate.record.path] = candidate.record
             }
 
             guard candidate.isDirectory, !candidate.isSymlink, decision.shouldDescend else {
-                return true
+                continue
             }
 
-            return enumerateShallowChildURLs(
+            var children: [URL] = []
+            let enumeratedChildren = enumerateShallowChildURLs(
                 in: candidate.url,
                 prunesDirectoryNamed: { name in
                     let prunes = exclusions.canPruneDirectoryComponentBeforeStat(name)
@@ -12588,21 +12605,17 @@ public final class FileIndex: @unchecked Sendable {
                     return prunes
                 }
             ) { child in
-                visit(child)
+                children.append(child)
+                return true
             }
+            guard enumeratedChildren else {
+                return nil
+            }
+            progress.pendingURLs.append(contentsOf: children.reversed())
         }
 
-        guard visit(root) else {
-            guard stoppedForBudget else { return nil }
-            return DirectoryUpdateScanResult(
-                records: records,
-                completed: false,
-                visitedCount: visitedCount,
-                exclusionInstrumentation: exclusionInstrumentation
-            )
-        }
         return DirectoryUpdateScanResult(
-            records: records,
+            records: progress.records,
             completed: true,
             visitedCount: visitedCount,
             exclusionInstrumentation: exclusionInstrumentation

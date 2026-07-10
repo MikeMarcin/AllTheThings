@@ -1315,6 +1315,63 @@ struct FileIndexTests {
         #expect(completedSnapshot.usage.maintenance.background.operations > 0)
     }
 
+    @Test("background directory refresh resumes across bounded slices")
+    func backgroundDirectoryRefreshResumesAcrossBoundedSlices() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        let folder = root.appendingPathComponent("Folder", isDirectory: true)
+        try fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        for offset in 0..<1_000 {
+            let file = folder.appendingPathComponent("Existing\(offset).swift")
+            try "existing".write(to: file, atomically: true, encoding: .utf8)
+        }
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        defer {
+            try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName))
+        }
+        let index = FileIndex(
+            applicationName: applicationName,
+            loadsSnapshotImmediately: false,
+            largeOverlayPersistRecordLimit: nil,
+            largeOverlayPersistDelay: nil,
+            backgroundRefreshDrainBackoffDelay: 0,
+            backgroundDirectoryScanBudget: 0.005,
+            backgroundDirectoryMaxDeferral: 60,
+            backgroundOptimizationPersistDelay: 60
+        )
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil {
+            let diagnostics = index.currentDiagnostics()
+            return !index.currentStats().isIndexing
+                && diagnostics.optimizedCount == diagnostics.indexedCount
+        }
+
+        let createdFile = folder.appendingPathComponent("CreatedDuringCatchup.swift")
+        try "created".write(to: createdFile, atomically: true, encoding: .utf8)
+        let before = index.currentDiagnostics()
+        index.update(paths: [folder.path], priority: .background)
+
+        try await waitUntil(timeout: .seconds(20)) {
+            let diagnostics = index.currentDiagnostics()
+            let response = index.search(SearchRequest(
+                query: "CreatedDuringCatchup",
+                sort: SortSpec(column: .relevance, ascending: false)
+            ), maxResults: 10)
+            return diagnostics.completedRefreshBatches > before.completedRefreshBatches + 1
+                && diagnostics.pendingBackgroundRefreshPathCount == 0
+                && response.results.contains { $0.record.path == createdFile.path }
+        }
+
+        let completedSnapshot = index.currentInsightsSnapshot()
+        #expect(completedSnapshot.usage.maintenance.counters(for: .directoryRefresh).yieldedSlices > 1)
+    }
+
     @Test("background structural update defers search optimization until promotion")
     func backgroundStructuralUpdateDefersSearchOptimizationUntilPromotion() async throws {
         let fileManager = FileManager.default
