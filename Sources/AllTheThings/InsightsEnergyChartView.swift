@@ -156,24 +156,21 @@ final class InsightsEnergyChartView: NSView {
             return
         }
 
-        let plot = InsightsEnergyTimelineLayout.plotRect(in: bounds)
+        let cpuPlot = InsightsEnergyTimelineLayout.cpuPlotRect(in: bounds)
+        let wakeupsPlot = InsightsEnergyTimelineLayout.wakeupsPlotRect(in: bounds)
         let maxLoad = Self.cpuLoadScaleMaximum(samples.map(\.cpuLoad))
         let maxWakeups = maxWakeupsPerMinute(samples: samples)
         let rects = InsightsEnergyTimelineLayout.sampleRects(samples: samples, in: bounds)
-        drawTimelineBackground(plot: plot)
+        drawTimelineBackground(plot: cpuPlot, intermediateLineCount: 3)
+        drawTimelineBackground(plot: wakeupsPlot, intermediateLineCount: 1)
 
-        let cpuPoints = samples.enumerated().compactMap { index, sample -> InsightsEnergyTimelinePoint? in
-            guard index < rects.count else { return nil }
-            return cpuPoint(x: rects[index].midX, value: sample.cpuLoad, maxValue: maxLoad, plot: plot)
-        }
-        let wakeupPoints = samples.enumerated().compactMap { index, sample -> NSPoint? in
-            guard index < rects.count else { return nil }
-            return wakeupPoint(x: rects[index].midX, value: sample.wakeupsPerMinute, maxValue: maxWakeups, plot: plot)
-        }
-
-        drawModeLine(points: cpuPoints, modes: samples.map(\.mode))
-        drawLine(points: wakeupPoints, color: .systemRed.withAlphaComponent(0.72), lineWidth: 1.5)
-        drawPointMarkers(points: cpuPoints.map(\.point), color: .labelColor.withAlphaComponent(0.18), radius: 2)
+        drawCategorizedCPULoad(samples: samples, slots: rects, maxLoad: maxLoad, plot: cpuPlot)
+        drawWakeupBars(
+            values: samples.map(\.wakeupsPerMinute),
+            maxValue: maxWakeups,
+            slots: rects,
+            plot: wakeupsPlot
+        )
 
         drawLegend(in: InsightsEnergyTimelineLayout.legendRect(in: bounds))
         drawHoverHighlight(rects: rects)
@@ -186,51 +183,40 @@ final class InsightsEnergyChartView: NSView {
             return
         }
 
-        let plot = InsightsEnergyTimelineLayout.plotRect(in: bounds)
-        let cpuLoads = rollups.flatMap { rollup in
-            [
-                rollup.energy.total.averageCPULoad,
-                rollup.energy.foreground.averageCPULoad,
-                rollup.energy.background.averageCPULoad
-            ]
-        }
-        let maxLoad = Self.cpuLoadScaleMaximum(cpuLoads)
+        let cpuPlot = InsightsEnergyTimelineLayout.cpuPlotRect(in: bounds)
+        let wakeupsPlot = InsightsEnergyTimelineLayout.wakeupsPlotRect(in: bounds)
+        let maxLoad = Self.cpuLoadScaleMaximum(rollups.map { $0.energy.total.averageCPULoad })
         let maxWakeups = maxWakeupsPerMinute(rollups: rollups)
         let rects = InsightsEnergyTimelineLayout.rollupRects(rollups: rollups, in: bounds)
-        drawTimelineBackground(plot: plot)
+        drawTimelineBackground(plot: cpuPlot, intermediateLineCount: 3)
+        drawTimelineBackground(plot: wakeupsPlot, intermediateLineCount: 1)
 
-        let foregroundPoints = rollups.enumerated().compactMap { index, rollup -> NSPoint? in
+        let totalPoints = rollups.enumerated().compactMap { index, rollup -> NSPoint? in
             guard index < rects.count else { return nil }
-            return cpuPoint(
+            return timelinePoint(
                 x: rects[index].midX,
-                value: rollup.energy.foreground.averageCPULoad,
+                value: rollup.energy.total.averageCPULoad,
                 maxValue: maxLoad,
-                plot: plot
-            )?.point
+                plot: cpuPlot
+            )
         }
         let backgroundPoints = rollups.enumerated().compactMap { index, rollup -> NSPoint? in
             guard index < rects.count else { return nil }
-            return cpuPoint(
+            return timelinePoint(
                 x: rects[index].midX,
-                value: rollup.energy.background.averageCPULoad,
+                value: Self.backgroundCPULoadContribution(rollup.energy),
                 maxValue: maxLoad,
-                plot: plot
-            )?.point
-        }
-        let wakeupPoints = rollups.enumerated().compactMap { index, rollup -> NSPoint? in
-            guard index < rects.count else { return nil }
-            return wakeupPoint(
-                x: rects[index].midX,
-                value: rollup.energy.total.wakeupsPerMinute,
-                maxValue: maxWakeups,
-                plot: plot
+                plot: cpuPlot
             )
         }
 
-        drawLine(points: foregroundPoints, color: Self.color(for: .foreground), lineWidth: 2)
-        drawLine(points: backgroundPoints, color: Self.color(for: .background), lineWidth: 2)
-        drawLine(points: wakeupPoints, color: .systemRed.withAlphaComponent(0.72), lineWidth: 1.5)
-        drawPointMarkers(points: foregroundPoints + backgroundPoints, color: .labelColor.withAlphaComponent(0.16), radius: 1.8)
+        drawStackedCPULoad(totalPoints: totalPoints, backgroundPoints: backgroundPoints, plot: cpuPlot)
+        drawWakeupBars(
+            values: rollups.map { $0.energy.total.wakeupsPerMinute },
+            maxValue: maxWakeups,
+            slots: rects,
+            plot: wakeupsPlot
+        )
 
         drawLegend(in: InsightsEnergyTimelineLayout.legendRect(in: bounds))
         drawHoverHighlight(rects: rects)
@@ -331,12 +317,14 @@ final class InsightsEnergyChartView: NSView {
         }
     }
 
-    private func drawTimelineBackground(plot: NSRect) {
+    private func drawTimelineBackground(plot: NSRect, intermediateLineCount: Int) {
         NSColor.separatorColor.withAlphaComponent(0.25).setStroke()
         NSBezierPath(rect: plot).stroke()
         NSColor.separatorColor.withAlphaComponent(0.14).setStroke()
-        for fraction in [0.25, 0.5, 0.75] {
-            let y = plot.minY + plot.height * CGFloat(fraction)
+        guard intermediateLineCount > 0 else { return }
+        for index in 1...intermediateLineCount {
+            let fraction = CGFloat(index) / CGFloat(intermediateLineCount + 1)
+            let y = plot.minY + plot.height * fraction
             let path = NSBezierPath()
             path.lineWidth = 1
             path.move(to: NSPoint(x: plot.minX, y: y))
@@ -345,34 +333,147 @@ final class InsightsEnergyChartView: NSView {
         }
     }
 
-    private func cpuPoint(x: CGFloat, value: Double, maxValue: Double, plot: NSRect) -> InsightsEnergyTimelinePoint? {
+    private func timelinePoint(x: CGFloat, value: Double, maxValue: Double, plot: NSRect) -> NSPoint? {
         guard value.isFinite, maxValue > 0, plot.width > 0, plot.height > 0 else { return nil }
         let fraction = min(max(value / maxValue, 0), 1)
-        return InsightsEnergyTimelinePoint(
-            point: NSPoint(x: x, y: plot.maxY - CGFloat(fraction) * plot.height)
+        return NSPoint(x: x, y: plot.maxY - CGFloat(fraction) * plot.height)
+    }
+
+    private func drawCategorizedCPULoad(
+        samples: [EnergyUsageIntervalSample],
+        slots: [NSRect],
+        maxLoad: Double,
+        plot: NSRect
+    ) {
+        guard samples.count == slots.count else { return }
+        let points = InsightsEnergyTimelineLayout.cpuLoadPoints(
+            loads: samples.map(\.cpuLoad),
+            maxLoad: maxLoad,
+            slots: slots,
+            plot: plot
         )
-    }
+        guard !points.isEmpty else { return }
+        let baseline = points.map { NSPoint(x: $0.x, y: plot.maxY) }
 
-    private func wakeupPoint(x: CGFloat, value: Double, maxValue: Double, plot: NSRect) -> NSPoint? {
-        guard value.isFinite, value >= 0, maxValue > 0, plot.width > 0, plot.height > 0 else { return nil }
-        let railHeight = plot.height * 0.22
-        let fraction = min(max(value / maxValue, 0), 1)
-        return NSPoint(x: x, y: plot.maxY - CGFloat(fraction) * railHeight)
-    }
-
-    private func drawModeLine(points: [InsightsEnergyTimelinePoint], modes: [EnergyUsageMode]) {
-        guard points.count > 1 else {
-            drawPointMarkers(points: points.map(\.point), color: Self.color(for: modes.first ?? .foreground), radius: 2.4)
-            return
+        for (sample, slot) in zip(samples, slots) {
+            let clipRect = slot.intersection(plot)
+            guard !clipRect.isEmpty else { continue }
+            NSGraphicsContext.saveGraphicsState()
+            NSBezierPath(rect: clipRect).addClip()
+            drawArea(
+                upperPoints: points,
+                lowerPoints: baseline,
+                color: Self.fillColor(for: sample.mode)
+            )
+            drawLine(points: points, color: Self.color(for: sample.mode), lineWidth: 1.5)
+            NSGraphicsContext.restoreGraphicsState()
         }
+    }
+
+    private func drawStackedCPULoad(totalPoints: [NSPoint], backgroundPoints: [NSPoint], plot: NSRect) {
+        guard totalPoints.count == backgroundPoints.count else { return }
+        let totalPoints = expandedSinglePointSeries(totalPoints, in: plot)
+        let backgroundPoints = expandedSinglePointSeries(backgroundPoints, in: plot)
+        let baseline = totalPoints.map { NSPoint(x: $0.x, y: plot.maxY) }
+        drawArea(
+            upperPoints: backgroundPoints,
+            lowerPoints: baseline,
+            color: Self.fillColor(for: .background)
+        )
+        drawArea(
+            upperPoints: totalPoints,
+            lowerPoints: backgroundPoints,
+            color: Self.fillColor(for: .foreground)
+        )
+        drawBackgroundOutline(points: backgroundPoints, baselineY: plot.maxY)
+        drawCPUOutline(totalPoints: totalPoints, backgroundPoints: backgroundPoints)
+    }
+
+    private func expandedSinglePointSeries(_ points: [NSPoint], in plot: NSRect) -> [NSPoint] {
+        guard let point = points.first, points.count == 1 else { return points }
+        return [
+            NSPoint(x: max(plot.minX, point.x - 1.5), y: point.y),
+            NSPoint(x: min(plot.maxX, point.x + 1.5), y: point.y)
+        ]
+    }
+
+    private func drawCPUOutline(totalPoints: [NSPoint], backgroundPoints: [NSPoint]) {
+        guard totalPoints.count == backgroundPoints.count else { return }
+        drawLineRuns(points: totalPoints) { index in
+            let previousHasForegroundLoad = totalPoints[index - 1].y < backgroundPoints[index - 1].y - 0.5
+            let currentHasForegroundLoad = totalPoints[index].y < backgroundPoints[index].y - 0.5
+            return previousHasForegroundLoad || currentHasForegroundLoad ? .foreground : .background
+        }
+    }
+
+    private func drawBackgroundOutline(points: [NSPoint], baselineY: CGFloat) {
+        drawLineRuns(points: points) { index in
+            let previousHasBackgroundLoad = points[index - 1].y < baselineY - 0.5
+            let currentHasBackgroundLoad = points[index].y < baselineY - 0.5
+            return previousHasBackgroundLoad && currentHasBackgroundLoad ? .background : nil
+        }
+    }
+
+    private func drawLineRuns(
+        points: [NSPoint],
+        modeForSegment: (Int) -> EnergyUsageMode?
+    ) {
+        guard points.count > 1 else { return }
+        var runStart: Int?
+        var runMode: EnergyUsageMode?
 
         for index in 1..<points.count {
-            let mode = index < modes.count ? modes[index] : modes.last ?? .foreground
+            let mode = modeForSegment(index)
+            guard mode != runMode else { continue }
+            if let runStart, let runMode {
+                drawLine(
+                    points: Array(points[runStart..<index]),
+                    color: Self.color(for: runMode),
+                    lineWidth: 1.5
+                )
+            }
+            runStart = mode == nil ? nil : index - 1
+            runMode = mode
+        }
+
+        if let runStart, let runMode {
             drawLine(
-                points: [points[index - 1].point, points[index].point],
-                color: Self.color(for: mode),
-                lineWidth: 2
+                points: Array(points[runStart...]),
+                color: Self.color(for: runMode),
+                lineWidth: 1.5
             )
+        }
+    }
+
+    private func drawArea(upperPoints: [NSPoint], lowerPoints: [NSPoint], color: NSColor) {
+        guard !upperPoints.isEmpty, upperPoints.count == lowerPoints.count else { return }
+        let path = NSBezierPath()
+        path.move(to: upperPoints[0])
+        for point in upperPoints.dropFirst() {
+            path.line(to: point)
+        }
+        for point in lowerPoints.reversed() {
+            path.line(to: point)
+        }
+        path.close()
+        color.setFill()
+        path.fill()
+    }
+
+    private func drawWakeupBars(values: [Double], maxValue: Double, slots: [NSRect], plot: NSRect) {
+        guard values.count == slots.count, maxValue > 0, plot.height > 0 else { return }
+        NSColor.systemRed.withAlphaComponent(0.72).setFill()
+        for (value, slot) in zip(values, slots) where value.isFinite && value > 0 {
+            let fraction = min(max(value / maxValue, 0), 1)
+            let height = max(1, CGFloat(fraction) * plot.height)
+            let horizontalInset = min(1, max(0, slot.width * 0.12))
+            let bar = NSRect(
+                x: slot.minX + horizontalInset,
+                y: plot.maxY - height,
+                width: max(1, slot.width - horizontalInset * 2),
+                height: height
+            ).intersection(plot)
+            NSBezierPath(roundedRect: bar, xRadius: min(1.5, bar.width / 2), yRadius: 1.5).fill()
         }
     }
 
@@ -388,19 +489,6 @@ final class InsightsEnergyChartView: NSView {
             path.line(to: point)
         }
         path.stroke()
-    }
-
-    private func drawPointMarkers(points: [NSPoint], color: NSColor, radius: CGFloat) {
-        guard radius > 0 else { return }
-        color.setFill()
-        for point in points {
-            NSBezierPath(ovalIn: NSRect(
-                x: point.x - radius,
-                y: point.y - radius,
-                width: radius * 2,
-                height: radius * 2
-            )).fill()
-        }
     }
 
     private func drawHoverHighlight(rects: [NSRect]) {
@@ -431,7 +519,7 @@ final class InsightsEnergyChartView: NSView {
         let items: [(String, NSColor)] = [
             ("Foreground CPU", Self.color(for: .foreground)),
             ("Background CPU", Self.color(for: .background)),
-            ("Wakeups", .systemRed.withAlphaComponent(0.72))
+            ("Wakeups / Min", .systemRed.withAlphaComponent(0.72))
         ]
         var x = rect.minX
         for item in items {
@@ -531,6 +619,10 @@ final class InsightsEnergyChartView: NSView {
         }
     }
 
+    private static func fillColor(for mode: EnergyUsageMode) -> NSColor {
+        color(for: mode).withAlphaComponent(0.28)
+    }
+
     nonisolated static func calendarColor(
         backgroundImpact: Double,
         maxBackgroundImpact: Double,
@@ -570,6 +662,12 @@ final class InsightsEnergyChartView: NSView {
 
     nonisolated static func cpuLoadScaleMaximum(_ values: [Double]) -> Double {
         max(values.filter { $0.isFinite && $0 > 0 }.max() ?? 0, 1)
+    }
+
+    nonisolated static func backgroundCPULoadContribution(_ energy: EnergyUsageBreakdown) -> Double {
+        let totalWallTime = energy.total.wallTime
+        guard totalWallTime > 0 else { return 0 }
+        return energy.background.cpuTime / totalWallTime
     }
 
     nonisolated static func calendarActivityBaseline(scores: [Double]) -> Double {
@@ -644,10 +742,6 @@ final class InsightsEnergyChartView: NSView {
     }
 }
 
-struct InsightsEnergyTimelinePoint: Equatable {
-    let point: NSPoint
-}
-
 struct InsightsEnergyCalendarItem: Equatable {
     let index: Int
     let day: String
@@ -678,6 +772,8 @@ enum InsightsEnergyTimelineLayout {
     static let inset = NSEdgeInsets(top: 10, left: 8, bottom: 10, right: 8)
     static let legendHeight: CGFloat = 14
     static let legendGap: CGFloat = 8
+    static let plotGap: CGFloat = 8
+    static let wakeupsPlotFraction: CGFloat = 0.25
     static let minimumSlotWidth: CGFloat = 2
 
     static func plotRect(in bounds: NSRect) -> NSRect {
@@ -699,6 +795,54 @@ enum InsightsEnergyTimelineLayout {
             width: plot.width,
             height: legendHeight
         )
+    }
+
+    static func cpuPlotRect(in bounds: NSRect) -> NSRect {
+        let plot = plotRect(in: bounds)
+        let availableHeight = max(0, plot.height - plotGap)
+        let wakeupsHeight = floor(availableHeight * wakeupsPlotFraction)
+        return NSRect(
+            x: plot.minX,
+            y: plot.minY,
+            width: plot.width,
+            height: max(0, availableHeight - wakeupsHeight)
+        )
+    }
+
+    static func wakeupsPlotRect(in bounds: NSRect) -> NSRect {
+        let plot = plotRect(in: bounds)
+        let cpuPlot = cpuPlotRect(in: bounds)
+        return NSRect(
+            x: plot.minX,
+            y: cpuPlot.maxY + plotGap,
+            width: plot.width,
+            height: max(0, plot.maxY - cpuPlot.maxY - plotGap)
+        )
+    }
+
+    static func cpuLoadPoints(loads: [Double], maxLoad: Double, slots: [NSRect], plot: NSRect) -> [NSPoint] {
+        guard
+            loads.count == slots.count,
+            !loads.isEmpty,
+            maxLoad > 0,
+            plot.width > 0,
+            plot.height > 0
+        else {
+            return []
+        }
+
+        let samplePoints = zip(loads, slots).map { load, slot in
+            let finiteLoad = load.isFinite ? load : 0
+            let fraction = min(max(finiteLoad / maxLoad, 0), 1)
+            return NSPoint(
+                x: slot.midX,
+                y: plot.maxY - CGFloat(fraction) * plot.height
+            )
+        }
+        guard let first = samplePoints.first, let last = samplePoints.last else { return [] }
+        return [NSPoint(x: slots[0].minX, y: first.y)]
+            + samplePoints
+            + [NSPoint(x: slots[slots.count - 1].maxX, y: last.y)]
     }
 
     static func sampleRects(samples: [EnergyUsageIntervalSample], in bounds: NSRect) -> [NSRect] {
