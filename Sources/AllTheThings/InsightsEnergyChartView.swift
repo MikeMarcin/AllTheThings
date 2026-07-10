@@ -867,9 +867,7 @@ enum InsightsEnergyTimelineLayout {
         let plot = plotRect(in: bounds)
         guard plot.contains(point) else { return nil }
         let rects = sampleRects(samples: samples, in: bounds)
-        return rects.indices.min { lhs, rhs in
-            abs(rects[lhs].midX - point.x) < abs(rects[rhs].midX - point.x)
-        }
+        return rects.lastIndex { $0.midX <= point.x }
     }
 
     static func rollupIndex(at point: NSPoint, rollups: [EnergyUsageRollup], in bounds: NSRect) -> Int? {
