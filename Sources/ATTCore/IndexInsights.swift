@@ -843,8 +843,34 @@ public extension DailyUsageBucket {
         calendarActivityScoreComponents.total
     }
 
-    var backgroundEnergyImpactScore: Double {
-        energy.background.cpuTime + Double(energy.background.wakeups) / 10_000
+    var backgroundEnergyIntensity: Double {
+        max(
+            Self.normalizedEnergyIntensity(
+                energy.background.averageCPULoad,
+                low: 0.01,
+                elevated: 0.05,
+                high: 0.15
+            ),
+            Self.normalizedEnergyIntensity(
+                energy.background.wakeupsPerMinute,
+                low: 30,
+                elevated: 60,
+                high: 120
+            )
+        )
+    }
+
+    private static func normalizedEnergyIntensity(
+        _ value: Double,
+        low: Double,
+        elevated: Double,
+        high: Double
+    ) -> Double {
+        guard value.isFinite, value > low else { return 0 }
+        if value < elevated {
+            return (value - low) / (elevated - low)
+        }
+        return 1 + min((value - elevated) / (high - elevated), 1)
     }
 }
 

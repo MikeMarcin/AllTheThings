@@ -565,17 +565,31 @@ struct FileIndexInsightsTests {
         #expect(abs(bucket.calendarActivityScore - (expectedSearch + expectedIndex + expectedRefresh)) < 0.000_001)
     }
 
-    @Test("background energy impact uses only background CPU and wakeups")
-    func backgroundEnergyImpactUsesOnlyBackgroundCPUAndWakeups() {
-        let bucket = DailyUsageBucket(
+    @Test("background energy intensity uses absolute CPU and wakeup thresholds")
+    func backgroundEnergyIntensityUsesAbsoluteCPUAndWakeupThresholds() {
+        let low = DailyUsageBucket(
             day: "2026-07-04",
             energy: EnergyUsageBreakdown(
                 foreground: EnergyUsageCounters(cpuTime: 100, wakeups: 100_000),
-                background: EnergyUsageCounters(cpuTime: 2, wakeups: 30_000)
+                background: EnergyUsageCounters(wallTime: 60, cpuTime: 0.6, wakeups: 30)
+            )
+        )
+        let elevated = DailyUsageBucket(
+            day: "2026-07-05",
+            energy: EnergyUsageBreakdown(
+                background: EnergyUsageCounters(wallTime: 60, cpuTime: 3, wakeups: 60)
+            )
+        )
+        let high = DailyUsageBucket(
+            day: "2026-07-06",
+            energy: EnergyUsageBreakdown(
+                background: EnergyUsageCounters(wallTime: 60, cpuTime: 9, wakeups: 120)
             )
         )
 
-        #expect(bucket.backgroundEnergyImpactScore == 5)
+        #expect(low.backgroundEnergyIntensity == 0)
+        #expect(elevated.backgroundEnergyIntensity == 1)
+        #expect(high.backgroundEnergyIntensity == 2)
     }
 
     @Test("energy samples build five minute rollups")

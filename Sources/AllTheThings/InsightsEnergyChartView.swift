@@ -238,10 +238,6 @@ final class InsightsEnergyChartView: NSView {
 
         let activityScores = visibleBuckets.map(Self.calendarActivityScore).filter { $0 > 0 }
         let activityBaseline = Self.calendarActivityBaseline(scores: activityScores)
-        let impactBuckets = visibleBuckets.filter { Self.backgroundEnergyImpactScore($0) > 0 }
-        let maxBackgroundImpact = max(impactBuckets.map(Self.backgroundEnergyImpactScore).max() ?? 0, 0.001)
-        let comparisonCount = impactBuckets.count
-
         for item in grid.items {
             guard let bucketIndex = item.bucketIndex, bucketIndex < buckets.count else { continue }
             let bucket = buckets[bucketIndex]
@@ -250,9 +246,7 @@ final class InsightsEnergyChartView: NSView {
             let radiusScale = Self.calendarRadiusScale(activity: activity, baseline: activityBaseline)
             let side = max(4, item.maximumRadius * 2 * radiusScale)
             Self.calendarColor(
-                backgroundImpact: Self.backgroundEnergyImpactScore(bucket),
-                maxBackgroundImpact: maxBackgroundImpact,
-                comparisonCount: comparisonCount
+                backgroundIntensity: Self.backgroundEnergyIntensity(bucket)
             ).setFill()
             NSBezierPath(
                 ovalIn: NSRect(
@@ -595,13 +589,14 @@ final class InsightsEnergyChartView: NSView {
         return [
             bucket.day,
             "Activity\t\(scoreString(components.total))",
-            "Background Impact\t\(scoreString(bucket.backgroundEnergyImpactScore))",
+            "Background Level\t\(backgroundIntensityLabel(bucket.backgroundEnergyIntensity))",
             "",
             "Search\t\(scoreString(components.search))",
             "Index\t\(scoreString(components.index))",
             "Refresh\t\(scoreString(components.refresh))",
             "",
             "Background CPU\t\(durationString(background.cpuTime))",
+            "Background Load\t\(cpuLoadString(background.averageCPULoad))",
             "Background Wakeups\t\(wakeupsPerMinuteString(background.wakeupsPerMinute))",
             "Total CPU\t\(durationString(total.cpuTime))",
             "Average Load\t\(cpuLoadString(total.averageCPULoad))",
@@ -623,32 +618,17 @@ final class InsightsEnergyChartView: NSView {
         color(for: mode).withAlphaComponent(0.28)
     }
 
-    nonisolated static func calendarColor(
-        backgroundImpact: Double,
-        maxBackgroundImpact: Double,
-        comparisonCount: Int
-    ) -> NSColor {
-        guard
-            backgroundImpact.isFinite,
-            backgroundImpact > 0,
-            maxBackgroundImpact.isFinite,
-            maxBackgroundImpact > 0
-        else {
+    nonisolated static func calendarColor(backgroundIntensity: Double) -> NSColor {
+        guard backgroundIntensity.isFinite, backgroundIntensity > 0 else {
             return NSColor.systemGreen.withAlphaComponent(0.78)
         }
 
-        let relativeImpact = min(max(backgroundImpact / maxBackgroundImpact, 0), 1)
-        if comparisonCount < 3 {
-            let blend = CGFloat(relativeImpact * 0.65)
+        if backgroundIntensity < 1 {
+            let blend = CGFloat(backgroundIntensity)
             return blendedColor(from: .systemGreen, to: .systemYellow, fraction: blend).withAlphaComponent(0.84)
         }
 
-        if relativeImpact < 0.55 {
-            let blend = CGFloat(relativeImpact / 0.55)
-            return blendedColor(from: .systemGreen, to: .systemYellow, fraction: blend).withAlphaComponent(0.84)
-        }
-
-        let blend = CGFloat((relativeImpact - 0.55) / 0.45)
+        let blend = CGFloat(min(backgroundIntensity - 1, 1))
         return blendedColor(from: .systemYellow, to: .systemRed, fraction: blend).withAlphaComponent(0.84)
     }
 
@@ -656,8 +636,8 @@ final class InsightsEnergyChartView: NSView {
         bucket.calendarActivityScore
     }
 
-    nonisolated static func backgroundEnergyImpactScore(_ bucket: DailyUsageBucket) -> Double {
-        bucket.backgroundEnergyImpactScore
+    nonisolated static func backgroundEnergyIntensity(_ bucket: DailyUsageBucket) -> Double {
+        bucket.backgroundEnergyIntensity
     }
 
     nonisolated static func cpuLoadScaleMaximum(_ values: [Double]) -> Double {
@@ -726,6 +706,16 @@ final class InsightsEnergyChartView: NSView {
     private func scoreString(_ value: Double) -> String {
         guard value.isFinite, value > 0 else { return "0.0" }
         return String(format: "%.1f", value)
+    }
+
+    private func backgroundIntensityLabel(_ intensity: Double) -> String {
+        if intensity >= 2 {
+            return "High"
+        }
+        if intensity >= 1 {
+            return "Elevated"
+        }
+        return "Low"
     }
 
     private func backgroundShareString(_ energy: EnergyUsageBreakdown) -> String {
