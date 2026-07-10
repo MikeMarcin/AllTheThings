@@ -1056,11 +1056,10 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         if selectedRange == .calendar {
             let buckets = calendarEnergyBuckets(from: usage, referenceDate: now)
             let activity = buckets.reduce(0) { $0 + $1.calendarActivityScore }
-            let backgroundImpact = buckets.reduce(0) { $0 + $1.backgroundEnergyImpactScore }
             replaceFacts(in: energyFactsStack, with: [
                 InsightsFact("Date Range", calendarEnergyDateRangeString(referenceDate: now)),
                 InsightsFact("Activity", scoreString(activity)),
-                InsightsFact("Background Impact", scoreString(backgroundImpact)),
+                InsightsFact("Avg Background Load", cpuLoadString(selected.background.averageCPULoad)),
                 InsightsFact("CPU Time", durationString(selected.total.cpuTime)),
                 InsightsFact("Background CPU", durationString(selected.background.cpuTime)),
                 InsightsFact("Background Share", backgroundShareString(selected)),

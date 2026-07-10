@@ -633,36 +633,28 @@ struct InsightsTreemapLayoutTests {
         #expect(InsightsEnergyCalendarLayout.itemIndex(at: firstBucket.center, in: items) == 0)
     }
 
-    @Test("energy calendar color does not turn red without comparison history")
-    func energyCalendarColorDoesNotTurnRedWithoutComparisonHistory() throws {
-        let baseline = try #require(
-            InsightsEnergyChartView.calendarColor(
-                backgroundImpact: 10,
-                maxBackgroundImpact: 10,
-                comparisonCount: 1
-            )
+    @Test("energy calendar color uses absolute background intensity bands")
+    func energyCalendarColorUsesAbsoluteBackgroundIntensityBands() throws {
+        let low = try #require(
+            InsightsEnergyChartView.calendarColor(backgroundIntensity: 0.2)
                 .usingColorSpace(.sRGB)
         )
-        let maturePeak = try #require(
-            InsightsEnergyChartView.calendarColor(
-                backgroundImpact: 10,
-                maxBackgroundImpact: 10,
-                comparisonCount: 7
-            )
+        let high = try #require(
+            InsightsEnergyChartView.calendarColor(backgroundIntensity: 2)
                 .usingColorSpace(.sRGB)
         )
 
-        #expect(baseline.greenComponent > baseline.redComponent)
-        #expect(maturePeak.redComponent >= maturePeak.greenComponent)
+        #expect(low.greenComponent > low.redComponent)
+        #expect(high.redComponent > high.greenComponent)
     }
 
-    @Test("energy calendar size uses activity while color uses background impact")
-    func energyCalendarSizeUsesActivityWhileColorUsesBackgroundImpact() throws {
+    @Test("energy calendar size uses activity while color uses background intensity")
+    func energyCalendarSizeUsesActivityWhileColorUsesBackgroundIntensity() throws {
         let lowActivityHighBackground = DailyUsageBucket(
             day: "2026-07-01",
             searches: SearchUsageCounters(completed: 1),
             energy: EnergyUsageBreakdown(
-                background: EnergyUsageCounters(cpuTime: 4, wakeups: 20_000)
+                background: EnergyUsageCounters(wallTime: 60, cpuTime: 12, wakeups: 120)
             )
         )
         let highActivityLowBackground = DailyUsageBucket(
@@ -698,23 +690,19 @@ struct InsightsTreemapLayoutTests {
 
         #expect(highActivityRadius > lowActivityRadius)
         #expect(
-            InsightsEnergyChartView.backgroundEnergyImpactScore(lowActivityHighBackground)
-                > InsightsEnergyChartView.backgroundEnergyImpactScore(highActivityLowBackground)
+            InsightsEnergyChartView.backgroundEnergyIntensity(lowActivityHighBackground)
+                > InsightsEnergyChartView.backgroundEnergyIntensity(highActivityLowBackground)
         )
 
         let noBackgroundColor = try #require(
             InsightsEnergyChartView.calendarColor(
-                backgroundImpact: InsightsEnergyChartView.backgroundEnergyImpactScore(highActivityLowBackground),
-                maxBackgroundImpact: InsightsEnergyChartView.backgroundEnergyImpactScore(lowActivityHighBackground),
-                comparisonCount: 3
+                backgroundIntensity: InsightsEnergyChartView.backgroundEnergyIntensity(highActivityLowBackground)
             )
                 .usingColorSpace(.sRGB)
         )
         let highBackgroundColor = try #require(
             InsightsEnergyChartView.calendarColor(
-                backgroundImpact: InsightsEnergyChartView.backgroundEnergyImpactScore(lowActivityHighBackground),
-                maxBackgroundImpact: InsightsEnergyChartView.backgroundEnergyImpactScore(lowActivityHighBackground),
-                comparisonCount: 3
+                backgroundIntensity: InsightsEnergyChartView.backgroundEnergyIntensity(lowActivityHighBackground)
             )
                 .usingColorSpace(.sRGB)
         )
