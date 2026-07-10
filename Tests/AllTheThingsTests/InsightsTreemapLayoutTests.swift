@@ -536,8 +536,8 @@ struct InsightsTreemapLayoutTests {
         #expect(InsightsActivityChartLayout.bucketIndex(at: NSPoint(x: 1, y: bounds.maxY - 1), bucketCount: 4, in: bounds) == nil)
     }
 
-    @Test("energy timeline selects each sample only after the pointer crosses it")
-    func energyTimelineSelectsEachSampleOnlyAfterPointerCrossesIt() {
+    @Test("energy timeline holds its current sample until the pointer crosses an adjacent sample")
+    func energyTimelineHoldsCurrentSampleUntilPointerCrossesAdjacentSample() {
         let bounds = NSRect(x: 0, y: 0, width: 420, height: 120)
         let completedAt = Date(timeIntervalSince1970: 1_800_000_000)
         let samples = [
@@ -576,6 +576,30 @@ struct InsightsTreemapLayoutTests {
             at: NSPoint(x: rects[1].midX, y: plot.midY),
             samples: samples,
             in: bounds
+        ) == 1)
+        #expect(InsightsEnergyTimelineLayout.sampleIndex(
+            at: NSPoint(x: rects[1].midX - 0.1, y: plot.midY),
+            samples: samples,
+            in: bounds,
+            currentIndex: 1
+        ) == 1)
+        #expect(InsightsEnergyTimelineLayout.sampleIndex(
+            at: NSPoint(x: rects[0].midX, y: plot.midY),
+            samples: samples,
+            in: bounds,
+            currentIndex: 1
+        ) == 0)
+        #expect(InsightsEnergyTimelineLayout.sampleIndex(
+            at: NSPoint(x: rects[1].midX - 0.1, y: plot.midY),
+            samples: samples,
+            in: bounds,
+            currentIndex: 0
+        ) == 0)
+        #expect(InsightsEnergyTimelineLayout.sampleIndex(
+            at: NSPoint(x: rects[1].midX, y: plot.midY),
+            samples: samples,
+            in: bounds,
+            currentIndex: 0
         ) == 1)
 
         let cpuPoints = InsightsEnergyTimelineLayout.cpuLoadPoints(
