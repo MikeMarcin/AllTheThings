@@ -536,8 +536,8 @@ struct InsightsTreemapLayoutTests {
         #expect(InsightsActivityChartLayout.bucketIndex(at: NSPoint(x: 1, y: bounds.maxY - 1), bucketCount: 4, in: bounds) == nil)
     }
 
-    @Test("energy timeline reserves space for legend and hit-tests line slots")
-    func energyTimelineReservesSpaceForLegendAndHitTestsLineSlots() {
+    @Test("energy timeline separates CPU and wakeup plots while sharing hit-test slots")
+    func energyTimelineSeparatesCPUAndWakeupPlotsWhileSharingHitTestSlots() {
         let bounds = NSRect(x: 0, y: 0, width: 420, height: 120)
         let completedAt = Date(timeIntervalSince1970: 1_800_000_000)
         let samples = [
@@ -546,15 +546,34 @@ struct InsightsTreemapLayoutTests {
         ]
 
         let plot = InsightsEnergyTimelineLayout.plotRect(in: bounds)
+        let cpuPlot = InsightsEnergyTimelineLayout.cpuPlotRect(in: bounds)
+        let wakeupsPlot = InsightsEnergyTimelineLayout.wakeupsPlotRect(in: bounds)
         let legend = InsightsEnergyTimelineLayout.legendRect(in: bounds)
         let rects = InsightsEnergyTimelineLayout.sampleRects(samples: samples, in: bounds)
 
         #expect(plot.minY >= bounds.minY)
+        #expect(cpuPlot.minY == plot.minY)
+        #expect(cpuPlot.maxY < wakeupsPlot.minY)
+        #expect(wakeupsPlot.maxY == plot.maxY)
+        #expect(cpuPlot.width == wakeupsPlot.width)
         #expect(plot.maxY <= legend.minY)
         #expect(legend.maxY <= bounds.maxY)
         #expect(rects.count == 2)
         #expect(InsightsEnergyTimelineLayout.sampleIndex(at: center(of: rects[1]), samples: samples, in: bounds) == 1)
         #expect(InsightsEnergyTimelineLayout.sampleIndex(at: NSPoint(x: 1, y: bounds.maxY - 1), samples: samples, in: bounds) == nil)
+
+        let cpuPoints = InsightsEnergyTimelineLayout.cpuLoadPoints(
+            loads: samples.map(\.cpuLoad),
+            maxLoad: 1,
+            slots: rects,
+            plot: cpuPlot
+        )
+        #expect(cpuPoints.count == samples.count + 2)
+        #expect(cpuPoints[0].x == rects[0].minX)
+        #expect(cpuPoints[1].x == rects[0].midX)
+        #expect(cpuPoints[2].x == rects[1].midX)
+        #expect(cpuPoints[3].x == rects[1].maxX)
+        #expect(rects[0].maxX == rects[1].minX)
     }
 
     @Test("energy CPU timeline uses one-core scale floor before autoscaling above it")
@@ -562,6 +581,17 @@ struct InsightsTreemapLayoutTests {
         #expect(InsightsEnergyChartView.cpuLoadScaleMaximum([0.021, 0.002]) == 1)
         #expect(InsightsEnergyChartView.cpuLoadScaleMaximum([0, .nan, -.infinity]) == 1)
         #expect(InsightsEnergyChartView.cpuLoadScaleMaximum([0.5, 1.4]) == 1.4)
+    }
+
+    @Test("energy CPU stack uses the total timeline as its shared denominator")
+    func energyCPUStackUsesTotalTimelineAsSharedDenominator() {
+        let energy = EnergyUsageBreakdown(
+            foreground: EnergyUsageCounters(wallTime: 30, cpuTime: 3),
+            background: EnergyUsageCounters(wallTime: 30, cpuTime: 6)
+        )
+
+        #expect(energy.total.averageCPULoad == 0.15)
+        #expect(InsightsEnergyChartView.backgroundCPULoadContribution(energy) == 0.1)
     }
 
     @Test("energy calendar lays out three month weekday grid with sparse buckets")
