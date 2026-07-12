@@ -1016,22 +1016,35 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         let oneDay = energyBreakdown(rollups: dayRollups)
         let live = snapshot.health.maintenance
         let backlogValue = live.pendingRefreshPathCount + live.pendingReconciliationScopeCount
+        let currentSystemCPU = currentSample.map {
+            InsightsEnergyCPUDisplay.systemLoadString($0.cpuLoad)
+        } ?? "No samples"
+        let currentCPUDetail = currentSample.map {
+            let mode = $0.mode == .foreground ? "foreground" : "background"
+            return "of system · \(mode) · \(durationString($0.cpuTime)) CPU"
+        } ?? "waiting for first sample"
+        let oneHourAverageSystemCPU = InsightsEnergyCPUDisplay.systemLoadString(
+            oneHour.total.averageCPULoad
+        )
+        let oneDayPeakSystemCPU = InsightsEnergyCPUDisplay.systemLoadString(
+            oneDay.total.peakCPULoad
+        )
 
         let tiles = [
             makeHealthTile(
-                title: "CPU Load",
-                value: currentSample.map { cpuLoadString($0.cpuLoad) } ?? "No samples",
-                detail: currentSample.map { "\($0.mode == .foreground ? "foreground" : "background") · \(durationString($0.cpuTime)) CPU" } ?? "waiting for first sample"
+                title: "AllTheThings CPU",
+                value: currentSystemCPU,
+                detail: currentCPUDetail
             ),
             makeHealthTile(
                 title: "1h CPU",
                 value: durationString(oneHour.total.cpuTime),
-                detail: "\(cpuLoadString(oneHour.total.averageCPULoad)) average load"
+                detail: "\(oneHourAverageSystemCPU) of system average"
             ),
             makeHealthTile(
                 title: "1h Background",
                 value: durationString(oneHour.background.cpuTime),
-                detail: "\(backgroundShareString(oneHour)) of CPU"
+                detail: "\(backgroundShareString(oneHour)) of AllTheThings CPU"
             ),
             makeHealthTile(
                 title: "Wakeups",
@@ -1040,8 +1053,8 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
             ),
             makeHealthTile(
                 title: "24h Peak",
-                value: cpuLoadString(oneDay.total.peakCPULoad),
-                detail: "\(durationString(oneDay.total.cpuTime)) CPU total"
+                value: oneDayPeakSystemCPU,
+                detail: "of system · \(durationString(oneDay.total.cpuTime)) CPU total"
             ),
             makeHealthTile(
                 title: "Energy Backlog",
@@ -1059,10 +1072,13 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
             replaceFacts(in: energyFactsStack, with: [
                 InsightsFact("Date Range", calendarEnergyDateRangeString(referenceDate: now)),
                 InsightsFact("Activity", scoreString(activity)),
-                InsightsFact("Avg Background Load", cpuLoadString(selected.background.averageCPULoad)),
+                InsightsFact(
+                    "Avg Background CPU (% System)",
+                    InsightsEnergyCPUDisplay.systemLoadString(selected.background.averageCPULoad)
+                ),
                 InsightsFact("CPU Time", durationString(selected.total.cpuTime)),
                 InsightsFact("Background CPU", durationString(selected.background.cpuTime)),
-                InsightsFact("Background Share", backgroundShareString(selected)),
+                InsightsFact("CPU While Background", backgroundShareString(selected)),
                 InsightsFact("Wakeups / Min", wakeupsPerMinuteString(selected.total.wakeupsPerMinute)),
                 InsightsFact("Samples", selected.total.samples.formatted())
             ])
@@ -1070,10 +1086,13 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
             replaceFacts(in: energyFactsStack, with: [
                 InsightsFact("Range", selectedRange.title),
                 InsightsFact("CPU Time", durationString(selected.total.cpuTime)),
-                InsightsFact("Avg CPU Load", cpuLoadString(selected.total.averageCPULoad)),
+                InsightsFact(
+                    "Avg CPU (% System)",
+                    InsightsEnergyCPUDisplay.systemLoadString(selected.total.averageCPULoad)
+                ),
                 InsightsFact("Foreground CPU", durationString(selected.foreground.cpuTime)),
                 InsightsFact("Background CPU", durationString(selected.background.cpuTime)),
-                InsightsFact("Background Share", backgroundShareString(selected)),
+                InsightsFact("CPU While Background", backgroundShareString(selected)),
                 InsightsFact("Wakeups / Min", wakeupsPerMinuteString(selected.total.wakeupsPerMinute)),
                 InsightsFact("Samples", selected.total.samples.formatted())
             ])
@@ -1951,15 +1970,6 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         return "\(Int(percent.rounded()))%"
     }
 
-    private func cpuLoadString(_ load: Double) -> String {
-        guard load.isFinite, load > 0 else { return "0%" }
-        let percent = load * 100
-        if percent < 10 {
-            return String(format: "%.1f%%", percent)
-        }
-        return "\(Int(percent.rounded()))%"
-    }
-
     private func wakeupsPerMinuteString(_ value: Double) -> String {
         guard value.isFinite, value > 0 else { return "0/min" }
         if value < 10 {
@@ -1976,7 +1986,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
     private func backgroundShareString(_ energy: EnergyUsageBreakdown) -> String {
         let totalCPU = energy.total.cpuTime
         guard totalCPU > 0 else { return "0%" }
-        return cpuLoadString(energy.background.cpuTime / totalCPU)
+        return InsightsEnergyCPUDisplay.percentageString(energy.background.cpuTime / totalCPU)
     }
 
     private func energySamples(

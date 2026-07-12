@@ -7,6 +7,40 @@ private enum InsightsEnergyHoverTarget: Equatable {
     case day(Int)
 }
 
+enum InsightsEnergyCPUDisplay {
+    static var activeProcessorCount: Int {
+        max(1, ProcessInfo.processInfo.activeProcessorCount)
+    }
+
+    nonisolated static func systemLoad(_ processLoad: Double, processorCount: Int) -> Double {
+        guard processLoad.isFinite, processLoad > 0 else { return 0 }
+        return processLoad / Double(max(1, processorCount))
+    }
+
+    static func systemLoad(_ processLoad: Double) -> Double {
+        systemLoad(processLoad, processorCount: activeProcessorCount)
+    }
+
+    nonisolated static func percentageString(_ fraction: Double) -> String {
+        guard fraction.isFinite, fraction > 0 else { return "0%" }
+        let percent = fraction * 100
+        if percent < 0.01 {
+            return "<0.01%"
+        }
+        if percent < 1 {
+            return String(format: "%.2f%%", percent)
+        }
+        if percent < 10 {
+            return String(format: "%.1f%%", percent)
+        }
+        return "\(Int(percent.rounded()))%"
+    }
+
+    static func systemLoadString(_ processLoad: Double) -> String {
+        percentageString(systemLoad(processLoad))
+    }
+}
+
 final class InsightsEnergyChartView: NSView {
     var usage = IndexUsageMetrics() {
         didSet {
@@ -169,24 +203,31 @@ final class InsightsEnergyChartView: NSView {
 
         let cpuPlot = InsightsEnergyTimelineLayout.cpuPlotRect(in: bounds)
         let wakeupsPlot = InsightsEnergyTimelineLayout.wakeupsPlotRect(in: bounds)
-        let maxLoad = Self.cpuLoadScaleMaximum(samples.map(\.cpuLoad))
+        let systemLoads = samples.map { InsightsEnergyCPUDisplay.systemLoad($0.cpuLoad) }
+        let maxLoad = Self.systemCPULoadScaleMaximum(systemLoads)
         let maxWakeups = maxWakeupsPerMinute(samples: samples)
         let rects = InsightsEnergyTimelineLayout.sampleRects(samples: samples, in: bounds)
-        drawTimelineBackground(plot: cpuPlot, intermediateLineCount: 3)
         drawTimelineBackground(plot: wakeupsPlot, intermediateLineCount: 1)
+        drawTimelineBackground(plot: cpuPlot, intermediateLineCount: 3)
 
-        drawCategorizedCPULoad(samples: samples, slots: rects, maxLoad: maxLoad, plot: cpuPlot)
         drawWakeupBars(
             values: samples.map(\.wakeupsPerMinute),
             maxValue: maxWakeups,
             slots: rects,
             plot: wakeupsPlot
         )
+        drawCategorizedCPULoad(
+            loads: systemLoads,
+            samples: samples,
+            slots: rects,
+            maxLoad: maxLoad,
+            plot: cpuPlot
+        )
 
         drawLegend(in: InsightsEnergyTimelineLayout.legendRect(in: bounds))
         drawHoverMarker(
             rects: rects,
-            values: samples.map(\.cpuLoad),
+            values: systemLoads,
             maxValue: maxLoad,
             plot: cpuPlot
         )
@@ -201,43 +242,49 @@ final class InsightsEnergyChartView: NSView {
 
         let cpuPlot = InsightsEnergyTimelineLayout.cpuPlotRect(in: bounds)
         let wakeupsPlot = InsightsEnergyTimelineLayout.wakeupsPlotRect(in: bounds)
-        let maxLoad = Self.cpuLoadScaleMaximum(rollups.map { $0.energy.total.averageCPULoad })
+        let systemLoads = rollups.map {
+            InsightsEnergyCPUDisplay.systemLoad($0.energy.total.averageCPULoad)
+        }
+        let backgroundSystemLoads = rollups.map {
+            InsightsEnergyCPUDisplay.systemLoad(Self.backgroundProcessLoadContribution($0.energy))
+        }
+        let maxLoad = Self.systemCPULoadScaleMaximum(systemLoads)
         let maxWakeups = maxWakeupsPerMinute(rollups: rollups)
         let rects = InsightsEnergyTimelineLayout.rollupRects(rollups: rollups, in: bounds)
-        drawTimelineBackground(plot: cpuPlot, intermediateLineCount: 3)
         drawTimelineBackground(plot: wakeupsPlot, intermediateLineCount: 1)
+        drawTimelineBackground(plot: cpuPlot, intermediateLineCount: 3)
 
-        let totalPoints = rollups.enumerated().compactMap { index, rollup -> NSPoint? in
+        let totalPoints = systemLoads.enumerated().compactMap { index, load -> NSPoint? in
             guard index < rects.count else { return nil }
             return timelinePoint(
                 x: rects[index].midX,
-                value: rollup.energy.total.averageCPULoad,
+                value: load,
                 maxValue: maxLoad,
                 plot: cpuPlot
             )
         }
-        let backgroundPoints = rollups.enumerated().compactMap { index, rollup -> NSPoint? in
+        let backgroundPoints = backgroundSystemLoads.enumerated().compactMap { index, load -> NSPoint? in
             guard index < rects.count else { return nil }
             return timelinePoint(
                 x: rects[index].midX,
-                value: Self.backgroundCPULoadContribution(rollup.energy),
+                value: load,
                 maxValue: maxLoad,
                 plot: cpuPlot
             )
         }
 
-        drawStackedCPULoad(totalPoints: totalPoints, backgroundPoints: backgroundPoints, plot: cpuPlot)
         drawWakeupBars(
             values: rollups.map { $0.energy.total.wakeupsPerMinute },
             maxValue: maxWakeups,
             slots: rects,
             plot: wakeupsPlot
         )
+        drawStackedCPULoad(totalPoints: totalPoints, backgroundPoints: backgroundPoints, plot: cpuPlot)
 
         drawLegend(in: InsightsEnergyTimelineLayout.legendRect(in: bounds))
         drawHoverMarker(
             rects: rects,
-            values: rollups.map { $0.energy.total.averageCPULoad },
+            values: systemLoads,
             maxValue: maxLoad,
             plot: cpuPlot
         )
@@ -355,14 +402,15 @@ final class InsightsEnergyChartView: NSView {
     }
 
     private func drawCategorizedCPULoad(
+        loads: [Double],
         samples: [EnergyUsageIntervalSample],
         slots: [NSRect],
         maxLoad: Double,
         plot: NSRect
     ) {
-        guard samples.count == slots.count else { return }
+        guard loads.count == samples.count, samples.count == slots.count else { return }
         let points = InsightsEnergyTimelineLayout.cpuLoadPoints(
-            loads: samples.map(\.cpuLoad),
+            loads: loads,
             maxLoad: maxLoad,
             slots: slots,
             plot: plot
@@ -552,9 +600,9 @@ final class InsightsEnergyChartView: NSView {
             .foregroundColor: NSColor.secondaryLabelColor
         ]
         let items: [(String, NSColor)] = [
-            ("Foreground CPU", Self.color(for: .foreground)),
-            ("Background CPU", Self.color(for: .background)),
-            ("Wakeups / Min", .systemRed.withAlphaComponent(0.72))
+            ("Wakeups / Min", .systemRed.withAlphaComponent(0.72)),
+            ("Foreground CPU (% system)", Self.color(for: .foreground)),
+            ("Background CPU (% system)", Self.color(for: .background))
         ]
         var x = rect.minX
         for item in items {
@@ -606,7 +654,7 @@ final class InsightsEnergyChartView: NSView {
     private func placardLines(for sample: EnergyUsageIntervalSample) -> [String] {
         [
             dateTimeString(sample.completedAt),
-            "\(modeTitle(sample.mode)) · \(cpuLoadString(sample.cpuLoad)) load",
+            "\(modeTitle(sample.mode)) · \(InsightsEnergyCPUDisplay.systemLoadString(sample.cpuLoad)) of system",
             "\(durationString(sample.cpuTime)) CPU over \(durationString(sample.duration))",
             "\(wakeupsPerMinuteString(sample.wakeupsPerMinute)) · \(sample.wakeups.formatted()) wakeups"
         ]
@@ -616,7 +664,7 @@ final class InsightsEnergyChartView: NSView {
         let total = rollup.energy.total
         return [
             dateTimeString(rollup.bucketStart),
-            "\(cpuLoadString(total.averageCPULoad)) average CPU load",
+            "\(InsightsEnergyCPUDisplay.systemLoadString(total.averageCPULoad)) of system average",
             "\(durationString(rollup.energy.foreground.cpuTime)) foreground CPU",
             "\(durationString(rollup.energy.background.cpuTime)) background CPU",
             "\(wakeupsPerMinuteString(total.wakeupsPerMinute)) · \(total.wakeups.formatted()) wakeups"
@@ -637,12 +685,12 @@ final class InsightsEnergyChartView: NSView {
             "Refresh\t\(scoreString(components.refresh))",
             "",
             "Background CPU\t\(durationString(background.cpuTime))",
-            "Background Load\t\(cpuLoadString(background.averageCPULoad))",
+            "Background CPU (% System)\t\(InsightsEnergyCPUDisplay.systemLoadString(background.averageCPULoad))",
             "Background Wakeups\t\(wakeupsPerMinuteString(background.wakeupsPerMinute))",
             "Total CPU\t\(durationString(total.cpuTime))",
-            "Average Load\t\(cpuLoadString(total.averageCPULoad))",
+            "Average CPU (% System)\t\(InsightsEnergyCPUDisplay.systemLoadString(total.averageCPULoad))",
             "Foreground CPU\t\(durationString(bucket.energy.foreground.cpuTime))",
-            "Background Share\t\(backgroundShareString(bucket.energy))"
+            "CPU While Background\t\(backgroundShareString(bucket.energy))"
         ]
     }
 
@@ -681,11 +729,11 @@ final class InsightsEnergyChartView: NSView {
         bucket.backgroundEnergyIntensity
     }
 
-    nonisolated static func cpuLoadScaleMaximum(_ values: [Double]) -> Double {
+    nonisolated static func systemCPULoadScaleMaximum(_ values: [Double]) -> Double {
         max(values.filter { $0.isFinite && $0 > 0 }.max() ?? 0, 1)
     }
 
-    nonisolated static func backgroundCPULoadContribution(_ energy: EnergyUsageBreakdown) -> Double {
+    nonisolated static func backgroundProcessLoadContribution(_ energy: EnergyUsageBreakdown) -> Double {
         let totalWallTime = energy.total.wallTime
         guard totalWallTime > 0 else { return 0 }
         return energy.background.cpuTime / totalWallTime
@@ -727,15 +775,6 @@ final class InsightsEnergyChartView: NSView {
         return String(format: "%.2f s", duration)
     }
 
-    private func cpuLoadString(_ load: Double) -> String {
-        guard load.isFinite, load > 0 else { return "0%" }
-        let percent = load * 100
-        if percent < 10 {
-            return String(format: "%.1f%%", percent)
-        }
-        return "\(Int(percent.rounded()))%"
-    }
-
     private func wakeupsPerMinuteString(_ value: Double) -> String {
         guard value.isFinite, value > 0 else { return "0/min" }
         if value < 10 {
@@ -762,7 +801,7 @@ final class InsightsEnergyChartView: NSView {
     private func backgroundShareString(_ energy: EnergyUsageBreakdown) -> String {
         let totalCPU = energy.total.cpuTime
         guard totalCPU > 0 else { return "0%" }
-        return cpuLoadString(energy.background.cpuTime / totalCPU)
+        return InsightsEnergyCPUDisplay.percentageString(energy.background.cpuTime / totalCPU)
     }
 
     private func dateTimeString(_ date: Date) -> String {
@@ -830,24 +869,23 @@ enum InsightsEnergyTimelineLayout {
 
     static func cpuPlotRect(in bounds: NSRect) -> NSRect {
         let plot = plotRect(in: bounds)
-        let availableHeight = max(0, plot.height - plotGap)
-        let wakeupsHeight = floor(availableHeight * wakeupsPlotFraction)
+        let wakeupsPlot = wakeupsPlotRect(in: bounds)
         return NSRect(
             x: plot.minX,
-            y: plot.minY,
+            y: wakeupsPlot.maxY + plotGap,
             width: plot.width,
-            height: max(0, availableHeight - wakeupsHeight)
+            height: max(0, plot.maxY - wakeupsPlot.maxY - plotGap)
         )
     }
 
     static func wakeupsPlotRect(in bounds: NSRect) -> NSRect {
         let plot = plotRect(in: bounds)
-        let cpuPlot = cpuPlotRect(in: bounds)
+        let availableHeight = max(0, plot.height - plotGap)
         return NSRect(
             x: plot.minX,
-            y: cpuPlot.maxY + plotGap,
+            y: plot.minY,
             width: plot.width,
-            height: max(0, plot.maxY - cpuPlot.maxY - plotGap)
+            height: floor(availableHeight * wakeupsPlotFraction)
         )
     }
 
