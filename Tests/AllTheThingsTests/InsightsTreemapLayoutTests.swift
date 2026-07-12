@@ -552,9 +552,9 @@ struct InsightsTreemapLayoutTests {
         let rects = InsightsEnergyTimelineLayout.sampleRects(samples: samples, in: bounds)
 
         #expect(plot.minY >= bounds.minY)
-        #expect(cpuPlot.minY == plot.minY)
-        #expect(cpuPlot.maxY < wakeupsPlot.minY)
-        #expect(wakeupsPlot.maxY == plot.maxY)
+        #expect(wakeupsPlot.minY == plot.minY)
+        #expect(wakeupsPlot.maxY < cpuPlot.minY)
+        #expect(cpuPlot.maxY == plot.maxY)
         #expect(cpuPlot.width == wakeupsPlot.width)
         #expect(plot.maxY <= legend.minY)
         #expect(legend.maxY <= bounds.maxY)
@@ -616,11 +616,23 @@ struct InsightsTreemapLayoutTests {
         #expect(rects[0].maxX == rects[1].minX)
     }
 
-    @Test("energy CPU timeline uses one-core scale floor before autoscaling above it")
-    func energyCPUTimelineUsesOneCoreScaleFloorBeforeAutoscalingAboveIt() {
-        #expect(InsightsEnergyChartView.cpuLoadScaleMaximum([0.021, 0.002]) == 1)
-        #expect(InsightsEnergyChartView.cpuLoadScaleMaximum([0, .nan, -.infinity]) == 1)
-        #expect(InsightsEnergyChartView.cpuLoadScaleMaximum([0.5, 1.4]) == 1.4)
+    @Test("energy CPU timeline uses whole-system scale before autoscaling above it")
+    func energyCPUTimelineUsesWholeSystemScaleBeforeAutoscalingAboveIt() {
+        #expect(InsightsEnergyChartView.systemCPULoadScaleMaximum([0.021, 0.002]) == 1)
+        #expect(InsightsEnergyChartView.systemCPULoadScaleMaximum([0, .nan, -.infinity]) == 1)
+        #expect(InsightsEnergyChartView.systemCPULoadScaleMaximum([0.5, 1.4]) == 1.4)
+    }
+
+    @Test("energy CPU display normalizes process load to total system capacity")
+    func energyCPUDisplayNormalizesToSystemCapacity() {
+        #expect(InsightsEnergyCPUDisplay.systemLoad(1.16, processorCount: 14) == 1.16 / 14)
+        #expect(InsightsEnergyCPUDisplay.systemLoad(0, processorCount: 14) == 0)
+        #expect(InsightsEnergyCPUDisplay.systemLoad(.nan, processorCount: 14) == 0)
+        #expect(InsightsEnergyCPUDisplay.systemLoad(0.5, processorCount: 0) == 0.5)
+        #expect(InsightsEnergyCPUDisplay.percentageString(1.16 / 14) == "8.3%")
+        #expect(InsightsEnergyCPUDisplay.percentageString(0.0004) == "0.04%")
+        #expect(InsightsEnergyCPUDisplay.percentageString(0.00001) == "<0.01%")
+        #expect(InsightsEnergyCPUDisplay.percentageString(0.99) == "99%")
     }
 
     @Test("energy CPU stack uses the total timeline as its shared denominator")
@@ -631,7 +643,7 @@ struct InsightsTreemapLayoutTests {
         )
 
         #expect(energy.total.averageCPULoad == 0.15)
-        #expect(InsightsEnergyChartView.backgroundCPULoadContribution(energy) == 0.1)
+        #expect(InsightsEnergyChartView.backgroundProcessLoadContribution(energy) == 0.1)
     }
 
     @Test("energy calendar lays out three month weekday grid with sparse buckets")
