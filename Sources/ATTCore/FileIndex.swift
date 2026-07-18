@@ -1119,17 +1119,28 @@ public final class FileIndex: @unchecked Sendable {
         var lastQueuedAt: Date
         var completions: [PendingRefreshCompletion]
         var directoryScanProgress: DirectoryUpdateScanProgress?
+        var requiresDirectoryRescanAfterProgress: Bool
 
         mutating func merge(_ incoming: PendingRefreshWork) {
-            let incomingPredatesCurrentWork = incoming.firstQueuedAt < firstQueuedAt
+            // Keep partial traversal state stable; a fresh event is satisfied by one
+            // clean follow-up pass after the current traversal reaches its boundary.
+            let progressCollidedWithFreshRequest = (directoryScanProgress == nil)
+                != (incoming.directoryScanProgress == nil)
             priority = IndexWorkPriority.merged(priority, incoming.priority)
             firstQueuedAt = min(firstQueuedAt, incoming.firstQueuedAt)
             lastQueuedAt = max(lastQueuedAt, incoming.lastQueuedAt)
             completions.append(contentsOf: incoming.completions)
-
-            if !incomingPredatesCurrentWork {
+            requiresDirectoryRescanAfterProgress = requiresDirectoryRescanAfterProgress
+                || incoming.requiresDirectoryRescanAfterProgress
+                || progressCollidedWithFreshRequest
+            if directoryScanProgress == nil {
                 directoryScanProgress = incoming.directoryScanProgress
             }
+        }
+
+        mutating func prepareForFollowUpDirectoryScan() {
+            directoryScanProgress = nil
+            requiresDirectoryRescanAfterProgress = false
         }
 
         mutating func promote() {
@@ -11801,7 +11812,8 @@ public final class FileIndex: @unchecked Sendable {
                     firstQueuedAt: queuedAt,
                     lastQueuedAt: queuedAt,
                     completions: completion.map { [$0] } ?? [],
-                    directoryScanProgress: nil
+                    directoryScanProgress: nil,
+                    requiresDirectoryRescanAfterProgress: false
                 )
             )
         }
@@ -12229,7 +12241,14 @@ public final class FileIndex: @unchecked Sendable {
                                 visitedCount += scanResult.visitedCount
                                 deferredDirectoryVisitCount += scanResult.visitedCount
                                 if scanResult.completed {
-                                    scannedRecords = scanResult.records
+                                    if request.requiresDirectoryRescanAfterProgress {
+                                        upserts.removeValue(forKey: candidate.record.path)
+                                        request.prepareForFollowUpDirectoryScan()
+                                        deferredRefreshes.append(request)
+                                        scannedRecords = nil
+                                    } else {
+                                        scannedRecords = scanResult.records
+                                    }
                                 } else {
                                     upserts.removeValue(forKey: candidate.record.path)
                                     request.directoryScanProgress = progress
@@ -12833,6 +12852,22 @@ public final class FileIndex: @unchecked Sendable {
         case metadataOverlayCheckpoint
     }
 
+    private struct ScheduledPersistBacklog {
+        let refreshPathCount: Int
+        let reconciliationScopeCount: Int
+        let refreshDrainScheduled: Bool
+        let reconciliationDrainScheduled: Bool
+        let hasActiveIndexWork: Bool
+
+        var requiresDeferral: Bool {
+            refreshPathCount > 0
+                || reconciliationScopeCount > 0
+                || refreshDrainScheduled
+                || reconciliationDrainScheduled
+                || hasActiveIndexWork
+        }
+    }
+
     private func scheduleMetadataOverlayPersistIfReasonable(
         _ snapshot: SearchSnapshot,
         changedPathCount: Int,
@@ -12923,11 +12958,52 @@ public final class FileIndex: @unchecked Sendable {
 
         indexQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self, self.isPersistRevisionCurrent(revision) else { return }
+            if self.deferScheduledPersistIfMaintenanceIsPending(mode: mode, priority: priority) {
+                return
+            }
             self.persistSnapshot(
                 forceMappedCheckpoint: mode == .metadataOverlayCheckpoint,
                 priority: priority
             )
         }
+    }
+
+    private func deferScheduledPersistIfMaintenanceIsPending(
+        mode: PersistMode,
+        priority: IndexMaintenancePriority
+    ) -> Bool {
+        let backlog = lock.withLock {
+            ScheduledPersistBacklog(
+                refreshPathCount: pendingRefreshPaths.count,
+                reconciliationScopeCount: pendingReconciliationIncludesAllRoots
+                    ? roots.count
+                    : pendingReconciliationPaths.count,
+                refreshDrainScheduled: isRefreshDrainScheduled,
+                reconciliationDrainScheduled: isReconciliationDrainScheduled,
+                hasActiveIndexWork: indexing || reconciling || updating
+            )
+        }
+        guard backlog.requiresDeferral else { return false }
+
+        let configuredDelay = priority == .background
+            ? backgroundOptimizationPersistDelay()
+            : largeOverlayPersistDelay()
+        let retryDelay = max(configuredDelay, 0.25)
+        DiagnosticLogger.shared.log(
+            category: "index",
+            event: "index.snapshotPersistDeferred",
+            fields: [
+                "pendingRefreshPathCount": .publicInt(backlog.refreshPathCount),
+                "pendingReconciliationScopeCount": .publicInt(backlog.reconciliationScopeCount),
+                "refreshDrainScheduled": .publicBool(backlog.refreshDrainScheduled),
+                "reconciliationDrainScheduled": .publicBool(backlog.reconciliationDrainScheduled),
+                "activeIndexWork": .publicBool(backlog.hasActiveIndexWork),
+                "retryDelaySeconds": .publicDouble(retryDelay),
+                "priority": .publicString(priority.rawValue)
+            ]
+        )
+        schedulePersist(delay: retryDelay, mode: mode, priority: priority)
+        return true
     }
 
     @discardableResult
@@ -14153,6 +14229,21 @@ public final class FileIndex: @unchecked Sendable {
     func persistSnapshotForTesting() {
         _ = indexQueue.sync {
             persistSnapshot(schedulesPathGramBuild: false)
+        }
+    }
+
+    func pendingDirectoryRefreshStateForTesting(
+        path rawPath: String
+    ) -> (recordCount: Int, requiresFollowUp: Bool)? {
+        let path = URL(fileURLWithPath: rawPath).standardizedFileURL.path
+        return lock.withLock {
+            guard
+                let work = pendingRefreshPaths[path],
+                let progress = work.directoryScanProgress
+            else {
+                return nil
+            }
+            return (progress.records.count, work.requiresDirectoryRescanAfterProgress)
         }
     }
 
