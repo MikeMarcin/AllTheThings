@@ -499,17 +499,170 @@ struct FileSystemWatcherTests {
         let reIncludedPath = root.appendingPathComponent("node_modules/acme/Sources/App.js").path
         let excludedPath = root.appendingPathComponent("node_modules/other/index.js").path
         let patterns = ["node_modules/", "!node_modules/acme/**"]
+        var instrumentation = FSEventIndexFilter.Instrumentation()
 
         let filtered = FSEventIndexFilter.indexableEvents(
             [
                 FileSystemEvent(path: reIncludedPath, flags: 0, eventID: 41),
                 FileSystemEvent(path: excludedPath, flags: 0, eventID: 42)
             ],
-            rootPaths: [root.path],
-            exclusionPatterns: patterns
+            context: FSEventIndexFilter.Context(
+                rootPaths: [root.path],
+                exclusionPatterns: patterns
+            ),
+            instrumentation: &instrumentation
         )
 
         #expect(filtered.map(\.path) == [reIncludedPath])
+        #expect(instrumentation.defaultFastPathDecisionCount == 0)
+        #expect(instrumentation.compiledQueryBuildCount == 1)
+        #expect(instrumentation.compiledDecisionCount == 3)
+    }
+
+    @Test("default filtering keeps large bursts on the known-rule fast path")
+    func defaultFilteringKeepsLargeBurstsOnFastPath() {
+        let root = "/tmp/allthethings/root-a"
+        let eventCount = 10_000
+        var events: [FileSystemEvent] = []
+        events.reserveCapacity(eventCount * 2)
+        for offset in 0..<eventCount {
+            events.append(FileSystemEvent(
+                path: "\(root)/Sources/Generated/Module-\(offset).swift",
+                flags: 0,
+                eventID: FSEventStreamEventId(offset * 2 + 1)
+            ))
+            events.append(FileSystemEvent(
+                path: "\(root)/.build/arm64-apple-macosx/debug/Module-\(offset).swift.o",
+                flags: 0,
+                eventID: FSEventStreamEventId(offset * 2 + 2)
+            ))
+        }
+        var instrumentation = FSEventIndexFilter.Instrumentation()
+
+        let filtered = FSEventIndexFilter.indexableEvents(
+            events,
+            context: FSEventIndexFilter.Context(
+                rootPaths: [root],
+                exclusionPatterns: FileExclusionRules.defaultPatterns,
+                eventsArePreCoalesced: true
+            ),
+            instrumentation: &instrumentation
+        )
+
+        #expect(filtered.count == eventCount)
+        #expect(instrumentation.defaultFastPathDecisionCount == eventCount * 2)
+        #expect(instrumentation.compiledQueryBuildCount == 0)
+        #expect(instrumentation.compiledDecisionCount == 0)
+        #expect(instrumentation.redundantCoalescingEventCountAvoided == eventCount * 2)
+    }
+
+    @Test("default FSEvent fast path matches ordered-rule boundary semantics")
+    func defaultFastPathMatchesOrderedRuleBoundaries() {
+        let root = "/tmp/project"
+        let samples: [(path: String, isDirectory: Bool)] = [
+            ("\(root)/Sources/App.swift", false),
+            ("\(root)/.git", true),
+            ("\(root)/.git/config", false),
+            ("\(root)/.git/HEAD", false),
+            ("\(root)/.git/description", false),
+            ("\(root)/.git/hooks", true),
+            ("\(root)/.git/hooks/pre-commit", false),
+            ("\(root)/.git/hooks/cache.pyc", false),
+            ("\(root)/.git/hooks/node_modules/package.json", false),
+            ("\(root)/.git/info/exclude", false),
+            ("\(root)/.git/objects/ab/cdef", false),
+            ("\(root)/.hg/store/data.i", false),
+            ("\(root)/.svn/pristine/ab/file.svn-base", false),
+            ("\(root)/node_modules/react/index.js", false),
+            ("\(root)/DerivedData/Build/App", false),
+            ("\(root)/.gradle/caches/state.bin", false),
+            ("\(root)/.dart_tool/package_config.json", false),
+            ("\(root)/.next/cache/client.pack", false),
+            ("\(root)/.parcel-cache/state", false),
+            ("\(root)/.turbo/log", false),
+            ("\(root)/Example.app/Contents/_CodeSignature/CodeResources", false),
+            ("\(root)/Xcode.app/Contents/Developer/Platforms/macOS.platform/Info.plist", false),
+            ("\(root)/Xcode.app/Contents/Developer/Toolchains/Default/usr/bin/swift", false),
+            ("\(root)/Engine/Binaries/ThirdParty/DotNet/runtime.dll", false),
+            ("\(root)/Engine/Binaries/ThirdParty/Python3/Lib/os.py", false),
+            ("\(root)/Engine/DerivedDataCache/cache.bin", false),
+            ("\(root)/Engine/Intermediate/Build/Target.make", false),
+            ("\(root)/Engine/Saved/Logs/Editor.log", false),
+            ("\(root)/Engine/Content/Textures/Hero.png", false),
+            ("\(root)/.build/index/store", true),
+            ("\(root)/.build/arm64/index/store", true),
+            ("\(root)/.build/arm64/index/store/v5/record", false),
+            ("\(root)/.build/debug/App", false),
+            ("\(root)/.build/release/App", false),
+            ("\(root)/.build/arm64/debug/App", false),
+            ("\(root)/.build/arm64/release/App", false),
+            ("\(root)/.build/arm64/index/build.db", false),
+            ("\(root)/.build/arm64/ModuleCache/SwiftShims.pcm", false),
+            ("\(root)/.build/plugins/cache/tool-output.json", false),
+            ("\(root)/.build/artifacts/package/checksum.zip", false),
+            ("\(root)/.build/checkouts/Dependency/Sources/App.swift", false),
+            ("\(root)/build/CMakeFiles/Target.dir/state", false),
+            ("\(root)/build/Testing/Temporary/LastTest.log", false),
+            ("\(root)/buck-out/gen/App.o", false),
+            ("\(root)/bazel-out/bin/App", false),
+            ("\(root)/.buckd/state.db", false),
+            ("\(root)/build/.cmake/api/v1/reply.json", false),
+            ("\(root)/build/_deps/Package/CMakeLists.txt", false),
+            ("\(root)/build/debug/_deps/Package/CMakeLists.txt", false),
+            ("\(root)/_deps/source/build/App.swift", false),
+            ("\(root)/build/.tmp-cache", false),
+            ("\(root)/build/generated/.tmp-cache", false),
+            ("\(root)/build/App.o", false),
+            ("\(root)/module.pyc", false),
+            ("\(root)/module.pyo", false),
+            ("\(root)/build/App.dSYM/Contents/Resources/DWARF/App", false),
+            ("\(root)/coverage.gcda", false),
+            ("\(root)/coverage.gcno", false),
+            ("\(root)/coverage.profraw", false),
+            ("\(root)/coverage.profdata", false),
+            ("\(root)/.venv/lib/python/site.py", false),
+            ("\(root)/venv/lib/python/site.py", false),
+            ("\(root)/.tox/state", false),
+            ("\(root)/__pycache__/module.pyc", false),
+            ("\(root)/.pytest_cache/state", false),
+            ("\(root)/.mypy_cache/state", false),
+            ("\(root)/.ruff_cache/state", false),
+            ("\(root)/.cache/state", false),
+            ("\(root)/Library/Caches/com.example/state", false),
+            ("\(root)/.Trash/deleted.txt", false),
+            ("\(root)/node_modules-copy/index.js", false),
+            ("\(root)/node_modules", false),
+            ("\(root)/nested/node_modules", true),
+            ("\(root)/.build/debug", false),
+            ("\(root)/nested/.build/debug", true),
+            ("\(root)/build/App", false)
+        ]
+        let events = samples.enumerated().map { offset, sample in
+            FileSystemEvent(
+                path: sample.path,
+                flags: sample.isDirectory
+                    ? FSEventStreamEventFlags(kFSEventStreamEventFlagItemIsDir)
+                    : 0,
+                eventID: FSEventStreamEventId(offset + 1)
+            )
+        }
+
+        let filtered = FSEventIndexFilter.indexableEvents(
+            events,
+            rootPaths: [root],
+            exclusionPatterns: FileExclusionRules.defaultPatterns
+        )
+        let rules = FileExclusionRules()
+        let expectedPaths = samples.compactMap { sample -> String? in
+            let url = URL(fileURLWithPath: sample.path, isDirectory: sample.isDirectory)
+            let decision = rules.decision(url: url, roots: [root], isDirectory: sample.isDirectory)
+            if decision != .prune { return sample.path }
+            guard !sample.isDirectory else { return nil }
+            let directoryDecision = rules.decision(url: url, roots: [root], isDirectory: true)
+            return directoryDecision == .prune ? nil : sample.path
+        }
+
+        #expect(filtered.map(\.path) == expectedPaths)
     }
 
     @Test("migrated default exclusion order retains the known fast path")
@@ -522,10 +675,46 @@ struct FileSystemWatcherTests {
             rootPaths: ["/tmp/allthethings/root-a"],
             exclusionPatterns: migratedOrder
         ).usesKnownExclusionFastPath)
+        let unsafeOrder = [defaults.last!] + Array(defaults.dropLast())
+        #expect(!FSEventDefaultExclusionPolicy.matches(unsafeOrder))
         #expect(!FSEventDefaultExclusionPolicy.matches([
             "node_modules/",
             "!node_modules/acme/**"
         ]))
+    }
+
+    @Test("default historical filtering applies later exclusions inside re-included git paths")
+    func defaultHistoricalFilteringAppliesRulesAfterGitReinclusion() async {
+        let root = URL(fileURLWithPath: "/tmp/allthethings/root-a", isDirectory: true)
+        let store = memoryCursorStore()
+        store.markBaseline(for: [root.path], eventID: 40)
+        let source = FakeHistoryReplaySource(
+            events: [
+                FileSystemEvent(
+                    path: root.appendingPathComponent(".git/hooks/cache.pyc").path,
+                    flags: 0,
+                    eventID: 41
+                ),
+                FileSystemEvent(
+                    path: root.path,
+                    flags: FSEventStreamEventFlags(kFSEventStreamEventFlagHistoryDone),
+                    eventID: 42
+                )
+            ],
+            completion: .completed
+        )
+        let coordinator = FSEventReconciliationCoordinator(
+            cursorStore: store,
+            replaySource: source,
+            currentEventID: { 42 }
+        )
+
+        let action = await actionFromCoordinator(
+            coordinator,
+            roots: [root],
+            exclusions: FileExclusionRules()
+        )
+        #expect(action == .upToDate(baselineEventID: 42))
     }
 
     @Test("custom negated exclusions reinclude historical FSEvents")
@@ -573,6 +762,17 @@ struct FileSystemWatcherTests {
             "\(root)/.build/arm64-apple-macosx/ModuleCache/SwiftShims.pcm",
             "\(root)/.build/plugins/cache/tool-output.json",
             "\(root)/.build/artifacts/package/checksum.zip",
+            "\(root)/Example.app/Contents/_CodeSignature/CodeResources",
+            "\(root)/Xcode.app/Contents/Developer/Platforms/macOS.platform/Info.plist",
+            "\(root)/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swift",
+            "\(root)/Engine/Binaries/ThirdParty/DotNet/runtime.dll",
+            "\(root)/Engine/Binaries/ThirdParty/Python3/Lib/os.py",
+            "\(root)/Engine/DerivedDataCache/cache.bin",
+            "\(root)/Engine/Intermediate/Build/Target.make",
+            "\(root)/Engine/Saved/Logs/Editor.log",
+            "\(root)/buck-out/gen/App.o",
+            "\(root)/bazel-out/bin/App.o",
+            "\(root)/.buckd/state.db",
             "\(root)/.next/cache/webpack/client.pack",
             "\(root)/build/debug/_deps/package/CMakeLists.txt",
             "\(root)/Sources/__pycache__/module.pyc",
@@ -648,6 +848,58 @@ struct FileSystemWatcherTests {
             "\(root)/Generated"
         ])
         #expect(routed.recursivePaths == ["\(root)/Generated"])
+    }
+
+    @Test("large scope bursts collapse with path-depth bounded work")
+    func largeScopeBurstsUsePathDepthBoundedWork() {
+        let root = "/tmp/allthethings/root-a"
+        let scopeCount = 2_000
+        let queryCount = 10_000
+        var scopeIndex = FSEventPathScopeIndex()
+
+        // Insert descendants first to cover the expensive ordering for a flat-list collapse.
+        for offset in 0..<scopeCount {
+            let scope = "\(root)/package-\(offset)"
+            scopeIndex.insert("\(scope)/Generated/Objects")
+            scopeIndex.insert(scope)
+        }
+
+        for offset in 0..<queryCount {
+            let scope = "\(root)/package-\(offset % scopeCount)"
+            let isCovered = scopeIndex.containsScope(covering: "\(scope)/Sources/File-\(offset).swift")
+            #expect(isCovered)
+        }
+
+        let prefixSiblingIsCovered = scopeIndex.containsScope(
+            covering: "\(root)/package-0-copy/Sources/File.swift"
+        )
+        #expect(!prefixSiblingIsCovered)
+        #expect(scopeIndex.collapsedScopes.count == scopeCount)
+        #expect(scopeIndex.instrumentation.insertedPathCount == scopeCount * 2)
+        #expect(scopeIndex.instrumentation.coverageQueryCount == queryCount + 1)
+        #expect(
+            scopeIndex.instrumentation.componentVisitCount
+                <= (scopeIndex.instrumentation.insertedPathCount
+                    + scopeIndex.instrumentation.coverageQueryCount) * 8
+        )
+    }
+
+    @Test("cursor matching normalizes once and selects the most specific root")
+    func cursorMatchingUsesMostSpecificCanonicalRoot() {
+        let parentRoot = "/tmp/allthethings"
+        let nestedRoot = "\(parentRoot)/root-a"
+        let advances = FSEventCursorAdvances.latestByRoot(
+            events: [
+                FileSystemEvent(
+                    path: "\(nestedRoot)/Sources/../Sources/App.swift/",
+                    flags: 0,
+                    eventID: 42
+                )
+            ],
+            rootPaths: [parentRoot, nestedRoot]
+        )
+
+        #expect(advances == [nestedRoot: 42])
     }
 
     @Test("live FSEvents coalesce duplicate paths while preserving recursive flags")

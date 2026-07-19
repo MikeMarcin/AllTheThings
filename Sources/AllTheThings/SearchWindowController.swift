@@ -4765,7 +4765,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                 events,
                 context: FSEventIndexFilter.Context(
                     rootPaths: rootPaths,
-                    exclusionPatterns: exclusionPatterns
+                    exclusionPatterns: exclusionPatterns,
+                    eventsArePreCoalesced: true
                 )
             )
             let cursorAdvances = FSEventCursorAdvances.latestByRoot(

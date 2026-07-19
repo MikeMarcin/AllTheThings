@@ -184,6 +184,18 @@ extension FileExclusionRules {
     func makeQuery(roots: [String]) -> FileExclusionQuery {
         FileExclusionQuery(patterns: patterns, roots: roots)
     }
+
+    @_spi(ATTInternal)
+    /// Creates a serial, batch-owned evaluator that reuses compiled rules and ancestor matches.
+    /// Callers must not invoke the returned closure concurrently.
+    public func makeDecisionEvaluator(
+        roots: [String]
+    ) -> (_ path: String, _ isDirectory: Bool) -> Decision {
+        let query = makeQuery(roots: roots)
+        return { path, isDirectory in
+            query.decision(path: path, isDirectory: isDirectory)
+        }
+    }
 }
 
 private final class RelativePathContext {

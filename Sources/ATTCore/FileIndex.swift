@@ -638,9 +638,14 @@ public final class FileIndex: @unchecked Sendable {
     private static let largeOverlayPersistDefaultDelay: TimeInterval = 30
     private static let largeOverlayChangedPathDefaultThreshold = 10_000
     private static let largeOverlayDrainBackoffDefaultDelay: TimeInterval = 5
-    private static let backgroundRefreshBatchDefaultLimit = 64
+    // Exact FSEvent bursts are cheaper and more energy-efficient when structural
+    // delta rewrites are amortized across the largest already-bounded batch.
+    private static let backgroundRefreshBatchDefaultLimit = maximumRefreshBatchPaths
     private static let backgroundRefreshDrainBackoffDefaultDelay: TimeInterval = 60
+    private static let backgroundRefreshRetryMaximumDelay: TimeInterval = 60 * 60
     private static let backgroundDirectoryScanBudgetDefault: TimeInterval = 1.5
+    private static let backgroundDirectoryIncrementalPublishLimit = 2_048
+    private static let backgroundDirectoryIncrementalPublishBatchLimit = 4
     private static let backgroundOptimizationPersistDefaultDelay: TimeInterval = 300
     private static let metadataOverlayPersistDefaultDelay: TimeInterval = 30
     private static let metadataOverlayCheckpointDefaultDelay: TimeInterval = 300
@@ -1161,6 +1166,7 @@ public final class FileIndex: @unchecked Sendable {
         let completionReady: Bool
         let largeOverlay: Bool
         let priority: IndexWorkPriority
+        let requestedDirectoryRefresh: Bool
         let batchPathCount: Int
         let changedPathCount: Int
         let visitedCount: Int
@@ -1174,6 +1180,7 @@ public final class FileIndex: @unchecked Sendable {
             completionReady: false,
             largeOverlay: false,
             priority: .interactive,
+            requestedDirectoryRefresh: false,
             batchPathCount: 0,
             changedPathCount: 0,
             visitedCount: 0,
@@ -1195,6 +1202,14 @@ public final class FileIndex: @unchecked Sendable {
             self.completion = completion
         }
 
+        func addPathDependency() -> Bool {
+            lock.withLock {
+                guard !didComplete else { return false }
+                remainingPathCount += 1
+                return true
+            }
+        }
+
         func completeOnePath() {
             let shouldComplete = lock.withLock { () -> Bool in
                 guard !didComplete else { return false }
@@ -1210,12 +1225,81 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
+    private final class DirectoryUpdateEnumerationCursor: @unchecked Sendable {
+        let directory: URL
+        private(set) var stream: UnsafeMutablePointer<DIR>?
+        var children: [URL] = []
+        var readEntryCount = 0
+
+        init(directory: URL, stream: UnsafeMutablePointer<DIR>) {
+            self.directory = directory
+            self.stream = stream
+        }
+
+        func close() {
+            guard let stream else { return }
+            closedir(stream)
+            self.stream = nil
+        }
+
+        func takeChildrenAndClose() -> [URL] {
+            close()
+            let result = children
+            self.children.removeAll(keepingCapacity: false)
+            return result
+        }
+
+        deinit {
+            close()
+        }
+    }
+
     private final class DirectoryUpdateScanProgress: @unchecked Sendable {
+        let rootPath: String
         var pendingURLs: [URL]
-        var records: [String: FileRecord] = [:]
+        var activeEnumeration: DirectoryUpdateEnumerationCursor?
+        var scannedPaths = Set<String>()
+        var unpublishedRecords: [String: FileRecord] = [:]
+        var incrementallyPublishedChangeCount = 0
+        var incrementalPublishBatchCount = 0
+        private(set) var supersededPrefixes: [String] = []
 
         init(root: URL) {
+            rootPath = root.standardizedFileURL.path
             pendingURLs = [root]
+        }
+
+        @discardableResult
+        func supersedeSubtree(at path: String) -> Bool {
+            guard path != rootPath,
+                  (rootPath == "/" ? path.hasPrefix("/") : path.hasPrefix(rootPath + "/")),
+                  !isSuperseded(path) else {
+                return false
+            }
+
+            supersededPrefixes.removeAll { Self.contains($0, in: path) }
+            supersededPrefixes.append(path)
+            supersededPrefixes.sort()
+            return true
+        }
+
+        func isSuperseded(_ path: String) -> Bool {
+            var lowerBound = 0
+            var upperBound = supersededPrefixes.count
+            while lowerBound < upperBound {
+                let middle = lowerBound + (upperBound - lowerBound) / 2
+                if supersededPrefixes[middle] <= path {
+                    lowerBound = middle + 1
+                } else {
+                    upperBound = middle
+                }
+            }
+            guard lowerBound > 0 else { return false }
+            return Self.contains(path, in: supersededPrefixes[lowerBound - 1])
+        }
+
+        private static func contains(_ path: String, in prefix: String) -> Bool {
+            path == prefix || (prefix == "/" ? path.hasPrefix("/") : path.hasPrefix(prefix + "/"))
         }
     }
 
@@ -1228,12 +1312,16 @@ public final class FileIndex: @unchecked Sendable {
         var directoryScanProgress: DirectoryUpdateScanProgress?
         var requiresDirectoryRescanAfterProgress: Bool
         var eligibleAt: Date?
+        var lastServiceSequence: UInt64?
+        var retryAttempt: Int
 
         mutating func merge(_ incoming: PendingRefreshWork) {
             // Keep partial traversal state stable; a fresh event is satisfied by one
             // clean follow-up pass after the current traversal reaches its boundary.
             let progressCollidedWithFreshRequest = (directoryScanProgress == nil)
                 != (incoming.directoryScanProgress == nil)
+            let breaksRetryBackoff = incoming.priority == .interactive
+                && incoming.retryAttempt == 0
             priority = IndexWorkPriority.merged(priority, incoming.priority)
             firstQueuedAt = min(firstQueuedAt, incoming.firstQueuedAt)
             lastQueuedAt = max(lastQueuedAt, incoming.lastQueuedAt)
@@ -1244,10 +1332,15 @@ public final class FileIndex: @unchecked Sendable {
             if directoryScanProgress == nil {
                 directoryScanProgress = incoming.directoryScanProgress
             }
-            if priority == .interactive {
+            retryAttempt = max(retryAttempt, incoming.retryAttempt)
+            if breaksRetryBackoff {
                 eligibleAt = nil
+                retryAttempt = 0
             } else if let incomingEligibleAt = incoming.eligibleAt {
                 eligibleAt = max(eligibleAt ?? incomingEligibleAt, incomingEligibleAt)
+            }
+            if let incomingSequence = incoming.lastServiceSequence {
+                lastServiceSequence = max(lastServiceSequence ?? incomingSequence, incomingSequence)
             }
         }
 
@@ -1259,6 +1352,7 @@ public final class FileIndex: @unchecked Sendable {
         mutating func promote() {
             priority = .interactive
             eligibleAt = nil
+            retryAttempt = 0
         }
 
         mutating func deferBackgroundWork(until date: Date) {
@@ -1269,12 +1363,33 @@ public final class FileIndex: @unchecked Sendable {
         func isEligible(at date: Date) -> Bool {
             eligibleAt.map { $0 <= date } ?? true
         }
+
+        mutating func markServiced(sequence: UInt64) {
+            lastServiceSequence = sequence
+        }
+
+        mutating func deferAfterRetryFailure(baseDelay: TimeInterval, now: Date = Date()) {
+            let delay = FileIndex.backgroundRefreshRetryDelay(
+                baseDelay: baseDelay,
+                priorFailureCount: retryAttempt
+            )
+            retryAttempt = min(retryAttempt + 1, 63)
+            let retryDate = now.addingTimeInterval(delay)
+            eligibleAt = max(eligibleAt ?? retryDate, retryDate)
+        }
+
+        mutating func clearRetryBackoffAfterProgress() {
+            retryAttempt = 0
+            eligibleAt = nil
+        }
     }
 
     private struct DirectoryUpdateScanResult {
         let records: [String: FileRecord]
         let completed: Bool
         let visitedCount: Int
+        let readEntryCount: Int
+        let encounteredRetryError: Bool
         let exclusionInstrumentation: FileExclusionQuery.Instrumentation
     }
 
@@ -1444,6 +1559,12 @@ public final class FileIndex: @unchecked Sendable {
         let isDirectory: Bool
         let isSymlink: Bool
         let record: FileRecord
+    }
+
+    private enum FileSystemRecordLookup {
+        case record(FileSystemRecordCandidate)
+        case missing
+        case retry(error: Int32)
     }
 
     private final class ScanVolumeNameCache: @unchecked Sendable {
@@ -3948,10 +4069,14 @@ public final class FileIndex: @unchecked Sendable {
     private var backgroundRefreshBatchLimitOverride: Int?
     private var backgroundRefreshDrainBackoffDelayOverride: TimeInterval?
     private var backgroundDirectoryScanBudgetOverride: TimeInterval?
+    private var backgroundDirectoryScanVisitLimitOverride: Int?
+    private var backgroundDirectoryScanEntryLimitOverride: Int?
     private var backgroundOptimizationPersistDelayOverride: TimeInterval?
     private var metadataOverlayPersistDelayOverride: TimeInterval?
     private var metadataOverlayCheckpointDelayOverride: TimeInterval?
     private var metadataOverlayPersistLimitOverride: Int?
+    private var directoryUpdateEnumerationFailuresForTesting: [String: Int] = [:]
+    private var fileSystemLookupFailuresForTesting: [String: (error: Int32, remaining: Int)] = [:]
     private var checkpointWriteInFlight = false
     private var usageMetricsDirtyGeneration: UInt64 = 0
     private var usageMetricsSavedGeneration: UInt64 = 0
@@ -3990,6 +4115,7 @@ public final class FileIndex: @unchecked Sendable {
     private var scheduledRefreshDrainPriority: IndexWorkPriority?
     private var scheduledRefreshDrainDeadline: Date?
     private var refreshDrainScheduleGeneration: UInt64 = 0
+    private var refreshServiceSequence: UInt64 = 0
     private var optimizesSnapshotAfterPromotedRefreshDrain = false
     private var pendingReconciliationPaths = Set<String>()
     private var pendingReconciliationIncludesAllRoots = false
@@ -4045,6 +4171,8 @@ public final class FileIndex: @unchecked Sendable {
         self.backgroundRefreshBatchLimitOverride = nil
         self.backgroundRefreshDrainBackoffDelayOverride = nil
         self.backgroundDirectoryScanBudgetOverride = nil
+        self.backgroundDirectoryScanVisitLimitOverride = nil
+        self.backgroundDirectoryScanEntryLimitOverride = nil
         self.backgroundOptimizationPersistDelayOverride = nil
         self.metadataOverlayPersistDelayOverride = nil
         self.metadataOverlayCheckpointDelayOverride = nil
@@ -4093,6 +4221,8 @@ public final class FileIndex: @unchecked Sendable {
         backgroundRefreshBatchLimit: Int? = nil,
         backgroundRefreshDrainBackoffDelay: TimeInterval? = nil,
         backgroundDirectoryScanBudget: TimeInterval? = nil,
+        backgroundDirectoryScanVisitLimit: Int? = nil,
+        backgroundDirectoryScanEntryLimit: Int? = nil,
         backgroundOptimizationPersistDelay: TimeInterval? = nil,
         metadataOverlayPersistDelay: TimeInterval? = nil,
         metadataOverlayCheckpointDelay: TimeInterval? = nil,
@@ -4112,6 +4242,8 @@ public final class FileIndex: @unchecked Sendable {
         self.backgroundRefreshBatchLimitOverride = backgroundRefreshBatchLimit.map { max(1, $0) }
         self.backgroundRefreshDrainBackoffDelayOverride = backgroundRefreshDrainBackoffDelay.map { max(0, $0) }
         self.backgroundDirectoryScanBudgetOverride = backgroundDirectoryScanBudget.map { max(0, $0) }
+        self.backgroundDirectoryScanVisitLimitOverride = backgroundDirectoryScanVisitLimit.map { max(0, $0) }
+        self.backgroundDirectoryScanEntryLimitOverride = backgroundDirectoryScanEntryLimit.map { max(0, $0) }
         self.backgroundOptimizationPersistDelayOverride = backgroundOptimizationPersistDelay.map { max(0, $0) }
         self.metadataOverlayPersistDelayOverride = metadataOverlayPersistDelay.map { max(0, $0) }
         self.metadataOverlayCheckpointDelayOverride = metadataOverlayCheckpointDelay.map { max(0, $0) }
@@ -12586,8 +12718,30 @@ public final class FileIndex: @unchecked Sendable {
         backgroundRefreshDrainBackoffDelayOverride ?? Self.backgroundRefreshDrainBackoffDefaultDelay
     }
 
+    private static func backgroundRefreshRetryDelay(
+        baseDelay: TimeInterval,
+        priorFailureCount: Int
+    ) -> TimeInterval {
+        let boundedBaseDelay = max(baseDelay, 0)
+        let exponent = min(max(priorFailureCount, 0), 20)
+        return min(
+            boundedBaseDelay * pow(2, Double(exponent)),
+            backgroundRefreshRetryMaximumDelay
+        )
+    }
+
     private func backgroundDirectoryScanBudget() -> TimeInterval {
         backgroundDirectoryScanBudgetOverride ?? Self.backgroundDirectoryScanBudgetDefault
+    }
+
+    private func backgroundDirectoryScanVisitLimit(for priority: IndexWorkPriority) -> Int? {
+        guard priority == .background else { return nil }
+        return backgroundDirectoryScanVisitLimitOverride
+    }
+
+    private func backgroundDirectoryScanEntryLimit(for priority: IndexWorkPriority) -> Int? {
+        guard priority == .background else { return nil }
+        return backgroundDirectoryScanEntryLimitOverride
     }
 
     private func backgroundOptimizationPersistDelay() -> TimeInterval {
@@ -12626,7 +12780,9 @@ public final class FileIndex: @unchecked Sendable {
                     completions: completion.map { [$0] } ?? [],
                     directoryScanProgress: nil,
                     requiresDirectoryRescanAfterProgress: false,
-                    eligibleAt: nil
+                    eligibleAt: nil,
+                    lastServiceSequence: nil,
+                    retryAttempt: 0
                 )
             )
         }
@@ -12641,12 +12797,57 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     private func queuePendingRefreshWorkWithoutLock(_ work: PendingRefreshWork) {
-        if var existing = pendingRefreshPaths[work.path] {
-            existing.merge(work)
-            pendingRefreshPaths[work.path] = existing
+        var queuedWork = work
+        markOverlappingDirectoryProgressWithoutLock(for: &queuedWork)
+        if var existing = pendingRefreshPaths[queuedWork.path] {
+            existing.merge(queuedWork)
+            pendingRefreshPaths[queuedWork.path] = existing
         } else {
-            pendingRefreshPaths[work.path] = work
+            pendingRefreshPaths[queuedWork.path] = queuedWork
         }
+    }
+
+    private func markOverlappingDirectoryProgressWithoutLock(for work: inout PendingRefreshWork) {
+        var ancestorPath = Self.parentPath(of: work.path)
+        while let path = ancestorPath {
+            if let ancestor = pendingRefreshPaths[path],
+               ancestor.directoryScanProgress?.supersedeSubtree(at: work.path) == true {
+                Self.addCompletionDependencies(from: ancestor.completions, to: &work.completions)
+            }
+            ancestorPath = Self.parentPath(of: path)
+        }
+
+        guard work.directoryScanProgress != nil else { return }
+        for descendantPath in Array(pendingRefreshPaths.keys)
+        where Self.isStrictDescendant(descendantPath, of: work.path) {
+            guard var descendant = pendingRefreshPaths[descendantPath] else { continue }
+            if work.directoryScanProgress?.supersedeSubtree(at: descendant.path) == true {
+                Self.addCompletionDependencies(from: work.completions, to: &descendant.completions)
+                pendingRefreshPaths[descendantPath] = descendant
+            }
+        }
+    }
+
+    private static func addCompletionDependencies(
+        from source: [PendingRefreshCompletion],
+        to destination: inout [PendingRefreshCompletion]
+    ) {
+        var destinationIDs = Set(destination.map(ObjectIdentifier.init))
+        for completion in source {
+            let identifier = ObjectIdentifier(completion)
+            guard !destinationIDs.contains(identifier), completion.addPathDependency() else { continue }
+            destination.append(completion)
+            destinationIDs.insert(identifier)
+        }
+    }
+
+    private static func isStrictDescendant(_ path: String, of ancestor: String) -> Bool {
+        path != ancestor && (ancestor == "/" || path.hasPrefix(ancestor + "/"))
+    }
+
+    private static func parentPath(of path: String) -> String? {
+        guard path != "/", let separator = path.lastIndex(of: "/") else { return nil }
+        return separator == path.startIndex ? "/" : String(path[..<separator])
     }
 
     private static func refreshBatchPriority(_ works: [PendingRefreshWork]) -> IndexWorkPriority {
@@ -12665,20 +12866,29 @@ public final class FileIndex: @unchecked Sendable {
     ) -> [PendingRefreshWork] {
         guard maximumCount > 0, !works.isEmpty else { return [] }
 
-        let allWorks = Array(works)
-        let queuedPaths = Set(allWorks.map(\.path))
+        let allWorks = works.sorted { $0.path < $1.path }
         var promotedAncestorPaths = Set<String>()
         var unblockedWorks: [PendingRefreshWork] = []
         unblockedWorks.reserveCapacity(min(allWorks.count, maximumCount))
+        var ancestorStack: [PendingRefreshWork] = []
 
         for work in allWorks {
-            if let ancestor = highestQueuedAncestor(of: work.path, in: queuedPaths) {
-                if work.priority == .interactive {
-                    promotedAncestorPaths.insert(ancestor)
-                }
-                continue
+            while let candidate = ancestorStack.last,
+                  !Self.isStrictDescendant(work.path, of: candidate.path) {
+                ancestorStack.removeLast()
             }
-            unblockedWorks.append(work)
+
+            let blockingAncestor = ancestorStack.first { ancestor in
+                ancestor.directoryScanProgress?.isSuperseded(work.path) != true
+            }
+            if let blockingAncestor {
+                if work.priority == .interactive {
+                    promotedAncestorPaths.insert(blockingAncestor.path)
+                }
+            } else {
+                unblockedWorks.append(work)
+            }
+            ancestorStack.append(work)
         }
 
         for index in unblockedWorks.indices where promotedAncestorPaths.contains(unblockedWorks[index].path) {
@@ -12689,27 +12899,17 @@ public final class FileIndex: @unchecked Sendable {
             if lhs.priority != rhs.priority {
                 return lhs.priority == .interactive
             }
+            if lhs.lastServiceSequence != rhs.lastServiceSequence {
+                guard let lhsSequence = lhs.lastServiceSequence else { return true }
+                guard let rhsSequence = rhs.lastServiceSequence else { return false }
+                return lhsSequence < rhsSequence
+            }
             if lhs.firstQueuedAt != rhs.firstQueuedAt {
                 return lhs.firstQueuedAt < rhs.firstQueuedAt
             }
             return lhs.path < rhs.path
         }
         return Array(unblockedWorks.prefix(maximumCount))
-    }
-
-    private static func highestQueuedAncestor(of path: String, in queuedPaths: Set<String>) -> String? {
-        var candidate = (path as NSString).deletingLastPathComponent
-        var highestAncestor: String?
-        while !candidate.isEmpty, candidate != path {
-            if queuedPaths.contains(candidate) {
-                highestAncestor = candidate
-            }
-            guard candidate != "/" else { break }
-            let parent = (candidate as NSString).deletingLastPathComponent
-            guard parent != candidate else { break }
-            candidate = parent
-        }
-        return highestAncestor
     }
 
     private func scheduleUpdateDrainIfNeeded(delay: DispatchTimeInterval) {
@@ -12831,11 +13031,7 @@ public final class FileIndex: @unchecked Sendable {
             let batchLimit = Self.hasInteractiveRefreshWork(eligibleWorks)
                 ? Self.maximumRefreshBatchPaths
                 : backgroundRefreshBatchLimit()
-            let batch = Self.nonoverlappingRefreshBatch(
-                from: allWorks,
-                maximumCount: batchLimit,
-                eligibleAt: now
-            )
+            let batch = Array(eligibleWorks.prefix(batchLimit))
             for work in batch {
                 pendingRefreshPaths.removeValue(forKey: work.path)
             }
@@ -12891,7 +13087,10 @@ public final class FileIndex: @unchecked Sendable {
             updateResult = updateNow(requests: drain.works)
         }
 
+        // Exact-path bursts are cheap, finite work and should drain continuously.
+        // Only recursive directory traversal needs the background duty-cycle cap.
         let backgroundResumeDate = updateResult.priority == .background
+            && updateResult.requestedDirectoryRefresh
             ? Date().addingTimeInterval(backgroundRefreshDrainBackoffDelay())
             : nil
         if !updateResult.deferredRefreshes.isEmpty {
@@ -12953,8 +13152,8 @@ public final class FileIndex: @unchecked Sendable {
         let remainingPathCount = lock.withLock { pendingRefreshPaths.count }
         if remainingPathCount > 0 {
             let delay: DispatchTimeInterval
-            if updateResult.priority == .background {
-                let backoff = max(backgroundResumeDate?.timeIntervalSinceNow ?? 0, 0)
+            if let backgroundResumeDate {
+                let backoff = max(backgroundResumeDate.timeIntervalSinceNow, 0)
                 recordMaintenance(IndexMaintenanceOperationMetric(
                     kind: .backgroundSlice,
                     priority: .background,
@@ -13219,12 +13418,40 @@ public final class FileIndex: @unchecked Sendable {
         var requiresDirectoryReconciliation = false
         let updateVolumeNameCache = ScanVolumeNameCache()
 
-        func stageUpsertIfChanged(_ record: FileRecord) {
+        func needsUpsert(_ record: FileRecord) -> Bool {
             if let rowID = previousSnapshot.store.rowID(forPath: record.path),
                Self.storedRecord(previousSnapshot.store, at: rowID, matches: record) {
+                return false
+            }
+            return true
+        }
+
+        func stageUpsertIfChanged(_ record: FileRecord) {
+            guard needsUpsert(record) else { return }
+            upserts[record.path] = record
+        }
+
+        func stageDeletedRows(
+            inSubtreeAt path: String,
+            keeping shouldKeep: (String) -> Bool
+        ) {
+            if let subtreeRows = previousSnapshot.store.rowIDs(inSubtreeAtPath: path) {
+                for existingRow in subtreeRows {
+                    let existingPath = previousSnapshot.store.path(at: existingRow)
+                    if !shouldKeep(existingPath) {
+                        deletedRows.insert(existingRow)
+                    }
+                }
                 return
             }
-            upserts[record.path] = record
+
+            for existingRow in 0..<previousSnapshot.count {
+                let existingPath = previousSnapshot.store.path(at: existingRow)
+                if (existingPath == path || existingPath.hasPrefix(path + "/")),
+                   !shouldKeep(existingPath) {
+                    deletedRows.insert(existingRow)
+                }
+            }
         }
 
         func makeUpdateResult(
@@ -13257,6 +13484,7 @@ public final class FileIndex: @unchecked Sendable {
                 completionReady: completionReady ?? applied,
                 largeOverlay: largeOverlay,
                 priority: updatePriority,
+                requestedDirectoryRefresh: requestedDirectoryRefresh,
                 batchPathCount: paths.count,
                 changedPathCount: changedPathCount,
                 visitedCount: visitedCount,
@@ -13269,15 +13497,28 @@ public final class FileIndex: @unchecked Sendable {
 
         for var request in requests {
             let path = request.path
+            guard Self.path(path, isWithinAnyRoot: indexState.rootPaths) else {
+                DiagnosticLogger.shared.log(
+                    category: "index",
+                    event: "index.updateDiscardedAfterRootChange",
+                    diagnosticFields: ["path": .path(path)]
+                )
+                continue
+            }
+            if request.priority == .background,
+               requestedDirectoryRefresh,
+               let deadline = backgroundDirectoryScanDeadline(
+                   for: request.priority,
+                   startedAt: updateStarted
+               ),
+               Date() >= deadline {
+                deferredRefreshes.append(request)
+                continue
+            }
             autoreleasepool {
                 let url = URL(fileURLWithPath: path).standardizedFileURL
-                if fileManager.fileExists(atPath: url.path) {
-                    guard let candidate = fileSystemRecordCandidate(
-                        for: url,
-                        volumeNameCache: updateVolumeNameCache
-                    ) else {
-                        return
-                    }
+                switch fileSystemRecordLookup(for: url, volumeNameCache: updateVolumeNameCache) {
+                case let .record(candidate):
                     let decision = exclusionDecision(
                         for: candidate.url,
                         exclusions: indexState.exclusions,
@@ -13298,7 +13539,7 @@ public final class FileIndex: @unchecked Sendable {
                             for: request.priority,
                             startedAt: updateStarted
                         )
-                        let scannedRecords: [String: FileRecord]?
+                        var concurrentlyScannedRecords: [String: FileRecord]?
                         if indexState.frontierMode == .singleDirectory {
                             let progress = request.directoryScanProgress
                                 ?? DirectoryUpdateScanProgress(root: candidate.url)
@@ -13308,29 +13549,72 @@ public final class FileIndex: @unchecked Sendable {
                                 rootPaths: indexState.rootPaths,
                                 query: exclusionQuery,
                                 deadline: deadline,
+                                maximumVisitCount: backgroundDirectoryScanVisitLimit(for: request.priority),
+                                maximumEntryCount: backgroundDirectoryScanEntryLimit(for: request.priority),
                                 generation: currentGeneration
                             )
                             if let scanResult {
+                                let scanWorkCount = scanResult.visitedCount + scanResult.readEntryCount
+                                if scanResult.encounteredRetryError {
+                                    request.deferAfterRetryFailure(
+                                        baseDelay: backgroundRefreshDrainBackoffDelay()
+                                    )
+                                } else if scanWorkCount > 0 {
+                                    request.clearRetryBackoffAfterProgress()
+                                }
+                                if scanWorkCount > 0 {
+                                    request.markServiced(sequence: nextRefreshServiceSequence())
+                                }
                                 exclusionInstrumentation.add(scanResult.exclusionInstrumentation)
-                                visitedCount += scanResult.visitedCount
-                                deferredDirectoryVisitCount += scanResult.visitedCount
+                                visitedCount += scanWorkCount
+                                deferredDirectoryVisitCount += scanWorkCount
+                                let completesCurrentTraversal = scanResult.completed
+                                    && !request.requiresDirectoryRescanAfterProgress
+                                let canPublishIncrementally = progress.incrementalPublishBatchCount
+                                    < Self.backgroundDirectoryIncrementalPublishBatchLimit
+                                var publishedIncrementalChange = false
+                                for record in scanResult.records.values
+                                where !progress.isSuperseded(record.path) && needsUpsert(record) {
+                                    if completesCurrentTraversal
+                                        || (canPublishIncrementally
+                                            && progress.incrementallyPublishedChangeCount
+                                                < Self.backgroundDirectoryIncrementalPublishLimit) {
+                                        upserts[record.path] = record
+                                        if !completesCurrentTraversal {
+                                            progress.incrementallyPublishedChangeCount += 1
+                                            publishedIncrementalChange = true
+                                        }
+                                    } else {
+                                        progress.unpublishedRecords[record.path] = record
+                                    }
+                                }
+                                if publishedIncrementalChange {
+                                    progress.incrementalPublishBatchCount += 1
+                                }
                                 if scanResult.completed {
                                     if request.requiresDirectoryRescanAfterProgress {
-                                        upserts.removeValue(forKey: candidate.record.path)
                                         request.prepareForFollowUpDirectoryScan()
                                         deferredRefreshes.append(request)
-                                        scannedRecords = nil
                                     } else {
-                                        scannedRecords = scanResult.records
+                                        for record in progress.unpublishedRecords.values
+                                        where !progress.isSuperseded(record.path) {
+                                            stageUpsertIfChanged(record)
+                                        }
+                                        progress.unpublishedRecords.removeAll(keepingCapacity: false)
+                                        requiresDirectoryReconciliation = true
+                                        reconciledDirectoryPrefixes.append(url.path)
+                                        stageDeletedRows(inSubtreeAt: url.path) { existingPath in
+                                            progress.isSuperseded(existingPath)
+                                                || progress.scannedPaths.contains(existingPath)
+                                        }
                                     }
                                 } else {
-                                    upserts.removeValue(forKey: candidate.record.path)
                                     request.directoryScanProgress = progress
                                     deferredRefreshes.append(request)
-                                    scannedRecords = nil
                                 }
                             } else {
-                                scannedRecords = nil
+                                request.directoryScanProgress = progress
+                                deferredRefreshes.append(request)
                             }
                         } else {
                             let scanResult = scanConcurrently(
@@ -13353,33 +13637,20 @@ public final class FileIndex: @unchecked Sendable {
                                 exclusionInstrumentation.add(scanResult.exclusionInstrumentation)
                                 visitedCount += scanResult.visited
                             }
-                            scannedRecords = scanResult?.records
+                            concurrentlyScannedRecords = scanResult?.records
                         }
-                        if let scannedRecords {
+                        if let scannedRecords = concurrentlyScannedRecords {
                             requiresDirectoryReconciliation = true
                             reconciledDirectoryPrefixes.append(url.path)
                             for record in scannedRecords.values {
                                 stageUpsertIfChanged(record)
                             }
-                            if let subtreeRows = previousSnapshot.store.rowIDs(inSubtreeAtPath: url.path) {
-                                for existingRow in subtreeRows {
-                                    let existingPath = previousSnapshot.store.path(at: existingRow)
-                                    if scannedRecords[existingPath] == nil {
-                                        deletedRows.insert(existingRow)
-                                    }
-                                }
-                            } else {
-                                for existingRow in 0..<previousSnapshot.count {
-                                    let existingPath = previousSnapshot.store.path(at: existingRow)
-                                    if (existingPath == url.path || existingPath.hasPrefix(url.path + "/")),
-                                       scannedRecords[existingPath] == nil {
-                                        deletedRows.insert(existingRow)
-                                    }
-                                }
+                            stageDeletedRows(inSubtreeAt: url.path) { existingPath in
+                                scannedRecords[existingPath] != nil
                             }
                         }
                     }
-                } else {
+                case .missing:
                     let fileDecision = exclusionDecision(
                         for: url,
                         exclusions: indexState.exclusions,
@@ -13398,11 +13669,34 @@ public final class FileIndex: @unchecked Sendable {
                     )
                     guard fileDecision != .prune || directoryDecision != .prune else { return }
                     deletedPrefixes.append(url.path)
+                case let .retry(error):
+                    request.markServiced(sequence: nextRefreshServiceSequence())
+                    request.deferAfterRetryFailure(
+                        baseDelay: backgroundRefreshDrainBackoffDelay()
+                    )
+                    deferredRefreshes.append(request)
+                    DiagnosticLogger.shared.log(
+                        level: .warning,
+                        category: "index",
+                        event: "index.updatePathLookupDeferred",
+                        fields: [
+                            "errorCode": .publicInt(Int(error))
+                        ],
+                        diagnosticFields: [
+                            "path": .path(url.path)
+                        ]
+                    )
                 }
             }
         }
 
-        guard isCurrentGeneration(currentGeneration) else { return .none }
+        guard isCurrentGeneration(currentGeneration) else {
+            lock.withLock {
+                queuePendingRefreshWorksWithoutLock(requests)
+            }
+            scheduleUpdateDrainIfNeeded(delay: .milliseconds(0))
+            return .none
+        }
         var unresolvedDeletedPrefixes: [String] = []
         let hasCompletePathLookup = previousSnapshot.store.hasColumnarSidecars
         for prefix in deletedPrefixes {
@@ -13733,30 +14027,116 @@ public final class FileIndex: @unchecked Sendable {
         rootPaths: [String],
         query: FileExclusionQuery?,
         deadline: Date?,
+        maximumVisitCount: Int?,
+        maximumEntryCount: Int?,
         generation currentGeneration: UInt64
     ) -> DirectoryUpdateScanResult? {
         let volumeNameCache = ScanVolumeNameCache()
+        var records: [String: FileRecord] = [:]
         var visitedCount = 0
+        var readEntryCount = 0
+        var checksDeadlineBeforeNextEntry = true
         var exclusionInstrumentation = FileExclusionQuery.Instrumentation()
 
-        while let url = progress.pendingURLs.last {
+        func incompleteResult(encounteredRetryError: Bool = false) -> DirectoryUpdateScanResult {
+            DirectoryUpdateScanResult(
+                records: records,
+                completed: false,
+                visitedCount: visitedCount,
+                readEntryCount: readEntryCount,
+                encounteredRetryError: encounteredRetryError,
+                exclusionInstrumentation: exclusionInstrumentation
+            )
+        }
+
+        func reachedDeadline() -> Bool {
+            deadline.map { Date() >= $0 } ?? false
+        }
+
+        while progress.activeEnumeration != nil || !progress.pendingURLs.isEmpty {
             guard isCurrentGeneration(currentGeneration) else { return nil }
-            if let deadline, Date() >= deadline {
-                return DirectoryUpdateScanResult(
-                    records: progress.records,
-                    completed: false,
-                    visitedCount: visitedCount,
-                    exclusionInstrumentation: exclusionInstrumentation
+
+            if let cursor = progress.activeEnumeration {
+                if progress.isSuperseded(cursor.directory.standardizedFileURL.path) {
+                    cursor.close()
+                    progress.activeEnumeration = nil
+                    continue
+                }
+
+                if maximumEntryCount.map({ readEntryCount >= $0 }) == true {
+                    return incompleteResult()
+                }
+                if checksDeadlineBeforeNextEntry || readEntryCount.isMultiple(of: 64) {
+                    checksDeadlineBeforeNextEntry = false
+                    if reachedDeadline() {
+                        return incompleteResult()
+                    }
+                }
+
+                guard let stream = cursor.stream else {
+                    progress.activeEnumeration = nil
+                    progress.pendingURLs.append(cursor.directory)
+                    return incompleteResult(encounteredRetryError: true)
+                }
+
+                errno = 0
+                guard let entry = readdir(stream) else {
+                    let readError = errno
+                    if readError == 0 {
+                        let children = cursor.takeChildrenAndClose()
+                        progress.activeEnumeration = nil
+                        progress.pendingURLs.append(contentsOf: children.reversed())
+                        continue
+                    }
+
+                    // A partial directory listing is not complete coverage. Drop
+                    // every child from that attempt and retry the directory later.
+                    cursor.close()
+                    progress.activeEnumeration = nil
+                    progress.pendingURLs.append(cursor.directory)
+                    return incompleteResult(encounteredRetryError: true)
+                }
+
+                readEntryCount += 1
+                cursor.readEntryCount += 1
+                guard let entryInfo = Self.directoryEntryInfo(entry) else { continue }
+                let name = entryInfo.name
+                guard name != "." && name != ".." else { continue }
+                if entryInfo.isDirectory,
+                   exclusions.canPruneDirectoryComponentBeforeStat(name) {
+                    exclusionInstrumentation.fastPruneDirectoryCount += 1
+                    continue
+                }
+                cursor.children.append(
+                    cursor.directory.appendingPathComponent(name, isDirectory: entryInfo.isDirectory)
                 )
+                continue
             }
-            progress.pendingURLs.removeLast()
+
+            if reachedDeadline()
+                || maximumVisitCount.map({ visitedCount >= $0 }) == true {
+                return incompleteResult()
+            }
+
+            guard let url = progress.pendingURLs.popLast() else { continue }
             visitedCount += 1
 
-            guard let candidate = fileSystemRecordCandidate(
-                for: url,
-                volumeNameCache: volumeNameCache
-            ) else {
+            if progress.isSuperseded(url.standardizedFileURL.path) {
                 continue
+            }
+
+            let candidate: FileSystemRecordCandidate
+            switch fileSystemRecordLookup(for: url, volumeNameCache: volumeNameCache) {
+            case let .record(recordCandidate):
+                candidate = recordCandidate
+            case .missing:
+                let missingPath = url.standardizedFileURL.path
+                progress.scannedPaths.remove(missingPath)
+                progress.unpublishedRecords.removeValue(forKey: missingPath)
+                continue
+            case .retry:
+                progress.pendingURLs.append(url)
+                return incompleteResult(encounteredRetryError: true)
             }
             let decision = exclusionDecision(
                 for: candidate.url,
@@ -13769,39 +14149,71 @@ public final class FileIndex: @unchecked Sendable {
             guard decision != .prune else { continue }
 
             if decision.shouldIndex {
-                progress.records[candidate.record.path] = candidate.record
+                progress.scannedPaths.insert(candidate.record.path)
+                records[candidate.record.path] = candidate.record
             }
 
             guard candidate.isDirectory, !candidate.isSymlink, decision.shouldDescend else {
                 continue
             }
 
-            var children: [URL] = []
-            let enumeratedChildren = enumerateShallowChildURLs(
-                in: candidate.url,
-                prunesDirectoryNamed: { name in
-                    let prunes = exclusions.canPruneDirectoryComponentBeforeStat(name)
-                    if prunes {
-                        exclusionInstrumentation.fastPruneDirectoryCount += 1
-                    }
-                    return prunes
-                }
-            ) { child in
-                children.append(child)
-                return true
+#if DEBUG
+            if consumeDirectoryUpdateEnumerationFailureForTesting(at: candidate.path) {
+                progress.pendingURLs.append(candidate.url)
+                return incompleteResult(encounteredRetryError: true)
             }
-            guard enumeratedChildren else {
-                return nil
+#endif
+
+            guard let stream = openDirectoryStream(candidate.url) else {
+                progress.pendingURLs.append(candidate.url)
+                return incompleteResult(encounteredRetryError: true)
             }
-            progress.pendingURLs.append(contentsOf: children.reversed())
+            progress.activeEnumeration = DirectoryUpdateEnumerationCursor(
+                directory: candidate.url,
+                stream: stream
+            )
+            checksDeadlineBeforeNextEntry = true
         }
 
         return DirectoryUpdateScanResult(
-            records: progress.records,
+            records: records,
             completed: true,
             visitedCount: visitedCount,
+            readEntryCount: readEntryCount,
+            encounteredRetryError: false,
             exclusionInstrumentation: exclusionInstrumentation
         )
+    }
+
+    private func nextRefreshServiceSequence() -> UInt64 {
+        lock.withLock {
+            refreshServiceSequence &+= 1
+            return refreshServiceSequence
+        }
+    }
+
+    private func consumeDirectoryUpdateEnumerationFailureForTesting(at path: String) -> Bool {
+        guard let remaining = directoryUpdateEnumerationFailuresForTesting[path], remaining > 0 else {
+            return false
+        }
+        if remaining == 1 {
+            directoryUpdateEnumerationFailuresForTesting.removeValue(forKey: path)
+        } else {
+            directoryUpdateEnumerationFailuresForTesting[path] = remaining - 1
+        }
+        return true
+    }
+
+    private func consumeFileSystemLookupFailureForTesting(at path: String) -> Int32? {
+        guard let failure = fileSystemLookupFailuresForTesting[path], failure.remaining > 0 else {
+            return nil
+        }
+        if failure.remaining == 1 {
+            fileSystemLookupFailuresForTesting.removeValue(forKey: path)
+        } else {
+            fileSystemLookupFailuresForTesting[path] = (failure.error, failure.remaining - 1)
+        }
+        return failure.error
     }
 
     @discardableResult
@@ -13815,7 +14227,11 @@ public final class FileIndex: @unchecked Sendable {
         }
         defer { closedir(stream) }
 
-        while let entry = readdir(stream) {
+        while true {
+            errno = 0
+            guard let entry = readdir(stream) else {
+                return errno == 0
+            }
             guard let entryInfo = Self.directoryEntryInfo(entry) else { continue }
             let name = entryInfo.name
             guard name != "." && name != ".." else { continue }
@@ -13826,19 +14242,41 @@ public final class FileIndex: @unchecked Sendable {
             let child = directory.appendingPathComponent(name, isDirectory: entryInfo.isDirectory)
             guard body(child) else { return false }
         }
-
-        return true
     }
 
     private func fileSystemRecordCandidate(
         for url: URL,
         volumeNameCache: ScanVolumeNameCache
     ) -> FileSystemRecordCandidate? {
+        guard case let .record(candidate) = fileSystemRecordLookup(
+            for: url,
+            volumeNameCache: volumeNameCache
+        ) else {
+            return nil
+        }
+        return candidate
+    }
+
+    private func fileSystemRecordLookup(
+        for url: URL,
+        volumeNameCache: ScanVolumeNameCache
+    ) -> FileSystemRecordLookup {
         let standardizedURL = url.standardizedFileURL
         let path = standardizedURL.path
+#if DEBUG
+        if let error = consumeFileSystemLookupFailureForTesting(at: path) {
+            return .retry(error: error)
+        }
+#endif
         var statBlock = stat()
+        errno = 0
         let result = path.withCString { lstat($0, &statBlock) }
-        guard result == 0 else { return nil }
+        guard result == 0 else {
+            let error = errno
+            return error == ENOENT || error == ENOTDIR
+                ? .missing
+                : .retry(error: error)
+        }
 
         let isDirectory = Self.isDirectoryMode(statBlock.st_mode)
         let isSymlink = Self.isSymbolicLinkMode(statBlock.st_mode)
@@ -13850,13 +14288,13 @@ public final class FileIndex: @unchecked Sendable {
             volumeName: volumeName
         )
 
-        return FileSystemRecordCandidate(
+        return .record(FileSystemRecordCandidate(
             url: standardizedURL,
             path: path,
             isDirectory: isDirectory,
             isSymlink: isSymlink,
             record: record
-        )
+        ))
     }
 
     private static func isDirectoryMode(_ mode: mode_t) -> Bool {
@@ -15737,7 +16175,16 @@ public final class FileIndex: @unchecked Sendable {
 
     func pendingDirectoryRefreshStateForTesting(
         path rawPath: String
-    ) -> (recordCount: Int, requiresFollowUp: Bool)? {
+    ) -> (
+        recordCount: Int,
+        requiresFollowUp: Bool,
+        incrementalPublishBatchCount: Int,
+        incrementallyPublishedChangeCount: Int,
+        unpublishedRecordCount: Int,
+        pendingURLCount: Int,
+        activeEnumerationEntryCount: Int?,
+        retryAttempt: Int
+    )? {
         let path = URL(fileURLWithPath: rawPath).standardizedFileURL.path
         return lock.withLock {
             guard
@@ -15746,12 +16193,79 @@ public final class FileIndex: @unchecked Sendable {
             else {
                 return nil
             }
-            return (progress.records.count, work.requiresDirectoryRescanAfterProgress)
+            return (
+                progress.scannedPaths.count,
+                work.requiresDirectoryRescanAfterProgress,
+                progress.incrementalPublishBatchCount,
+                progress.incrementallyPublishedChangeCount,
+                progress.unpublishedRecords.count,
+                progress.pendingURLs.count,
+                progress.activeEnumeration?.readEntryCount,
+                work.retryAttempt
+            )
         }
+    }
+
+    func pendingRefreshRetryStateForTesting(
+        path rawPath: String
+    ) -> (attempt: Int, eligibleAt: Date?)? {
+        let path = URL(fileURLWithPath: rawPath).standardizedFileURL.path
+        return lock.withLock {
+            guard let work = pendingRefreshPaths[path] else { return nil }
+            return (work.retryAttempt, work.eligibleAt)
+        }
+    }
+
+    static func backgroundRefreshRetryDelayForTesting(
+        baseDelay: TimeInterval,
+        priorFailureCount: Int
+    ) -> TimeInterval {
+        backgroundRefreshRetryDelay(
+            baseDelay: baseDelay,
+            priorFailureCount: priorFailureCount
+        )
     }
 
     func pendingRefreshPathsForTesting() -> Set<String> {
         lock.withLock { Set(pendingRefreshPaths.keys) }
+    }
+
+    func promotePendingRefreshForTesting(path rawPath: String) {
+        let path = URL(fileURLWithPath: rawPath).standardizedFileURL.path
+        lock.withLock {
+            guard var work = pendingRefreshPaths[path] else { return }
+            work.promote()
+            pendingRefreshPaths[path] = work
+        }
+        scheduleUpdateDrainIfNeeded(delay: .milliseconds(0))
+    }
+
+    func resumePendingRefreshForTesting(path rawPath: String) {
+        let path = URL(fileURLWithPath: rawPath).standardizedFileURL.path
+        lock.withLock {
+            guard var work = pendingRefreshPaths[path] else { return }
+            work.eligibleAt = nil
+            pendingRefreshPaths[path] = work
+        }
+        scheduleUpdateDrainIfNeeded(delay: .milliseconds(0))
+    }
+
+    func failNextDirectoryUpdateEnumerationsForTesting(path rawPath: String, count: Int = 1) {
+        let path = URL(fileURLWithPath: rawPath).standardizedFileURL.path
+        indexQueue.sync {
+            directoryUpdateEnumerationFailuresForTesting[path] = max(count, 0)
+        }
+    }
+
+    func failNextFileSystemLookupsForTesting(
+        path rawPath: String,
+        error: Int32 = EIO,
+        count: Int = 1
+    ) {
+        let path = URL(fileURLWithPath: rawPath).standardizedFileURL.path
+        indexQueue.sync {
+            fileSystemLookupFailuresForTesting[path] = (error, max(count, 0))
+        }
     }
 
     func recordMaintenanceForTesting(_ metric: IndexMaintenanceOperationMetric) {

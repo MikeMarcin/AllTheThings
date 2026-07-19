@@ -495,6 +495,29 @@ struct FileExclusionRulesTests {
         #expect(instrumentation.regexMatchCount == 0)
     }
 
+    @Test("compiled exclusion queries reuse ancestor work across event bursts")
+    func compiledQueriesReuseAncestorWorkAcrossBursts() {
+        let root = "/tmp/project"
+        let eventCount = 10_000
+        let patterns = FileExclusionRules.defaultPatterns
+        let query = FileExclusionRules(patterns: patterns).makeQuery(roots: [root])
+        var instrumentation = FileExclusionQuery.Instrumentation()
+
+        for offset in 0..<eventCount {
+            let decision = query.decision(
+                path: "\(root)/Sources/Generated/File-\(offset).swift",
+                isDirectory: false,
+                instrumentation: &instrumentation
+            )
+            #expect(decision == .index)
+        }
+
+        #expect(instrumentation.compiledExclusionDecisionCount == eventCount)
+        #expect(instrumentation.componentSplitCount == eventCount)
+        #expect(instrumentation.regexMatchCount == 0)
+        #expect(instrumentation.ancestorMatchCheckCount <= patterns.count * 3)
+    }
+
     private func assertCompiledQueryParity(
         patterns: [String],
         roots: [String],
