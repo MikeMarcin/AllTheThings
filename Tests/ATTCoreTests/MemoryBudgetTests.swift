@@ -433,6 +433,175 @@ struct MemoryBudgetTests {
         #expect(store.subtreeEnd(at: 2) == 4)
     }
 
+    @Test("mapped and overlay path lookup avoids path materialization")
+    func mappedAndOverlayPathLookupAvoidsPathMaterialization() throws {
+        let packageURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AllTheThings-PathLookup-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: packageURL) }
+
+        let root = "/tmp/allthethings-path-lookup"
+        let unicodeDirectory = "\(root)/Café 😺".decomposedStringWithCanonicalMapping
+        let unicodeFile = "\(unicodeDirectory)/résumé.swift".decomposedStringWithCanonicalMapping
+        let sibling = "\(root)/Sibling.txt"
+        let records = [
+            makeRecord(path: root, isDirectory: true),
+            makeRecord(path: unicodeDirectory, isDirectory: true),
+            makeRecord(path: unicodeFile),
+            makeRecord(path: sibling)
+        ]
+        try MappedRecordStore.writePackage(
+            records: records,
+            roots: [root],
+            exclusionPatterns: [],
+            packageURL: packageURL
+        )
+
+        let mapped = try MappedRecordStore(packageURL: packageURL)
+        #expect(mapped.pathMaterializationCountForTesting == 0)
+        for path in records.map(\.path) {
+            #expect(mapped.rowID(forPath: path) != nil)
+        }
+        #expect(mapped.rowID(forPath: "\(unicodeDirectory)/resume.swift") == nil)
+        #expect(mapped.rowID(forPath: unicodeFile + "/") == nil)
+        #expect(mapped.rowID(forPath: "\(root)/Missing.txt") == nil)
+        #expect(mapped.pathMaterializationCountForTesting == 0)
+
+        let deletedRow = try #require(mapped.rowID(forPath: sibling))
+        let added = makeRecord(path: "\(root)/Added.txt")
+        let overlay = OverlayRecordStore(base: mapped, upserts: [added], deletedRows: [deletedRow])
+        let materializedBeforeOverlayLookups = mapped.pathMaterializationCountForTesting
+
+        #expect(overlay.rowID(forPath: unicodeFile) != nil)
+        #expect(overlay.rowID(forPath: sibling) == nil)
+        #expect(overlay.rowID(forPath: added.path) != nil)
+        #expect(overlay.rowID(forPath: "\(root)/Still-Missing.txt") == nil)
+        #expect(mapped.pathMaterializationCountForTesting == materializedBeforeOverlayLookups)
+    }
+
+    @Test("subtree cursors enumerate mapped overlay replacing and heap stores in bounded batches")
+    func subtreeCursorsEnumerateEveryStoreKindInBoundedBatches() throws {
+        let packageURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AllTheThings-SubtreeCursor-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: packageURL) }
+
+        let root = "/tmp/allthethings-subtree-cursor/project"
+        let deletedPath = "\(root)/Deleted.txt"
+        let existingPath = "\(root)/Sources/Existing.swift"
+        let outsidePath = "/tmp/allthethings-subtree-cursor/Outside.txt"
+        let records = [
+            makeRecord(path: root, isDirectory: true),
+            makeRecord(path: "\(root)/Sources", isDirectory: true),
+            makeRecord(path: existingPath),
+            makeRecord(path: deletedPath),
+            makeRecord(path: outsidePath)
+        ]
+        try MappedRecordStore.writePackage(
+            records: records,
+            roots: ["/tmp/allthethings-subtree-cursor"],
+            exclusionPatterns: [],
+            packageURL: packageURL
+        )
+
+        let mapped = try MappedRecordStore(packageURL: packageURL)
+        var mappedCursor = mapped.makeSubtreeRowCursor(atPath: root)
+        var mappedRows: [Int] = []
+        var mappedBatchCount = 0
+        while let batch = mappedCursor.nextBatch(maximumVisitedRows: 2) {
+            #expect(batch.rowRange.count <= 2)
+            #expect(batch.includesEveryRow)
+            mappedBatchCount += 1
+            batch.forEachMatchingRow { mappedRows.append($0) }
+        }
+        #expect(mappedBatchCount > 1)
+        #expect(mappedCursor.isComplete)
+        #expect(mapped.pathMaterializationCountForTesting == 0)
+        #expect(Set(mappedRows.map { mapped.path(at: $0) }) == [
+            root,
+            "\(root)/Sources",
+            existingPath,
+            deletedPath
+        ])
+
+        let existingRow = try #require(mapped.rowID(forPath: existingPath))
+        let replacement = makeRecord(path: existingPath, modifiedTime: 42)
+        let replacing = ReplacingRecordStore(base: mapped, replacements: [existingRow: replacement])
+        let materializedBeforeReplacingCursor = mapped.pathMaterializationCountForTesting
+        var replacingCursor = replacing.makeSubtreeRowCursor(atPath: root)
+        var replacingRows: [Int] = []
+        while let batch = replacingCursor.nextBatch(maximumVisitedRows: 3) {
+            #expect(batch.includesEveryRow)
+            batch.forEachMatchingRow { replacingRows.append($0) }
+        }
+        #expect(replacingRows == mappedRows)
+        #expect(mapped.pathMaterializationCountForTesting == materializedBeforeReplacingCursor)
+
+        let deletedRow = try #require(mapped.rowID(forPath: deletedPath))
+        let newPath = "\(root)/Sources/New.swift"
+        let similarPrefixPath = "\(root)-peer/Not-A-Descendant.swift"
+        let overlay = OverlayRecordStore(
+            base: mapped,
+            upserts: [
+                makeRecord(path: root, isDirectory: true, modifiedTime: 43),
+                makeRecord(path: newPath),
+                makeRecord(path: similarPrefixPath)
+            ],
+            deletedRows: [deletedRow]
+        )
+        let materializedBeforeOverlayCursor = mapped.pathMaterializationCountForTesting
+        var overlayCursor = overlay.makeSubtreeRowCursor(atPath: root)
+        var overlayRows: [Int] = []
+        while let batch = overlayCursor.nextBatch(maximumVisitedRows: 2) {
+            #expect(batch.rowRange.count <= 2)
+            #expect(batch.includesEveryRow)
+            batch.forEachMatchingRow { overlayRows.append($0) }
+        }
+        #expect(mapped.pathMaterializationCountForTesting == materializedBeforeOverlayCursor)
+        #expect(Set(overlayRows.map { overlay.path(at: $0) }) == [
+            root,
+            "\(root)/Sources",
+            existingPath,
+            newPath
+        ])
+
+        let heap = HeapPagedRecordStore(records: [
+            makeRecord(path: outsidePath),
+            makeRecord(path: existingPath),
+            makeRecord(path: root, isDirectory: true),
+            makeRecord(path: similarPrefixPath),
+            makeRecord(path: "\(root)/Sources", isDirectory: true)
+        ])
+        var heapCursor = heap.makeSubtreeRowCursor(atPath: root)
+        var heapRows: [Int] = []
+        var visitedRowCount = 0
+        while let batch = heapCursor.nextBatch(maximumVisitedRows: 2) {
+            #expect(batch.rowRange.count <= 2)
+            #expect(!batch.includesEveryRow)
+            visitedRowCount += batch.rowRange.count
+            batch.forEachMatchingRow { heapRows.append($0) }
+        }
+        #expect(visitedRowCount == heap.count)
+        #expect(Set(heapRows.map { heap.path(at: $0) }) == [
+            root,
+            "\(root)/Sources",
+            existingPath
+        ])
+    }
+
+    @Test("subtree cursor retains its immutable store")
+    func subtreeCursorRetainsItsStore() {
+        var heap: HeapPagedRecordStore? = HeapPagedRecordStore(records: [
+            makeRecord(path: "/tmp/allthethings-retained-cursor", isDirectory: true)
+        ])
+        weak var retainedStore = heap
+        var cursor = heap?.makeSubtreeRowCursor(atPath: "/tmp/allthethings-retained-cursor")
+
+        heap = nil
+        #expect(retainedStore != nil)
+        #expect(cursor?.nextBatch(maximumVisitedRows: 1)?.rowRange.count == 1)
+        cursor = nil
+        #expect(retainedStore == nil)
+    }
+
     @Test("snapshots share name and virtual component postings")
     func snapshotsShareNameAndVirtualComponentPostings() throws {
         let applicationName = "AllTheThingsTests-\(UUID().uuidString)"

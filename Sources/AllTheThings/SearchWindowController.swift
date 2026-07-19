@@ -1,5 +1,5 @@
 import AppKit
-import ATTCore
+@_spi(ATTInternal) import ATTCore
 import CoreServices
 import QuartzCore
 import UniformTypeIdentifiers
@@ -4062,6 +4062,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             recordProcessResourceSample(mode: energyMode)
         }
         energyMode = mode
+        index.setBackgroundMaintenanceEnabled(mode == .background)
         backgroundEnergyModeEnteredAt = mode == .background ? Date() : nil
         startWatchingIfNeeded()
         startApplicationWatchingIfNeeded()
@@ -4806,7 +4807,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
 
         flushSuppressedDroppedOnlyFSEventLogs()
-        let recursiveEventCount = filteredEvents.filter(\.requiresRecursiveRescan).count
+        let recursiveEventCount = filteredEvents.filter {
+            $0.requiresRecursiveRescan || $0.mayIntroduceDirectorySubtree
+        }.count
         for event in filteredEvents {
             if let existing = pendingFSEventsByPath[event.path] {
                 pendingFSEventsByPath[event.path] = existing.merging(event)
@@ -4918,13 +4921,16 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         if !routedScopes.recursivePaths.isEmpty {
             index.recordRecursiveRescan()
         }
-        let updatePaths = routedScopes.exactPaths + routedScopes.directoryPaths
-        guard !updatePaths.isEmpty else {
+        guard !routedScopes.isEmpty else {
             commitReadyFSEventCursorBatches(cursorBatchIDs)
             return
         }
 
-        index.update(paths: updatePaths, priority: priority) { [weak self] in
+        self.index.update(
+            exactPaths: routedScopes.exactPaths,
+            recursivePaths: routedScopes.recursivePaths,
+            priority: priority
+        ) { [weak self] in
             Task { @MainActor [weak self] in
                 self?.commitReadyFSEventCursorBatches(cursorBatchIDs)
             }

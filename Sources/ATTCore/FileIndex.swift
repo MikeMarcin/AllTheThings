@@ -643,10 +643,19 @@ public final class FileIndex: @unchecked Sendable {
     private static let backgroundRefreshBatchDefaultLimit = maximumRefreshBatchPaths
     private static let backgroundRefreshDrainBackoffDefaultDelay: TimeInterval = 60
     private static let backgroundRefreshRetryMaximumDelay: TimeInterval = 60 * 60
+    private static let fullScanRetryLimit = 3
     private static let backgroundDirectoryScanBudgetDefault: TimeInterval = 1.5
+    private static let backgroundDirectoryScanVisitDefaultLimit = 2_048
+    private static let backgroundDirectoryScanEntryDefaultLimit = 8_192
+    private static let backgroundDirectoryFinalizationDefaultLimit = 1_048_576
+    private static let directoryFinalizationCursorBatchSize = 4_096
     private static let backgroundDirectoryIncrementalPublishLimit = 2_048
     private static let backgroundDirectoryIncrementalPublishBatchLimit = 4
     private static let backgroundOptimizationPersistDefaultDelay: TimeInterval = 300
+    private static let structuralDeltaCompactionWriterConflictWarningDelay: TimeInterval = 15 * 60
+    private static let structuralDeltaCompactionRetryDelay: TimeInterval = 30
+    private static let structuralDeltaCompactionImmediateChangeMultiplier = 4
+    private static let structuralDeltaCompactionImmediateByteLimit: UInt64 = 64 * 1_024 * 1_024
     private static let metadataOverlayPersistDefaultDelay: TimeInterval = 30
     private static let metadataOverlayCheckpointDefaultDelay: TimeInterval = 300
     private static let metadataOverlayPersistDefaultLimit = 10_000
@@ -660,11 +669,19 @@ public final class FileIndex: @unchecked Sendable {
     static var defaultBackgroundDirectoryMaintenancePolicyForTesting: (
         scanBudget: TimeInterval,
         backoff: TimeInterval,
+        visitLimit: Int,
+        entryLimit: Int,
         targetDutyCycle: Double
     ) {
         let scanBudget = backgroundDirectoryScanBudgetDefault
         let backoff = backgroundRefreshDrainBackoffDefaultDelay
-        return (scanBudget, backoff, scanBudget / (scanBudget + backoff))
+        return (
+            scanBudget,
+            backoff,
+            backgroundDirectoryScanVisitDefaultLimit,
+            backgroundDirectoryScanEntryDefaultLimit,
+            scanBudget / (scanBudget + backoff)
+        )
     }
 #endif
 
@@ -1173,6 +1190,7 @@ public final class FileIndex: @unchecked Sendable {
         let exclusionInstrumentation: FileExclusionQuery.Instrumentation
         let reconciledDirectoryPrefixes: [String]
         let deferredRefreshes: [PendingRefreshWork]
+        let completedRefreshes: [PendingRefreshWork]
         let deferredDirectoryVisitCount: Int
 
         static let none = RefreshUpdateResult(
@@ -1187,6 +1205,7 @@ public final class FileIndex: @unchecked Sendable {
             exclusionInstrumentation: FileExclusionQuery.Instrumentation(),
             reconciledDirectoryPrefixes: [],
             deferredRefreshes: [],
+            completedRefreshes: [],
             deferredDirectoryVisitCount: 0
         )
     }
@@ -1227,12 +1246,14 @@ public final class FileIndex: @unchecked Sendable {
 
     private final class DirectoryUpdateEnumerationCursor: @unchecked Sendable {
         let directory: URL
+        let directoryPath: String
         private(set) var stream: UnsafeMutablePointer<DIR>?
         var children: [URL] = []
         var readEntryCount = 0
 
         init(directory: URL, stream: UnsafeMutablePointer<DIR>) {
             self.directory = directory
+            self.directoryPath = directory.path
             self.stream = stream
         }
 
@@ -1256,17 +1277,49 @@ public final class FileIndex: @unchecked Sendable {
 
     private final class DirectoryUpdateScanProgress: @unchecked Sendable {
         let rootPath: String
+        let baselineStore: RecordStore
         var pendingURLs: [URL]
+        var deferredRetryURLs: [URL] = []
         var activeEnumeration: DirectoryUpdateEnumerationCursor?
-        var scannedPaths = Set<String>()
+        var seenBaselineRows: PackedRowBitSet
+        var scannedRecordCount = 0
         var unpublishedRecords: [String: FileRecord] = [:]
         var incrementallyPublishedChangeCount = 0
         var incrementalPublishBatchCount = 0
+        var finalization: DirectoryUpdateFinalization?
+        var traversalWorkCount = 0
         private(set) var supersededPrefixes: [String] = []
 
-        init(root: URL) {
+        init(root: URL, baselineStore: RecordStore) {
             rootPath = root.standardizedFileURL.path
+            self.baselineStore = baselineStore
+            seenBaselineRows = PackedRowBitSet(bitCount: baselineStore.count)
             pendingURLs = [root]
+        }
+
+        func recordObservedPath(_ path: String) {
+            scannedRecordCount += 1
+            guard let rowID = baselineStore.rowID(forPath: path) else { return }
+            seenBaselineRows.insert(rowID)
+        }
+
+        func recordMissingPath(_ path: String) {
+            guard let rowID = baselineStore.rowID(forPath: path) else { return }
+            seenBaselineRows.remove(rowID)
+        }
+
+        func activateDeferredRetriesIfNeeded() {
+            guard activeEnumeration == nil,
+                  pendingURLs.isEmpty,
+                  !deferredRetryURLs.isEmpty else {
+                return
+            }
+            pendingURLs = deferredRetryURLs
+            deferredRetryURLs.removeAll(keepingCapacity: true)
+        }
+
+        func deferForRetry(_ url: URL) {
+            deferredRetryURLs.append(url)
         }
 
         @discardableResult
@@ -1303,12 +1356,46 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
+    private enum DirectoryUpdateFinalizationPhase: String, Sendable {
+        case baselineRows
+        case unpublishedUpserts
+        case readyToCommit
+    }
+
+    private final class DirectoryUpdateFinalization: @unchecked Sendable {
+        var baselineCursor: RecordStoreSubtreeCursor
+        let unpublishedRecords: [String: FileRecord]
+        var unpublishedRecordIndex: Dictionary<String, FileRecord>.Index
+        var phase = DirectoryUpdateFinalizationPhase.baselineRows
+        var deletionPaths: [String] = []
+        var preparedUpsertPaths: [String] = []
+        var baselineRowsVisited = 0
+        var matchingBaselineRowsVisited = 0
+        var upsertsVisited = 0
+        var materializedDeletionPathCount = 0
+
+        init(progress: DirectoryUpdateScanProgress) {
+            baselineCursor = progress.baselineStore.makeSubtreeRowCursor(atPath: progress.rootPath)
+            let unpublishedRecords = progress.unpublishedRecords
+            self.unpublishedRecords = unpublishedRecords
+            unpublishedRecordIndex = unpublishedRecords.startIndex
+            progress.unpublishedRecords.removeAll(keepingCapacity: false)
+        }
+    }
+
+    private struct DirectoryUpdateFinalizationResult {
+        let completed: Bool
+        let visitedCount: Int
+    }
+
     private struct PendingRefreshWork: Sendable {
         let path: String
         var priority: IndexWorkPriority
+        var recursivelyScansDirectory: Bool
+        var followUpRecursivelyScansDirectory: Bool
         var firstQueuedAt: Date
-        var lastQueuedAt: Date
         var completions: [PendingRefreshCompletion]
+        var followUpCompletions: [PendingRefreshCompletion]
         var directoryScanProgress: DirectoryUpdateScanProgress?
         var requiresDirectoryRescanAfterProgress: Bool
         var eligibleAt: Date?
@@ -1324,8 +1411,20 @@ public final class FileIndex: @unchecked Sendable {
                 && incoming.retryAttempt == 0
             priority = IndexWorkPriority.merged(priority, incoming.priority)
             firstQueuedAt = min(firstQueuedAt, incoming.firstQueuedAt)
-            lastQueuedAt = max(lastQueuedAt, incoming.lastQueuedAt)
-            completions.append(contentsOf: incoming.completions)
+            if directoryScanProgress != nil, incoming.directoryScanProgress == nil {
+                followUpRecursivelyScansDirectory = followUpRecursivelyScansDirectory
+                    || incoming.recursivelyScansDirectory
+                    || incoming.followUpRecursivelyScansDirectory
+                followUpCompletions.append(contentsOf: incoming.completions)
+                followUpCompletions.append(contentsOf: incoming.followUpCompletions)
+            } else {
+                recursivelyScansDirectory = recursivelyScansDirectory
+                    || incoming.recursivelyScansDirectory
+                followUpRecursivelyScansDirectory = followUpRecursivelyScansDirectory
+                    || incoming.followUpRecursivelyScansDirectory
+                completions.append(contentsOf: incoming.completions)
+                followUpCompletions.append(contentsOf: incoming.followUpCompletions)
+            }
             requiresDirectoryRescanAfterProgress = requiresDirectoryRescanAfterProgress
                 || incoming.requiresDirectoryRescanAfterProgress
                 || progressCollidedWithFreshRequest
@@ -1347,12 +1446,20 @@ public final class FileIndex: @unchecked Sendable {
         mutating func prepareForFollowUpDirectoryScan() {
             directoryScanProgress = nil
             requiresDirectoryRescanAfterProgress = false
+            recursivelyScansDirectory = followUpRecursivelyScansDirectory
+            followUpRecursivelyScansDirectory = false
+            completions = followUpCompletions
+            followUpCompletions.removeAll(keepingCapacity: false)
         }
 
         mutating func promote() {
             priority = .interactive
             eligibleAt = nil
             retryAttempt = 0
+        }
+
+        mutating func demote() {
+            priority = .background
         }
 
         mutating func deferBackgroundWork(until date: Date) {
@@ -1567,6 +1674,12 @@ public final class FileIndex: @unchecked Sendable {
         case retry(error: Int32)
     }
 
+    private enum ShallowDirectoryEnumerationResult {
+        case completed
+        case stopped
+        case retry(error: Int32)
+    }
+
     private final class ScanVolumeNameCache: @unchecked Sendable {
         private var volumeNamesByDevice: [dev_t: String] = [:]
 
@@ -1584,6 +1697,7 @@ public final class FileIndex: @unchecked Sendable {
     private final class ConcurrentScanState: @unchecked Sendable {
         private let condition = NSCondition()
         private var pendingDirectories: [URL] = []
+        private var knownDirectoryPaths: Set<String>
         private var activeDirectories: Set<String> = []
         private var completedDirectories: Set<String>
         private var shouldStop = false
@@ -1610,6 +1724,7 @@ public final class FileIndex: @unchecked Sendable {
             buildsRecordStore: Bool = true
         ) {
             self.completedDirectories = completedDirectories
+            knownDirectoryPaths = completedDirectories
             self.operationStartedAt = operationStartedAt
             checkpointSchedule = ScanCheckpointSchedule(
                 operationStartedAt: operationStartedAt,
@@ -1627,7 +1742,8 @@ public final class FileIndex: @unchecked Sendable {
             for record in existingRecords {
                 appendRecordWithoutLock(record)
             }
-            for directory in pendingDirectories where !completedDirectories.contains(directory.path) {
+            for directory in pendingDirectories
+                where knownDirectoryPaths.insert(directory.path).inserted {
                 self.pendingDirectories.append(directory)
             }
             frontierMetrics.maxPendingDirectoryCount = self.pendingDirectories.count
@@ -1643,7 +1759,7 @@ public final class FileIndex: @unchecked Sendable {
             condition.lock()
             frontierMetrics.enqueueCallCount += 1
             var enqueuedCount = 0
-            for directory in directories where !completedDirectories.contains(directory.path) {
+            for directory in directories where knownDirectoryPaths.insert(directory.path).inserted {
                 pendingDirectories.append(directory)
                 enqueuedCount += 1
             }
@@ -4071,6 +4187,7 @@ public final class FileIndex: @unchecked Sendable {
     private var backgroundDirectoryScanBudgetOverride: TimeInterval?
     private var backgroundDirectoryScanVisitLimitOverride: Int?
     private var backgroundDirectoryScanEntryLimitOverride: Int?
+    private var backgroundDirectoryFinalizationLimitOverride: Int?
     private var backgroundOptimizationPersistDelayOverride: TimeInterval?
     private var metadataOverlayPersistDelayOverride: TimeInterval?
     private var metadataOverlayCheckpointDelayOverride: TimeInterval?
@@ -4104,6 +4221,10 @@ public final class FileIndex: @unchecked Sendable {
     private var lastScanFrontierMetrics = ScanFrontierMetrics()
     private var generation: UInt64 = 0
     private var persistRevision: UInt64 = 0
+    private var structuralDeltaCompactionRevision: UInt64 = 0
+    private var structuralDeltaCompactionScheduledAt: Date?
+    private var structuralDeltaCompactionWriterConflictWarningDeadline: Date?
+    private var structuralDeltaCompactionIsImmediate = false
     private var pendingRefreshPaths: [String: PendingRefreshWork] = [:]
     private var pendingDurabilityCompletions: [PendingRefreshCompletion] = []
     private var hasUnpersistedSnapshotChanges = false
@@ -4116,6 +4237,7 @@ public final class FileIndex: @unchecked Sendable {
     private var scheduledRefreshDrainDeadline: Date?
     private var refreshDrainScheduleGeneration: UInt64 = 0
     private var refreshServiceSequence: UInt64 = 0
+    private var backgroundMaintenanceEnteredAt: Date?
     private var optimizesSnapshotAfterPromotedRefreshDrain = false
     private var pendingReconciliationPaths = Set<String>()
     private var pendingReconciliationIncludesAllRoots = false
@@ -4173,6 +4295,7 @@ public final class FileIndex: @unchecked Sendable {
         self.backgroundDirectoryScanBudgetOverride = nil
         self.backgroundDirectoryScanVisitLimitOverride = nil
         self.backgroundDirectoryScanEntryLimitOverride = nil
+        self.backgroundDirectoryFinalizationLimitOverride = nil
         self.backgroundOptimizationPersistDelayOverride = nil
         self.metadataOverlayPersistDelayOverride = nil
         self.metadataOverlayCheckpointDelayOverride = nil
@@ -4223,6 +4346,7 @@ public final class FileIndex: @unchecked Sendable {
         backgroundDirectoryScanBudget: TimeInterval? = nil,
         backgroundDirectoryScanVisitLimit: Int? = nil,
         backgroundDirectoryScanEntryLimit: Int? = nil,
+        backgroundDirectoryFinalizationLimit: Int? = nil,
         backgroundOptimizationPersistDelay: TimeInterval? = nil,
         metadataOverlayPersistDelay: TimeInterval? = nil,
         metadataOverlayCheckpointDelay: TimeInterval? = nil,
@@ -4244,6 +4368,7 @@ public final class FileIndex: @unchecked Sendable {
         self.backgroundDirectoryScanBudgetOverride = backgroundDirectoryScanBudget.map { max(0, $0) }
         self.backgroundDirectoryScanVisitLimitOverride = backgroundDirectoryScanVisitLimit.map { max(0, $0) }
         self.backgroundDirectoryScanEntryLimitOverride = backgroundDirectoryScanEntryLimit.map { max(0, $0) }
+        self.backgroundDirectoryFinalizationLimitOverride = backgroundDirectoryFinalizationLimit.map { max(0, $0) }
         self.backgroundOptimizationPersistDelayOverride = backgroundOptimizationPersistDelay.map { max(0, $0) }
         self.metadataOverlayPersistDelayOverride = metadataOverlayPersistDelay.map { max(0, $0) }
         self.metadataOverlayCheckpointDelayOverride = metadataOverlayCheckpointDelay.map { max(0, $0) }
@@ -4734,11 +4859,48 @@ public final class FileIndex: @unchecked Sendable {
         priority: IndexWorkPriority = .interactive,
         completion: (@Sendable () -> Void)? = nil
     ) {
-        let requestedPaths = Set(rawPaths.map { URL(fileURLWithPath: $0).standardizedFileURL.path })
+        queueUpdate(
+            exactPaths: [],
+            recursivePaths: rawPaths,
+            priority: priority,
+            completion: completion
+        )
+    }
+
+    @_spi(ATTInternal)
+    public func update(
+        exactPaths rawExactPaths: [String],
+        recursivePaths rawRecursivePaths: [String],
+        priority: IndexWorkPriority = .interactive,
+        completion: (@Sendable () -> Void)? = nil
+    ) {
+        queueUpdate(
+            exactPaths: rawExactPaths,
+            recursivePaths: rawRecursivePaths,
+            priority: priority,
+            completion: completion
+        )
+    }
+
+    private func queueUpdate(
+        exactPaths rawExactPaths: [String],
+        recursivePaths rawRecursivePaths: [String],
+        priority: IndexWorkPriority,
+        completion: (@Sendable () -> Void)?
+    ) {
+        let requestedRecursivePaths = Set(rawRecursivePaths.map {
+            URL(fileURLWithPath: $0).standardizedFileURL.path
+        })
+        let requestedExactPaths = Set(rawExactPaths.map {
+            URL(fileURLWithPath: $0).standardizedFileURL.path
+        }).subtracting(requestedRecursivePaths)
+        let requestedPaths = requestedExactPaths.union(requestedRecursivePaths)
         let rootPaths = lock.withLock { roots }
         let paths = Set(requestedPaths.filter { path in
             Self.path(path, isWithinAnyRoot: rootPaths)
         })
+        let recursivePaths = requestedRecursivePaths.intersection(paths)
+        let exactPaths = requestedExactPaths.intersection(paths)
         let discardedPaths = requestedPaths.subtracting(paths)
         if !discardedPaths.isEmpty {
             DiagnosticLogger.shared.log(
@@ -4763,6 +4925,8 @@ public final class FileIndex: @unchecked Sendable {
             event: "index.updateQueued",
             fields: [
                 "pathCount": .publicInt(paths.count),
+                "exactPathCount": .publicInt(exactPaths.count),
+                "recursivePathCount": .publicInt(recursivePaths.count),
                 "priority": .publicString(priority.rawValue)
             ],
             diagnosticFields: [
@@ -4776,8 +4940,16 @@ public final class FileIndex: @unchecked Sendable {
         }
         lock.withLock {
             queuePendingRefreshPathsWithoutLock(
-                paths,
+                exactPaths,
                 priority: priority,
+                recursivelyScansDirectory: false,
+                queuedAt: queuedAt,
+                completion: completionTracker
+            )
+            queuePendingRefreshPathsWithoutLock(
+                recursivePaths,
+                priority: priority,
+                recursivelyScansDirectory: true,
                 queuedAt: queuedAt,
                 completion: completionTracker
             )
@@ -4793,6 +4965,31 @@ public final class FileIndex: @unchecked Sendable {
 
     public func refresh(paths rawPaths: [String]) {
         update(paths: rawPaths)
+    }
+
+    @_spi(ATTInternal)
+    public func setBackgroundMaintenanceEnabled(_ enabled: Bool) {
+        let changed = lock.withLock { () -> Bool in
+            let wasEnabled = backgroundMaintenanceEnteredAt != nil
+            guard wasEnabled != enabled else { return false }
+
+            backgroundMaintenanceEnteredAt = enabled ? Date() : nil
+            if enabled {
+                for path in pendingRefreshPaths.keys {
+                    guard var work = pendingRefreshPaths[path] else { continue }
+                    work.demote()
+                    pendingRefreshPaths[path] = work
+                }
+            }
+            return true
+        }
+
+        guard changed else { return }
+        DiagnosticLogger.shared.log(
+            category: "index",
+            event: "index.backgroundMaintenanceModeChanged",
+            fields: ["enabled": .publicBool(enabled)]
+        )
     }
 
     public func promoteBackgroundMaintenance() {
@@ -10253,7 +10450,10 @@ public final class FileIndex: @unchecked Sendable {
         }
         try? fileManager.removeItem(at: snapshotURL)
         try? structuralDeltaStore.clear()
-        lock.withLock { structuralDelta = nil }
+        lock.withLock {
+            structuralDelta = nil
+            clearStructuralDeltaCompactionWithoutLock()
+        }
         removeScanCheckpoint()
         cleanupObsoleteIndexFiles()
         cleanupStaleTemporaryFiles()
@@ -10516,15 +10716,22 @@ public final class FileIndex: @unchecked Sendable {
             workerQoS: .utility,
             progress: publishPrimary
         ) else {
+            let cancelled = !isCurrentGeneration(currentGeneration)
             DiagnosticLogger.shared.log(
-                level: .warning,
+                level: cancelled ? .warning : .error,
                 category: "index",
-                event: "index.rebuildCancelled",
+                event: cancelled ? "index.rebuildCancelled" : "index.rebuildFailed",
                 fields: [
                     "mode": .publicString(Self.diagnosticRebuildModeString(mode)),
                     "durationSeconds": .publicDouble(Date().timeIntervalSince(started))
                 ]
             )
+            if !cancelled {
+                failIndexing(
+                    "Could not read the filesystem while building the index.",
+                    generation: currentGeneration
+                )
+            }
             return
         }
 
@@ -10628,19 +10835,21 @@ public final class FileIndex: @unchecked Sendable {
             workerQoS: .utility,
             progress: { _, _, _ in }
         ) else {
-            lock.withLock {
-                if generation == currentGeneration {
-                    clearActiveReconciliationWithoutLock()
-                }
-            }
+            let cancelled = !isCurrentGeneration(currentGeneration)
             DiagnosticLogger.shared.log(
-                level: .warning,
+                level: cancelled ? .warning : .error,
                 category: "index",
-                event: "index.reconcileCancelled",
+                event: cancelled ? "index.reconcileCancelled" : "index.reconcileFailed",
                 fields: [
                     "durationSeconds": .publicDouble(Date().timeIntervalSince(started))
                 ]
             )
+            if !cancelled {
+                failIndexing(
+                    "Could not read the filesystem while reconciling the index.",
+                    generation: currentGeneration
+                )
+            }
             return
         }
 
@@ -10988,8 +11197,7 @@ public final class FileIndex: @unchecked Sendable {
             roots: rootPaths,
             existingRecords: checkpoint?.store.allRecords() ?? [],
             pendingDirectories: checkpoint?.state.resumableDirectories
-                .map { URL(fileURLWithPath: $0, isDirectory: true) }
-                .filter { canScanDirectory($0) } ?? [],
+                .map { URL(fileURLWithPath: $0, isDirectory: true) } ?? [],
             completedDirectories: Set(checkpoint?.state.completedDirectories ?? []),
             operationStartedAt: operationStartedAt,
             lastCheckpointCount: checkpoint?.state.recordCount ?? 0,
@@ -11036,24 +11244,19 @@ public final class FileIndex: @unchecked Sendable {
             let rootVolumeNameCache = ScanVolumeNameCache()
             var rootInstrumentation = FileExclusionQuery.Instrumentation()
             for root in rootURLs {
-                var isDirectory: ObjCBool = false
-                guard fileManager.fileExists(atPath: root.path, isDirectory: &isDirectory) else {
+                let rootCandidate: FileSystemRecordCandidate
+                switch retryingFileSystemRecordLookup(for: root, volumeNameCache: rootVolumeNameCache) {
+                case .record(let candidate):
+                    rootCandidate = candidate
+                case .missing:
                     logSkippedRoot(root, reason: "missing")
                     continue
+                case .retry(let error):
+                    logFullScanTraversalFailure(path: root.path, error: error)
+                    return nil
                 }
-                guard isDirectory.boolValue else {
+                guard rootCandidate.isDirectory || rootCandidate.isSymlink else {
                     logSkippedRoot(root, reason: "notDirectory")
-                    continue
-                }
-                guard canScanDirectory(root) else {
-                    logSkippedRoot(root, reason: "unreadable")
-                    continue
-                }
-                guard let rootCandidate = fileSystemRecordCandidate(
-                    for: root,
-                    volumeNameCache: rootVolumeNameCache
-                ) else {
-                    logSkippedRoot(root, reason: "unreadable")
                     continue
                 }
                 let rootDecision = exclusionDecision(
@@ -11119,11 +11322,12 @@ public final class FileIndex: @unchecked Sendable {
                         }
 
                         var childDirectories: [URL] = []
+                        var childLookupRetryError: Int32?
                         if usesBatchedEnqueue {
                             childDirectories.reserveCapacity(32)
                         }
 
-                        _ = self.enumerateShallowChildURLs(
+                        let enumerationResult = self.enumerateShallowChildURLs(
                             in: directory,
                             prunesDirectoryNamed: { name in
                                 let prunes = exclusions.canPruneDirectoryComponentBeforeStat(name)
@@ -11139,10 +11343,17 @@ public final class FileIndex: @unchecked Sendable {
                             }
 
                             autoreleasepool {
-                                guard let candidate = self.fileSystemRecordCandidate(
+                                let candidate: FileSystemRecordCandidate
+                                switch self.retryingFileSystemRecordLookup(
                                     for: child,
                                     volumeNameCache: volumeNameCache
-                                ) else {
+                                ) {
+                                case .record(let recordCandidate):
+                                    candidate = recordCandidate
+                                case .missing:
+                                    return
+                                case .retry(let error):
+                                    childLookupRetryError = error
                                     return
                                 }
                                 let decision = self.exclusionDecision(
@@ -11171,6 +11382,9 @@ public final class FileIndex: @unchecked Sendable {
                                 }
                             }
 
+                            if childLookupRetryError != nil {
+                                return false
+                            }
                             if batch.count >= 256 {
                                 state.append(batch)
                                 batch.removeAll(keepingCapacity: true)
@@ -11179,6 +11393,26 @@ public final class FileIndex: @unchecked Sendable {
                                 checkpointProgress(state.checkpointIfNeeded(force: false), false)
                             }
                             return true
+                        }
+
+                        switch enumerationResult {
+                        case .completed:
+                            break
+                        case .stopped:
+                            if let childLookupRetryError {
+                                self.logFullScanTraversalFailure(
+                                    path: directory.path,
+                                    error: childLookupRetryError
+                                )
+                            }
+                            state.finishDirectories(finishedDirectories)
+                            state.markStopped()
+                            break scanLoop
+                        case .retry(let error):
+                            self.logFullScanTraversalFailure(path: directory.path, error: error)
+                            state.finishDirectories(finishedDirectories)
+                            state.markStopped()
+                            break scanLoop
                         }
 
                         if usesBatchedEnqueue {
@@ -11207,7 +11441,7 @@ public final class FileIndex: @unchecked Sendable {
         let (result, wasStopped) = state.result(
             exclusionInstrumentation: exclusionInstrumentationAccumulator.snapshot()
         )
-        return wasStopped && !isCurrentGeneration(currentGeneration) ? nil : result
+        return wasStopped ? nil : result
     }
 
     private func shouldPublishSearchableSnapshotsDuringScan() -> Bool {
@@ -11575,6 +11809,7 @@ public final class FileIndex: @unchecked Sendable {
                         return false
                     }
                     self.structuralDelta = nil
+                    self.clearStructuralDeltaCompactionWithoutLock()
                     self.clearSnapshotDurabilityPendingWithoutLock()
                     self.searchSnapshot = optimizedSnapshot
                     self.searchSnapshotRevision &+= 1
@@ -12473,6 +12708,7 @@ public final class FileIndex: @unchecked Sendable {
         try replaceMappedSnapshotPackageOnDisk(packageURL)
         lock.withLock {
             structuralDelta = nil
+            clearStructuralDeltaCompactionWithoutLock()
             clearSnapshotDurabilityPendingWithoutLock()
         }
         finishMappedSnapshotInstallation()
@@ -12737,11 +12973,19 @@ public final class FileIndex: @unchecked Sendable {
     private func backgroundDirectoryScanVisitLimit(for priority: IndexWorkPriority) -> Int? {
         guard priority == .background else { return nil }
         return backgroundDirectoryScanVisitLimitOverride
+            ?? Self.backgroundDirectoryScanVisitDefaultLimit
     }
 
     private func backgroundDirectoryScanEntryLimit(for priority: IndexWorkPriority) -> Int? {
         guard priority == .background else { return nil }
         return backgroundDirectoryScanEntryLimitOverride
+            ?? Self.backgroundDirectoryScanEntryDefaultLimit
+    }
+
+    private func backgroundDirectoryFinalizationLimit(for priority: IndexWorkPriority) -> Int? {
+        guard priority == .background else { return nil }
+        return backgroundDirectoryFinalizationLimitOverride
+            ?? Self.backgroundDirectoryFinalizationDefaultLimit
     }
 
     private func backgroundOptimizationPersistDelay() -> TimeInterval {
@@ -12767,6 +13011,7 @@ public final class FileIndex: @unchecked Sendable {
     private func queuePendingRefreshPathsWithoutLock(
         _ paths: Set<String>,
         priority: IndexWorkPriority,
+        recursivelyScansDirectory: Bool = true,
         queuedAt: Date,
         completion: PendingRefreshCompletion? = nil
     ) {
@@ -12775,9 +13020,11 @@ public final class FileIndex: @unchecked Sendable {
                 PendingRefreshWork(
                     path: path,
                     priority: priority,
+                    recursivelyScansDirectory: recursivelyScansDirectory,
+                    followUpRecursivelyScansDirectory: false,
                     firstQueuedAt: queuedAt,
-                    lastQueuedAt: queuedAt,
                     completions: completion.map { [$0] } ?? [],
+                    followUpCompletions: [],
                     directoryScanProgress: nil,
                     requiresDirectoryRescanAfterProgress: false,
                     eligibleAt: nil,
@@ -12788,11 +13035,9 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
-    private func queuePendingRefreshWorksWithoutLock(_ works: [PendingRefreshWork], queuedAt: Date = Date()) {
+    private func queuePendingRefreshWorksWithoutLock(_ works: [PendingRefreshWork]) {
         for work in works {
-            var queuedWork = work
-            queuedWork.lastQueuedAt = queuedAt
-            queuePendingRefreshWorkWithoutLock(queuedWork)
+            queuePendingRefreshWorkWithoutLock(work)
         }
     }
 
@@ -12800,8 +13045,13 @@ public final class FileIndex: @unchecked Sendable {
         var queuedWork = work
         markOverlappingDirectoryProgressWithoutLock(for: &queuedWork)
         if var existing = pendingRefreshPaths[queuedWork.path] {
-            existing.merge(queuedWork)
-            pendingRefreshPaths[queuedWork.path] = existing
+            if existing.directoryScanProgress == nil, queuedWork.directoryScanProgress != nil {
+                queuedWork.merge(existing)
+                pendingRefreshPaths[queuedWork.path] = queuedWork
+            } else {
+                existing.merge(queuedWork)
+                pendingRefreshPaths[queuedWork.path] = existing
+            }
         } else {
             pendingRefreshPaths[queuedWork.path] = queuedWork
         }
@@ -12859,6 +13109,11 @@ public final class FileIndex: @unchecked Sendable {
         works.contains { $0.priority == .interactive }
     }
 
+    private static func requiresBackgroundDirectoryDelay(_ work: PendingRefreshWork) -> Bool {
+        guard work.priority == .background, work.recursivelyScansDirectory else { return false }
+        return work.directoryScanProgress?.finalization?.phase != .readyToCommit
+    }
+
     private static func nonoverlappingRefreshBatch(
         from works: [PendingRefreshWork],
         maximumCount: Int,
@@ -12879,7 +13134,9 @@ public final class FileIndex: @unchecked Sendable {
             }
 
             let blockingAncestor = ancestorStack.first { ancestor in
-                ancestor.directoryScanProgress?.isSuperseded(work.path) != true
+                ancestor.isEligible(at: date)
+                    && ancestor.recursivelyScansDirectory
+                    && ancestor.directoryScanProgress?.isSuperseded(work.path) != true
             }
             if let blockingAncestor {
                 if work.priority == .interactive {
@@ -12996,7 +13253,6 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     private func drainUpdateQueue(scheduledGeneration: UInt64) {
-        let drainStartedAt = Date()
         let drain = lock.withLock { () -> (
             acceptedSchedule: Bool,
             works: [PendingRefreshWork],
@@ -13089,14 +13345,16 @@ public final class FileIndex: @unchecked Sendable {
 
         // Exact-path bursts are cheap, finite work and should drain continuously.
         // Only recursive directory traversal needs the background duty-cycle cap.
-        let backgroundResumeDate = updateResult.priority == .background
-            && updateResult.requestedDirectoryRefresh
+        let backgroundResumeDate = updateResult.deferredRefreshes.contains(
+            where: Self.requiresBackgroundDirectoryDelay
+        )
             ? Date().addingTimeInterval(backgroundRefreshDrainBackoffDelay())
             : nil
         if !updateResult.deferredRefreshes.isEmpty {
             var deferredRefreshes = updateResult.deferredRefreshes
             if let backgroundResumeDate {
-                for index in deferredRefreshes.indices {
+                for index in deferredRefreshes.indices
+                where Self.requiresBackgroundDirectoryDelay(deferredRefreshes[index]) {
                     deferredRefreshes[index].deferBackgroundWork(until: backgroundResumeDate)
                 }
             }
@@ -13118,13 +13376,17 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         let deferredPaths = Set(updateResult.deferredRefreshes.map(\.path))
-        let finishedWorks = drain.works.filter { !deferredPaths.contains($0.path) }
+        let explicitlyCompletedPaths = Set(updateResult.completedRefreshes.map(\.path))
+        let finishedWorks = drain.works.filter {
+            !deferredPaths.contains($0.path) && !explicitlyCompletedPaths.contains($0.path)
+        }
+        let completionWorks = finishedWorks + updateResult.completedRefreshes
         var completedWorks: [PendingRefreshWork] = []
         if updateResult.applied, updateResult.completionReady {
-            completedWorks = finishedWorks
+            completedWorks = completionWorks
         } else if updateResult.applied {
             lock.withLock {
-                for work in finishedWorks {
+                for work in completionWorks {
                     pendingDurabilityCompletions.append(contentsOf: work.completions)
                 }
             }
@@ -13136,18 +13398,6 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         Self.completePendingRefreshWorks(completedWorks)
-
-        if let backgroundResumeDate {
-            lock.withLock {
-                for path in pendingRefreshPaths.keys {
-                    guard var work = pendingRefreshPaths[path], work.lastQueuedAt <= drainStartedAt else {
-                        continue
-                    }
-                    work.deferBackgroundWork(until: backgroundResumeDate)
-                    pendingRefreshPaths[path] = work
-                }
-            }
-        }
 
         let remainingPathCount = lock.withLock { pendingRefreshPaths.count }
         if remainingPathCount > 0 {
@@ -13171,7 +13421,10 @@ public final class FileIndex: @unchecked Sendable {
                         "delaySeconds": .publicDouble(backoff)
                     ]
                 )
-                delay = .milliseconds(Int((backoff * 1_000).rounded(.up)))
+                // The yielded directory carries its own eligibility date. Ask the
+                // scheduler to run any independent exact work immediately; when
+                // only yielded scopes remain it will select their earliest date.
+                delay = .milliseconds(0)
             } else if updateResult.largeOverlay {
                 let backoff = largeOverlayDrainBackoffDelay()
                 DiagnosticLogger.shared.log(
@@ -13332,14 +13585,21 @@ public final class FileIndex: @unchecked Sendable {
         for priority: IndexWorkPriority,
         startedAt: Date
     ) -> Date? {
-        guard priority == .background else { return nil }
-        return startedAt.addingTimeInterval(backgroundDirectoryScanBudget())
+        let backgroundEnteredAt = lock.withLock { backgroundMaintenanceEnteredAt }
+        guard priority == .background || backgroundEnteredAt != nil else { return nil }
+        let budgetStartedAt = max(startedAt, backgroundEnteredAt ?? startedAt)
+        return budgetStartedAt.addingTimeInterval(backgroundDirectoryScanBudget())
+    }
+
+    private func effectiveRefreshPriority(_ requestedPriority: IndexWorkPriority) -> IndexWorkPriority {
+        lock.withLock {
+            backgroundMaintenanceEnteredAt == nil ? requestedPriority : .background
+        }
     }
 
     private func updateNow(requests: [PendingRefreshWork]) -> RefreshUpdateResult {
         let paths = requests.map(\.path)
-        let updatePriority = Self.refreshBatchPriority(requests)
-        let requiresDurableCompletion = requests.contains { !$0.completions.isEmpty }
+        let updatePriority = effectiveRefreshPriority(Self.refreshBatchPriority(requests))
         let updateStarted = Date()
         let updateContext = lock.withLock { () -> (generation: UInt64, preservedReadyStatus: String?)? in
             guard !indexing else { return nil }
@@ -13411,6 +13671,7 @@ public final class FileIndex: @unchecked Sendable {
         var deletedPrefixes: [String] = []
         var reconciledDirectoryPrefixes: [String] = []
         var deferredRefreshes: [PendingRefreshWork] = []
+        var completedRefreshes: [PendingRefreshWork] = []
         var deferredDirectoryVisitCount = 0
         var visitedCount = 0
         var requestedDirectoryRefresh = false
@@ -13431,6 +13692,16 @@ public final class FileIndex: @unchecked Sendable {
             upserts[record.path] = record
         }
 
+        func coverFollowUpWithCurrentObservation(_ request: inout PendingRefreshWork) {
+            guard request.requiresDirectoryRescanAfterProgress else { return }
+            request.completions.append(contentsOf: request.followUpCompletions)
+            request.followUpCompletions.removeAll(keepingCapacity: false)
+            request.requiresDirectoryRescanAfterProgress = false
+            request.followUpRecursivelyScansDirectory = false
+            request.directoryScanProgress = nil
+            completedRefreshes.append(request)
+        }
+
         func stageDeletedRows(
             inSubtreeAt path: String,
             keeping shouldKeep: (String) -> Bool
@@ -13442,6 +13713,14 @@ public final class FileIndex: @unchecked Sendable {
                         deletedRows.insert(existingRow)
                     }
                 }
+                return
+            }
+
+            // A mapped tree has complete path lookup and materializes virtual
+            // ancestors, so a missing root proves there is no old subtree. Avoid
+            // walking the entire snapshot for a newly introduced directory.
+            if previousSnapshot.store.hasColumnarSidecars,
+               previousSnapshot.store.rowID(forPath: path) == nil {
                 return
             }
 
@@ -13460,6 +13739,7 @@ public final class FileIndex: @unchecked Sendable {
             changedPathCount: Int,
             completionReady: Bool? = nil
         ) -> RefreshUpdateResult {
+            let resultPriority = effectiveRefreshPriority(updatePriority)
             if applied {
                 let operationKind: IndexMaintenanceOperationKind = (requestedDirectoryRefresh || visitedCount > 0 || requiresDirectoryReconciliation)
                     ? .directoryRefresh
@@ -13467,7 +13747,7 @@ public final class FileIndex: @unchecked Sendable {
                 recordMaintenance(
                     maintenanceMeasurement.operation(
                         kind: operationKind,
-                        priority: updatePriority.maintenancePriority,
+                        priority: resultPriority.maintenancePriority,
                         paths: paths.count,
                         records: changedPathCount,
                         visited: visitedCount,
@@ -13483,7 +13763,7 @@ public final class FileIndex: @unchecked Sendable {
                 applied: applied,
                 completionReady: completionReady ?? applied,
                 largeOverlay: largeOverlay,
-                priority: updatePriority,
+                priority: resultPriority,
                 requestedDirectoryRefresh: requestedDirectoryRefresh,
                 batchPathCount: paths.count,
                 changedPathCount: changedPathCount,
@@ -13491,11 +13771,85 @@ public final class FileIndex: @unchecked Sendable {
                 exclusionInstrumentation: exclusionInstrumentation,
                 reconciledDirectoryPrefixes: reconciledDirectoryPrefixes,
                 deferredRefreshes: deferredRefreshes,
+                completedRefreshes: completedRefreshes,
                 deferredDirectoryVisitCount: deferredDirectoryVisitCount
             )
         }
 
+        func requeueRequestsAfterGenerationChange() {
+            lock.withLock {
+                let carriedPaths = Set(
+                    deferredRefreshes.map(\.path) + completedRefreshes.map(\.path)
+                )
+                let untouchedRequests = requests.filter { !carriedPaths.contains($0.path) }
+                queuePendingRefreshWorksWithoutLock(
+                    completedRefreshes + deferredRefreshes + untouchedRequests
+                )
+            }
+            scheduleUpdateDrainIfNeeded(delay: .milliseconds(0))
+        }
+
+        func stageCompletedDirectoryFinalization(
+            _ progress: DirectoryUpdateScanProgress,
+            at url: URL,
+            request: inout PendingRefreshWork
+        ) {
+            guard let finalization = progress.finalization else { return }
+
+            // The active work is temporarily absent from pendingRefreshPaths. Fold
+            // in anything queued during this slice before committing, then mark
+            // pending descendants as newer observations. Events arriving after
+            // this barrier linearize after the directory pass and repair their row
+            // in the next update.
+            lock.withLock {
+                if let queuedSamePath = pendingRefreshPaths.removeValue(forKey: request.path) {
+                    request.merge(queuedSamePath)
+                }
+                markOverlappingDirectoryProgressWithoutLock(for: &request)
+            }
+
+            for path in finalization.preparedUpsertPaths
+            where !progress.isSuperseded(path) && upserts[path] == nil {
+                guard let record = finalization.unpublishedRecords[path] else { continue }
+                stageUpsertIfChanged(record)
+            }
+            for path in finalization.deletionPaths
+            where !progress.isSuperseded(path) && upserts[path] == nil {
+                guard let rowID = previousSnapshot.store.rowID(forPath: path) else { continue }
+                deletedRows.insert(rowID)
+            }
+
+            requiresDirectoryReconciliation = true
+            reconciledDirectoryPrefixes.append(url.path)
+            DiagnosticLogger.shared.log(
+                category: "index",
+                event: "index.directoryFinalizationCompleted",
+                fields: [
+                    "baselineRowsVisited": .publicInt(finalization.baselineRowsVisited),
+                    "matchingBaselineRowsVisited": .publicInt(finalization.matchingBaselineRowsVisited),
+                    "materializedDeletionPathCount": .publicInt(finalization.materializedDeletionPathCount),
+                    "preparedDeletionCount": .publicInt(finalization.deletionPaths.count),
+                    "preparedUpsertCount": .publicInt(finalization.preparedUpsertPaths.count),
+                    "upsertsVisited": .publicInt(finalization.upsertsVisited)
+                ],
+                diagnosticFields: ["path": .path(url.path)]
+            )
+
+            var completedRequest = request
+            completedRequest.followUpCompletions.removeAll(keepingCapacity: false)
+            completedRequest.requiresDirectoryRescanAfterProgress = false
+            completedRequest.directoryScanProgress = progress
+            completedRefreshes.append(completedRequest)
+
+            if request.requiresDirectoryRescanAfterProgress {
+                request.prepareForFollowUpDirectoryScan()
+                request.priority = effectiveRefreshPriority(request.priority)
+                deferredRefreshes.append(request)
+            }
+        }
+
         for var request in requests {
+            request.priority = effectiveRefreshPriority(request.priority)
             let path = request.path
             guard Self.path(path, isWithinAnyRoot: indexState.rootPaths) else {
                 DiagnosticLogger.shared.log(
@@ -13503,6 +13857,7 @@ public final class FileIndex: @unchecked Sendable {
                     event: "index.updateDiscardedAfterRootChange",
                     diagnosticFields: ["path": .path(path)]
                 )
+                coverFollowUpWithCurrentObservation(&request)
                 continue
             }
             if request.priority == .background,
@@ -13516,7 +13871,9 @@ public final class FileIndex: @unchecked Sendable {
                 continue
             }
             autoreleasepool {
-                let url = URL(fileURLWithPath: path).standardizedFileURL
+                // Refresh paths are canonicalized once at queue ingress and retain
+                // that representation across yielded slices.
+                let url = URL(fileURLWithPath: path)
                 switch fileSystemRecordLookup(for: url, volumeNameCache: updateVolumeNameCache) {
                 case let .record(candidate):
                     let decision = exclusionDecision(
@@ -13527,34 +13884,49 @@ public final class FileIndex: @unchecked Sendable {
                         isDirectory: candidate.isDirectory,
                         instrumentation: &exclusionInstrumentation
                     )
-                    guard decision != .prune else { return }
+                    guard decision != .prune else {
+                        coverFollowUpWithCurrentObservation(&request)
+                        return
+                    }
 
                     if decision.shouldIndex {
                         stageUpsertIfChanged(candidate.record)
                     }
 
-                    if candidate.isDirectory, !candidate.isSymlink, decision.shouldDescend {
+                    if request.recursivelyScansDirectory,
+                       candidate.isDirectory,
+                       !candidate.isSymlink,
+                       decision.shouldDescend {
                         requestedDirectoryRefresh = true
-                        let deadline = backgroundDirectoryScanDeadline(
-                            for: request.priority,
-                            startedAt: updateStarted
-                        )
                         var concurrentlyScannedRecords: [String: FileRecord]?
                         if indexState.frontierMode == .singleDirectory {
                             let progress = request.directoryScanProgress
-                                ?? DirectoryUpdateScanProgress(root: candidate.url)
-                            let scanResult = scanDirectoryForUpdate(
-                                progress: progress,
-                                exclusions: indexState.exclusions,
-                                rootPaths: indexState.rootPaths,
-                                query: exclusionQuery,
-                                deadline: deadline,
-                                maximumVisitCount: backgroundDirectoryScanVisitLimit(for: request.priority),
-                                maximumEntryCount: backgroundDirectoryScanEntryLimit(for: request.priority),
-                                generation: currentGeneration
-                            )
-                            if let scanResult {
+                                ?? DirectoryUpdateScanProgress(
+                                    root: candidate.url,
+                                    baselineStore: previousSnapshot.store
+                                )
+
+                            if progress.finalization == nil {
+                                let scanResult = scanDirectoryForUpdate(
+                                    progress: progress,
+                                    exclusions: indexState.exclusions,
+                                    rootPaths: indexState.rootPaths,
+                                    query: exclusionQuery,
+                                    requestedPriority: request.priority,
+                                    startedAt: updateStarted,
+                                    maximumVisitCount: backgroundDirectoryScanVisitLimit(for: request.priority),
+                                    maximumEntryCount: backgroundDirectoryScanEntryLimit(for: request.priority),
+                                    generation: currentGeneration
+                                )
+                                guard let scanResult else {
+                                    request.directoryScanProgress = progress
+                                    request.priority = effectiveRefreshPriority(request.priority)
+                                    deferredRefreshes.append(request)
+                                    return
+                                }
+
                                 let scanWorkCount = scanResult.visitedCount + scanResult.readEntryCount
+                                progress.traversalWorkCount += scanWorkCount
                                 if scanResult.encounteredRetryError {
                                     request.deferAfterRetryFailure(
                                         baseDelay: backgroundRefreshDrainBackoffDelay()
@@ -13569,21 +13941,22 @@ public final class FileIndex: @unchecked Sendable {
                                 visitedCount += scanWorkCount
                                 deferredDirectoryVisitCount += scanWorkCount
                                 let completesCurrentTraversal = scanResult.completed
-                                    && !request.requiresDirectoryRescanAfterProgress
                                 let canPublishIncrementally = progress.incrementalPublishBatchCount
                                     < Self.backgroundDirectoryIncrementalPublishBatchLimit
                                 var publishedIncrementalChange = false
                                 for record in scanResult.records.values
                                 where !progress.isSuperseded(record.path) && needsUpsert(record) {
-                                    if completesCurrentTraversal
-                                        || (canPublishIncrementally
-                                            && progress.incrementallyPublishedChangeCount
-                                                < Self.backgroundDirectoryIncrementalPublishLimit) {
+                                    if completesCurrentTraversal {
+                                        // Final-slice changes join the resumable
+                                        // commit so reconciliation is published as
+                                        // one structural update.
+                                        progress.unpublishedRecords[record.path] = record
+                                    } else if canPublishIncrementally
+                                        && progress.incrementallyPublishedChangeCount
+                                            < Self.backgroundDirectoryIncrementalPublishLimit {
                                         upserts[record.path] = record
-                                        if !completesCurrentTraversal {
-                                            progress.incrementallyPublishedChangeCount += 1
-                                            publishedIncrementalChange = true
-                                        }
+                                        progress.incrementallyPublishedChangeCount += 1
+                                        publishedIncrementalChange = true
                                     } else {
                                         progress.unpublishedRecords[record.path] = record
                                     }
@@ -13591,29 +13964,39 @@ public final class FileIndex: @unchecked Sendable {
                                 if publishedIncrementalChange {
                                     progress.incrementalPublishBatchCount += 1
                                 }
-                                if scanResult.completed {
-                                    if request.requiresDirectoryRescanAfterProgress {
-                                        request.prepareForFollowUpDirectoryScan()
-                                        deferredRefreshes.append(request)
-                                    } else {
-                                        for record in progress.unpublishedRecords.values
-                                        where !progress.isSuperseded(record.path) {
-                                            stageUpsertIfChanged(record)
-                                        }
-                                        progress.unpublishedRecords.removeAll(keepingCapacity: false)
-                                        requiresDirectoryReconciliation = true
-                                        reconciledDirectoryPrefixes.append(url.path)
-                                        stageDeletedRows(inSubtreeAt: url.path) { existingPath in
-                                            progress.isSuperseded(existingPath)
-                                                || progress.scannedPaths.contains(existingPath)
-                                        }
-                                    }
+
+                                if completesCurrentTraversal {
+                                    progress.finalization = DirectoryUpdateFinalization(progress: progress)
+                                }
+                            }
+
+                            if progress.finalization != nil {
+                                let finalizationResult = advanceDirectoryUpdateFinalization(
+                                    progress: progress,
+                                    priority: request.priority,
+                                    startedAt: updateStarted,
+                                    generation: currentGeneration
+                                )
+                                visitedCount += finalizationResult.visitedCount
+                                deferredDirectoryVisitCount += finalizationResult.visitedCount
+                                if finalizationResult.visitedCount > 0 {
+                                    request.clearRetryBackoffAfterProgress()
+                                    request.markServiced(sequence: nextRefreshServiceSequence())
+                                }
+                                if finalizationResult.completed {
+                                    stageCompletedDirectoryFinalization(
+                                        progress,
+                                        at: url,
+                                        request: &request
+                                    )
                                 } else {
                                     request.directoryScanProgress = progress
+                                    request.priority = effectiveRefreshPriority(request.priority)
                                     deferredRefreshes.append(request)
                                 }
                             } else {
                                 request.directoryScanProgress = progress
+                                request.priority = effectiveRefreshPriority(request.priority)
                                 deferredRefreshes.append(request)
                             }
                         } else {
@@ -13649,6 +14032,14 @@ public final class FileIndex: @unchecked Sendable {
                                 scannedRecords[existingPath] != nil
                             }
                         }
+                    } else {
+                        if request.directoryScanProgress != nil, !candidate.isDirectory {
+                            // The former directory became a file or symlink while
+                            // its traversal was suspended. Replace the old subtree
+                            // and retain the current candidate as an upsert.
+                            deletedPrefixes.append(url.path)
+                        }
+                        coverFollowUpWithCurrentObservation(&request)
                     }
                 case .missing:
                     let fileDecision = exclusionDecision(
@@ -13667,8 +14058,12 @@ public final class FileIndex: @unchecked Sendable {
                         isDirectory: true,
                         instrumentation: &exclusionInstrumentation
                     )
-                    guard fileDecision != .prune || directoryDecision != .prune else { return }
+                    guard fileDecision != .prune || directoryDecision != .prune else {
+                        coverFollowUpWithCurrentObservation(&request)
+                        return
+                    }
                     deletedPrefixes.append(url.path)
+                    coverFollowUpWithCurrentObservation(&request)
                 case let .retry(error):
                     request.markServiced(sequence: nextRefreshServiceSequence())
                     request.deferAfterRetryFailure(
@@ -13691,10 +14086,7 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         guard isCurrentGeneration(currentGeneration) else {
-            lock.withLock {
-                queuePendingRefreshWorksWithoutLock(requests)
-            }
-            scheduleUpdateDrainIfNeeded(delay: .milliseconds(0))
+            requeueRequestsAfterGenerationChange()
             return .none
         }
         var unresolvedDeletedPrefixes: [String] = []
@@ -13733,6 +14125,16 @@ public final class FileIndex: @unchecked Sendable {
             }
         }
 
+        let finalUpdatePriority = effectiveRefreshPriority(updatePriority)
+        let deferredPaths = Set(deferredRefreshes.map(\.path))
+        let explicitlyCompletedPaths = Set(completedRefreshes.map(\.path))
+        let requiresDurableCompletion = completedRefreshes.contains { !$0.completions.isEmpty }
+            || requests.contains { request in
+                !deferredPaths.contains(request.path)
+                    && !explicitlyCompletedPaths.contains(request.path)
+                    && !request.completions.isEmpty
+            }
+
         guard !upserts.isEmpty || !deletedRows.isEmpty else {
             let didApply = lock.withLock { () -> Bool in
                 guard generation == currentGeneration else { return false }
@@ -13751,6 +14153,7 @@ public final class FileIndex: @unchecked Sendable {
                 return true
             }
             if !didApply {
+                requeueRequestsAfterGenerationChange()
                 return .none
             }
             publishStats()
@@ -13773,7 +14176,7 @@ public final class FileIndex: @unchecked Sendable {
                 if requiresDurableCompletion {
                     completionReady = persistSnapshot(
                         schedulesPathGramBuild: false,
-                        priority: updatePriority.maintenancePriority
+                        priority: finalUpdatePriority.maintenancePriority
                     )
                 } else {
                     scheduleDurabilityRetry()
@@ -13815,6 +14218,7 @@ public final class FileIndex: @unchecked Sendable {
                 return true
             }
             if !didApply {
+                requeueRequestsAfterGenerationChange()
                 return .none
             }
 
@@ -13833,7 +14237,7 @@ public final class FileIndex: @unchecked Sendable {
                     if requiresDurableCompletion {
                         completionReady = persistSnapshot(
                             schedulesPathGramBuild: false,
-                            priority: updatePriority.maintenancePriority
+                            priority: finalUpdatePriority.maintenancePriority
                         )
                         if !completionReady {
                             markSnapshotDurabilityPending()
@@ -13843,7 +14247,7 @@ public final class FileIndex: @unchecked Sendable {
                         scheduleMetadataOverlayPersistIfReasonable(
                             updatedSnapshot,
                             changedPathCount: changedPathCount,
-                            priority: updatePriority
+                            priority: finalUpdatePriority
                         )
                         completionReady = true
                     }
@@ -13855,7 +14259,7 @@ public final class FileIndex: @unchecked Sendable {
             } else if requiresDurableCompletion {
                 completionReady = persistSnapshot(
                     schedulesPathGramBuild: false,
-                    priority: updatePriority.maintenancePriority
+                    priority: finalUpdatePriority.maintenancePriority
                 )
                 if !completionReady {
                     markSnapshotDurabilityPending()
@@ -13865,7 +14269,7 @@ public final class FileIndex: @unchecked Sendable {
                 scheduleMetadataOverlayPersistIfReasonable(
                     updatedSnapshot,
                     changedPathCount: changedPathCount,
-                    priority: updatePriority
+                    priority: finalUpdatePriority
                 )
                 completionReady = true
             }
@@ -13915,7 +14319,7 @@ public final class FileIndex: @unchecked Sendable {
         )
         let shouldOptimizeOverlay = previousSnapshot.isOptimizedForSearch
             && !isLargeOverlayUpdate
-            && updatePriority == .interactive
+            && finalUpdatePriority == .interactive
             && previousSnapshot.count <= Self.interactiveOverlayOptimizationRecordLimit
         let snapshot = SearchSnapshot(
             store: overlayStore,
@@ -13925,7 +14329,7 @@ public final class FileIndex: @unchecked Sendable {
             buildsAdditionalSortOrders: false,
             prefersDegradedSearch: !shouldOptimizeOverlay
                 && (isLargeOverlayUpdate
-                    || updatePriority == .background
+                    || finalUpdatePriority == .background
                     || previousSnapshot.count > Self.interactiveOverlayOptimizationRecordLimit)
         )
 
@@ -13948,6 +14352,7 @@ public final class FileIndex: @unchecked Sendable {
             return true
         }
         if !didApply {
+            requeueRequestsAfterGenerationChange()
             return .none
         }
 
@@ -13965,7 +14370,7 @@ public final class FileIndex: @unchecked Sendable {
             if requiresDurableCompletion {
                 completionReady = persistSnapshot(
                     schedulesPathGramBuild: false,
-                    priority: updatePriority.maintenancePriority
+                    priority: finalUpdatePriority.maintenancePriority
                 )
                 if !completionReady {
                     markSnapshotDurabilityPending()
@@ -13975,7 +14380,7 @@ public final class FileIndex: @unchecked Sendable {
                 scheduleRefreshPersistIfReasonable(
                     snapshot,
                     immediateLargeOverlay: isLargeOverlayUpdate,
-                    priority: updatePriority
+                    priority: finalUpdatePriority
                 )
                 completionReady = true
             }
@@ -14021,12 +14426,137 @@ public final class FileIndex: @unchecked Sendable {
         )
     }
 
+    private func advanceDirectoryUpdateFinalization(
+        progress: DirectoryUpdateScanProgress,
+        priority: IndexWorkPriority,
+        startedAt: Date,
+        generation currentGeneration: UInt64
+    ) -> DirectoryUpdateFinalizationResult {
+        guard let finalization = progress.finalization else {
+            return DirectoryUpdateFinalizationResult(completed: false, visitedCount: 0)
+        }
+        guard isCurrentGeneration(currentGeneration) else {
+            return DirectoryUpdateFinalizationResult(completed: false, visitedCount: 0)
+        }
+        if finalization.phase == .readyToCommit {
+            return DirectoryUpdateFinalizationResult(completed: true, visitedCount: 0)
+        }
+
+        let deadline = backgroundDirectoryScanDeadline(for: priority, startedAt: startedAt)
+        let maximumWorkCount = backgroundDirectoryFinalizationLimit(for: priority)
+        var visitedCount = 0
+
+        func canContinue() -> Bool {
+            guard isCurrentGeneration(currentGeneration) else { return false }
+            if maximumWorkCount.map({ visitedCount >= $0 }) == true {
+                return false
+            }
+            return deadline.map { Date() < $0 } ?? true
+        }
+
+        func remainingWorkCount() -> Int {
+            maximumWorkCount.map { max($0 - visitedCount, 0) } ?? Int.max
+        }
+
+        while canContinue() {
+            switch finalization.phase {
+            case .baselineRows:
+                let batchLimit = min(
+                    Self.directoryFinalizationCursorBatchSize,
+                    remainingWorkCount()
+                )
+                guard batchLimit > 0,
+                      let batch = finalization.baselineCursor.nextBatch(
+                        maximumVisitedRows: batchLimit
+                      ) else {
+                    if finalization.baselineCursor.isComplete {
+                        finalization.phase = .unpublishedUpserts
+                        continue
+                    }
+                    return DirectoryUpdateFinalizationResult(
+                        completed: false,
+                        visitedCount: visitedCount
+                    )
+                }
+
+                let baselineStore = progress.baselineStore
+                if batch.includesEveryRow {
+                    finalization.matchingBaselineRowsVisited += batch.rowRange.count
+                    progress.seenBaselineRows.forEachUnset(in: batch.rowRange) { rowID in
+                        let path = baselineStore.path(at: rowID)
+                        finalization.materializedDeletionPathCount += 1
+                        guard !progress.isSuperseded(path) else { return }
+                        finalization.deletionPaths.append(path)
+                    }
+                } else {
+                    finalization.matchingBaselineRowsVisited += batch.forEachMatchingRow { rowID in
+                        guard !progress.seenBaselineRows.contains(rowID) else { return }
+                        let path = baselineStore.path(at: rowID)
+                        finalization.materializedDeletionPathCount += 1
+                        guard !progress.isSuperseded(path) else { return }
+                        finalization.deletionPaths.append(path)
+                    }
+                }
+                finalization.baselineRowsVisited += batch.rowRange.count
+                visitedCount += batch.rowRange.count
+                if batch.isComplete {
+                    finalization.phase = .unpublishedUpserts
+                }
+
+            case .unpublishedUpserts:
+                let chunkLimit = min(
+                    Self.directoryFinalizationCursorBatchSize,
+                    remainingWorkCount()
+                )
+                guard chunkLimit > 0 else {
+                    return DirectoryUpdateFinalizationResult(
+                        completed: false,
+                        visitedCount: visitedCount
+                    )
+                }
+
+                var processedCount = 0
+                while processedCount < chunkLimit,
+                      finalization.unpublishedRecordIndex
+                        != finalization.unpublishedRecords.endIndex {
+                    let currentIndex = finalization.unpublishedRecordIndex
+                    let path = finalization.unpublishedRecords[currentIndex].key
+                    finalization.unpublishedRecordIndex = finalization.unpublishedRecords.index(
+                        after: currentIndex
+                    )
+                    finalization.upsertsVisited += 1
+                    visitedCount += 1
+                    processedCount += 1
+                    if !progress.isSuperseded(path) {
+                        finalization.preparedUpsertPaths.append(path)
+                    }
+                }
+                if finalization.unpublishedRecordIndex == finalization.unpublishedRecords.endIndex {
+                    finalization.phase = .readyToCommit
+                    return DirectoryUpdateFinalizationResult(
+                        completed: false,
+                        visitedCount: visitedCount
+                    )
+                }
+
+            case .readyToCommit:
+                preconditionFailure("Ready finalization should commit in its next update slice")
+            }
+        }
+
+        return DirectoryUpdateFinalizationResult(
+            completed: false,
+            visitedCount: visitedCount
+        )
+    }
+
     private func scanDirectoryForUpdate(
         progress: DirectoryUpdateScanProgress,
         exclusions: FileExclusionRules,
         rootPaths: [String],
         query: FileExclusionQuery?,
-        deadline: Date?,
+        requestedPriority: IndexWorkPriority,
+        startedAt: Date,
         maximumVisitCount: Int?,
         maximumEntryCount: Int?,
         generation currentGeneration: UInt64
@@ -14036,9 +14566,10 @@ public final class FileIndex: @unchecked Sendable {
         var visitedCount = 0
         var readEntryCount = 0
         var checksDeadlineBeforeNextEntry = true
+        var encounteredRetryError = false
         var exclusionInstrumentation = FileExclusionQuery.Instrumentation()
 
-        func incompleteResult(encounteredRetryError: Bool = false) -> DirectoryUpdateScanResult {
+        func incompleteResult() -> DirectoryUpdateScanResult {
             DirectoryUpdateScanResult(
                 records: records,
                 completed: false,
@@ -14050,14 +14581,22 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         func reachedDeadline() -> Bool {
-            deadline.map { Date() >= $0 } ?? false
+            backgroundDirectoryScanDeadline(
+                for: requestedPriority,
+                startedAt: startedAt
+            ).map { Date() >= $0 } ?? false
         }
+
+        // Retry a failed URL only after the healthy work that was already queued
+        // beside it. Otherwise appending it back to this LIFO stack makes the
+        // same persistent failure the first item selected on every slice.
+        progress.activateDeferredRetriesIfNeeded()
 
         while progress.activeEnumeration != nil || !progress.pendingURLs.isEmpty {
             guard isCurrentGeneration(currentGeneration) else { return nil }
 
             if let cursor = progress.activeEnumeration {
-                if progress.isSuperseded(cursor.directory.standardizedFileURL.path) {
+                if progress.isSuperseded(cursor.directoryPath) {
                     cursor.close()
                     progress.activeEnumeration = nil
                     continue
@@ -14075,8 +14614,9 @@ public final class FileIndex: @unchecked Sendable {
 
                 guard let stream = cursor.stream else {
                     progress.activeEnumeration = nil
-                    progress.pendingURLs.append(cursor.directory)
-                    return incompleteResult(encounteredRetryError: true)
+                    progress.deferForRetry(cursor.directory)
+                    encounteredRetryError = true
+                    continue
                 }
 
                 errno = 0
@@ -14093,8 +14633,9 @@ public final class FileIndex: @unchecked Sendable {
                     // every child from that attempt and retry the directory later.
                     cursor.close()
                     progress.activeEnumeration = nil
-                    progress.pendingURLs.append(cursor.directory)
-                    return incompleteResult(encounteredRetryError: true)
+                    progress.deferForRetry(cursor.directory)
+                    encounteredRetryError = true
+                    continue
                 }
 
                 readEntryCount += 1
@@ -14121,7 +14662,7 @@ public final class FileIndex: @unchecked Sendable {
             guard let url = progress.pendingURLs.popLast() else { continue }
             visitedCount += 1
 
-            if progress.isSuperseded(url.standardizedFileURL.path) {
+            if progress.isSuperseded(url.path) {
                 continue
             }
 
@@ -14130,13 +14671,14 @@ public final class FileIndex: @unchecked Sendable {
             case let .record(recordCandidate):
                 candidate = recordCandidate
             case .missing:
-                let missingPath = url.standardizedFileURL.path
-                progress.scannedPaths.remove(missingPath)
+                let missingPath = url.path
+                progress.recordMissingPath(missingPath)
                 progress.unpublishedRecords.removeValue(forKey: missingPath)
                 continue
             case .retry:
-                progress.pendingURLs.append(url)
-                return incompleteResult(encounteredRetryError: true)
+                progress.deferForRetry(url)
+                encounteredRetryError = true
+                continue
             }
             let decision = exclusionDecision(
                 for: candidate.url,
@@ -14149,7 +14691,7 @@ public final class FileIndex: @unchecked Sendable {
             guard decision != .prune else { continue }
 
             if decision.shouldIndex {
-                progress.scannedPaths.insert(candidate.record.path)
+                progress.recordObservedPath(candidate.record.path)
                 records[candidate.record.path] = candidate.record
             }
 
@@ -14159,20 +14701,26 @@ public final class FileIndex: @unchecked Sendable {
 
 #if DEBUG
             if consumeDirectoryUpdateEnumerationFailureForTesting(at: candidate.path) {
-                progress.pendingURLs.append(candidate.url)
-                return incompleteResult(encounteredRetryError: true)
+                progress.deferForRetry(candidate.url)
+                encounteredRetryError = true
+                continue
             }
 #endif
 
             guard let stream = openDirectoryStream(candidate.url) else {
-                progress.pendingURLs.append(candidate.url)
-                return incompleteResult(encounteredRetryError: true)
+                progress.deferForRetry(candidate.url)
+                encounteredRetryError = true
+                continue
             }
             progress.activeEnumeration = DirectoryUpdateEnumerationCursor(
                 directory: candidate.url,
                 stream: stream
             )
             checksDeadlineBeforeNextEntry = true
+        }
+
+        guard progress.deferredRetryURLs.isEmpty else {
+            return incompleteResult()
         }
 
         return DirectoryUpdateScanResult(
@@ -14216,53 +14764,92 @@ public final class FileIndex: @unchecked Sendable {
         return failure.error
     }
 
-    @discardableResult
     private func enumerateShallowChildURLs(
         in directory: URL,
         prunesDirectoryNamed: ((String) -> Bool)? = nil,
         _ body: (URL) -> Bool
-    ) -> Bool {
-        guard let stream = openDirectoryStream(directory) else {
-            return false
-        }
-        defer { closedir(stream) }
-
-        while true {
-            errno = 0
-            guard let entry = readdir(stream) else {
-                return errno == 0
-            }
-            guard let entryInfo = Self.directoryEntryInfo(entry) else { continue }
-            let name = entryInfo.name
-            guard name != "." && name != ".." else { continue }
-            if entryInfo.isDirectory, prunesDirectoryNamed?(name) == true {
+    ) -> ShallowDirectoryEnumerationResult {
+        for attempt in 0..<Self.fullScanRetryLimit {
+            guard let stream = openDirectoryStream(directory) else {
+                let error = errno == 0 ? EIO : errno
+                if error == ENOENT || error == ENOTDIR {
+                    return .completed
+                }
+                if attempt + 1 == Self.fullScanRetryLimit {
+                    return .retry(error: error)
+                }
                 continue
             }
 
-            let child = directory.appendingPathComponent(name, isDirectory: entryInfo.isDirectory)
-            guard body(child) else { return false }
+            var result = ShallowDirectoryEnumerationResult.completed
+            while true {
+                errno = 0
+                guard let entry = readdir(stream) else {
+                    let error = errno
+                    if error != 0 {
+                        result = .retry(error: error)
+                    }
+                    break
+                }
+                guard let entryInfo = Self.directoryEntryInfo(entry) else { continue }
+                let name = entryInfo.name
+                guard name != "." && name != ".." else { continue }
+                if entryInfo.isDirectory, prunesDirectoryNamed?(name) == true {
+                    continue
+                }
+
+                let child = directory.appendingPathComponent(name, isDirectory: entryInfo.isDirectory)
+                guard body(child) else {
+                    result = .stopped
+                    break
+                }
+            }
+            closedir(stream)
+
+            if case .retry = result, attempt + 1 < Self.fullScanRetryLimit {
+                continue
+            }
+            return result
         }
+
+        return .retry(error: EIO)
     }
 
-    private func fileSystemRecordCandidate(
+    private func retryingFileSystemRecordLookup(
         for url: URL,
         volumeNameCache: ScanVolumeNameCache
-    ) -> FileSystemRecordCandidate? {
-        guard case let .record(candidate) = fileSystemRecordLookup(
-            for: url,
-            volumeNameCache: volumeNameCache
-        ) else {
-            return nil
+    ) -> FileSystemRecordLookup {
+        var lastResult = FileSystemRecordLookup.retry(error: EIO)
+        for _ in 0..<Self.fullScanRetryLimit {
+            let result = fileSystemRecordLookup(for: url, volumeNameCache: volumeNameCache)
+            switch result {
+            case .record, .missing:
+                return result
+            case .retry:
+                lastResult = result
+            }
         }
-        return candidate
+        return lastResult
+    }
+
+    private func logFullScanTraversalFailure(path: String, error: Int32) {
+        DiagnosticLogger.shared.log(
+            level: .error,
+            category: "index",
+            event: "index.scanTraversalFailed",
+            fields: [
+                "error": .publicInt(Int(error)),
+                "path": .path(path),
+                "retryLimit": .publicInt(Self.fullScanRetryLimit)
+            ]
+        )
     }
 
     private func fileSystemRecordLookup(
         for url: URL,
         volumeNameCache: ScanVolumeNameCache
     ) -> FileSystemRecordLookup {
-        let standardizedURL = url.standardizedFileURL
-        let path = standardizedURL.path
+        let path = url.path
 #if DEBUG
         if let error = consumeFileSystemLookupFailureForTesting(at: path) {
             return .retry(error: error)
@@ -14280,7 +14867,7 @@ public final class FileIndex: @unchecked Sendable {
 
         let isDirectory = Self.isDirectoryMode(statBlock.st_mode)
         let isSymlink = Self.isSymbolicLinkMode(statBlock.st_mode)
-        let volumeName = volumeNameCache.volumeName(for: standardizedURL, statBlock: statBlock)
+        let volumeName = volumeNameCache.volumeName(for: url, statBlock: statBlock)
         let record = FileRecord.fileIndexStatDerived(
             path: path,
             statBlock: statBlock,
@@ -14289,7 +14876,7 @@ public final class FileIndex: @unchecked Sendable {
         )
 
         return .record(FileSystemRecordCandidate(
-            url: standardizedURL,
+            url: url,
             path: path,
             isDirectory: isDirectory,
             isSymlink: isSymlink,
@@ -14419,9 +15006,58 @@ public final class FileIndex: @unchecked Sendable {
             return
         }
 
-        let delay = largeOverlayPersistDelayOverride != nil
+        let configuredDelay = largeOverlayPersistDelayOverride != nil
             ? largeOverlayPersistDelay(immediateLargeOverlay: true)
             : backgroundOptimizationPersistDelay()
+        let multipliedThreshold = threshold.multipliedReportingOverflow(
+            by: Self.structuralDeltaCompactionImmediateChangeMultiplier
+        )
+        let immediateChangeThreshold = multipliedThreshold.overflow
+            ? Int.max
+            : multipliedThreshold.partialValue
+        let deltaBytes = Self.allocatedFileSize(of: structuralDeltaStore.url)
+        let requiresImmediateCompaction = largeOverlayPersistRecordLimitOverride == nil
+            && (deltaState.changeCount >= immediateChangeThreshold
+                || deltaBytes >= Self.structuralDeltaCompactionImmediateByteLimit)
+        let delay = requiresImmediateCompaction ? 0 : configuredDelay
+        let schedule = lock.withLock { () -> (
+            revision: UInt64,
+            writerConflictWarningDeadline: Date,
+            escalated: Bool
+        )? in
+            if let writerConflictWarningDeadline = structuralDeltaCompactionWriterConflictWarningDeadline,
+               structuralDeltaCompactionScheduledAt != nil {
+                guard requiresImmediateCompaction, !structuralDeltaCompactionIsImmediate else {
+                    return nil
+                }
+                structuralDeltaCompactionRevision &+= 1
+                structuralDeltaCompactionIsImmediate = true
+                return (structuralDeltaCompactionRevision, writerConflictWarningDeadline, true)
+            }
+
+            let scheduledAt = Date()
+            structuralDeltaCompactionRevision &+= 1
+            structuralDeltaCompactionScheduledAt = scheduledAt
+            structuralDeltaCompactionIsImmediate = requiresImmediateCompaction
+            let writerConflictWarningDeadline = scheduledAt.addingTimeInterval(
+                max(Self.structuralDeltaCompactionWriterConflictWarningDelay, delay)
+            )
+            structuralDeltaCompactionWriterConflictWarningDeadline = writerConflictWarningDeadline
+            return (structuralDeltaCompactionRevision, writerConflictWarningDeadline, false)
+        }
+        guard let schedule else {
+            DiagnosticLogger.shared.log(
+                category: "index",
+                event: "index.structuralDeltaCompactionAlreadyScheduled",
+                fields: [
+                    "recordCount": .publicInt(snapshot.count),
+                    "changeCount": .publicInt(deltaState.changeCount),
+                    "deltaBytes": .publicUInt64(deltaBytes),
+                    "immediate": .publicBool(requiresImmediateCompaction)
+                ]
+            )
+            return
+        }
         recordDeferredOptimization(reason: "structuralDeltaThreshold", delay: delay)
         DiagnosticLogger.shared.log(
             category: "index",
@@ -14430,10 +15066,89 @@ public final class FileIndex: @unchecked Sendable {
                 "recordCount": .publicInt(snapshot.count),
                 "changeCount": .publicInt(deltaState.changeCount),
                 "threshold": .publicInt(threshold),
-                "delaySeconds": .publicDouble(delay)
+                "deltaBytes": .publicUInt64(deltaBytes),
+                "immediate": .publicBool(requiresImmediateCompaction),
+                "escalated": .publicBool(schedule.escalated),
+                "delaySeconds": .publicDouble(delay),
+                "writerConflictWarningDeadlineSeconds": .publicDouble(
+                    max(schedule.writerConflictWarningDeadline.timeIntervalSinceNow, 0)
+                )
             ]
         )
-        schedulePersist(delay: delay, priority: .background)
+        scheduleStructuralDeltaCompaction(
+            revision: schedule.revision,
+            delay: delay
+        )
+    }
+
+    private func scheduleStructuralDeltaCompaction(revision: UInt64, delay: TimeInterval) {
+        indexQueue.asyncAfter(deadline: .now() + max(delay, 0)) { [weak self] in
+            self?.runStructuralDeltaCompaction(revision: revision)
+        }
+    }
+
+    private func runStructuralDeltaCompaction(revision: UInt64) {
+        let state = lock.withLock { () -> (
+            isCurrent: Bool,
+            hasDelta: Bool,
+            hasConflictingWriter: Bool,
+            writerConflictWarningDeadline: Date?
+        ) in
+            (
+                structuralDeltaCompactionRevision == revision
+                    && structuralDeltaCompactionScheduledAt != nil,
+                structuralDelta != nil,
+                activeDeferredOptimizationRevision != nil
+                    || activePathGramBuildGeneration != nil,
+                structuralDeltaCompactionWriterConflictWarningDeadline
+            )
+        }
+        guard state.isCurrent else { return }
+        guard state.hasDelta else {
+            lock.withLock { clearStructuralDeltaCompactionWithoutLock() }
+            return
+        }
+
+        // Queued background refreshes intentionally are not blockers: they were
+        // the reason the old sliding persistence timer could starve forever.
+        // Package writers remain blockers because they can race installation.
+        if state.hasConflictingWriter {
+            let retryDelay = Self.structuralDeltaCompactionRetryDelay
+            DiagnosticLogger.shared.log(
+                category: "index",
+                event: "index.structuralDeltaCompactionDeferred",
+                fields: [
+                    "reason": .publicString("conflictingWriter"),
+                    "writerConflictWarningReached": .publicBool(
+                        state.writerConflictWarningDeadline.map { Date() >= $0 } ?? false
+                    ),
+                    "retryDelaySeconds": .publicDouble(retryDelay)
+                ]
+            )
+            scheduleStructuralDeltaCompaction(revision: revision, delay: retryDelay)
+            return
+        }
+
+        lock.withLock { persistRevision &+= 1 }
+        let succeeded = persistSnapshot(
+            forceMappedCheckpoint: true,
+            priority: .background
+        )
+        if succeeded {
+            lock.withLock { clearStructuralDeltaCompactionWithoutLock() }
+        } else {
+            scheduleStructuralDeltaCompaction(
+                revision: revision,
+                delay: Self.structuralDeltaCompactionRetryDelay
+            )
+        }
+    }
+
+    private func clearStructuralDeltaCompactionWithoutLock() {
+        structuralDeltaCompactionRevision &+= 1
+        structuralDeltaCompactionScheduledAt = nil
+        structuralDeltaCompactionWriterConflictWarningDeadline = nil
+        structuralDeltaCompactionIsImmediate = false
     }
 
     private func scheduleRefreshPersistIfReasonable(
@@ -15288,6 +16003,7 @@ public final class FileIndex: @unchecked Sendable {
         try? structuralDeltaStore.clear()
         lock.withLock {
             structuralDelta = nil
+            clearStructuralDeltaCompactionWithoutLock()
             clearSnapshotDurabilityPendingWithoutLock()
         }
         removeScanCheckpoint()
@@ -15924,6 +16640,26 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
+    func structuralDeltaCompactionScheduleForTesting() -> (
+        revision: UInt64,
+        scheduledAt: Date,
+        writerConflictWarningDeadline: Date
+    )? {
+        lock.withLock {
+            guard
+                let scheduledAt = structuralDeltaCompactionScheduledAt,
+                let writerConflictWarningDeadline = structuralDeltaCompactionWriterConflictWarningDeadline
+            else {
+                return nil
+            }
+            return (
+                structuralDeltaCompactionRevision,
+                scheduledAt,
+                writerConflictWarningDeadline
+            )
+        }
+    }
+
     private func currentDiagnosticsWithoutLock() -> FileIndexDiagnostics {
         FileIndexDiagnostics(
             indexedCount: searchSnapshot.resultCount,
@@ -16183,7 +16919,9 @@ public final class FileIndex: @unchecked Sendable {
         unpublishedRecordCount: Int,
         pendingURLCount: Int,
         activeEnumerationEntryCount: Int?,
-        retryAttempt: Int
+        retryAttempt: Int,
+        recursivelyScansDirectory: Bool,
+        followUpRecursivelyScansDirectory: Bool
     )? {
         let path = URL(fileURLWithPath: rawPath).standardizedFileURL.path
         return lock.withLock {
@@ -16193,15 +16931,53 @@ public final class FileIndex: @unchecked Sendable {
             else {
                 return nil
             }
+            let unpublishedRecordCount = progress.finalization.map {
+                max($0.unpublishedRecords.count - $0.upsertsVisited, 0)
+            } ?? progress.unpublishedRecords.count
             return (
-                progress.scannedPaths.count,
+                progress.scannedRecordCount,
                 work.requiresDirectoryRescanAfterProgress,
                 progress.incrementalPublishBatchCount,
                 progress.incrementallyPublishedChangeCount,
-                progress.unpublishedRecords.count,
+                unpublishedRecordCount,
                 progress.pendingURLs.count,
                 progress.activeEnumeration?.readEntryCount,
-                work.retryAttempt
+                work.retryAttempt,
+                work.recursivelyScansDirectory,
+                work.followUpRecursivelyScansDirectory
+            )
+        }
+    }
+
+    func pendingDirectoryFinalizationStateForTesting(
+        path rawPath: String
+    ) -> (
+        phase: String,
+        traversalWorkCount: Int,
+        seenBaselineRowCount: Int,
+        baselineRowsVisited: Int,
+        matchingBaselineRowsVisited: Int,
+        upsertsVisited: Int,
+        preparedUpsertCount: Int,
+        materializedDeletionPathCount: Int
+    )? {
+        let path = URL(fileURLWithPath: rawPath).standardizedFileURL.path
+        return lock.withLock {
+            guard
+                let progress = pendingRefreshPaths[path]?.directoryScanProgress,
+                let finalization = progress.finalization
+            else {
+                return nil
+            }
+            return (
+                finalization.phase.rawValue,
+                progress.traversalWorkCount,
+                progress.seenBaselineRows.setBitCount,
+                finalization.baselineRowsVisited,
+                finalization.matchingBaselineRowsVisited,
+                finalization.upsertsVisited,
+                finalization.preparedUpsertPaths.count,
+                finalization.materializedDeletionPathCount
             )
         }
     }
@@ -16213,6 +16989,24 @@ public final class FileIndex: @unchecked Sendable {
         return lock.withLock {
             guard let work = pendingRefreshPaths[path] else { return nil }
             return (work.retryAttempt, work.eligibleAt)
+        }
+    }
+
+    func pendingDirectoryTraversalPathsForTesting(
+        path rawPath: String
+    ) -> (pending: [String], deferredRetries: [String])? {
+        let path = URL(fileURLWithPath: rawPath).standardizedFileURL.path
+        return lock.withLock {
+            guard
+                let work = pendingRefreshPaths[path],
+                let progress = work.directoryScanProgress
+            else {
+                return nil
+            }
+            return (
+                progress.pendingURLs.map(\.path),
+                progress.deferredRetryURLs.map(\.path)
+            )
         }
     }
 
@@ -16632,7 +17426,10 @@ public final class FileIndex: @unchecked Sendable {
             try fileManager.removeItem(at: checkpointURL)
         }
         try structuralDeltaStore.clear()
-        lock.withLock { structuralDelta = nil }
+        lock.withLock {
+            structuralDelta = nil
+            clearStructuralDeltaCompactionWithoutLock()
+        }
 
         guard
             let contents = try? fileManager.contentsOfDirectory(
