@@ -1,11 +1,32 @@
 import CoreServices
-import ATTCore
+@_spi(ATTInternal) import ATTCore
 import Foundation
 
 struct FileSystemEvent: Sendable {
     let path: String
     let flags: FSEventStreamEventFlags
     let eventID: FSEventStreamEventId
+
+    init(path: String, flags: FSEventStreamEventFlags, eventID: FSEventStreamEventId) {
+        // FSEvents supplies canonical paths. Synthetic events used by repair and tests
+        // occasionally do not, so normalize those exceptional cases once at ingress.
+        if Self.requiresPathNormalization(path) {
+            self.path = URL(fileURLWithPath: path).standardizedFileURL.path
+        } else {
+            self.path = path
+        }
+        self.flags = flags
+        self.eventID = eventID
+    }
+
+    private static func requiresPathNormalization(_ path: String) -> Bool {
+        (path.count > 1 && path.hasSuffix("/"))
+            || path.contains("//")
+            || path.contains("/./")
+            || path.contains("/../")
+            || path.hasSuffix("/.")
+            || path.hasSuffix("/..")
+    }
 
     var historyReplayCompleted: Bool {
         flags & FSEventStreamEventFlags(kFSEventStreamEventFlagHistoryDone) != 0
@@ -68,6 +89,41 @@ enum ApplicationSearchEventFilter {
     }
 }
 
+struct FSEventRootMatcher {
+    private struct Root {
+        let path: String
+        let descendantPrefix: String
+    }
+
+    let rootPaths: [String]
+    private let roots: [Root]
+
+    init(rootPaths: [String]) {
+        let standardizedRoots = rootPaths.enumerated().map { offset, path in
+            (offset: offset, path: URL(fileURLWithPath: path).standardizedFileURL.path)
+        }
+        let orderedRoots = standardizedRoots.sorted { lhs, rhs in
+            if lhs.path.count != rhs.path.count {
+                return lhs.path.count > rhs.path.count
+            }
+            return lhs.offset < rhs.offset
+        }
+        self.rootPaths = orderedRoots.map(\.path)
+        roots = self.rootPaths.map { rootPath in
+            Root(
+                path: rootPath,
+                descendantPrefix: rootPath == "/" ? "/" : rootPath + "/"
+            )
+        }
+    }
+
+    func matchingRoot(for path: String) -> String? {
+        roots.first { root in
+            root.path == "/" || path == root.path || path.hasPrefix(root.descendantPrefix)
+        }?.path
+    }
+}
+
 enum FSEventCursorAdvances {
     static func latestByRoot(
         events: [FileSystemEvent],
@@ -76,27 +132,24 @@ enum FSEventCursorAdvances {
     ) -> [String: UInt64] {
         guard !events.isEmpty, !rootPaths.isEmpty else { return [:] }
 
-        let rootPaths = rootPaths.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
+        let rootMatcher = FSEventRootMatcher(rootPaths: rootPaths)
         if
             let wrappedBaselineEventID,
             events.contains(where: \.eventIDsWrapped)
         {
-            return Dictionary(uniqueKeysWithValues: rootPaths.map { ($0, wrappedBaselineEventID) })
+            return Dictionary(uniqueKeysWithValues: rootMatcher.rootPaths.map { ($0, wrappedBaselineEventID) })
         }
 
         var latestByRoot: [String: UInt64] = [:]
         for event in events {
             if event.historyIsUnsafe {
-                for root in rootPaths {
+                for root in rootMatcher.rootPaths {
                     latestByRoot[root] = max(latestByRoot[root] ?? 0, UInt64(event.eventID))
                 }
                 continue
             }
 
-            let path = URL(fileURLWithPath: event.path).standardizedFileURL.path
-            guard let root = rootPaths.first(where: { root in
-                root == "/" || path == root || path.hasPrefix(root + "/")
-            }) else {
+            guard let root = rootMatcher.matchingRoot(for: event.path) else {
                 continue
             }
             latestByRoot[root] = max(latestByRoot[root] ?? 0, UInt64(event.eventID))
@@ -111,7 +164,7 @@ enum FSEventDefaultExclusionPolicy {
     static func matches(_ patterns: [String]) -> Bool {
         patterns.count == FileExclusionRules.defaultPatterns.count
             && Set(patterns) == Set(FileExclusionRules.defaultPatterns)
-            && patterns.filter(isOrderSensitive) == orderedRules
+            && Array(patterns.prefix(orderedRules.count)) == orderedRules
     }
 
     private static func isOrderSensitive(_ pattern: String) -> Bool {
@@ -120,15 +173,28 @@ enum FSEventDefaultExclusionPolicy {
 }
 
 enum FSEventIndexFilter {
+    struct Instrumentation: Equatable, Sendable {
+        var defaultFastPathDecisionCount = 0
+        var compiledQueryBuildCount = 0
+        var compiledDecisionCount = 0
+        var redundantCoalescingEventCountAvoided = 0
+    }
+
     struct Context: Sendable {
         let rootPaths: [String]
         let exclusionPatterns: [String]
         let activePatterns: Set<String>
         let usesKnownExclusionFastPath: Bool
+        let eventsArePreCoalesced: Bool
 
-        init(rootPaths: [String], exclusionPatterns: [String]) {
+        init(
+            rootPaths: [String],
+            exclusionPatterns: [String],
+            eventsArePreCoalesced: Bool = false
+        ) {
             self.rootPaths = rootPaths
             self.exclusionPatterns = exclusionPatterns
+            self.eventsArePreCoalesced = eventsArePreCoalesced
             activePatterns = Set(exclusionPatterns)
             usesKnownExclusionFastPath = FSEventDefaultExclusionPolicy.matches(exclusionPatterns)
         }
@@ -149,25 +215,54 @@ enum FSEventIndexFilter {
         _ events: [FileSystemEvent],
         context: Context
     ) -> [FileSystemEvent] {
-        guard !events.isEmpty else { return [] }
-        let events = coalescedEventsByPath(events)
-        var exclusions: FileExclusionRules?
-        var filteredEvents: [FileSystemEvent] = []
-        filteredEvents.reserveCapacity(events.count)
+        var instrumentation = Instrumentation()
+        return indexableEvents(events, context: context, instrumentation: &instrumentation)
+    }
 
-        for event in events {
+    static func indexableEvents(
+        _ events: [FileSystemEvent],
+        context: Context,
+        instrumentation: inout Instrumentation
+    ) -> [FileSystemEvent] {
+        guard !events.isEmpty else { return [] }
+        let candidateEvents: [FileSystemEvent]
+        if context.eventsArePreCoalesced {
+            instrumentation.redundantCoalescingEventCountAvoided += events.count
+            candidateEvents = events
+        } else {
+            candidateEvents = coalescedEventsByPath(events)
+        }
+        var exclusionDecision: ((String, Bool) -> FileExclusionRules.Decision)?
+        var filteredEvents: [FileSystemEvent] = []
+        filteredEvents.reserveCapacity(candidateEvents.count)
+
+        for event in candidateEvents {
             if event.requiresRecursiveRescan {
                 filteredEvents.append(event)
                 continue
             }
-            if context.usesKnownExclusionFastPath,
-               isKnownExcludedEventPath(event.path, activePatterns: context.activePatterns) {
+            if context.usesKnownExclusionFastPath {
+                instrumentation.defaultFastPathDecisionCount += 1
+                if isKnownExcludedEventPath(
+                    event.path,
+                    activePatterns: context.activePatterns,
+                    isDirectory: event.itemIsDirectory
+                ) {
+                    continue
+                }
+                filteredEvents.append(event)
                 continue
             }
-            if exclusions == nil {
-                exclusions = FileExclusionRules(patterns: context.exclusionPatterns)
+            if exclusionDecision == nil {
+                exclusionDecision = FileExclusionRules(patterns: context.exclusionPatterns)
+                    .makeDecisionEvaluator(roots: context.rootPaths)
+                instrumentation.compiledQueryBuildCount += 1
             }
-            guard let exclusions, shouldQueue(event, rootPaths: context.rootPaths, exclusions: exclusions) else {
+            guard let exclusionDecision, shouldQueue(
+                event,
+                exclusionDecision: exclusionDecision,
+                instrumentation: &instrumentation
+            ) else {
                 continue
             }
             filteredEvents.append(event)
@@ -197,106 +292,194 @@ enum FSEventIndexFilter {
         return coalescedEvents
     }
 
-    static func isKnownExcludedEventPath(_ path: String, activePatterns: Set<String>) -> Bool {
+    static func isKnownExcludedEventPath(
+        _ path: String,
+        activePatterns: Set<String>,
+        isDirectory: Bool = false
+    ) -> Bool {
         let lowerPath = path.lowercased()
         let lastComponent = lastPathComponent(in: lowerPath)
 
         if activePatterns.contains(".git/*"), containsComponent(".git", in: lowerPath) {
-            if lowerPath.hasSuffix("/.git") {
-                return false
-            }
-            if containsPathFragment("/.git/hooks", in: lowerPath)
+            let isReincluded = lowerPath.hasSuffix("/.git")
+                || containsPathFragment("/.git/hooks", in: lowerPath)
                 || containsPathFragment("/.git/info", in: lowerPath)
                 || lowerPath.hasSuffix("/.git/config")
                 || lowerPath.hasSuffix("/.git/head")
                 || lowerPath.hasSuffix("/.git/description")
-            {
-                return false
+            if !isReincluded {
+                return true
             }
+        }
+        if activePatterns.contains(".hg/store/"),
+           containsDirectoryPathFragment("/.hg/store", in: lowerPath, isDirectory: isDirectory) {
             return true
         }
-        if activePatterns.contains(".hg/store/"), containsPathFragment("/.hg/store", in: lowerPath) {
-            return true
-        }
-        if activePatterns.contains(".svn/pristine/"), containsPathFragment("/.svn/pristine", in: lowerPath) {
+        if activePatterns.contains(".svn/pristine/"),
+           containsDirectoryPathFragment("/.svn/pristine", in: lowerPath, isDirectory: isDirectory) {
             return true
         }
 
-        if activePatterns.contains("node_modules/"), containsComponent("node_modules", in: lowerPath) {
+        if activePatterns.contains("node_modules/"),
+           containsDirectoryComponent("node_modules", in: lowerPath, isDirectory: isDirectory) {
             return true
         }
-        if activePatterns.contains("DerivedData/"), containsComponent("deriveddata", in: lowerPath) {
+        if activePatterns.contains("DerivedData/"),
+           containsDirectoryComponent("deriveddata", in: lowerPath, isDirectory: isDirectory) {
             return true
         }
-        if activePatterns.contains(".gradle/caches/"), containsPathFragment("/.gradle/caches", in: lowerPath) {
+        if activePatterns.contains(".gradle/caches/"),
+           containsDirectoryPathFragment("/.gradle/caches", in: lowerPath, isDirectory: isDirectory) {
             return true
         }
-        if activePatterns.contains(".dart_tool/"), containsComponent(".dart_tool", in: lowerPath) {
+        if activePatterns.contains(".dart_tool/"),
+           containsDirectoryComponent(".dart_tool", in: lowerPath, isDirectory: isDirectory) {
             return true
         }
-        if activePatterns.contains(".next/cache/"), containsPathFragment("/.next/cache", in: lowerPath) {
+        if activePatterns.contains(".next/cache/"),
+           containsDirectoryPathFragment("/.next/cache", in: lowerPath, isDirectory: isDirectory) {
             return true
         }
-        if activePatterns.contains(".parcel-cache/"), containsComponent(".parcel-cache", in: lowerPath) {
+        if activePatterns.contains(".parcel-cache/"),
+           containsDirectoryComponent(".parcel-cache", in: lowerPath, isDirectory: isDirectory) {
             return true
         }
-        if activePatterns.contains(".turbo/"), containsComponent(".turbo", in: lowerPath) {
+        if activePatterns.contains(".turbo/"),
+           containsDirectoryComponent(".turbo", in: lowerPath, isDirectory: isDirectory) {
             return true
         }
-        if activePatterns.contains(".build/**/index/store/"), lowerPath.contains("/.build/"),
-           containsPathFragment("/index/store", in: lowerPath) {
+        if activePatterns.contains("*.app/Contents/_CodeSignature/"),
+           containsDirectoryPathFragment(
+               ".app/contents/_codesignature",
+               in: lowerPath,
+               isDirectory: isDirectory
+           ) {
+            return true
+        }
+        if activePatterns.contains("Xcode.app/Contents/Developer/Platforms/"),
+           containsDirectoryPathFragment(
+               "/xcode.app/contents/developer/platforms",
+               in: lowerPath,
+               isDirectory: isDirectory
+           ) {
+            return true
+        }
+        if activePatterns.contains("Xcode.app/Contents/Developer/Toolchains/"),
+           containsDirectoryPathFragment(
+               "/xcode.app/contents/developer/toolchains",
+               in: lowerPath,
+               isDirectory: isDirectory
+           ) {
+            return true
+        }
+        if activePatterns.contains("Engine/Binaries/ThirdParty/DotNet/"),
+           containsDirectoryPathFragment(
+               "/engine/binaries/thirdparty/dotnet",
+               in: lowerPath,
+               isDirectory: isDirectory
+           ) {
+            return true
+        }
+        if activePatterns.contains("Engine/Binaries/ThirdParty/Python3/"),
+           containsDirectoryPathFragment(
+               "/engine/binaries/thirdparty/python3",
+               in: lowerPath,
+               isDirectory: isDirectory
+           ) {
+            return true
+        }
+        if activePatterns.contains("Engine/DerivedDataCache/"),
+           containsDirectoryPathFragment(
+               "/engine/deriveddatacache",
+               in: lowerPath,
+               isDirectory: isDirectory
+           ) {
+            return true
+        }
+        if activePatterns.contains("Engine/Intermediate/"),
+           containsDirectoryPathFragment(
+               "/engine/intermediate",
+               in: lowerPath,
+               isDirectory: isDirectory
+           ) {
+            return true
+        }
+        if activePatterns.contains("Engine/Saved/"),
+           containsDirectoryPathFragment("/engine/saved", in: lowerPath, isDirectory: isDirectory) {
             return true
         }
         if lowerPath.contains("/.build/") {
-            if activePatterns.contains(".build/debug/"), containsPathFragment("/.build/debug", in: lowerPath) {
+            if activePatterns.contains(".build/**/index/store/"),
+               containsNestedBuildIndexStore(in: lowerPath, isDirectory: isDirectory) {
                 return true
             }
-            if activePatterns.contains(".build/release/"), containsPathFragment("/.build/release", in: lowerPath) {
+            if activePatterns.contains(".build/debug/"),
+               containsDirectoryPathFragment("/.build/debug", in: lowerPath, isDirectory: isDirectory) {
                 return true
             }
-            if activePatterns.contains(".build/plugins/"), containsPathFragment("/.build/plugins", in: lowerPath) {
+            if activePatterns.contains(".build/release/"),
+               containsDirectoryPathFragment("/.build/release", in: lowerPath, isDirectory: isDirectory) {
                 return true
             }
-            if activePatterns.contains(".build/artifacts/"), containsPathFragment("/.build/artifacts", in: lowerPath) {
+            if activePatterns.contains(".build/plugins/"),
+               containsDirectoryPathFragment("/.build/plugins", in: lowerPath, isDirectory: isDirectory) {
+                return true
+            }
+            if activePatterns.contains(".build/artifacts/"),
+               containsDirectoryPathFragment("/.build/artifacts", in: lowerPath, isDirectory: isDirectory) {
                 return true
             }
             if activePatterns.contains(".build/*/debug/"),
-               containsBuildNestedDirectory("debug", in: lowerPath) {
+               containsBuildNestedDirectory("debug", in: lowerPath, isDirectory: isDirectory) {
                 return true
             }
             if activePatterns.contains(".build/*/release/"),
-               containsBuildNestedDirectory("release", in: lowerPath) {
+               containsBuildNestedDirectory("release", in: lowerPath, isDirectory: isDirectory) {
                 return true
             }
             if activePatterns.contains(".build/*/index/"),
-               containsBuildNestedDirectory("index", in: lowerPath) {
+               containsBuildNestedDirectory("index", in: lowerPath, isDirectory: isDirectory) {
                 return true
             }
             if activePatterns.contains(".build/*/ModuleCache/"),
-               containsBuildNestedDirectory("modulecache", in: lowerPath) {
+               containsBuildNestedDirectory("modulecache", in: lowerPath, isDirectory: isDirectory) {
                 return true
             }
         }
-        if activePatterns.contains("CMakeFiles/"), containsComponent("cmakefiles", in: lowerPath) {
+        if activePatterns.contains("CMakeFiles/"),
+           containsDirectoryComponent("cmakefiles", in: lowerPath, isDirectory: isDirectory) {
             return true
         }
-        if activePatterns.contains("Testing/Temporary/"), containsPathFragment("/testing/temporary", in: lowerPath) {
+        if activePatterns.contains("Testing/Temporary/"),
+           containsDirectoryPathFragment("/testing/temporary", in: lowerPath, isDirectory: isDirectory) {
             return true
         }
-        if activePatterns.contains("build/.cmake/api/"), containsPathFragment("/build/.cmake/api", in: lowerPath) {
+        if activePatterns.contains("buck-out/"),
+           containsDirectoryComponent("buck-out", in: lowerPath, isDirectory: isDirectory) {
+            return true
+        }
+        if activePatterns.contains("bazel-out/"),
+           containsDirectoryComponent("bazel-out", in: lowerPath, isDirectory: isDirectory) {
+            return true
+        }
+        if activePatterns.contains(".buckd/"),
+           containsDirectoryComponent(".buckd", in: lowerPath, isDirectory: isDirectory) {
+            return true
+        }
+        if activePatterns.contains("build/.cmake/api/"),
+           containsDirectoryPathFragment("/build/.cmake/api", in: lowerPath, isDirectory: isDirectory) {
             return true
         }
         if
             (activePatterns.contains("build/_deps/") || activePatterns.contains("build/**/_deps/")),
-            lowerPath.contains("/build/"),
-            containsComponent("_deps", in: lowerPath)
+            containsBuildDependencyDirectory(in: lowerPath, isDirectory: isDirectory)
         {
             return true
         }
         if
             activePatterns.contains("build/**/*.tmp*"),
-            lowerPath.contains("/build/"),
-            lastComponent.contains(".tmp")
+            lastComponent.contains(".tmp"),
+            containsNestedBuildTemporary(in: lowerPath)
         {
             return true
         }
@@ -321,37 +504,48 @@ enum FSEventIndexFilter {
         if activePatterns.contains("*.profdata"), lastComponent.hasSuffix(".profdata") {
             return true
         }
-        if activePatterns.contains("*.dSYM/"), lowerPath.contains(".dsym/") || lowerPath.hasSuffix(".dsym") {
+        if activePatterns.contains("*.dSYM/"),
+           lowerPath.contains(".dsym/") || (isDirectory && lowerPath.hasSuffix(".dsym")) {
             return true
         }
-        if activePatterns.contains(".venv/"), containsComponent(".venv", in: lowerPath) {
+        if activePatterns.contains(".venv/"),
+           containsDirectoryComponent(".venv", in: lowerPath, isDirectory: isDirectory) {
             return true
         }
-        if activePatterns.contains("venv/"), containsComponent("venv", in: lowerPath) {
+        if activePatterns.contains("venv/"),
+           containsDirectoryComponent("venv", in: lowerPath, isDirectory: isDirectory) {
             return true
         }
-        if activePatterns.contains(".tox/"), containsComponent(".tox", in: lowerPath) {
+        if activePatterns.contains(".tox/"),
+           containsDirectoryComponent(".tox", in: lowerPath, isDirectory: isDirectory) {
             return true
         }
-        if activePatterns.contains("__pycache__/"), containsComponent("__pycache__", in: lowerPath) {
+        if activePatterns.contains("__pycache__/"),
+           containsDirectoryComponent("__pycache__", in: lowerPath, isDirectory: isDirectory) {
             return true
         }
-        if activePatterns.contains(".pytest_cache/"), containsComponent(".pytest_cache", in: lowerPath) {
+        if activePatterns.contains(".pytest_cache/"),
+           containsDirectoryComponent(".pytest_cache", in: lowerPath, isDirectory: isDirectory) {
             return true
         }
-        if activePatterns.contains(".mypy_cache/"), containsComponent(".mypy_cache", in: lowerPath) {
+        if activePatterns.contains(".mypy_cache/"),
+           containsDirectoryComponent(".mypy_cache", in: lowerPath, isDirectory: isDirectory) {
             return true
         }
-        if activePatterns.contains(".ruff_cache/"), containsComponent(".ruff_cache", in: lowerPath) {
+        if activePatterns.contains(".ruff_cache/"),
+           containsDirectoryComponent(".ruff_cache", in: lowerPath, isDirectory: isDirectory) {
             return true
         }
-        if activePatterns.contains(".cache/"), containsComponent(".cache", in: lowerPath) {
+        if activePatterns.contains(".cache/"),
+           containsDirectoryComponent(".cache", in: lowerPath, isDirectory: isDirectory) {
             return true
         }
-        if activePatterns.contains("Library/Caches/"), containsPathFragment("/library/caches", in: lowerPath) {
+        if activePatterns.contains("Library/Caches/"),
+           containsDirectoryPathFragment("/library/caches", in: lowerPath, isDirectory: isDirectory) {
             return true
         }
-        if activePatterns.contains(".Trash/"), containsComponent(".trash", in: lowerPath) {
+        if activePatterns.contains(".Trash/"),
+           containsDirectoryComponent(".trash", in: lowerPath, isDirectory: isDirectory) {
             return true
         }
 
@@ -369,34 +563,92 @@ enum FSEventIndexFilter {
         lowerPath.hasSuffix("/" + component) || lowerPath.contains("/" + component + "/")
     }
 
+    private static func containsDirectoryComponent(
+        _ component: String,
+        in lowerPath: String,
+        isDirectory: Bool
+    ) -> Bool {
+        lowerPath.contains("/" + component + "/")
+            || (isDirectory && lowerPath.hasSuffix("/" + component))
+    }
+
     private static func containsPathFragment(_ fragment: String, in lowerPath: String) -> Bool {
         lowerPath.contains(fragment + "/") || lowerPath.hasSuffix(fragment)
     }
 
-    private static func containsBuildNestedDirectory(_ directory: String, in lowerPath: String) -> Bool {
-        guard let buildRange = lowerPath.range(of: "/.build/") else { return false }
-        let remainder = lowerPath[buildRange.upperBound...]
-        let components = remainder.split(separator: "/", maxSplits: 2, omittingEmptySubsequences: true)
-        guard components.count >= 2 else { return false }
-        return components[1] == Substring(directory)
+    private static func containsDirectoryPathFragment(
+        _ fragment: String,
+        in lowerPath: String,
+        isDirectory: Bool
+    ) -> Bool {
+        lowerPath.contains(fragment + "/")
+            || (isDirectory && lowerPath.hasSuffix(fragment))
+    }
+
+    private static func containsBuildNestedDirectory(
+        _ directory: String,
+        in lowerPath: String,
+        isDirectory: Bool
+    ) -> Bool {
+        let components = lowerPath.split(separator: "/", omittingEmptySubsequences: true)
+        for index in components.indices
+            where components[index] == ".build"
+                && index + 2 < components.count
+                && components[index + 2] == Substring(directory) {
+            return index + 2 < components.count - 1 || isDirectory
+        }
+        return false
+    }
+
+    private static func containsNestedBuildIndexStore(in lowerPath: String, isDirectory: Bool) -> Bool {
+        let components = lowerPath.split(separator: "/", omittingEmptySubsequences: true)
+        for buildIndex in components.indices where components[buildIndex] == ".build" {
+            guard buildIndex + 3 < components.count else { continue }
+            for index in (buildIndex + 2)..<(components.count - 1)
+                where components[index] == "index" && components[index + 1] == "store" {
+                return index + 1 < components.count - 1 || isDirectory
+            }
+        }
+        return false
+    }
+
+    private static func containsNestedBuildTemporary(in lowerPath: String) -> Bool {
+        let components = lowerPath.split(separator: "/", omittingEmptySubsequences: true)
+        return components.indices.contains { index in
+            components[index] == "build" && index + 2 < components.count
+        }
+    }
+
+    private static func containsBuildDependencyDirectory(in lowerPath: String, isDirectory: Bool) -> Bool {
+        let components = lowerPath.split(separator: "/", omittingEmptySubsequences: true)
+        for buildIndex in components.indices where components[buildIndex] == "build" {
+            guard buildIndex + 1 < components.count else { continue }
+            for dependencyIndex in (buildIndex + 1)..<components.count
+                where components[dependencyIndex] == "_deps" {
+                return dependencyIndex < components.count - 1 || isDirectory
+            }
+        }
+        return false
     }
 
     private static func shouldQueue(
         _ event: FileSystemEvent,
-        rootPaths: [String],
-        exclusions: FileExclusionRules
+        exclusionDecision: (String, Bool) -> FileExclusionRules.Decision,
+        instrumentation: inout Instrumentation
     ) -> Bool {
-        let url = URL(fileURLWithPath: event.path)
         if event.itemIsDirectory {
-            return exclusions.decision(url: url, roots: rootPaths, isDirectory: true) != .prune
+            instrumentation.compiledDecisionCount += 1
+            return exclusionDecision(event.path, true) != .prune
         }
 
-        let fileDecision = exclusions.decision(url: url, roots: rootPaths, isDirectory: false)
+        instrumentation.compiledDecisionCount += 1
+        let fileDecision = exclusionDecision(event.path, false)
         if fileDecision != .prune {
             return true
         }
 
-        let directoryDecision = exclusions.decision(url: url, roots: rootPaths, isDirectory: true)
+        instrumentation.compiledDecisionCount += 1
+        let directoryDecision = exclusionDecision(event.path, true)
         return directoryDecision != .prune
     }
 }
@@ -420,31 +672,120 @@ struct FSEventLiveRefreshScopeRouting: Equatable, Sendable {
     }
 }
 
+/// A component trie keeps scope collapsing and coverage checks proportional to path
+/// depth instead of comparing every path with every queued scope.
+struct FSEventPathScopeIndex {
+    struct Instrumentation: Equatable, Sendable {
+        var insertedPathCount = 0
+        var coverageQueryCount = 0
+        var componentVisitCount = 0
+    }
+
+    private struct Node {
+        var children: [Substring: Int] = [:]
+        var scopePath: String?
+    }
+
+    private var nodes = [Node()]
+    private(set) var instrumentation = Instrumentation()
+
+    mutating func insert(_ path: String) {
+        instrumentation.insertedPathCount += 1
+        var nodeIndex = 0
+
+        if nodes[nodeIndex].scopePath != nil {
+            return
+        }
+
+        for component in path.split(separator: "/", omittingEmptySubsequences: true) {
+            instrumentation.componentVisitCount += 1
+            if let childIndex = nodes[nodeIndex].children[component] {
+                nodeIndex = childIndex
+            } else {
+                let childIndex = nodes.count
+                nodes.append(Node())
+                nodes[nodeIndex].children[component] = childIndex
+                nodeIndex = childIndex
+            }
+
+            if nodes[nodeIndex].scopePath != nil {
+                return
+            }
+        }
+
+        nodes[nodeIndex].scopePath = path
+        // A newly inserted parent supersedes any descendant scopes already present.
+        nodes[nodeIndex].children.removeAll(keepingCapacity: false)
+    }
+
+    mutating func containsScope(covering path: String) -> Bool {
+        instrumentation.coverageQueryCount += 1
+        var nodeIndex = 0
+        if nodes[nodeIndex].scopePath != nil {
+            return true
+        }
+
+        for component in path.split(separator: "/", omittingEmptySubsequences: true) {
+            instrumentation.componentVisitCount += 1
+            guard let childIndex = nodes[nodeIndex].children[component] else {
+                return false
+            }
+            nodeIndex = childIndex
+            if nodes[nodeIndex].scopePath != nil {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    var collapsedScopes: [String] {
+        var scopes: [String] = []
+        var pendingNodeIndexes = [0]
+        while let nodeIndex = pendingNodeIndexes.popLast() {
+            if let scopePath = nodes[nodeIndex].scopePath {
+                scopes.append(scopePath)
+            } else {
+                pendingNodeIndexes.append(contentsOf: nodes[nodeIndex].children.values)
+            }
+        }
+        return scopes.sorted()
+    }
+
+    static func collapse(_ paths: Set<String>) -> [String] {
+        var index = FSEventPathScopeIndex()
+        for path in paths {
+            index.insert(path)
+        }
+        return index.collapsedScopes
+    }
+}
+
 enum FSEventLiveRefreshScopeRouter {
     static func route(events: [FileSystemEvent], rootPaths: [String]) -> FSEventLiveRefreshScopeRouting {
-        let rootPaths = rootPaths.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
+        let rootMatcher = FSEventRootMatcher(rootPaths: rootPaths)
         var exactPaths = Set<String>()
         var directoryScopes = Set<String>()
         var recursivePaths = Set<String>()
 
         for event in events {
-            let path = URL(fileURLWithPath: event.path).standardizedFileURL.path
+            let path = event.path
             if event.invalidatesEntireStream {
-                directoryScopes.formUnion(rootPaths)
-                recursivePaths.formUnion(rootPaths)
+                directoryScopes.formUnion(rootMatcher.rootPaths)
+                recursivePaths.formUnion(rootMatcher.rootPaths)
                 continue
             }
 
-            guard pathIsWithinRoots(path, rootPaths: rootPaths) else {
+            guard let rootPath = rootMatcher.matchingRoot(for: path) else {
                 if event.requiresRecursiveRescan {
-                    directoryScopes.formUnion(rootPaths)
-                    recursivePaths.formUnion(rootPaths)
+                    directoryScopes.formUnion(rootMatcher.rootPaths)
+                    recursivePaths.formUnion(rootMatcher.rootPaths)
                 }
                 continue
             }
 
             if event.requiresDirectoryRefreshScope {
-                let scope = directoryScope(for: event, standardizedPath: path, rootPaths: rootPaths)
+                let scope = directoryScope(for: event, path: path, rootPath: rootPath)
                 directoryScopes.insert(scope)
                 if event.requiresRecursiveRescan {
                     recursivePaths.insert(scope)
@@ -454,58 +795,40 @@ enum FSEventLiveRefreshScopeRouter {
             }
         }
 
+        var directoryScopeIndex = FSEventPathScopeIndex()
+        for scope in directoryScopes {
+            directoryScopeIndex.insert(scope)
+        }
         if !directoryScopes.isEmpty {
-            exactPaths = exactPaths.filter { exactPath in
-                directoryScopes.contains { scope in
-                    exactPath == scope || exactPath.hasPrefix(scope + "/")
-                } == false
-            }
+            exactPaths = exactPaths.filter { !directoryScopeIndex.containsScope(covering: $0) }
         }
 
         return FSEventLiveRefreshScopeRouting(
             exactPaths: exactPaths.sorted(),
-            directoryPaths: collapsedPaths(directoryScopes),
+            directoryPaths: directoryScopeIndex.collapsedScopes,
             recursivePaths: recursivePaths.sorted()
         )
     }
 
-    private static func pathIsWithinRoots(_ path: String, rootPaths: [String]) -> Bool {
-        rootPaths.contains { pathIsWithinRoot(path, root: $0) }
-    }
-
     private static func directoryScope(
         for event: FileSystemEvent,
-        standardizedPath: String,
-        rootPaths: [String]
+        path: String,
+        rootPath: String
     ) -> String {
-        guard let root = rootPaths.first(where: { pathIsWithinRoot(standardizedPath, root: $0) }) else {
-            return standardizedPath
-        }
-        guard standardizedPath != root else { return root }
+        guard path != rootPath else { return rootPath }
         if event.itemIsDirectory {
-            return standardizedPath
+            return path
         }
 
-        let parent = URL(fileURLWithPath: standardizedPath).deletingLastPathComponent().standardizedFileURL.path
-        guard pathIsWithinRoot(parent, root: root) else {
-            return root
+        let parent = URL(fileURLWithPath: path).deletingLastPathComponent().standardizedFileURL.path
+        guard pathIsWithinRoot(parent, root: rootPath) else {
+            return rootPath
         }
         return parent
     }
 
     private static func pathIsWithinRoot(_ path: String, root: String) -> Bool {
         root == "/" || path == root || path.hasPrefix(root + "/")
-    }
-
-    private static func collapsedPaths(_ paths: Set<String>) -> [String] {
-        var collapsed: [String] = []
-        for path in paths.sorted(by: { $0.count < $1.count }) {
-            guard !collapsed.contains(where: { pathIsWithinRoot(path, root: $0) }) else {
-                continue
-            }
-            collapsed.append(path)
-        }
-        return collapsed
     }
 }
 
@@ -776,8 +1099,10 @@ final class FSEventReconciliationCoordinator: @unchecked Sendable {
 private final class FSEventHistoryReplayCollector: @unchecked Sendable {
     private static let maximumHistoricalReconciliationPaths = 5_000
 
+    private let rootMatcher: FSEventRootMatcher
     private let rootPaths: [String]
     private let exclusions: FileExclusionRules
+    private var exclusionEvaluator: ((String, Bool) -> FileExclusionRules.Decision)?
     private let activeExclusionPatterns: Set<String>
     private let usesKnownExclusionFastPath: Bool
     private let lock = NSLock()
@@ -791,7 +1116,9 @@ private final class FSEventHistoryReplayCollector: @unchecked Sendable {
     private var droppedExcludedEventCount = 0
 
     init(rootPaths: [String], exclusions: FileExclusionRules, baselineEventID: UInt64) {
-        self.rootPaths = rootPaths.sorted { $0.count > $1.count }
+        let rootMatcher = FSEventRootMatcher(rootPaths: rootPaths)
+        self.rootMatcher = rootMatcher
+        self.rootPaths = rootMatcher.rootPaths
         self.exclusions = exclusions
         replayBaselineEventID = baselineEventID
         activeExclusionPatterns = Set(exclusions.patterns)
@@ -829,13 +1156,20 @@ private final class FSEventHistoryReplayCollector: @unchecked Sendable {
                 continue
             }
 
-            if usesKnownExclusionFastPath,
-               FSEventIndexFilter.isKnownExcludedEventPath(event.path, activePatterns: activeExclusionPatterns) {
-                droppedExcludedEventCount += 1
-                continue
+            let decision: FileExclusionRules.Decision
+            if usesKnownExclusionFastPath {
+                if FSEventIndexFilter.isKnownExcludedEventPath(
+                    event.path,
+                    activePatterns: activeExclusionPatterns,
+                    isDirectory: event.itemIsDirectory
+                ) {
+                    droppedExcludedEventCount += 1
+                    continue
+                }
+                decision = .index
+            } else {
+                decision = exclusionDecision(for: event)
             }
-
-            let decision = exclusionDecision(for: event)
             guard decision != .prune else {
                 droppedExcludedEventCount += 1
                 continue
@@ -909,15 +1243,23 @@ private final class FSEventHistoryReplayCollector: @unchecked Sendable {
     }
 
     private func matchingRoot(for path: String) -> String? {
-        rootPaths.first { path == $0 || path.hasPrefix($0 + "/") }
+        rootMatcher.matchingRoot(for: path)
     }
 
     private func exclusionDecision(for event: FileSystemEvent) -> FileExclusionRules.Decision {
-        let url = URL(fileURLWithPath: event.path).standardizedFileURL
-        let decision = exclusions.decision(url: url, roots: rootPaths, isDirectory: event.itemIsDirectory)
+        let evaluator: (String, Bool) -> FileExclusionRules.Decision
+        if let exclusionEvaluator {
+            evaluator = exclusionEvaluator
+        } else {
+            let newEvaluator = exclusions.makeDecisionEvaluator(roots: rootPaths)
+            exclusionEvaluator = newEvaluator
+            evaluator = newEvaluator
+        }
+
+        let decision = evaluator(event.path, event.itemIsDirectory)
         guard decision == .prune, !event.itemIsDirectory else { return decision }
 
-        let directoryDecision = exclusions.decision(url: url, roots: rootPaths, isDirectory: true)
+        let directoryDecision = evaluator(event.path, true)
         return directoryDecision == .index ? directoryDecision : decision
     }
 
@@ -949,14 +1291,7 @@ private final class FSEventHistoryReplayCollector: @unchecked Sendable {
     }
 
     private static func collapsedPaths(_ paths: Set<String>) -> [String] {
-        var collapsed: [String] = []
-        for path in paths.sorted(by: { $0.count < $1.count }) {
-            guard !collapsed.contains(where: { path == $0 || path.hasPrefix($0 + "/") }) else {
-                continue
-            }
-            collapsed.append(path)
-        }
-        return collapsed
+        FSEventPathScopeIndex.collapse(paths)
     }
 }
 
