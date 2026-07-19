@@ -192,6 +192,101 @@ struct InsightsTreemapLayoutTests {
         #expect(InsightsRootDisplay.activePlaceholderLabel(for: makeStats(isIndexing: true, phase: .saving)) == "Saving")
     }
 
+    @Test("index readiness distinguishes searchable from fully optimized")
+    func indexReadinessDistinguishesSearchableFromFullyOptimized() {
+        let searchable = makeStats(
+            isIndexing: false,
+            phase: .ready,
+            indexedCount: 800_000,
+            searchableCount: 800_000,
+            optimizedCount: 0
+        )
+        #expect(InsightsIndexReadinessDisplay.state(stats: searchable, failureCount: 0) == "Searchable")
+        #expect(InsightsIndexReadinessDisplay.summaryDetail(stats: searchable) == "800,000 searchable · 0% optimized")
+        #expect(InsightsIndexReadinessDisplay.progressValue(completed: 0, total: 800_000) == "0 / 800,000 (0%)")
+
+        let ready = makeStats(
+            isIndexing: false,
+            phase: .ready,
+            indexedCount: 800_000,
+            searchableCount: 800_000,
+            optimizedCount: 800_000
+        )
+        #expect(InsightsIndexReadinessDisplay.state(stats: ready, failureCount: 0) == "Ready")
+        #expect(InsightsIndexReadinessDisplay.percentString(completed: 800_000, total: 800_000) == "100%")
+        #expect(InsightsIndexReadinessDisplay.state(stats: ready, failureCount: 1) == "Needs attention")
+    }
+
+    @Test("last update display stays compact and flags cleanup warnings")
+    func lastUpdateDisplayStaysCompactAndFlagsCleanupWarnings() {
+        let summary = LastUpdateSummary(
+            completedAt: Date(),
+            targetVersion: "1.2.3",
+            currentVersion: "1.2.3",
+            targetReached: true,
+            assetName: "AllTheThings-1.2.3.dmg",
+            assetType: "dmg",
+            totalDuration: 12,
+            downloadDuration: 5,
+            preparationDuration: 2,
+            validationDuration: 1,
+            helperLaunchDuration: 0.1,
+            replacementDuration: 0.5,
+            installMethod: "copy",
+            cleanupWarning: true
+        )
+
+        #expect(InsightsLastUpdateDisplay.title(summary) == "Last Update")
+        #expect(InsightsLastUpdateDisplay.version(summary) == "v1.2.3")
+        #expect(InsightsLastUpdateDisplay.installPath(summary) == "DMG → copy · cleanup warning")
+
+        let failedAttempt = LastUpdateSummary(
+            completedAt: summary.completedAt,
+            targetVersion: "1.3.0",
+            currentVersion: "1.2.3",
+            targetReached: false,
+            assetName: summary.assetName,
+            assetType: summary.assetType,
+            totalDuration: summary.totalDuration,
+            downloadDuration: summary.downloadDuration,
+            preparationDuration: summary.preparationDuration,
+            validationDuration: summary.validationDuration,
+            helperLaunchDuration: summary.helperLaunchDuration,
+            replacementDuration: summary.replacementDuration,
+            installMethod: summary.installMethod,
+            cleanupWarning: summary.cleanupWarning
+        )
+        #expect(InsightsLastUpdateDisplay.title(failedAttempt) == "Update Attempt")
+        #expect(InsightsLastUpdateDisplay.version(failedAttempt) == "v1.3.0")
+    }
+
+    @Test("index work never reports idle while maintenance is queued")
+    func indexWorkNeverReportsIdleWhileMaintenanceIsQueued() {
+        let ready = makeStats(
+            isIndexing: false,
+            phase: .ready,
+            indexedCount: 100,
+            searchableCount: 100,
+            optimizedCount: 100
+        )
+        let reconciliation = IndexMaintenanceLiveDiagnostics(pendingReconciliationScopeCount: 2)
+        #expect(InsightsIndexWorkDisplay.state(stats: ready, live: reconciliation, activeIndexJobs: 0) == .queued)
+
+        let backgroundRefresh = IndexMaintenanceLiveDiagnostics(
+            pendingRefreshPathCount: 3,
+            pendingBackgroundRefreshPathCount: 3
+        )
+        #expect(InsightsIndexWorkDisplay.state(stats: ready, live: backgroundRefresh, activeIndexJobs: 0) == .catchingUp)
+
+        #expect(
+            InsightsIndexWorkDisplay.state(
+                stats: ready,
+                live: IndexMaintenanceLiveDiagnostics(),
+                activeIndexJobs: 0
+            ) == .idle
+        )
+    }
+
     @Test("query route summary handles zero cancellation and mixed routes")
     func queryRouteSummaryHandlesZeroCancellationAndMixedRoutes() {
         #expect(InsightsQueryRouteSummary.compactRouteSummary(SearchUsageCounters()) == "none")
@@ -266,6 +361,9 @@ struct InsightsTreemapLayoutTests {
         #expect(window.titleVisibility == .hidden)
         #expect(window.titlebarAppearsTransparent)
         #expect(window.styleMask.contains(.fullSizeContentView))
+        #expect(!window.styleMask.contains(.resizable))
+        #expect(window.contentMinSize == window.contentMaxSize)
+        #expect(window.contentMinSize == InsightsWindowController.defaultContentSize)
         #expect(window.titlebarAccessoryViewControllers.isEmpty)
         #expect(findView(accessibilityIdentifier: "Insights.TabControl", in: contentRoot) == nil)
         #expect(findView(accessibilityIdentifier: "Insights.TitlebarActions", in: contentRoot) == nil)
@@ -281,8 +379,8 @@ struct InsightsTreemapLayoutTests {
         #expect(healthTiles.frame.maxX <= healthFactsTable.frame.minX - 12)
         #expect(abs(healthTiles.frame.width - healthFactsTable.frame.width) <= 1)
         #expect(healthFactsTable.frame.width <= summaryPage.frame.width * 0.55)
-        #expect(healthFactsTable.frame.height <= 120)
-        #expect(healthTiles.frame.height > healthFactsTable.frame.height)
+        #expect(healthFactsTable.frame.height <= 230)
+        #expect(healthFactsTable.frame.height <= healthTiles.frame.height + 1)
     }
 
     @Test("Insights tab pages fit the initial viewport")
@@ -310,15 +408,19 @@ struct InsightsTreemapLayoutTests {
         )
         let window = try #require(controller.window)
         window.setContentSize(InsightsWindowController.defaultContentSize)
-        window.contentView?.layoutSubtreeIfNeeded()
+        window.orderFront(nil)
+        defer { window.orderOut(nil) }
+        settleWindowLayout(window)
 
         let contentRoot = try #require(findView(accessibilityIdentifier: "Insights.ContentView", in: window.contentView))
         let tabControl = try #require(findTitlebarTabControl(in: window))
-        let pageIdentifiers = [
-            "Insights.SummaryPage",
-            "Insights.IndexPage",
-            "Insights.ActivityPage",
-            "Insights.EnergyPage"
+        let fixedFrameSize = window.frame.size
+        let fixedContentSize = try #require(window.contentView?.frame.size)
+        let tabsToTest = [
+            (segment: 1, identifier: "Insights.IndexPage"),
+            (segment: 2, identifier: "Insights.ActivityPage"),
+            (segment: 3, identifier: "Insights.EnergyPage"),
+            (segment: 0, identifier: "Insights.SummaryPage")
         ]
         let expectedTables = [
             "Insights.SummaryPage": "Insights.HealthFactsTable",
@@ -331,11 +433,15 @@ struct InsightsTreemapLayoutTests {
             "Insights.EnergyPage": "Insights.EnergyChart"
         ]
 
-        for (index, identifier) in pageIdentifiers.enumerated() {
-            tabControl.selectedSegment = index
+        for tab in tabsToTest {
+            let identifier = tab.identifier
+            tabControl.selectedSegment = tab.segment
             _ = tabControl.sendAction(tabControl.action, to: tabControl.target)
-            window.contentView?.layoutSubtreeIfNeeded()
+            settleWindowLayout(window)
             contentRoot.layoutSubtreeIfNeeded()
+
+            #expect(window.frame.size == fixedFrameSize, "\(identifier) changed the window frame")
+            #expect(window.contentView?.frame.size == fixedContentSize, "\(identifier) changed the content size")
 
             let page = try #require(findView(accessibilityIdentifier: identifier, in: contentRoot))
             #expect(contentRoot.fittingSize.height <= contentRoot.bounds.height + 1)
@@ -382,6 +488,8 @@ struct InsightsTreemapLayoutTests {
                 let queryFactsTable = try #require(findView(accessibilityIdentifier: "Insights.QueryRouteFactsTable", in: page))
                 let activityCard = try #require(findView(accessibilityIdentifier: "Insights.ActivityCard", in: page))
                 let activityChart = try #require(findView(accessibilityIdentifier: "Insights.ActivityChart", in: page))
+                let maintenanceChart = try #require(findView(accessibilityIdentifier: "Insights.MaintenanceCostChart", in: page))
+                let activityDetailMode = try #require(findView(accessibilityIdentifier: "Insights.ActivityDetailModeControl", in: page) as? NSSegmentedControl)
                 let routeMatrixHeader = try #require(findView(accessibilityIdentifier: "Insights.RouteMatrixHeader", in: page))
                 let previewRouteGroup = try #require(findView(accessibilityIdentifier: "Insights.PreviewRouteGroup", in: page))
                 let finalRouteGroup = try #require(findView(accessibilityIdentifier: "Insights.FinalRouteGroup", in: page))
@@ -397,6 +505,10 @@ struct InsightsTreemapLayoutTests {
                 #expect(queryPanel.frame.maxY <= page.bounds.maxY + 1)
                 #expect(activityCard.frame.minY >= page.bounds.minY - 1)
                 #expect(activityChart.frame.height >= 150)
+                #expect(maintenanceChart.frame == activityChart.frame)
+                #expect(!activityChart.isHidden)
+                #expect(maintenanceChart.isHidden)
+                #expect((0..<activityDetailMode.segmentCount).map { activityDetailMode.label(forSegment: $0) } == ["Activity", "Maintenance"])
                 #expect(queryFactsTable.frame.width >= 600)
                 #expect(queryFactsTable.frame.width <= page.bounds.width * 0.75)
                 #expect(queryFactsTable.frame.height <= 150)
@@ -417,6 +529,16 @@ struct InsightsTreemapLayoutTests {
                 #expect(routeMatrixHeader.frame.height <= 32)
                 #expect(previewRouteGroup.frame.height <= 58)
                 #expect(finalRouteGroup.frame.height <= 58)
+
+                activityDetailMode.selectedSegment = 1
+                _ = activityDetailMode.sendAction(activityDetailMode.action, to: activityDetailMode.target)
+                window.contentView?.layoutSubtreeIfNeeded()
+                #expect(activityChart.isHidden)
+                #expect(!maintenanceChart.isHidden)
+                #expect(window.frame.size == fixedFrameSize)
+
+                activityDetailMode.selectedSegment = 0
+                _ = activityDetailMode.sendAction(activityDetailMode.action, to: activityDetailMode.target)
             }
 
             if identifier == "Insights.EnergyPage" {
@@ -896,14 +1018,19 @@ struct InsightsTreemapLayoutTests {
         isReconciling: Bool = false,
         isUpdating: Bool = false,
         phase: IndexPhase,
+        indexedCount: Int = 0,
+        searchableCount: Int? = nil,
+        optimizedCount: Int? = nil,
         activityPresentation: IndexActivityPresentation = .foreground
     ) -> IndexStats {
         IndexStats(
-            indexedCount: 0,
+            indexedCount: indexedCount,
             isIndexing: isIndexing,
             isReconciling: isReconciling,
             isUpdating: isUpdating,
             phase: phase,
+            searchableCount: searchableCount,
+            optimizedCount: optimizedCount,
             status: "",
             lastUpdated: Date(),
             activityPresentation: activityPresentation
@@ -927,6 +1054,14 @@ struct InsightsTreemapLayoutTests {
     @MainActor
     private func findTitlebarTabControl(in window: NSWindow) -> NSSegmentedControl? {
         findView(accessibilityIdentifier: "Insights.TabControl", in: window.contentView) as? NSSegmentedControl
+    }
+
+    @MainActor
+    private func settleWindowLayout(_ window: NSWindow) {
+        window.contentView?.layoutSubtreeIfNeeded()
+        window.displayIfNeeded()
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05))
+        window.contentView?.layoutSubtreeIfNeeded()
     }
 
     @MainActor

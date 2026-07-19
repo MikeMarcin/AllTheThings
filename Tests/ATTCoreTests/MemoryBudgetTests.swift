@@ -377,13 +377,85 @@ struct MemoryBudgetTests {
         ), maxResults: 5).results.contains { $0.record.name == "File000010.swift" })
     }
 
-    @Test("v7 snapshots persist a virtual component namespace")
-    func v7SnapshotsPersistVirtualComponentNamespace() {
+    @Test("package row preparation shares ancestor work across records")
+    func packageRowPreparationSharesAncestorWorkAcrossRecords() {
+        let recordCount = 10_000
+        let root = "/tmp/allthethings-package-work"
+        let directory = "\(root)/shared/deep"
+        let records = (0..<recordCount).map { index in
+            makeRecord(path: "\(directory)/File\(index).swift")
+        }
+
+        let diagnostics = MappedRecordStore.packageRowPreparationDiagnosticsForTesting(
+            records: records,
+            roots: [root]
+        )
+
+        #expect(diagnostics.sourceRecordCount == recordCount)
+        #expect(diagnostics.resultRowCount == recordCount)
+        #expect(diagnostics.virtualRowCount == 4)
+        #expect(diagnostics.ancestorPathProbeCount == 5)
+    }
+
+    @Test("optimized package row preparation preserves virtual depth-first layout")
+    func optimizedPackageRowPreparationPreservesVirtualDepthFirstLayout() throws {
+        let packageURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AllTheThings-PackageRows-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: packageURL) }
+
+        let root = "/workspace/project"
+        let records = [
+            makeRecord(path: root, isDirectory: true),
+            makeRecord(path: "\(root)/zeta/Z.txt"),
+            makeRecord(path: "\(root)/alpha", isDirectory: true),
+            makeRecord(path: "\(root)/alpha/A.txt")
+        ]
+        try MappedRecordStore.writePackage(
+            records: records,
+            roots: [root],
+            exclusionPatterns: [],
+            packageURL: packageURL
+        )
+
+        let store = try MappedRecordStore(packageURL: packageURL)
+        #expect((0..<store.count).map { store.path(at: $0) } == [
+            "/workspace",
+            "/workspace/project",
+            "/workspace/project/alpha",
+            "/workspace/project/alpha/A.txt",
+            "/workspace/project/zeta",
+            "/workspace/project/zeta/Z.txt"
+        ])
+        #expect((0..<store.count).map { store.isVirtual(at: $0) } == [true, false, false, false, true, false])
+        #expect(store.storedResultCount == records.count)
+        #expect(store.parentRowID(at: 3) == 2)
+        #expect(store.subtreeEnd(at: 0) == store.count)
+        #expect(store.subtreeEnd(at: 2) == 4)
+    }
+
+    @Test("snapshots share name and virtual component postings")
+    func snapshotsShareNameAndVirtualComponentPostings() throws {
         let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let supportDirectory = try applicationSupportDirectory(for: applicationName)
+        defer { try? FileManager.default.removeItem(at: supportDirectory) }
         let records = makeCatalogRecords(count: 2_000)
         let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
         index.replaceRecordsForTesting(records)
         index.persistSnapshotForTesting()
+
+        let packageURL = SnapshotLayout.packageURL(in: supportDirectory)
+        let namePostingsURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.namePostings)
+        let legacyComponentPostingsURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.componentPostings)
+        let componentSupplementURL = packageURL.appendingPathComponent(
+            SnapshotLayout.FileName.componentSupplementPostings
+        )
+        let fileManager = FileManager.default
+        let nameByteCount = try fileSize(at: namePostingsURL, fileManager: fileManager)
+        let legacyComponentByteCount = try fileSize(at: legacyComponentPostingsURL, fileManager: fileManager)
+
+        #expect(nameByteCount > 0)
+        #expect(legacyComponentByteCount == 0)
+        #expect(try fileSize(at: componentSupplementURL, fileManager: fileManager) == 0)
 
         let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
         let diagnostics = reloaded.currentDiagnostics()
@@ -392,7 +464,7 @@ struct MemoryBudgetTests {
         #expect(diagnostics.indexedCount == records.count)
         #expect(diagnostics.resultCount == records.count)
         #expect(diagnostics.virtualRowCount > 0)
-        #expect(diagnostics.componentGramPostingCount > diagnostics.nameGramPostingCount)
+        #expect(diagnostics.componentGramPostingCount == diagnostics.nameGramPostingCount)
 
         let response = reloaded.search(SearchRequest(
             query: "catalog",
@@ -403,6 +475,58 @@ struct MemoryBudgetTests {
         #expect(response.usesIndexedCandidates)
         #expect(response.totalMatches == records.count)
         #expect(response.results.count == 25)
+    }
+
+    @Test("legacy combined component postings remain searchable")
+    func legacyCombinedComponentPostingsRemainSearchable() throws {
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let supportDirectory = try applicationSupportDirectory(for: applicationName)
+        defer { try? FileManager.default.removeItem(at: supportDirectory) }
+        let records = makeCatalogRecords(count: 1_000)
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        index.replaceRecordsForTesting(records)
+        index.persistSnapshotForTesting()
+
+        let fileManager = FileManager.default
+        let packageURL = SnapshotLayout.packageURL(in: supportDirectory)
+        let store = try MappedRecordStore(packageURL: packageURL)
+        var combinedPostingMap: [Int: [Int32]] = [:]
+        var keys = Set<Int>()
+        for rowID in 0..<store.count {
+            keys.removeAll(keepingCapacity: true)
+            collectSearchGramKeysForTesting(from: store.normalizedName(at: rowID), into: &keys)
+            for key in keys {
+                combinedPostingMap[key, default: []].append(Int32(rowID))
+            }
+        }
+        let builtCombinedIndex = try MappedIntPostingIndex.build(
+            from: combinedPostingMap,
+            temporaryName: "att-legacy-component-postings-test"
+        )
+        let combinedIndex = try #require(builtCombinedIndex)
+        try combinedIndex.write(
+            to: packageURL.appendingPathComponent(SnapshotLayout.FileName.componentPostings)
+        )
+        let supplementURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.componentSupplementPostings)
+        if fileManager.fileExists(atPath: supplementURL.path) {
+            try fileManager.removeItem(at: supplementURL)
+        }
+
+        let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
+        let ancestorResponse = reloaded.search(SearchRequest(
+            query: "catalog",
+            sort: SortSpec(column: .name, ascending: true),
+            includeHidden: false
+        ), maxResults: 25)
+        let nameResponse = reloaded.search(SearchRequest(
+            query: "File000123",
+            sort: SortSpec(column: .relevance, ascending: false),
+            includeHidden: false
+        ), maxResults: 25)
+
+        #expect(ancestorResponse.usesIndexedCandidates)
+        #expect(ancestorResponse.totalMatches == records.count)
+        #expect(nameResponse.results.contains { $0.record.name == "File000123.swift" })
     }
 
     @Test("corrupt mmap snapshots are ignored")
@@ -1093,6 +1217,26 @@ struct MemoryBudgetTests {
     private func applicationSupportDirectory(for applicationName: String) throws -> URL {
         let root = try #require(FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first)
         return root.appendingPathComponent(applicationName, isDirectory: true)
+    }
+
+    private func fileSize(at url: URL, fileManager: FileManager) throws -> Int {
+        let attributes = try fileManager.attributesOfItem(atPath: url.path)
+        return try #require((attributes[.size] as? NSNumber)?.intValue)
+    }
+
+    private func collectSearchGramKeysForTesting(from text: String, into keys: inout Set<Int>) {
+        let bytes = Array(text.utf8)
+        guard !bytes.isEmpty else { return }
+
+        for length in 1...min(3, bytes.count) {
+            for start in 0...(bytes.count - length) {
+                var key = length << 24
+                for offset in 0..<length {
+                    key |= Int(bytes[start + offset]) << ((2 - offset) * 8)
+                }
+                keys.insert(key)
+            }
+        }
     }
 
     private func waitUntil(

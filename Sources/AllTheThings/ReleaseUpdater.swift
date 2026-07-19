@@ -4,6 +4,48 @@ import Darwin
 import Foundation
 import Security
 
+struct PendingUpdatePhaseRecord: Codable, Equatable, Sendable {
+    let assetType: String
+    var downloadDuration: TimeInterval?
+    var preparationDuration: TimeInterval?
+    var validationDuration: TimeInterval?
+    var helperLaunchDuration: TimeInterval?
+    var cleanupWarning: Bool?
+
+    init(
+        assetType: String,
+        downloadDuration: TimeInterval? = nil,
+        preparationDuration: TimeInterval? = nil,
+        validationDuration: TimeInterval? = nil,
+        helperLaunchDuration: TimeInterval? = nil,
+        cleanupWarning: Bool? = nil
+    ) {
+        self.assetType = assetType
+        self.downloadDuration = downloadDuration
+        self.preparationDuration = preparationDuration
+        self.validationDuration = validationDuration
+        self.helperLaunchDuration = helperLaunchDuration
+        self.cleanupWarning = cleanupWarning
+    }
+}
+
+struct LastUpdateSummary: Codable, Equatable, Sendable {
+    let completedAt: Date
+    let targetVersion: String
+    let currentVersion: String
+    let targetReached: Bool
+    let assetName: String
+    let assetType: String?
+    let totalDuration: TimeInterval
+    let downloadDuration: TimeInterval?
+    let preparationDuration: TimeInterval?
+    let validationDuration: TimeInterval?
+    let helperLaunchDuration: TimeInterval?
+    let replacementDuration: TimeInterval?
+    let installMethod: String?
+    let cleanupWarning: Bool?
+}
+
 @MainActor
 final class ReleaseUpdater {
     static let shared = ReleaseUpdater()
@@ -15,6 +57,8 @@ final class ReleaseUpdater {
         static let installStartedAt = "ATTUpdateInstallStartedAt"
         static let installTargetVersion = "ATTUpdateInstallTargetVersion"
         static let installAssetName = "ATTUpdateInstallAssetName"
+        static let pendingPhaseRecord = "ATTUpdatePendingPhaseRecordV1"
+        static let lastUpdateSummary = "ATTLastUpdateSummaryV1"
     }
 
     private enum UpdateError: LocalizedError {
@@ -188,6 +232,7 @@ final class ReleaseUpdater {
     private struct PreparedUpdate: Sendable {
         let appURL: URL
         let workDirectory: URL
+        let cleanupWarning: Bool
     }
 
     private struct MountedDiskImage: Sendable {
@@ -235,6 +280,17 @@ final class ReleaseUpdater {
         ])
     }
 
+    nonisolated static func lastUpdateSummary(defaults: UserDefaults = .standard) -> LastUpdateSummary? {
+        guard
+            let data = defaults.data(forKey: DefaultsKey.lastUpdateSummary),
+            let summary = try? JSONDecoder().decode(LastUpdateSummary.self, from: data),
+            isValid(summary)
+        else {
+            return nil
+        }
+        return summary
+    }
+
     func performLaunchMaintenance() {
         recordCompletedInstallIfNeeded()
         Task.detached(priority: .utility) {
@@ -243,28 +299,46 @@ final class ReleaseUpdater {
     }
 
     private func recordCompletedInstallIfNeeded() {
-        guard let startedAt = defaults.object(forKey: DefaultsKey.installStartedAt) as? Date else {
+        let currentVersion = currentBundleVersion()
+        let receipt = Self.loadInstallReceipt()
+        guard let summary = completePendingInstallTelemetry(
+            currentVersion: currentVersion,
+            completedAt: Date(),
+            receipt: receipt
+        ) else {
             return
         }
 
-        let targetVersion = defaults.string(forKey: DefaultsKey.installTargetVersion) ?? "unknown"
-        let assetName = defaults.string(forKey: DefaultsKey.installAssetName) ?? "unknown"
-        let currentVersion = currentBundleVersion()
         var fields: [String: DiagnosticLogFieldValue] = [
-            "assetName": .publicString(assetName),
-            "targetVersion": .publicString(targetVersion),
-            "currentVersion": .publicString(currentVersion),
-            "targetReached": .publicBool(currentVersion == targetVersion),
-            "elapsed": .publicDouble(max(0, Date().timeIntervalSince(startedAt)))
+            "assetName": .publicString(summary.assetName),
+            "targetVersion": .publicString(summary.targetVersion),
+            "currentVersion": .publicString(summary.currentVersion),
+            "targetReached": .publicBool(summary.targetReached),
+            "elapsed": .publicDouble(summary.totalDuration)
         ]
-
-        if let receipt = Self.loadInstallReceipt() {
-            if let method = receipt["installMethod"] {
-                fields["installMethod"] = .publicString(method)
-            }
-            if let duration = receipt["replacementDuration"].flatMap(Double.init) {
-                fields["replacementDuration"] = .publicDouble(duration)
-            }
+        if let assetType = summary.assetType {
+            fields["assetType"] = .publicString(assetType)
+        }
+        if let method = summary.installMethod {
+            fields["installMethod"] = .publicString(method)
+        }
+        if let duration = summary.replacementDuration {
+            fields["replacementDuration"] = .publicDouble(duration)
+        }
+        if let cleanupWarning = summary.cleanupWarning {
+            fields["cleanupWarning"] = .publicBool(cleanupWarning)
+        }
+        if let duration = summary.downloadDuration {
+            fields["downloadDuration"] = .publicDouble(duration)
+        }
+        if let duration = summary.preparationDuration {
+            fields["preparationDuration"] = .publicDouble(duration)
+        }
+        if let duration = summary.validationDuration {
+            fields["validationDuration"] = .publicDouble(duration)
+        }
+        if let duration = summary.helperLaunchDuration {
+            fields["helperLaunchDuration"] = .publicDouble(duration)
         }
 
         DiagnosticLogger.shared.log(
@@ -272,14 +346,55 @@ final class ReleaseUpdater {
             event: "updates.installCompleted",
             fields: fields
         )
-        clearPendingInstallTelemetry()
         try? FileManager.default.removeItem(at: Self.installReceiptURL())
+    }
+
+    private func completePendingInstallTelemetry(
+        currentVersion: String,
+        completedAt: Date,
+        receipt: [String: String]?
+    ) -> LastUpdateSummary? {
+        guard let startedAt = defaults.object(forKey: DefaultsKey.installStartedAt) as? Date else {
+            return nil
+        }
+
+        let targetVersion = defaults.string(forKey: DefaultsKey.installTargetVersion) ?? "unknown"
+        let assetName = defaults.string(forKey: DefaultsKey.installAssetName) ?? "unknown"
+        let phaseRecord = Self.pendingPhaseRecord(defaults: defaults)
+        let replacementDuration = Self.normalizedDuration(
+            receipt?["replacementDuration"].flatMap(Double.init)
+        )
+        let installMethod = receipt?["installMethod"].flatMap(Self.normalizedInstallMethod)
+        let summary = LastUpdateSummary(
+            completedAt: completedAt,
+            targetVersion: targetVersion,
+            currentVersion: currentVersion,
+            targetReached: currentVersion == targetVersion,
+            assetName: assetName,
+            assetType: phaseRecord?.assetType ?? Self.assetTypeName(forAssetName: assetName),
+            totalDuration: max(0, completedAt.timeIntervalSince(startedAt)),
+            downloadDuration: phaseRecord?.downloadDuration,
+            preparationDuration: phaseRecord?.preparationDuration,
+            validationDuration: phaseRecord?.validationDuration,
+            helperLaunchDuration: phaseRecord?.helperLaunchDuration,
+            replacementDuration: replacementDuration,
+            installMethod: installMethod,
+            cleanupWarning: phaseRecord?.cleanupWarning
+        )
+
+        guard Self.saveLastUpdateSummary(summary, defaults: defaults), defaults.synchronize() else {
+            return nil
+        }
+        clearPendingInstallTelemetry()
+        return summary
     }
 
     private func clearPendingInstallTelemetry() {
         defaults.removeObject(forKey: DefaultsKey.installStartedAt)
         defaults.removeObject(forKey: DefaultsKey.installTargetVersion)
         defaults.removeObject(forKey: DefaultsKey.installAssetName)
+        defaults.removeObject(forKey: DefaultsKey.pendingPhaseRecord)
+        defaults.synchronize()
     }
 
     func checkAutomaticallyIfNeeded(presentingWindow: NSWindow?) {
@@ -492,6 +607,7 @@ final class ReleaseUpdater {
         var workDirectory: URL?
         var shouldCleanUp = true
         let installStartedAt = Date()
+        var phaseRecord = PendingUpdatePhaseRecord(assetType: Self.assetTypeName(asset))
 
         DiagnosticLogger.shared.log(
             category: "updates",
@@ -507,7 +623,11 @@ final class ReleaseUpdater {
             let downloadStartedAt = Date()
             let downloaded = try await Self.download(asset: asset)
             workDirectory = downloaded.workDirectory
-            logInstallPhase("download", startedAt: downloadStartedAt, asset: asset)
+            phaseRecord.downloadDuration = logInstallPhase(
+                "download",
+                startedAt: downloadStartedAt,
+                asset: asset
+            )
 
             try Task.checkCancellation()
             progressWindowController?.updateStatus("Preparing update...")
@@ -515,7 +635,12 @@ final class ReleaseUpdater {
             let prepared = try await Task.detached(priority: .userInitiated) {
                 try Self.prepareDownloadedApp(downloaded: downloaded, asset: asset)
             }.value
-            logInstallPhase("preparation", startedAt: preparationStartedAt, asset: asset)
+            phaseRecord.preparationDuration = logInstallPhase(
+                "preparation",
+                startedAt: preparationStartedAt,
+                asset: asset
+            )
+            phaseRecord.cleanupWarning = prepared.cleanupWarning
 
             try Task.checkCancellation()
             progressWindowController?.updateStatus("Validating update...")
@@ -534,7 +659,11 @@ final class ReleaseUpdater {
                     currentVersion: currentVersion
                 )
             }.value
-            logInstallPhase("validation", startedAt: validationStartedAt, asset: asset)
+            phaseRecord.validationDuration = logInstallPhase(
+                "validation",
+                startedAt: validationStartedAt,
+                asset: asset
+            )
 
             try Self.preflightInstallPermissions(currentAppURL: currentAppURL)
 
@@ -549,6 +678,7 @@ final class ReleaseUpdater {
             defaults.set(installStartedAt, forKey: DefaultsKey.installStartedAt)
             defaults.set(downloadedVersion, forKey: DefaultsKey.installTargetVersion)
             defaults.set(asset.name, forKey: DefaultsKey.installAssetName)
+            Self.savePendingPhaseRecord(phaseRecord, defaults: defaults)
             defaults.synchronize()
             let helperStartedAt = Date()
             do {
@@ -557,7 +687,12 @@ final class ReleaseUpdater {
                 clearPendingInstallTelemetry()
                 throw error
             }
-            logInstallPhase("helperLaunch", startedAt: helperStartedAt, asset: asset)
+            phaseRecord.helperLaunchDuration = logInstallPhase(
+                "helperLaunch",
+                startedAt: helperStartedAt,
+                asset: asset
+            )
+            Self.savePendingPhaseRecord(phaseRecord, defaults: defaults)
 
             shouldCleanUp = false
             defaults.removeObject(forKey: DefaultsKey.skippedReleaseTag)
@@ -585,7 +720,9 @@ final class ReleaseUpdater {
         }
     }
 
-    private func logInstallPhase(_ phase: String, startedAt: Date, asset: GitHubAsset) {
+    @discardableResult
+    private func logInstallPhase(_ phase: String, startedAt: Date, asset: GitHubAsset) -> TimeInterval {
+        let duration = max(0, Date().timeIntervalSince(startedAt))
         DiagnosticLogger.shared.log(
             category: "updates",
             event: "updates.installPhaseCompleted",
@@ -593,9 +730,10 @@ final class ReleaseUpdater {
                 "phase": .publicString(phase),
                 "assetName": .publicString(asset.name),
                 "assetType": .publicString(Self.assetTypeName(asset)),
-                "duration": .publicDouble(max(0, Date().timeIntervalSince(startedAt)))
+                "duration": .publicDouble(duration)
             ]
         )
+        return duration
     }
 
     private nonisolated static func download(asset: GitHubAsset) async throws -> DownloadedAsset {
@@ -664,7 +802,11 @@ final class ReleaseUpdater {
         ])
 
         let appURL = try findAppBundle(in: extractionDirectory)
-        return PreparedUpdate(appURL: appURL, workDirectory: downloaded.workDirectory)
+        return PreparedUpdate(
+            appURL: appURL,
+            workDirectory: downloaded.workDirectory,
+            cleanupWarning: false
+        )
     }
 
     private nonisolated static func prepareTarUpdate(downloaded: DownloadedAsset) throws -> PreparedUpdate {
@@ -678,7 +820,11 @@ final class ReleaseUpdater {
         ])
 
         let appURL = try findAppBundle(in: extractionDirectory)
-        return PreparedUpdate(appURL: appURL, workDirectory: downloaded.workDirectory)
+        return PreparedUpdate(
+            appURL: appURL,
+            workDirectory: downloaded.workDirectory,
+            cleanupWarning: false
+        )
     }
 
     private nonisolated static func prepareDiskImageUpdate(downloaded: DownloadedAsset) throws -> PreparedUpdate {
@@ -701,8 +847,11 @@ final class ReleaseUpdater {
             fromAttachPlist: attachResult.standardOutput,
             fallbackMountPoint: mountPoint
         )
+        var didAttemptDetach = false
         defer {
-            _ = detachDiskImageBestEffort(mountedImage)
+            if !didAttemptDetach {
+                _ = detachDiskImageBestEffort(mountedImage)
+            }
         }
 
         let mountedAppURL = try findAppBundle(in: mountPoint)
@@ -712,7 +861,13 @@ final class ReleaseUpdater {
             copiedAppURL.path
         ])
 
-        return PreparedUpdate(appURL: copiedAppURL, workDirectory: downloaded.workDirectory)
+        let detached = detachDiskImageBestEffort(mountedImage)
+        didAttemptDetach = true
+        return PreparedUpdate(
+            appURL: copiedAppURL,
+            workDirectory: downloaded.workDirectory,
+            cleanupWarning: !detached
+        )
     }
 
     private nonisolated static func validatePreparedApp(
@@ -921,6 +1076,98 @@ final class ReleaseUpdater {
         if asset.isZipArchive { return "zip" }
         if asset.isDiskImage { return "dmg" }
         return "archive"
+    }
+
+    private nonisolated static func assetTypeName(forAssetName assetName: String) -> String? {
+        let lowercasedName = assetName.lowercased()
+        if lowercasedName.hasSuffix(".zip") { return "zip" }
+        if lowercasedName.hasSuffix(".dmg") { return "dmg" }
+        if lowercasedName.hasSuffix(".tar.gz") || lowercasedName.hasSuffix(".tgz") {
+            return "archive"
+        }
+        return nil
+    }
+
+    private nonisolated static func pendingPhaseRecord(defaults: UserDefaults) -> PendingUpdatePhaseRecord? {
+        guard
+            let data = defaults.data(forKey: DefaultsKey.pendingPhaseRecord),
+            let record = try? JSONDecoder().decode(PendingUpdatePhaseRecord.self, from: data),
+            isValid(record)
+        else {
+            return nil
+        }
+        return record
+    }
+
+    @discardableResult
+    private nonisolated static func savePendingPhaseRecord(
+        _ record: PendingUpdatePhaseRecord,
+        defaults: UserDefaults
+    ) -> Bool {
+        guard
+            isValid(record),
+            let data = try? JSONEncoder().encode(record)
+        else {
+            return false
+        }
+        defaults.set(data, forKey: DefaultsKey.pendingPhaseRecord)
+        return true
+    }
+
+    @discardableResult
+    private nonisolated static func saveLastUpdateSummary(
+        _ summary: LastUpdateSummary,
+        defaults: UserDefaults
+    ) -> Bool {
+        guard
+            isValid(summary),
+            let data = try? JSONEncoder().encode(summary)
+        else {
+            return false
+        }
+        defaults.set(data, forKey: DefaultsKey.lastUpdateSummary)
+        return true
+    }
+
+    private nonisolated static func normalizedInstallMethod(_ value: String) -> String? {
+        switch value {
+        case "move", "copy":
+            return value
+        default:
+            return nil
+        }
+    }
+
+    private nonisolated static func normalizedDuration(_ value: TimeInterval?) -> TimeInterval? {
+        guard let value, isValidDuration(value) else { return nil }
+        return value
+    }
+
+    private nonisolated static func isValid(_ record: PendingUpdatePhaseRecord) -> Bool {
+        !record.assetType.isEmpty && areValidDurations([
+            record.downloadDuration,
+            record.preparationDuration,
+            record.validationDuration,
+            record.helperLaunchDuration
+        ])
+    }
+
+    private nonisolated static func isValid(_ summary: LastUpdateSummary) -> Bool {
+        isValidDuration(summary.totalDuration) && areValidDurations([
+            summary.downloadDuration,
+            summary.preparationDuration,
+            summary.validationDuration,
+            summary.helperLaunchDuration,
+            summary.replacementDuration
+        ])
+    }
+
+    private nonisolated static func areValidDurations(_ values: [TimeInterval?]) -> Bool {
+        values.compactMap { $0 }.allSatisfy(isValidDuration)
+    }
+
+    private nonisolated static func isValidDuration(_ value: TimeInterval) -> Bool {
+        value.isFinite && value >= 0
     }
 
     private nonisolated static func mountedDiskImage(
@@ -1171,6 +1418,46 @@ final class ReleaseUpdater {
     }
 
 #if DEBUG
+    func stagePendingInstallTelemetryForTesting(
+        startedAt: Date,
+        targetVersion: String,
+        assetName: String,
+        phaseRecord: PendingUpdatePhaseRecord?
+    ) {
+        defaults.set(startedAt, forKey: DefaultsKey.installStartedAt)
+        defaults.set(targetVersion, forKey: DefaultsKey.installTargetVersion)
+        defaults.set(assetName, forKey: DefaultsKey.installAssetName)
+        if let phaseRecord {
+            Self.savePendingPhaseRecord(phaseRecord, defaults: defaults)
+        } else {
+            defaults.removeObject(forKey: DefaultsKey.pendingPhaseRecord)
+        }
+        defaults.synchronize()
+    }
+
+    func completePendingInstallTelemetryForTesting(
+        currentVersion: String,
+        completedAt: Date,
+        receipt: [String: String]? = nil
+    ) -> LastUpdateSummary? {
+        completePendingInstallTelemetry(
+            currentVersion: currentVersion,
+            completedAt: completedAt,
+            receipt: receipt
+        )
+    }
+
+    func hasPendingInstallTelemetryForTesting() -> Bool {
+        defaults.object(forKey: DefaultsKey.installStartedAt) != nil ||
+            defaults.object(forKey: DefaultsKey.installTargetVersion) != nil ||
+            defaults.object(forKey: DefaultsKey.installAssetName) != nil ||
+            defaults.object(forKey: DefaultsKey.pendingPhaseRecord) != nil
+    }
+
+    nonisolated static func setLastUpdateSummaryDataForTesting(_ data: Data, defaults: UserDefaults) {
+        defaults.set(data, forKey: DefaultsKey.lastUpdateSummary)
+    }
+
     nonisolated static func preferredAssetNameForTesting(_ assetNames: [String]) -> String? {
         let assets = assetNames.map { name in
             GitHubAsset(

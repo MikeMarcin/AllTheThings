@@ -1,5 +1,54 @@
 import Foundation
 
+/// Coalesces small writes while keeping the pending in-memory payload bounded.
+///
+/// Package construction emits many short, fixed-width records and strings. Writing
+/// each one through `FileHandle` turns serialization into hundreds of thousands of
+/// syscalls for a large index, so keep a modest buffer and flush large payloads
+/// directly.
+final class BufferedFileWriter {
+    static let defaultBufferSize = 1_048_576
+
+    private let handle: FileHandle
+    private let bufferSize: Int
+    private var buffer: Data
+    private(set) var physicalWriteCount = 0
+
+    init(handle: FileHandle, bufferSize: Int = BufferedFileWriter.defaultBufferSize) {
+        precondition(bufferSize > 0, "The file-write buffer must not be empty")
+        self.handle = handle
+        self.bufferSize = bufferSize
+        self.buffer = Data()
+        self.buffer.reserveCapacity(bufferSize)
+    }
+
+    func write(contentsOf data: Data) throws {
+        guard !data.isEmpty else { return }
+
+        if data.count >= bufferSize {
+            try flush()
+            try writeDirectly(data)
+            return
+        }
+
+        if buffer.count + data.count > bufferSize {
+            try flush()
+        }
+        buffer.append(data)
+    }
+
+    func flush() throws {
+        guard !buffer.isEmpty else { return }
+        try writeDirectly(buffer)
+        buffer.removeAll(keepingCapacity: true)
+    }
+
+    private func writeDirectly(_ data: Data) throws {
+        try handle.write(contentsOf: data)
+        physicalWriteCount += 1
+    }
+}
+
 enum RecordStoreKind: String, Sendable {
     case empty
     case heapPaged
@@ -247,6 +296,7 @@ protocol RecordStore: AnyObject, Sendable {
     var heapPageCount: Int { get }
     var overlayCount: Int { get }
     var hasColumnarSidecars: Bool { get }
+    var hasContiguousSubtreeRanges: Bool { get }
     var storedVisibleCount: Int? { get }
     var storedResultCount: Int? { get }
     var storedRootAttribution: RootAttributionTable? { get }
@@ -272,6 +322,7 @@ protocol RecordStore: AnyObject, Sendable {
     func normalizedPath(at index: Int) -> String
     func parentRowID(at index: Int) -> Int?
     func subtreeEnd(at index: Int) -> Int
+    func rowIDs(inSubtreeAtPath path: String) -> [Int]?
     func depth(at index: Int) -> Int
     func rootID(at index: Int) -> UInt16?
     func rootPath(at index: Int) -> String?
@@ -338,6 +389,7 @@ extension RecordStore {
     var heapPageCount: Int { 0 }
     var overlayCount: Int { 0 }
     var hasColumnarSidecars: Bool { false }
+    var hasContiguousSubtreeRanges: Bool { false }
     var storedVisibleCount: Int? { nil }
     var storedResultCount: Int? { nil }
     var storedRootAttribution: RootAttributionTable? { nil }
@@ -376,6 +428,10 @@ extension RecordStore {
         return rowID(forPath: record.directoryPath)
     }
     func subtreeEnd(at index: Int) -> Int { index + 1 }
+    func rowIDs(inSubtreeAtPath path: String) -> [Int]? {
+        guard hasContiguousSubtreeRanges, let rowID = rowID(forPath: path) else { return nil }
+        return Array(rowID..<subtreeEnd(at: rowID))
+    }
     func depth(at index: Int) -> Int {
         let path = path(at: index)
         return path.split(separator: "/").count
@@ -453,11 +509,12 @@ final class HeapPagedRecordStore: RecordStore {
     let kind = RecordStoreKind.heapPaged
     let pages: [[FileRecord]]
     private let pathIndex: [String: Int]?
-    private let rootIDs: [UInt16]?
+    private let rootIDPages: [[UInt16]]?
     let storedRootAttribution: RootAttributionTable?
     let count: Int
 
     var heapPageCount: Int { pages.count }
+    var storedResultCount: Int? { count }
 
     init(records: [FileRecord], buildsPathIndex: Bool = true, roots: [String] = []) {
         var builtPages: [[FileRecord]] = []
@@ -487,26 +544,22 @@ final class HeapPagedRecordStore: RecordStore {
                 sizeBytes: record.sizeBytes
             )
         }
-        self.rootIDs = attribution?.rootIDs
+        self.rootIDPages = attribution.map { Self.makeRootIDPages(from: $0.rootIDs) }
         self.storedRootAttribution = attribution?.table
     }
 
-    fileprivate init(pages: [[FileRecord]], count: Int, pathIndex: [String: Int]?, roots: [String]) {
+    fileprivate init(
+        pages: [[FileRecord]],
+        count: Int,
+        pathIndex: [String: Int]?,
+        rootIDPages: [[UInt16]]?,
+        rootAttribution: RootAttributionTable?
+    ) {
         self.pages = pages
         self.count = count
         self.pathIndex = pathIndex
-        let attribution = try? RootAttributionTable.build(roots: roots, rowCount: count) { index in
-            let record = pages[index / Self.pageSize][index % Self.pageSize]
-            return RootAttributionInput(
-                path: record.path,
-                isResultRow: true,
-                isDirectory: record.isDirectory,
-                isHidden: record.isHidden,
-                sizeBytes: record.sizeBytes
-            )
-        }
-        self.rootIDs = attribution?.rootIDs
-        self.storedRootAttribution = attribution?.table
+        self.rootIDPages = rootIDPages
+        self.storedRootAttribution = rootAttribution
     }
 
     func record(at index: Int) -> FileRecord {
@@ -528,8 +581,11 @@ final class HeapPagedRecordStore: RecordStore {
     func recordID(at index: Int) -> UInt64 { record(at: index).id }
 
     func rootID(at index: Int) -> UInt16? {
-        guard let rootIDs, index >= 0, index < rootIDs.count else { return nil }
-        let rootID = rootIDs[index]
+        guard let rootIDPages, index >= 0, index < count else { return nil }
+        let pageIndex = index / Self.pageSize
+        let pageOffset = index % Self.pageSize
+        guard pageIndex < rootIDPages.count, pageOffset < rootIDPages[pageIndex].count else { return nil }
+        let rootID = rootIDPages[pageIndex][pageOffset]
         return rootID == RootAttributionTable.unassignedRootID ? nil : rootID
     }
 
@@ -537,20 +593,140 @@ final class HeapPagedRecordStore: RecordStore {
         guard let rootID = rootID(at: index) else { return nil }
         return storedRootAttribution?.rootPath(for: rootID)
     }
+
+    private static func makeRootIDPages(from rootIDs: [UInt16]) -> [[UInt16]] {
+        var pages: [[UInt16]] = []
+        pages.reserveCapacity((rootIDs.count + pageSize - 1) / pageSize)
+
+        var start = 0
+        while start < rootIDs.count {
+            let end = min(start + pageSize, rootIDs.count)
+            pages.append(Array(rootIDs[start..<end]))
+            start = end
+        }
+        return pages
+    }
 }
 
 extension HeapPagedRecordStore {
+    struct BuilderDiagnostics: Equatable, Sendable {
+        let snapshotCount: Int
+        let rootAttributionEvaluationCount: Int
+        let rootIDPageCopyCount: Int
+        let rootIDCopiedElementCount: Int
+        let maximumRootIDCopyElementCount: Int
+    }
+
+    private struct RootIDPageBuilder {
+        private(set) var sealedPages: [[UInt16]] = []
+        private(set) var currentPage: [UInt16] = []
+        private var currentPageIsShared = false
+        private(set) var pageCopyCount = 0
+        private(set) var copiedElementCount = 0
+        private(set) var maximumCopyElementCount = 0
+
+        init() {
+            currentPage.reserveCapacity(HeapPagedRecordStore.pageSize)
+        }
+
+        var count: Int {
+            sealedPages.count * HeapPagedRecordStore.pageSize + currentPage.count
+        }
+
+        mutating func append(_ rootID: UInt16) {
+            if currentPage.count == HeapPagedRecordStore.pageSize {
+                sealedPages.append(currentPage)
+                currentPage = []
+                currentPage.reserveCapacity(HeapPagedRecordStore.pageSize)
+                currentPageIsShared = false
+            } else {
+                detachCurrentPageIfNeeded()
+            }
+            currentPage.append(rootID)
+        }
+
+        func value(at index: Int) -> UInt16? {
+            guard index >= 0, index < count else { return nil }
+            let pageIndex = index / HeapPagedRecordStore.pageSize
+            let pageOffset = index % HeapPagedRecordStore.pageSize
+            if pageIndex < sealedPages.count {
+                return sealedPages[pageIndex][pageOffset]
+            }
+            return currentPage[pageOffset]
+        }
+
+        mutating func replace(at index: Int, with rootID: UInt16) {
+            precondition(index >= 0 && index < count, "Root-attribution index \(index) is out of bounds")
+            let pageIndex = index / HeapPagedRecordStore.pageSize
+            let pageOffset = index % HeapPagedRecordStore.pageSize
+            if pageIndex < sealedPages.count {
+                var replacement: [UInt16] = []
+                replacement.reserveCapacity(HeapPagedRecordStore.pageSize)
+                replacement.append(contentsOf: sealedPages[pageIndex])
+                recordCopy(of: replacement.count)
+                replacement[pageOffset] = rootID
+                sealedPages[pageIndex] = replacement
+            } else {
+                detachCurrentPageIfNeeded()
+                currentPage[pageOffset] = rootID
+            }
+        }
+
+        mutating func snapshotPages() -> [[UInt16]] {
+            var pages = sealedPages
+            if !currentPage.isEmpty {
+                pages.append(currentPage)
+                currentPageIsShared = true
+            }
+            return pages
+        }
+
+        private mutating func detachCurrentPageIfNeeded() {
+            guard currentPageIsShared else { return }
+            var replacement: [UInt16] = []
+            replacement.reserveCapacity(HeapPagedRecordStore.pageSize)
+            replacement.append(contentsOf: currentPage)
+            recordCopy(of: replacement.count)
+            currentPage = replacement
+            currentPageIsShared = false
+        }
+
+        private mutating func recordCopy(of elementCount: Int) {
+            pageCopyCount += 1
+            copiedElementCount += elementCount
+            maximumCopyElementCount = max(maximumCopyElementCount, elementCount)
+        }
+    }
+
     final class Builder: @unchecked Sendable {
         private var sealedPages: [[FileRecord]] = []
         private var currentPage: [FileRecord] = []
         private var pathIndex: [String: Int] = [:]
+        private var rootIDPageBuilder: RootIDPageBuilder?
+        private var rootAttribution: RootAttributionTable?
+        private let rootAttributionMatcher: RootAttributionMatcher?
         private var recordCount = 0
-        private let roots: [String]
+        private var snapshotCount = 0
+        private var rootAttributionEvaluationCount = 0
 
         var count: Int { recordCount }
+        var diagnostics: BuilderDiagnostics {
+            BuilderDiagnostics(
+                snapshotCount: snapshotCount,
+                rootAttributionEvaluationCount: rootAttributionEvaluationCount,
+                rootIDPageCopyCount: rootIDPageBuilder?.pageCopyCount ?? 0,
+                rootIDCopiedElementCount: rootIDPageBuilder?.copiedElementCount ?? 0,
+                maximumRootIDCopyElementCount: rootIDPageBuilder?.maximumCopyElementCount ?? 0
+            )
+        }
 
         init(reservedCapacity: Int, roots: [String] = []) {
-            self.roots = roots
+            let attribution = try? RootAttributionTable.build(roots: roots, rowCount: 0) { _ in
+                preconditionFailure("An empty root-attribution build cannot request a row")
+            }
+            rootIDPageBuilder = attribution.map { _ in RootIDPageBuilder() }
+            rootAttribution = attribution?.table
+            rootAttributionMatcher = attribution?.table.makeMatcher()
             currentPage.reserveCapacity(HeapPagedRecordStore.pageSize)
             pathIndex.reserveCapacity(reservedCapacity)
         }
@@ -569,6 +745,7 @@ extension HeapPagedRecordStore {
 
             currentPage.append(record)
             pathIndex[record.path] = recordCount
+            appendRootAttribution(for: record)
             recordCount += 1
         }
 
@@ -579,15 +756,18 @@ extension HeapPagedRecordStore {
         }
 
         func snapshot(includesPathIndex: Bool = false) -> HeapPagedRecordStore {
+            snapshotCount += 1
             var pages = sealedPages
             if !currentPage.isEmpty {
                 pages.append(currentPage)
             }
+            let rootIDPages = rootIDPageBuilder?.snapshotPages()
             return HeapPagedRecordStore(
                 pages: pages,
                 count: recordCount,
                 pathIndex: includesPathIndex ? pathIndex : nil,
-                roots: roots
+                rootIDPages: rootIDPages,
+                rootAttribution: rootAttribution
             )
         }
 
@@ -596,11 +776,47 @@ extension HeapPagedRecordStore {
         }
 
         private func replace(at index: Int, with record: FileRecord) {
+            let previousRecord: FileRecord
             if index < sealedPages.count * HeapPagedRecordStore.pageSize {
+                previousRecord = sealedPages[index / HeapPagedRecordStore.pageSize][index % HeapPagedRecordStore.pageSize]
                 sealedPages[index / HeapPagedRecordStore.pageSize][index % HeapPagedRecordStore.pageSize] = record
             } else {
+                previousRecord = currentPage[index - sealedPages.count * HeapPagedRecordStore.pageSize]
                 currentPage[index - sealedPages.count * HeapPagedRecordStore.pageSize] = record
             }
+            replaceRootAttribution(at: index, previousRecord: previousRecord, with: record)
+        }
+
+        private func appendRootAttribution(for record: FileRecord) {
+            guard rootIDPageBuilder != nil, rootAttribution != nil else { return }
+            rootAttributionEvaluationCount += 1
+            let input = Self.rootAttributionInput(for: record)
+            let rootID = rootAttributionMatcher?.rootID(forNormalizedPath: input.path)
+                ?? RootAttributionTable.unassignedRootID
+            rootIDPageBuilder?.append(rootID)
+            rootAttribution?.add(input, to: rootID)
+        }
+
+        private func replaceRootAttribution(at index: Int, previousRecord: FileRecord, with record: FileRecord) {
+            guard let previousRootID = rootIDPageBuilder?.value(at: index), rootAttribution != nil else { return }
+            rootAttributionEvaluationCount += 1
+            rootAttribution?.subtract(Self.rootAttributionInput(for: previousRecord), from: previousRootID)
+
+            let input = Self.rootAttributionInput(for: record)
+            let rootID = rootAttributionMatcher?.rootID(forNormalizedPath: input.path)
+                ?? RootAttributionTable.unassignedRootID
+            rootIDPageBuilder?.replace(at: index, with: rootID)
+            rootAttribution?.add(input, to: rootID)
+        }
+
+        private static func rootAttributionInput(for record: FileRecord) -> RootAttributionInput {
+            RootAttributionInput(
+                path: record.path,
+                isResultRow: true,
+                isDirectory: record.isDirectory,
+                isHidden: record.isHidden,
+                sizeBytes: record.sizeBytes
+            )
         }
     }
 }
@@ -611,13 +827,14 @@ final class OverlayRecordStore: RecordStore {
     private let base: RecordStore
     private let upserts: [FileRecord]
     private let deletedRows: Set<Int>
-    private let visibleBaseRows: [Int]
+    private let deletedRowsSorted: [Int]
+    private let visibleBaseCount: Int
     private let pathToOverlay: [String: Int]
     private let resultCount: Int
     private let rootAttribution: RootAttributionTable?
     private let rootAttributionMatcher: RootAttributionMatcher?
 
-    var count: Int { visibleBaseRows.count + upserts.count }
+    var count: Int { visibleBaseCount + upserts.count }
     var mappedByteSize: Int { base.mappedByteSize }
     var heapPageCount: Int { base.heapPageCount }
     var overlayCount: Int { upserts.count + deletedRows.count }
@@ -626,33 +843,102 @@ final class OverlayRecordStore: RecordStore {
     var storedRootAttribution: RootAttributionTable? { rootAttribution }
     var schemaVersion: Int { base.schemaVersion }
 
-    init(base: RecordStore, upserts: [FileRecord], deletedRows: Set<Int>) {
-        self.base = base
+    init(base requestedBase: RecordStore, upserts incomingUpserts: [FileRecord], deletedRows incomingDeletedRows: Set<Int>) {
+        let replacingStore = requestedBase as? ReplacingRecordStore
+        let priorStore = replacingStore?.overlayBaseStore ?? requestedBase
+        let priorOverlay = priorStore as? OverlayRecordStore
+        let resolvedBase = priorOverlay?.base ?? priorStore
+        var resolvedDeletedRows = priorOverlay?.deletedRows ?? []
+        var resolvedUpserts = Dictionary(
+            uniqueKeysWithValues: (priorOverlay?.upserts ?? []).map { ($0.path, $0) }
+        )
+
+        enum PriorRowOrigin {
+            case base(Int)
+            case upsert(String)
+        }
+
+        func origin(of rowID: Int) -> PriorRowOrigin? {
+            guard rowID >= 0, rowID < priorStore.count else { return nil }
+            guard let priorOverlay else { return .base(rowID) }
+            if rowID < priorOverlay.visibleBaseCount {
+                return .base(priorOverlay.baseRow(forVisibleIndex: rowID))
+            }
+            return .upsert(priorOverlay.upserts[rowID - priorOverlay.visibleBaseCount].path)
+        }
+
+        func remove(_ rowOrigin: PriorRowOrigin?) {
+            switch rowOrigin {
+            case .base(let rowID):
+                resolvedDeletedRows.insert(rowID)
+            case .upsert(let path):
+                resolvedUpserts.removeValue(forKey: path)
+            case nil:
+                break
+            }
+        }
+
+        func apply(_ record: FileRecord) {
+            if let rowID = resolvedBase.rowID(forPath: record.path) {
+                resolvedDeletedRows.insert(rowID)
+            }
+            resolvedUpserts[record.path] = record
+        }
+
+        if let replacingStore {
+            for (rowID, record) in replacingStore.overlayReplacements.sorted(by: { $0.key < $1.key }) {
+                remove(origin(of: rowID))
+                if !incomingDeletedRows.contains(rowID) {
+                    apply(record)
+                }
+            }
+        }
+        for rowID in incomingDeletedRows {
+            remove(origin(of: rowID))
+        }
+        for record in incomingUpserts {
+            apply(record)
+        }
+
+        resolvedDeletedRows = Set(resolvedDeletedRows.filter { $0 >= 0 && $0 < resolvedBase.count })
+        let upserts = resolvedUpserts.values.sorted { $0.path < $1.path }
+        self.base = resolvedBase
         self.upserts = upserts
-        self.deletedRows = deletedRows
-        self.visibleBaseRows = (0..<base.count).filter { !deletedRows.contains($0) }
-        self.pathToOverlay = Dictionary(uniqueKeysWithValues: upserts.enumerated().map { ($0.element.path, base.count + $0.offset) })
-        let baseResultCount = base.storedResultCount ?? (0..<base.count).filter { base.isResultRow(at: $0) }.count
-        let deletedResultCount = deletedRows.filter { base.isResultRow(at: $0) }.count
+        self.deletedRows = resolvedDeletedRows
+        self.deletedRowsSorted = resolvedDeletedRows.sorted()
+        let visibleBaseCount = max(resolvedBase.count - resolvedDeletedRows.count, 0)
+        self.visibleBaseCount = visibleBaseCount
+        self.pathToOverlay = Dictionary(
+            uniqueKeysWithValues: upserts.enumerated().map { ($0.element.path, visibleBaseCount + $0.offset) }
+        )
+        let baseResultCount = resolvedBase.storedResultCount
+            ?? (0..<resolvedBase.count).filter { resolvedBase.isResultRow(at: $0) }.count
+        let deletedResultCount = resolvedDeletedRows.filter { resolvedBase.isResultRow(at: $0) }.count
         self.resultCount = max(0, baseResultCount - deletedResultCount) + upserts.count
-        let rootAttribution = Self.adjustedRootAttribution(base: base, upserts: upserts, deletedRows: deletedRows)
+        let rootAttribution = Self.adjustedRootAttribution(
+            base: resolvedBase,
+            upserts: upserts,
+            deletedRows: resolvedDeletedRows
+        )
         self.rootAttribution = rootAttribution
         self.rootAttributionMatcher = rootAttribution?.makeMatcher()
     }
 
     func record(at index: Int) -> FileRecord {
-        if index < visibleBaseRows.count {
-            return base.record(at: visibleBaseRows[index])
+        if index < visibleBaseCount {
+            return base.record(at: baseRow(forVisibleIndex: index))
         }
-        return upserts[index - visibleBaseRows.count]
+        return upserts[index - visibleBaseCount]
     }
 
     func allRecords() -> [FileRecord] {
-        var records = base.allRecords()
-        if !deletedRows.isEmpty {
-            let deletedIDs = Set(deletedRows.map { base.recordID(at: $0) })
-            records.removeAll { deletedIDs.contains($0.id) }
-        }
+        let deletedPaths = Set(
+            deletedRows.lazy
+                .filter { self.base.isResultRow(at: $0) }
+                .map { self.base.path(at: $0) }
+        )
+        var records = base.allRecords().filter { !deletedPaths.contains($0.path) }
+        records.reserveCapacity(resultCount)
         records.append(contentsOf: upserts)
         return records
     }
@@ -710,44 +996,97 @@ final class OverlayRecordStore: RecordStore {
     }
 
     func parentRowID(at index: Int) -> Int? {
-        if index < visibleBaseRows.count {
-            guard let parent = base.parentRowID(at: visibleBaseRows[index]) else { return nil }
-            return visibleIndex(forBaseRow: parent)
+        if index < visibleBaseCount {
+            let baseRow = baseRow(forVisibleIndex: index)
+            if let parent = base.parentRowID(at: baseRow), let visibleParent = visibleIndex(forBaseRow: parent) {
+                return visibleParent
+            }
+            let parentPath = base.directoryPath(at: baseRow)
+            guard parentPath != base.path(at: baseRow) else { return nil }
+            return rowID(forPath: parentPath)
         }
-        return rowID(forPath: upserts[index - visibleBaseRows.count].directoryPath)
+        return rowID(forPath: upserts[index - visibleBaseCount].directoryPath)
     }
 
     func subtreeEnd(at index: Int) -> Int {
-        guard index < visibleBaseRows.count else { return index + 1 }
-        return visibleLowerBound(forBaseRowAtLeast: base.subtreeEnd(at: visibleBaseRows[index]))
+        guard index < visibleBaseCount else { return index + 1 }
+        return visibleLowerBound(forBaseRowAtLeast: base.subtreeEnd(at: baseRow(forVisibleIndex: index)))
+    }
+
+    func rowIDs(inSubtreeAtPath path: String) -> [Int]? {
+        var rows: [Int] = []
+        if let baseRows = base.rowIDs(inSubtreeAtPath: path) {
+            rows.reserveCapacity(baseRows.count)
+            for baseRow in baseRows {
+                if let visibleRow = visibleIndex(forBaseRow: baseRow) {
+                    rows.append(visibleRow)
+                }
+            }
+        } else if !base.hasColumnarSidecars {
+            for baseRow in 0..<base.count {
+                let candidatePath = base.path(at: baseRow)
+                guard candidatePath == path || candidatePath.hasPrefix(path + "/") else { continue }
+                if let visibleRow = visibleIndex(forBaseRow: baseRow) {
+                    rows.append(visibleRow)
+                }
+            }
+        }
+
+        func lowerBound(for value: String) -> Int {
+            var lower = 0
+            var upper = upserts.count
+            while lower < upper {
+                let middle = (lower + upper) / 2
+                if upserts[middle].path < value {
+                    lower = middle + 1
+                } else {
+                    upper = middle
+                }
+            }
+            return lower
+        }
+
+        let exactOffset = lowerBound(for: path)
+        if exactOffset < upserts.count, upserts[exactOffset].path == path {
+            rows.append(visibleBaseCount + exactOffset)
+        }
+        let descendantPrefix = path + "/"
+        var offset = lowerBound(for: descendantPrefix)
+        while offset < upserts.count {
+            let candidatePath = upserts[offset].path
+            guard candidatePath.hasPrefix(descendantPrefix) else { break }
+            rows.append(visibleBaseCount + offset)
+            offset += 1
+        }
+        return rows
     }
 
     func depth(at index: Int) -> Int {
-        if index < visibleBaseRows.count {
-            return base.depth(at: visibleBaseRows[index])
+        if index < visibleBaseCount {
+            return base.depth(at: baseRow(forVisibleIndex: index))
         }
-        return upserts[index - visibleBaseRows.count].path.split(separator: "/").count
+        return upserts[index - visibleBaseCount].path.split(separator: "/").count
     }
 
     func isResultRow(at index: Int) -> Bool {
-        if index < visibleBaseRows.count {
-            return base.isResultRow(at: visibleBaseRows[index])
+        if index < visibleBaseCount {
+            return base.isResultRow(at: baseRow(forVisibleIndex: index))
         }
         return true
     }
 
     func isVirtual(at index: Int) -> Bool {
-        if index < visibleBaseRows.count {
-            return base.isVirtual(at: visibleBaseRows[index])
+        if index < visibleBaseCount {
+            return base.isVirtual(at: baseRow(forVisibleIndex: index))
         }
         return false
     }
 
     func isVisible(at index: Int) -> Bool {
-        if index < visibleBaseRows.count {
-            return base.isVisible(at: visibleBaseRows[index])
+        if index < visibleBaseCount {
+            return base.isVisible(at: baseRow(forVisibleIndex: index))
         }
-        return !upserts[index - visibleBaseRows.count].isHidden
+        return !upserts[index - visibleBaseCount].isHidden
     }
 
     func isHiddenInPath(at index: Int, cache _: inout [Int: Bool]) -> Bool {
@@ -756,7 +1095,7 @@ final class OverlayRecordStore: RecordStore {
 
     func rowID(forPath path: String) -> Int? {
         if let row = pathToOverlay[path] {
-            return visibleBaseRows.count + (row - base.count)
+            return row
         }
         guard let row = base.rowID(forPath: path), !deletedRows.contains(row) else {
             return nil
@@ -765,11 +1104,11 @@ final class OverlayRecordStore: RecordStore {
     }
 
     func rootID(at index: Int) -> UInt16? {
-        if index < visibleBaseRows.count {
-            return base.rootID(at: visibleBaseRows[index])
+        if index < visibleBaseCount {
+            return base.rootID(at: baseRow(forVisibleIndex: index))
         }
         guard let rootAttributionMatcher else { return nil }
-        return rootAttributionMatcher.rootID(forNormalizedPath: upserts[index - visibleBaseRows.count].path)
+        return rootAttributionMatcher.rootID(forNormalizedPath: upserts[index - visibleBaseCount].path)
     }
 
     func rootPath(at index: Int) -> String? {
@@ -783,31 +1122,49 @@ final class OverlayRecordStore: RecordStore {
         upsertValue: KeyPath<FileRecord, Value>
     ) -> Value {
         precondition(index >= 0 && index < count, "Record index \(index) is out of bounds")
-        if index < visibleBaseRows.count {
-            return baseValue(visibleBaseRows[index])
+        if index < visibleBaseCount {
+            return baseValue(baseRow(forVisibleIndex: index))
         }
-        return upserts[index - visibleBaseRows.count][keyPath: upsertValue]
+        return upserts[index - visibleBaseCount][keyPath: upsertValue]
     }
 
     private func visibleIndex(forBaseRow row: Int) -> Int? {
-        let index = visibleLowerBound(forBaseRowAtLeast: row)
-        return index < visibleBaseRows.count && visibleBaseRows[index] == row ? index : nil
+        guard !deletedRows.contains(row) else { return nil }
+        return visibleLowerBound(forBaseRowAtLeast: row)
     }
 
     private func visibleLowerBound(forBaseRowAtLeast row: Int) -> Int {
-        var lower = 0
-        var upper = visibleBaseRows.count
+        min(max(row - deletedRowCount(lessThan: row), 0), visibleBaseCount)
+    }
 
+    private func baseRow(forVisibleIndex index: Int) -> Int {
+        precondition(index >= 0 && index < visibleBaseCount, "Visible base index \(index) is out of bounds")
+        var lower = index
+        var upper = min(index + deletedRowsSorted.count, base.count - 1)
         while lower < upper {
             let middle = (lower + upper) / 2
-            let candidate = visibleBaseRows[middle]
-            if candidate < row {
+            let deletedThroughMiddle = deletedRowCount(lessThan: middle + 1)
+            let visibleThroughMiddle = middle + 1 - deletedThroughMiddle
+            if visibleThroughMiddle <= index {
                 lower = middle + 1
             } else {
                 upper = middle
             }
         }
+        return lower
+    }
 
+    private func deletedRowCount(lessThan value: Int) -> Int {
+        var lower = 0
+        var upper = deletedRowsSorted.count
+        while lower < upper {
+            let middle = (lower + upper) / 2
+            if deletedRowsSorted[middle] < value {
+                lower = middle + 1
+            } else {
+                upper = middle
+            }
+        }
         return lower
     }
 
@@ -863,6 +1220,7 @@ final class ReplacingRecordStore: RecordStore {
     var heapPageCount: Int { base.heapPageCount }
     var overlayCount: Int { replacements.count }
     var hasColumnarSidecars: Bool { base.hasColumnarSidecars }
+    var hasContiguousSubtreeRanges: Bool { base.hasContiguousSubtreeRanges }
     var storedResultCount: Int? { base.storedResultCount }
     var storedRootAttribution: RootAttributionTable? { rootAttribution }
     var schemaVersion: Int { base.schemaVersion }
@@ -871,6 +1229,8 @@ final class ReplacingRecordStore: RecordStore {
         replacements.keys.sorted().compactMap { replacements[$0] }
     }
     var metadataBaseStoreKind: RecordStoreKind { base.kind }
+    fileprivate var overlayBaseStore: RecordStore { base }
+    fileprivate var overlayReplacements: [Int: FileRecord] { replacements }
 
     init(base: RecordStore, replacements: [Int: FileRecord]) {
         let resolvedBase: RecordStore
@@ -966,6 +1326,10 @@ final class ReplacingRecordStore: RecordStore {
 
     func subtreeEnd(at index: Int) -> Int {
         base.subtreeEnd(at: index)
+    }
+
+    func rowIDs(inSubtreeAtPath path: String) -> [Int]? {
+        base.rowIDs(inSubtreeAtPath: path)
     }
 
     func depth(at index: Int) -> Int {
@@ -1133,6 +1497,7 @@ final class MappedRecordStore: RecordStore {
             + rootIDData.count + rootsByteSize
     }
     var hasColumnarSidecars: Bool { true }
+    var hasContiguousSubtreeRanges: Bool { true }
     var storedVisibleCount: Int? { visibleCount }
     var storedResultCount: Int? { resultCount }
 
@@ -1584,33 +1949,71 @@ final class MappedRecordStore: RecordStore {
         let isVirtual: Bool
     }
 
-    private static func preparePackageRows(recordSource: RecordPackageRecordSource, roots: [String]) -> [PackageRow] {
+    struct PackageRowPreparationDiagnostics: Equatable, Sendable {
+        let sourceRecordCount: Int
+        let resultRowCount: Int
+        let virtualRowCount: Int
+        let ancestorPathProbeCount: Int
+    }
+
+    private struct PreparedPackageRows {
+        let rows: [PackageRow]
+        let diagnostics: PackageRowPreparationDiagnostics
+    }
+
+    private static func preparePackageRows(
+        recordSource: RecordPackageRecordSource,
+        roots: [String]
+    ) -> PreparedPackageRows {
         var rowsByPath: [String: PackageRow] = [:]
         rowsByPath.reserveCapacity(recordSource.estimatedRecordCount)
-        var virtualDirectoryPaths = Set<String>()
-        virtualDirectoryPaths.reserveCapacity(min(max(recordSource.estimatedRecordCount / 4, roots.count), recordSource.estimatedRecordCount))
-
-        func addVirtualDirectoryCandidate(_ path: String) {
-            guard path != "/", !path.isEmpty else { return }
-            virtualDirectoryPaths.insert(path)
-        }
-
-        for root in roots {
-            forEachAncestorPath(through: root, addVirtualDirectoryCandidate)
-        }
+        var sourceRecordCount = 0
+        var directoryPaths = Set<String>()
+        directoryPaths.reserveCapacity(min(recordSource.estimatedRecordCount, 4_096))
 
         recordSource.forEachRecord { record in
+            sourceRecordCount += 1
             rowsByPath[record.path] = PackageRow(record: record, isVirtual: false)
-            forEachAncestorPath(through: record.directoryPath, addVirtualDirectoryCandidate)
+            if record.directoryPath != "/", !record.directoryPath.isEmpty {
+                directoryPaths.insert(record.directoryPath)
+            }
         }
 
-        func addVirtualDirectory(_ path: String) {
-            guard path != "/", !path.isEmpty, rowsByPath[path] == nil else { return }
-            rowsByPath[path] = PackageRow(record: virtualDirectoryRecord(path: path), isVirtual: true)
+        var ancestorPathProbeCount = 0
+        var virtualRowCount = 0
+
+        func addMissingVirtualDirectory(_ path: String) {
+            rowsByPath[path] = PackageRow(
+                record: virtualDirectoryRecord(path: path),
+                isVirtual: true
+            )
+            virtualRowCount += 1
         }
 
-        for path in virtualDirectoryPaths {
-            addVirtualDirectory(path)
+        // Roots must retain their complete ancestor chain even when the root itself
+        // is already represented by a real row.
+        for root in roots {
+            var path = packageAncestorPath(through: root)
+            while let currentPath = path, currentPath != "/", !currentPath.isEmpty {
+                ancestorPathProbeCount += 1
+                if rowsByPath[currentPath] == nil {
+                    addMissingVirtualDirectory(currentPath)
+                }
+                path = packageParentPath(of: currentPath)
+            }
+        }
+
+        // Most records share a directory. Walk each distinct immediate parent only
+        // until it joins a chain that is already complete instead of rebuilding all
+        // ancestor strings for every record.
+        for directoryPath in directoryPaths {
+            var path = packageAncestorPath(through: directoryPath)
+            while let currentPath = path, currentPath != "/", !currentPath.isEmpty {
+                ancestorPathProbeCount += 1
+                guard rowsByPath[currentPath] == nil else { break }
+                addMissingVirtualDirectory(currentPath)
+                path = packageParentPath(of: currentPath)
+            }
         }
 
         var childrenByParent: [String: [String]] = [:]
@@ -1648,27 +2051,43 @@ final class MappedRecordStore: RecordStore {
             }
         }
 
-        return ordered
+        return PreparedPackageRows(
+            rows: ordered,
+            diagnostics: PackageRowPreparationDiagnostics(
+                sourceRecordCount: sourceRecordCount,
+                resultRowCount: ordered.count - virtualRowCount,
+                virtualRowCount: virtualRowCount,
+                ancestorPathProbeCount: ancestorPathProbeCount
+            )
+        )
     }
 
-    private static func ancestorPaths(through path: String) -> [String] {
-        var ancestors: [String] = []
-        forEachAncestorPath(through: path) { ancestor in
-            ancestors.append(ancestor)
-        }
-        return ancestors
+    private static func packageAncestorPath(through path: String) -> String? {
+        let components = path.split(separator: "/")
+        guard !components.isEmpty else { return nil }
+        return "/" + components.joined(separator: "/")
     }
 
-    private static func forEachAncestorPath(through path: String, _ body: (String) -> Void) {
-        guard path != "/", !path.isEmpty else { return }
-        let parts = path.split(separator: "/")
-        guard !parts.isEmpty else { return }
-
-        var current = ""
-        for part in parts {
-            current += "/" + part
-            body(current)
+    private static func packageParentPath(of path: String) -> String? {
+        guard
+            path != "/",
+            !path.isEmpty,
+            let separator = path.lastIndex(of: "/"),
+            separator != path.startIndex
+        else {
+            return nil
         }
+        return String(path[..<separator])
+    }
+
+    static func packageRowPreparationDiagnosticsForTesting(
+        records: [FileRecord],
+        roots: [String]
+    ) -> PackageRowPreparationDiagnostics {
+        preparePackageRows(
+            recordSource: RecordPackageRecordSource(records: records),
+            roots: roots
+        ).diagnostics
     }
 
     private static func parentPath(for record: FileRecord) -> String? {
@@ -1727,8 +2146,9 @@ final class MappedRecordStore: RecordStore {
             try fileManager.removeItem(at: packageURL)
         }
         try fileManager.createDirectory(at: packageURL, withIntermediateDirectories: true)
-        let packageRows = preparePackageRows(recordSource: recordSource, roots: roots)
-        let resultCount = packageRows.reduce(0) { $0 + ($1.isVirtual ? 0 : 1) }
+        let preparedRows = preparePackageRows(recordSource: recordSource, roots: roots)
+        let packageRows = preparedRows.rows
+        let resultCount = preparedRows.diagnostics.resultRowCount
         let rootAttribution = try RootAttributionTable.build(roots: roots, rowCount: packageRows.count) { index in
             let row = packageRows[index]
             return RootAttributionInput(
@@ -1794,6 +2214,9 @@ final class MappedRecordStore: RecordStore {
         let stringsHandle = try FileHandle(forWritingTo: stringsURL)
         let recordsHandle = try FileHandle(forWritingTo: recordsURL)
         let lookupHandle = try FileHandle(forWritingTo: lookupURL)
+        let stringsWriter = BufferedFileWriter(handle: stringsHandle)
+        let recordsWriter = BufferedFileWriter(handle: recordsHandle)
+        let lookupWriter = BufferedFileWriter(handle: lookupHandle)
         defer {
             try? stringsHandle.close()
             try? recordsHandle.close()
@@ -1804,7 +2227,7 @@ final class MappedRecordStore: RecordStore {
         func appendString(_ value: String) throws -> (offset: UInt64, length: UInt32) {
             let data = Data(value.utf8)
             let result = (stringOffset, UInt32(data.count))
-            try stringsHandle.write(contentsOf: data)
+            try stringsWriter.write(contentsOf: data)
             stringOffset += UInt64(data.count)
             return result
         }
@@ -1821,7 +2244,7 @@ final class MappedRecordStore: RecordStore {
         header.appendUInt32LE(UInt32(Self.rowSize))
         header.appendUInt64LE(UInt64(packageRows.count))
         header.appendUInt64LE(0)
-        try recordsHandle.write(contentsOf: header)
+        try recordsWriter.write(contentsOf: header)
 
         var lookupEntries: [(hash: UInt64, rowID: Int32)] = []
         lookupEntries.reserveCapacity(packageRows.count)
@@ -1873,7 +2296,7 @@ final class MappedRecordStore: RecordStore {
                 row.appendUInt64LE(0)
 
                 precondition(row.count == Self.rowSize)
-                try recordsHandle.write(contentsOf: row)
+                try recordsWriter.write(contentsOf: row)
                 lookupEntries.append((FileRecord.stableID(for: record.path), Int32(index)))
                 parentColumn.appendInt32LE(parent)
                 flagColumn.append(packedFlags)
@@ -1908,15 +2331,19 @@ final class MappedRecordStore: RecordStore {
         lookupHeader.appendUInt32LE(1)
         lookupHeader.appendUInt32LE(UInt32(Self.pathLookupEntrySize))
         lookupHeader.appendUInt64LE(UInt64(lookupEntries.count))
-        try lookupHandle.write(contentsOf: lookupHeader)
+        try lookupWriter.write(contentsOf: lookupHeader)
 
         for entry in lookupEntries {
             var data = Data()
             data.appendUInt64LE(entry.hash)
             data.appendInt32LE(entry.rowID)
             data.appendUInt32LE(0)
-            try lookupHandle.write(contentsOf: data)
+            try lookupWriter.write(contentsOf: data)
         }
+
+        try stringsWriter.flush()
+        try recordsWriter.flush()
+        try lookupWriter.flush()
 
         try Data().write(to: packageURL.appendingPathComponent(SnapshotLayout.FileName.modifiedOrder, isDirectory: false))
         try Data().write(to: packageURL.appendingPathComponent(SnapshotLayout.FileName.namePostings, isDirectory: false))
@@ -2086,6 +2513,22 @@ final class MappedIntPostingIndex: @unchecked Sendable {
 
         let temporaryURL = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("\(temporaryName)-\(UUID().uuidString).bin", isDirectory: false)
+        return try build(from: index, outputURL: temporaryURL, removesFileOnDeinit: true)
+    }
+
+    static func build(
+        from index: [Int: [Int32]],
+        outputURL: URL
+    ) throws -> MappedIntPostingIndex? {
+        guard !index.isEmpty else { return nil }
+        return try build(from: index, outputURL: outputURL, removesFileOnDeinit: false)
+    }
+
+    private static func build(
+        from index: [Int: [Int32]],
+        outputURL: URL,
+        removesFileOnDeinit: Bool
+    ) throws -> MappedIntPostingIndex {
         var data = Data()
         let sortedEntries = index.sorted { $0.key < $1.key }
         let postingCount = sortedEntries.reduce(0) { $0 + $1.value.count }
@@ -2111,9 +2554,19 @@ final class MappedIntPostingIndex: @unchecked Sendable {
             }
         }
 
-        try data.write(to: temporaryURL, options: .atomic)
-        let mapped = try Data(contentsOf: temporaryURL, options: [.mappedIfSafe])
-        return try MappedIntPostingIndex(data: mapped, temporaryURL: temporaryURL)
+        do {
+            // The path is unique and unpublished, so an atomic shadow copy only
+            // doubles peak I/O for large posting indexes without adding crash safety.
+            try data.write(to: outputURL)
+            let mapped = try Data(contentsOf: outputURL, options: [.mappedIfSafe])
+            return try MappedIntPostingIndex(
+                data: mapped,
+                temporaryURL: removesFileOnDeinit ? outputURL : nil
+            )
+        } catch {
+            try? FileManager.default.removeItem(at: outputURL)
+            throw error
+        }
     }
 
     static func load(from url: URL, fileManager: FileManager = .default) throws -> MappedIntPostingIndex? {
@@ -2130,6 +2583,8 @@ final class MappedIntPostingIndex: @unchecked Sendable {
     }
 
     func write(to url: URL) throws {
+        // This may replace the source of mapped `data` when an existing snapshot
+        // is optimized in place, so retain atomic replacement at this boundary.
         try data.write(to: url, options: .atomic)
     }
 

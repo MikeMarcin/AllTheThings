@@ -458,6 +458,89 @@ struct FileIndexInsightsTests {
         #expect(metrics.dailyBuckets[0].day == IndexUsageMetrics.dayKey(for: completedAt))
     }
 
+    @Test("maintenance metrics separate background work by operation kind")
+    func maintenanceMetricsSeparateBackgroundWorkByOperationKind() throws {
+        var metrics = IndexUsageMetrics()
+        let completedAt = Date(timeIntervalSince1970: 1_800_000_000)
+        metrics.recordMaintenance(IndexMaintenanceOperationMetric(
+            kind: .optimization,
+            priority: .interactive,
+            completedAt: completedAt,
+            wallTime: 2,
+            approximateCPUTime: 1,
+            records: 20
+        ))
+        metrics.recordMaintenance(IndexMaintenanceOperationMetric(
+            kind: .optimization,
+            priority: .background,
+            completedAt: completedAt,
+            wallTime: 5,
+            approximateCPUTime: 3,
+            records: 50
+        ))
+        metrics.recordMaintenance(IndexMaintenanceOperationMetric(
+            kind: .snapshotPersist,
+            priority: .background,
+            completedAt: completedAt,
+            wallTime: 7,
+            approximateCPUTime: 4,
+            records: 70
+        ))
+        metrics.recordMaintenance(IndexMaintenanceOperationMetric(
+            kind: .optimization,
+            priority: .background,
+            completedAt: completedAt,
+            wallTime: 4,
+            approximateCPUTime: 2,
+            records: 40
+        ))
+
+        #expect(metrics.maintenance.counters(for: .optimization).operations == 3)
+        #expect(metrics.maintenance.counters(for: .optimization).wallTime == 11)
+        #expect(metrics.maintenance.backgroundCounters(for: .optimization).operations == 2)
+        #expect(metrics.maintenance.backgroundCounters(for: .optimization).wallTime == 9)
+        #expect(metrics.maintenance.backgroundCounters(for: .optimization).approximateCPUTime == 5)
+        #expect(metrics.maintenance.backgroundCounters(for: .optimization).records == 90)
+        #expect(metrics.maintenance.backgroundCounters(for: .snapshotPersist).wallTime == 7)
+        #expect(metrics.maintenance.backgroundCounters(for: .fullRebuild).operations == 0)
+
+        let bucket = try #require(metrics.dailyBuckets.first)
+        #expect(bucket.maintenance.backgroundCounters(for: .optimization).wallTime == 9)
+        #expect(bucket.maintenance.backgroundCounters(for: .snapshotPersist).wallTime == 7)
+
+        let decoded = try JSONDecoder().decode(
+            IndexUsageMetrics.self,
+            from: JSONEncoder().encode(metrics)
+        )
+        #expect(decoded.maintenance.backgroundCounters(for: .optimization).wallTime == 9)
+        #expect(decoded.dailyBuckets.first?.maintenance.backgroundCounters(for: .snapshotPersist).wallTime == 7)
+    }
+
+    @Test("legacy maintenance counters decode with empty background operation kinds")
+    func legacyMaintenanceCountersDecodeWithEmptyBackgroundOperationKinds() throws {
+        let legacyCounters = IndexMaintenanceCostCounters(
+            total: IndexMaintenanceOperationCounters(operations: 2, wallTime: 8),
+            interactive: IndexMaintenanceOperationCounters(operations: 1, wallTime: 3),
+            background: IndexMaintenanceOperationCounters(operations: 1, wallTime: 5),
+            byKind: [
+                .optimization: IndexMaintenanceOperationCounters(operations: 2, wallTime: 8)
+            ]
+        )
+        let encoded = try JSONEncoder().encode(legacyCounters)
+        var object = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        object.removeValue(forKey: "backgroundByKind")
+        let legacyData = try JSONSerialization.data(withJSONObject: object)
+
+        let decoded = try JSONDecoder().decode(IndexMaintenanceCostCounters.self, from: legacyData)
+
+        #expect(decoded.total == legacyCounters.total)
+        #expect(decoded.interactive == legacyCounters.interactive)
+        #expect(decoded.background == legacyCounters.background)
+        #expect(decoded.counters(for: .optimization) == legacyCounters.counters(for: .optimization))
+        #expect(decoded.backgroundByKind.isEmpty)
+        #expect(decoded.backgroundCounters(for: .optimization).operations == 0)
+    }
+
     @Test("maintenance metrics are visible immediately but saved on flush")
     func maintenanceMetricsAreVisibleImmediatelyButSavedOnFlush() throws {
         let fileManager = FileManager.default
@@ -490,6 +573,49 @@ struct FileIndexInsightsTests {
         let persisted = try JSONDecoder().decode(IndexUsageMetrics.self, from: data)
         #expect(persisted.maintenance.counters(for: .exactRefresh).operations == 1)
         #expect(persisted.maintenance.background.operations == 1)
+    }
+
+    @Test("deferred optimization and path grams count as background maintenance")
+    func deferredOptimizationAndPathGramsCountAsBackgroundMaintenance() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsInsights-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        try "alpha".write(
+            to: root.appendingPathComponent("Alpha.swift"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let applicationName = "AllTheThingsInsights-\(UUID().uuidString)"
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        defer {
+            try? fileManager.removeItem(at: index.dataDirectoryURL)
+        }
+
+        index.setDeferredOptimizationRecordThresholdForTesting(1)
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+
+        try await waitUntil(timeout: .seconds(90)) {
+            let maintenance = index.currentInsightsSnapshot().usage.maintenance
+            return maintenance.counters(for: .optimization).operations == 2
+                && maintenance.counters(for: .pathGramBuild).operations == 1
+        }
+
+        let snapshot = index.currentInsightsSnapshot()
+        let maintenance = snapshot.usage.maintenance
+        #expect(maintenance.counters(for: .fullRebuild).operations == 1)
+        #expect(maintenance.counters(for: .optimization).operations == 2)
+        #expect(maintenance.counters(for: .optimization).optimizationDeferrals == 1)
+        #expect(maintenance.counters(for: .pathGramBuild).operations == 1)
+        #expect(maintenance.interactive.operations == 1)
+        #expect(maintenance.background.operations == 3)
+        #expect(snapshot.health.maintenance.lastOperation?.kind == .pathGramBuild)
+        #expect(snapshot.health.maintenance.lastOperation?.priority == .background)
     }
 
     @Test("search and memory metrics are batched until flush")

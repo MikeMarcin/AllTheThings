@@ -413,7 +413,7 @@ struct FileIndexTests {
         #expect(reloadedPaths == allIndexedPaths(in: index))
     }
 
-    @Test("deferred optimization preserves scoped reconcile results")
+    @Test("scoped reconciliation publishes a durable delta before deferred compaction")
     func deferredOptimizationPreservesScopedReconcileResults() async throws {
         let fileManager = FileManager.default
         let root = fileManager.temporaryDirectory
@@ -466,9 +466,14 @@ struct FileIndexTests {
         #expect(!paths.contains(removedFile.path))
 
         let diagnostics = index.currentDiagnostics()
-        #expect(diagnostics.recordStoreKind == .mapped)
-        #expect(diagnostics.optimizedCount == diagnostics.indexedCount)
-        #expect(!recorder.snapshot().contains {
+        #expect(diagnostics.recordStoreKind == .overlay)
+        #expect(diagnostics.optimizedCount == 0)
+        try await waitUntil {
+            recorder.snapshot().contains {
+                $0.phase == .ready && $0.indexedCount > 0 && $0.optimizedCount == 0
+            }
+        }
+        #expect(recorder.snapshot().contains {
             $0.phase == .ready && $0.indexedCount > 0 && $0.optimizedCount == 0
         })
 
@@ -1078,6 +1083,199 @@ struct FileIndexTests {
         ).path))
     }
 
+    @Test("structural refresh completion persists a delta without rewriting the base snapshot")
+    func structuralRefreshPersistsDurableDelta() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: root) }
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let support = supportDirectory(applicationName: applicationName)
+        defer { try? fileManager.removeItem(at: support) }
+        let index = FileIndex(
+            applicationName: applicationName,
+            loadsSnapshotImmediately: false,
+            largeOverlayPersistRecordLimit: nil,
+            largeOverlayPersistDelay: nil,
+            backgroundOptimizationPersistDelay: 60
+        )
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil(timeout: .seconds(10)) {
+            let diagnostics = index.currentDiagnostics()
+            return !index.currentStats().isIndexing
+                && diagnostics.recordStoreKind == .mapped
+                && diagnostics.optimizedCount == diagnostics.indexedCount
+        }
+
+        let packageURL = SnapshotLayout.packageURL(in: support)
+        let manifestURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.manifest)
+        let originalManifest = try Data(contentsOf: manifestURL)
+        let addedFile = root.appendingPathComponent("DurableDelta.swift")
+        try "delta".write(to: addedFile, atomically: true, encoding: .utf8)
+        let completion = CompletionFlag()
+        index.update(paths: [addedFile.path]) { completion.mark() }
+
+        try await waitUntil(timeout: .seconds(5)) { completion.isMarked }
+        #expect(index.currentDiagnostics().recordStoreKind == .overlay)
+        #expect(try Data(contentsOf: manifestURL) == originalManifest)
+        #expect(fileManager.fileExists(atPath: support
+            .appendingPathComponent(StructuralDeltaStore.fileName)
+            .path))
+
+        let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
+        #expect(reloaded.currentDiagnostics().recordStoreKind == .overlay)
+        let response = reloaded.search(
+            SearchRequest(
+                query: "DurableDelta",
+                sort: SortSpec(column: .relevance, ascending: false)
+            ),
+            maxResults: 10
+        )
+        #expect(response.results.contains { $0.record.path == addedFile.path })
+    }
+
+    @Test("no-op refresh clears earlier durability debt before completing")
+    func noopRefreshPersistsEarlierDurabilityDebt() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: root) }
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let support = supportDirectory(applicationName: applicationName)
+        defer { try? fileManager.removeItem(at: support) }
+        let index = FileIndex(
+            applicationName: applicationName,
+            loadsSnapshotImmediately: false,
+            largeOverlayPersistRecordLimit: nil,
+            largeOverlayPersistDelay: nil,
+            backgroundOptimizationPersistDelay: 60
+        )
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil(timeout: .seconds(10)) {
+            let diagnostics = index.currentDiagnostics()
+            return !index.currentStats().isIndexing
+                && diagnostics.recordStoreKind == .mapped
+                && diagnostics.optimizedCount == diagnostics.indexedCount
+        }
+
+        let deltaURL = support.appendingPathComponent(StructuralDeltaStore.fileName)
+        try fileManager.createDirectory(at: deltaURL, withIntermediateDirectories: false)
+
+        let addedFile = root.appendingPathComponent("DebtMustPersist.swift")
+        try "debt".write(to: addedFile, atomically: true, encoding: .utf8)
+        let firstCompletion = CompletionFlag()
+        let before = index.currentDiagnostics()
+        index.update(paths: [addedFile.path]) { firstCompletion.mark() }
+
+        try await waitUntil(timeout: .seconds(3)) {
+            index.currentDiagnostics().completedRefreshBatches > before.completedRefreshBatches
+                && index.hasPendingDurabilityForTesting()
+        }
+        #expect(!firstCompletion.isMarked)
+
+        try fileManager.removeItem(at: deltaURL)
+        let secondCompletion = CompletionFlag()
+        index.update(paths: [addedFile.path]) { secondCompletion.mark() }
+
+        try await waitUntil(timeout: .seconds(10)) {
+            firstCompletion.isMarked
+                && secondCompletion.isMarked
+                && !index.hasPendingDurabilityForTesting()
+        }
+
+        let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
+        let response = reloaded.search(
+            SearchRequest(
+                query: "DebtMustPersist",
+                sort: SortSpec(column: .relevance, ascending: false)
+            ),
+            maxResults: 10
+        )
+        #expect(response.results.contains { $0.record.path == addedFile.path })
+    }
+
+    @Test("deleting a directory removes descendants added by an earlier delta")
+    func directoryDeletionRemovesDeltaAddedDescendants() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        let folder = root.appendingPathComponent("Folder", isDirectory: true)
+        let originalFile = folder.appendingPathComponent("Original.txt")
+        try fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
+        try "original".write(to: originalFile, atomically: true, encoding: .utf8)
+        defer { try? fileManager.removeItem(at: root) }
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let support = supportDirectory(applicationName: applicationName)
+        defer { try? fileManager.removeItem(at: support) }
+        let index = FileIndex(
+            applicationName: applicationName,
+            loadsSnapshotImmediately: false,
+            largeOverlayPersistRecordLimit: nil,
+            largeOverlayPersistDelay: nil,
+            backgroundOptimizationPersistDelay: 60
+        )
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil(timeout: .seconds(10)) {
+            let diagnostics = index.currentDiagnostics()
+            return !index.currentStats().isIndexing
+                && diagnostics.recordStoreKind == .mapped
+                && diagnostics.optimizedCount == diagnostics.indexedCount
+        }
+
+        let addedFile = folder.appendingPathComponent("AddedLater.swift")
+        try "added".write(to: addedFile, atomically: true, encoding: .utf8)
+        let addCompletion = CompletionFlag()
+        index.update(paths: [addedFile.path]) { addCompletion.mark() }
+        try await waitUntil { addCompletion.isMarked }
+        #expect(allIndexedPaths(in: index).contains(addedFile.path))
+        let ancestorMatches = index.search(
+            SearchRequest(
+                query: "folder",
+                sort: SortSpec(column: .name, ascending: true)
+            ),
+            maxResults: 50
+        )
+        #expect(ancestorMatches.results.contains { $0.record.path == addedFile.path })
+
+        try fileManager.removeItem(at: folder)
+        let deleteCompletion = CompletionFlag()
+        index.update(paths: [folder.path]) { deleteCompletion.mark() }
+        try await waitUntil { deleteCompletion.isMarked }
+
+        let currentPaths = allIndexedPaths(in: index)
+        #expect(!currentPaths.contains(folder.path))
+        #expect(!currentPaths.contains(originalFile.path))
+        #expect(!currentPaths.contains(addedFile.path))
+
+        let unrepresentedFolder = root.appendingPathComponent("AddedFolder", isDirectory: true)
+        let onlyChild = unrepresentedFolder.appendingPathComponent("OnlyChild.swift")
+        try fileManager.createDirectory(at: unrepresentedFolder, withIntermediateDirectories: true)
+        try "child".write(to: onlyChild, atomically: true, encoding: .utf8)
+        let childCompletion = CompletionFlag()
+        index.update(paths: [onlyChild.path]) { childCompletion.mark() }
+        try await waitUntil { childCompletion.isMarked }
+        #expect(allIndexedPaths(in: index).contains(onlyChild.path))
+        #expect(!allIndexedPaths(in: index).contains(unrepresentedFolder.path))
+
+        try fileManager.removeItem(at: unrepresentedFolder)
+        let ancestorCompletion = CompletionFlag()
+        index.update(paths: [unrepresentedFolder.path]) { ancestorCompletion.mark() }
+        try await waitUntil { ancestorCompletion.isMarked }
+        #expect(!allIndexedPaths(in: index).contains(onlyChild.path))
+
+        let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
+        let reloadedPaths = allIndexedPaths(in: reloaded)
+        #expect(!reloadedPaths.contains(folder.path))
+        #expect(!reloadedPaths.contains(originalFile.path))
+        #expect(!reloadedPaths.contains(addedFile.path))
+        #expect(!reloadedPaths.contains(onlyChild.path))
+    }
+
     @Test("metadata overlay checkpoints into mapped snapshot after quiet interval")
     func metadataOverlayCheckpointsIntoMappedSnapshotAfterQuietInterval() async throws {
         let fileManager = FileManager.default
@@ -1255,6 +1453,66 @@ struct FileIndexTests {
         #expect(policy.scanBudget == 1.5)
         #expect(policy.backoff == 60)
         #expect(policy.targetDutyCycle <= 0.025)
+    }
+
+    @Test("new events do not wake a deferred background directory traversal")
+    func newEventsDoNotBypassBackgroundTraversalBackoff() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        let deferredFolder = root.appendingPathComponent("Deferred", isDirectory: true)
+        try fileManager.createDirectory(at: deferredFolder, withIntermediateDirectories: true)
+        try "existing".write(
+            to: deferredFolder.appendingPathComponent("Existing.swift"),
+            atomically: true,
+            encoding: .utf8
+        )
+        defer { try? fileManager.removeItem(at: root) }
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        defer { try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName)) }
+        let index = FileIndex(
+            applicationName: applicationName,
+            loadsSnapshotImmediately: false,
+            largeOverlayPersistRecordLimit: nil,
+            largeOverlayPersistDelay: nil,
+            backgroundRefreshDrainBackoffDelay: 1,
+            backgroundDirectoryScanBudget: 0,
+            backgroundOptimizationPersistDelay: 60
+        )
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil { !index.currentStats().isIndexing }
+
+        index.update(paths: [deferredFolder.path], priority: .background)
+        try await waitUntil {
+            index.pendingDirectoryRefreshStateForTesting(path: deferredFolder.path) != nil
+        }
+        let progressBeforeEvent = try #require(
+            index.pendingDirectoryRefreshStateForTesting(path: deferredFolder.path)
+        )
+
+        let independentFile = root.appendingPathComponent("Independent.swift")
+        try "new".write(to: independentFile, atomically: true, encoding: .utf8)
+        index.update(paths: [independentFile.path], priority: .background)
+        try await waitUntil {
+            index.search(
+                SearchRequest(
+                    query: "Independent",
+                    sort: SortSpec(column: .relevance, ascending: false)
+                ),
+                maxResults: 10
+            ).results.contains { $0.record.path == independentFile.path }
+        }
+
+        let progressAfterEvent = try #require(
+            index.pendingDirectoryRefreshStateForTesting(path: deferredFolder.path)
+        )
+        #expect(progressAfterEvent.recordCount == progressBeforeEvent.recordCount)
+
+        index.promoteBackgroundMaintenance()
+        try await waitUntil(timeout: .seconds(10)) {
+            index.currentDiagnostics().pendingRefreshPathCount == 0
+        }
     }
 
     @Test("background directory refresh yields and foreground promotion completes catch up")
@@ -1477,7 +1735,7 @@ struct FileIndexTests {
             largeOverlayPersistRecordLimit: nil,
             largeOverlayPersistDelay: nil,
             backgroundRefreshBatchLimit: 512,
-            backgroundRefreshDrainBackoffDelay: 0.2,
+            backgroundRefreshDrainBackoffDelay: 0.02,
             backgroundDirectoryScanBudget: 0.005,
             backgroundOptimizationPersistDelay: 60
         )
@@ -1500,6 +1758,7 @@ struct FileIndexTests {
             return !pending.contains(folder.path) && pending.contains(lateFile.path)
         }
 
+        index.promoteBackgroundMaintenance()
         try await waitUntil(timeout: .seconds(10)) {
             index.currentDiagnostics().pendingRefreshPathCount == 0
                 && index.search(SearchRequest(
@@ -1923,6 +2182,8 @@ struct FileIndexTests {
             try? FileManager.default.removeItem(at: index.dataDirectoryURL)
         }
         index.replaceRecordsForTesting(records, buildsSearchStructures: false, phase: .ready)
+        index.markSnapshotDurabilityPendingForTesting()
+        let revisionsBeforePromotion = index.durabilityRevisionsForTesting()
 
         let firstResponse = index.search(SearchRequest(
             query: "",
@@ -1936,6 +2197,9 @@ struct FileIndexTests {
         ), maxResults: 10)
 
         let expectedNames = (0..<10).map { String(format: "File%06d.txt", $0) }
+        let revisionsAfterPromotion = index.durabilityRevisionsForTesting()
+        #expect(revisionsAfterPromotion.snapshot > revisionsBeforePromotion.snapshot)
+        #expect(revisionsAfterPromotion.unpersisted == revisionsAfterPromotion.snapshot)
         #expect(firstResponse.totalMatches == recordCount)
         #expect(firstResponse.results.map(\.record.name) == expectedNames)
         #expect(firstResponse.executionProfile.executionPath == .emptyQuerySortedOrder)
@@ -2053,6 +2317,53 @@ struct FileIndexTests {
         reloaded.persistSnapshotForTesting()
 
         #expect(fileSize(at: createdOrderURL) == 0)
+    }
+
+    @Test("mapped persistence keeps virtual ancestors out of search results")
+    func mappedPersistenceKeepsVirtualAncestorsOutOfSearchResults() throws {
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let supportDirectory = supportDirectory(applicationName: applicationName)
+        defer {
+            try? FileManager.default.removeItem(at: supportDirectory)
+        }
+
+        let root = URL(fileURLWithPath: "/tmp/att-virtual-persist-\(UUID().uuidString)/Project", isDirectory: true)
+        let records = [
+            makeRecord(path: root.path, isDirectory: true),
+            makeRecord(path: root.appendingPathComponent("Main.swift").path)
+        ]
+        let expectedPaths = records.map(\.path).sorted()
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        index.replaceRecordsForTesting(records, roots: [root])
+
+        index.persistSnapshotForTesting()
+        let initiallyMapped = index.currentDiagnostics()
+        #expect(initiallyMapped.recordStoreKind == .mapped)
+        #expect(initiallyMapped.indexedCount == records.count)
+        #expect(initiallyMapped.virtualRowCount > 0)
+
+        // Persist the already-mapped store again. Virtual rows are necessary for
+        // hierarchy traversal, but must not become real result rows when compacted.
+        index.persistSnapshotForTesting()
+
+        let response = index.search(SearchRequest(
+            query: "",
+            sort: SortSpec(column: .path, ascending: true),
+            includeHidden: true
+        ), maxResults: 100)
+        #expect(response.totalMatches == records.count)
+        #expect(response.results.map(\.record.path) == expectedPaths)
+        #expect(index.currentDiagnostics().virtualRowCount > 0)
+
+        let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
+        let reloadedResponse = reloaded.search(SearchRequest(
+            query: "",
+            sort: SortSpec(column: .path, ascending: true),
+            includeHidden: true
+        ), maxResults: 100)
+        #expect(reloadedResponse.totalMatches == records.count)
+        #expect(reloadedResponse.results.map(\.record.path) == expectedPaths)
+        #expect(reloaded.currentDiagnostics().virtualRowCount > 0)
     }
 
     @Test("degraded active search scans bounded rows and optimized search returns rich totals")
@@ -2848,14 +3159,21 @@ struct FileIndexTests {
         for fileName in [
             SnapshotLayout.FileName.modifiedOrder,
             SnapshotLayout.FileName.visibleModifiedOrder,
-            SnapshotLayout.FileName.namePostings,
-            SnapshotLayout.FileName.componentPostings
+            SnapshotLayout.FileName.namePostings
         ] {
             let attributes = try FileManager.default.attributesOfItem(
                 atPath: packageURL.appendingPathComponent(fileName).path
             )
             #expect((attributes[.size] as? NSNumber)?.intValue ?? 0 > 0)
         }
+        let legacyComponentAttributes = try FileManager.default.attributesOfItem(
+            atPath: packageURL.appendingPathComponent(SnapshotLayout.FileName.componentPostings).path
+        )
+        #expect((legacyComponentAttributes[.size] as? NSNumber)?.intValue ?? 0 == 0)
+        let componentMarkerAttributes = try FileManager.default.attributesOfItem(
+            atPath: packageURL.appendingPathComponent(SnapshotLayout.FileName.componentSupplementPostings).path
+        )
+        #expect((componentMarkerAttributes[.size] as? NSNumber)?.intValue ?? -1 == 0)
 
         let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
         let response = reloaded.search(SearchRequest(
@@ -2899,6 +3217,129 @@ struct FileIndexTests {
         #expect(response.results.map(\.record.name) == ["LogViewer.swift"])
     }
 
+    @Test("fast scans do not package full-prefix checkpoints")
+    func fastScansDoNotPackageFullPrefixCheckpoints() {
+        let startedAt = Date(timeIntervalSinceReferenceDate: 10_000)
+        var schedule = ScanCheckpointSchedule(operationStartedAt: startedAt)
+        var checkpointCount = 0
+        var checkpointRowWork = 0
+
+        for second in 0..<60 {
+            let recordCount = (second + 1) * 20_000
+            if schedule.shouldCreateCheckpoint(
+                recordCount: recordCount,
+                at: startedAt.addingTimeInterval(TimeInterval(second))
+            ) {
+                checkpointCount += 1
+                checkpointRowWork += recordCount
+            }
+        }
+
+        #expect(checkpointCount == 0)
+        #expect(checkpointRowWork == 0)
+
+        let firstCheckpointCount = 1_220_000
+        let createsFirstCheckpoint = schedule.shouldCreateCheckpoint(
+            recordCount: firstCheckpointCount,
+            at: startedAt.addingTimeInterval(60)
+        )
+        #expect(createsFirstCheckpoint)
+        checkpointCount += 1
+        checkpointRowWork += firstCheckpointCount
+
+        let createsPrematureCheckpoint = schedule.shouldCreateCheckpoint(
+            recordCount: firstCheckpointCount + 200_000,
+            at: startedAt.addingTimeInterval(61)
+        )
+        #expect(!createsPrematureCheckpoint)
+        let createsSecondCheckpoint = schedule.shouldCreateCheckpoint(
+            recordCount: firstCheckpointCount + 200_000,
+            at: startedAt.addingTimeInterval(120)
+        )
+        #expect(createsSecondCheckpoint)
+        checkpointCount += 1
+        checkpointRowWork += firstCheckpointCount + 200_000
+
+        #expect(checkpointCount == 2)
+        #expect(checkpointRowWork == 2_640_000)
+    }
+
+    @Test("heap-paged partial snapshots reuse incremental counts and root attribution")
+    func heapPagedPartialSnapshotsReuseIncrementalMetadata() throws {
+        let root = "/tmp/allthethings-incremental-snapshot"
+        let recordCount = HeapPagedRecordStore.pageSize + 1
+        let builder = HeapPagedRecordStore.Builder(reservedCapacity: recordCount, roots: [root])
+
+        for index in 0..<recordCount {
+            builder.append(makeRecord(path: "\(root)/File-\(index).txt", sizeBytes: 1))
+        }
+
+        for _ in 0..<8 {
+            let snapshot = builder.snapshot()
+            #expect(snapshot.storedResultCount == recordCount)
+            let summary = try #require(snapshot.storedRootAttribution?.roots.first)
+            #expect(summary.trackedFileCount == recordCount)
+            #expect(summary.indexedContentBytes == UInt64(recordCount))
+        }
+
+        #expect(builder.diagnostics.snapshotCount == 8)
+        #expect(builder.diagnostics.rootAttributionEvaluationCount == recordCount)
+
+        let originalSnapshot = builder.snapshot()
+        builder.append(makeRecord(path: "\(root)/File-0.txt", sizeBytes: 42))
+        let replacedSnapshot = builder.snapshot()
+        let originalSummary = try #require(originalSnapshot.storedRootAttribution?.roots.first)
+        let replacedSummary = try #require(replacedSnapshot.storedRootAttribution?.roots.first)
+        #expect(originalSnapshot.sizeBytes(at: 0) == 1)
+        #expect(originalSummary.indexedContentBytes == UInt64(recordCount))
+        #expect(replacedSnapshot.count == recordCount)
+        #expect(replacedSnapshot.storedResultCount == recordCount)
+        #expect(replacedSummary.trackedFileCount == recordCount)
+        #expect(replacedSummary.indexedContentBytes == UInt64(recordCount - 1 + 42))
+        #expect(builder.diagnostics.snapshotCount == 10)
+        #expect(builder.diagnostics.rootAttributionEvaluationCount == recordCount + 1)
+    }
+
+    @Test("heap-paged root attribution copies bounded pages while snapshots are retained")
+    func heapPagedRootAttributionSnapshotCopiesStayBounded() throws {
+        let root = "/tmp/allthethings-paged-root-attribution"
+        let snapshotInterval = 512
+        let recordCount = HeapPagedRecordStore.pageSize * 3 + 257
+        let builder = HeapPagedRecordStore.Builder(reservedCapacity: recordCount, roots: [root])
+        var retainedSnapshots: [HeapPagedRecordStore] = []
+
+        for index in 0..<recordCount {
+            builder.append(makeRecord(path: "\(root)/File-\(index).txt", sizeBytes: 1))
+            if (index + 1).isMultiple(of: snapshotInterval) {
+                retainedSnapshots.append(builder.snapshot())
+            }
+        }
+
+        for (index, snapshot) in retainedSnapshots.enumerated() {
+            let expectedCount = (index + 1) * snapshotInterval
+            #expect(snapshot.count == expectedCount)
+            #expect(snapshot.rootID(at: expectedCount - 1) == 0)
+            let summary = try #require(snapshot.storedRootAttribution?.roots.first)
+            #expect(summary.trackedFileCount == expectedCount)
+        }
+
+        let diagnostics = builder.diagnostics
+        #expect(diagnostics.rootIDPageCopyCount > 0)
+        #expect(diagnostics.rootIDPageCopyCount <= diagnostics.snapshotCount)
+        #expect(diagnostics.maximumRootIDCopyElementCount <= HeapPagedRecordStore.pageSize)
+        #expect(
+            diagnostics.rootIDCopiedElementCount
+                <= diagnostics.rootIDPageCopyCount * HeapPagedRecordStore.pageSize
+        )
+
+        let finalSnapshot = builder.snapshot()
+        #expect(finalSnapshot.count == recordCount)
+        #expect(finalSnapshot.rootID(at: recordCount - 1) == 0)
+        let finalSummary = try #require(finalSnapshot.storedRootAttribution?.roots.first)
+        #expect(finalSummary.trackedFileCount == recordCount)
+        #expect(builder.diagnostics.rootAttributionEvaluationCount == recordCount)
+    }
+
     @Test("resumed checkpoints continue pending directories and clean up after final install")
     func resumedCheckpointsContinuePendingDirectoriesAndCleanUp() async throws {
         let fileManager = FileManager.default
@@ -2928,11 +3369,16 @@ struct FileIndexTests {
         #expect(index.checkpointExistsForTesting())
 
         let resumed = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        resumed.setDeferredOptimizationRecordThresholdForTesting(1)
         resumed.replaceRootsAndRebuild([root], mode: .resumeIfAvailable)
 
-        try await waitUntil {
+        try await waitUntil(timeout: .seconds(10)) {
             let stats = resumed.currentStats()
-            return !stats.isIndexing && stats.indexedCount >= 3
+            let diagnostics = resumed.currentDiagnostics()
+            return !stats.isIndexing
+                && stats.indexedCount >= 3
+                && diagnostics.recordStoreKind == .mapped
+                && diagnostics.optimizedCount == diagnostics.indexedCount
         }
 
         let response = resumed.search(SearchRequest(
@@ -2941,6 +3387,62 @@ struct FileIndexTests {
         ), maxResults: 10)
         #expect(response.results.contains { $0.record.path == pendingFile.path })
         #expect(!resumed.checkpointExistsForTesting())
+    }
+
+    @Test("resumed checkpoints optimize when external reconciliation is already up to date")
+    func resumedCheckpointsOptimizeWhenExternalReconciliationIsAlreadyUpToDate() async throws {
+        let fileManager = FileManager.default
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        let pendingDirectory = root.appendingPathComponent("pending", isDirectory: true)
+        try fileManager.createDirectory(at: pendingDirectory, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+            try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName))
+        }
+
+        let existingFile = root.appendingPathComponent("Existing.log")
+        let pendingFile = pendingDirectory.appendingPathComponent("Pending.log")
+        try "existing".write(to: existingFile, atomically: true, encoding: .utf8)
+        try "pending".write(to: pendingFile, atomically: true, encoding: .utf8)
+
+        let checkpointRecords = [root, existingFile].compactMap { FileRecord(url: $0) }
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        index.persistCheckpointForTesting(
+            records: checkpointRecords,
+            roots: [root],
+            pendingDirectories: [pendingDirectory],
+            completedDirectories: [root]
+        )
+        #expect(index.checkpointExistsForTesting())
+
+        let reconciliationRequested = CompletionFlag()
+        let resumed = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        resumed.setDeferredOptimizationRecordThresholdForTesting(1)
+        resumed.onBackgroundReconciliationRequested = { _ in
+            // An external FSEvents reconciler that reports `upToDate` has no
+            // changed paths to send back to FileIndex.
+            reconciliationRequested.mark()
+        }
+        resumed.replaceRootsAndRebuild([root], mode: .resumeIfAvailable)
+
+        try await waitUntil(timeout: .seconds(10)) {
+            let stats = resumed.currentStats()
+            let diagnostics = resumed.currentDiagnostics()
+            return reconciliationRequested.isMarked
+                && !stats.isIndexing
+                && stats.indexedCount >= 3
+                && diagnostics.recordStoreKind == .mapped
+                && diagnostics.optimizedCount == diagnostics.indexedCount
+                && !resumed.checkpointExistsForTesting()
+        }
+
+        let response = resumed.search(SearchRequest(
+            query: "Pending",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10)
+        #expect(response.results.contains { $0.record.path == pendingFile.path })
     }
 
     @Test("checkpoint cleanup covers settings mismatch fresh rebuild and final snapshot install")
@@ -3019,6 +3521,7 @@ struct FileIndexTests {
         #expect(!indexingStats.contains { $0.isUpdating })
         #expect(!indexingStats.contains { $0.indexedCount > 0 })
         #expect(index.currentStats().indexedCount >= 1_501)
+        #expect(index.currentDiagnostics().scanFrontierMetrics.retainedRecordDictionaryCount == 0)
     }
 
     @Test("reconciliation publishes reconciling scan progress from zero")
@@ -3060,6 +3563,14 @@ struct FileIndexTests {
         #expect(!scanStats.contains { $0.isUpdating })
         #expect(!scanStats.contains { $0.status.hasPrefix("Indexing") })
         #expect(!index.currentStats().isReconciling)
+
+        let scanWork = index.currentDiagnostics().scanFrontierMetrics
+        #expect(scanWork.searchableSnapshotCount == 0)
+        #expect(scanWork.searchableSnapshotRowCount == 0)
+        #expect(scanWork.checkpointSnapshotCount == 0)
+        #expect(scanWork.finalSnapshotCount == 0)
+        #expect(scanWork.finalSnapshotRowCount == 0)
+        #expect(scanWork.retainedRecordDictionaryCount >= 1_501)
     }
 
     @Test("loaded snapshots reconcile changes made while app was closed")
@@ -3095,6 +3606,53 @@ struct FileIndexTests {
             ), maxResults: 10)
             return response.results.contains { $0.record.path == closedAppFile.path }
         }
+    }
+
+    @Test("unchanged reconciliation performs no package or snapshot rebuild")
+    func unchangedReconciliationIsDiffFirstNoop() async throws {
+        let fileManager = FileManager.default
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        try "stable".write(
+            to: root.appendingPathComponent("Stable.swift"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let support = supportDirectory(applicationName: applicationName)
+        defer {
+            try? fileManager.removeItem(at: root)
+            try? fileManager.removeItem(at: support)
+        }
+
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil(timeout: .seconds(10)) {
+            let diagnostics = index.currentDiagnostics()
+            return !index.currentStats().isIndexing
+                && diagnostics.recordStoreKind == .mapped
+                && diagnostics.optimizedCount == diagnostics.indexedCount
+        }
+
+        let before = index.currentDiagnostics()
+        let manifestURL = SnapshotLayout.packageURL(in: support)
+            .appendingPathComponent(SnapshotLayout.FileName.manifest)
+        let manifestBefore = try Data(contentsOf: manifestURL)
+        #expect(index.reconcileIndexedRootsInBackground() == .started)
+        try await waitUntil(timeout: .seconds(10)) {
+            !index.currentStats().isIndexing
+                && index.currentStats().status.hasPrefix("Reconciled ")
+        }
+
+        let after = index.currentDiagnostics()
+        #expect(after.snapshotRevision == before.snapshotRevision)
+        #expect(after.completedSnapshotRebuilds == before.completedSnapshotRebuilds)
+        #expect(after.recordStoreKind == .mapped)
+        #expect(try Data(contentsOf: manifestURL) == manifestBefore)
+        #expect(!fileManager.fileExists(atPath: support
+            .appendingPathComponent(StructuralDeltaStore.fileName)
+            .path))
     }
 
     @Test("scoped reconciliation preserves records from unchanged roots")
@@ -3188,8 +3746,8 @@ struct FileIndexTests {
         }
     }
 
-    @Test("scoped reconciliation streams merged records into mapped packages")
-    func scopedReconciliationStreamsMergedRecordsIntoMappedPackages() async throws {
+    @Test("scoped reconciliation persists a delta without rebuilding the mapped package")
+    func scopedReconciliationPersistsDeltaWithoutRebuildingMappedPackage() async throws {
         let fileManager = FileManager.default
         let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
         let root = fileManager.temporaryDirectory
@@ -3246,8 +3804,8 @@ struct FileIndexTests {
             guard let replacedRecord = replaced.results.first?.record else { return false }
             let paths = allIndexedPaths(in: index)
             return !index.currentStats().isIndexing
-                && diagnostics.recordStoreKind == .mapped
-                && diagnostics.optimizedCount == diagnostics.indexedCount
+                && diagnostics.recordStoreKind == .overlay
+                && diagnostics.optimizedCount == 0
                 && diagnostics.virtualRowCount > 0
                 && paths.contains(addedFile.path)
                 && paths.contains(retainedFile.path)
@@ -3259,7 +3817,6 @@ struct FileIndexTests {
             query: "Target",
             sort: SortSpec(column: .relevance, ascending: false)
         ), maxResults: 10)
-        #expect(response.usesIndexedCandidates)
         #expect(response.results.contains { $0.record.path == addedFile.path })
         #expect(response.results.contains { $0.record.path == replacedFile.path })
         #expect(response.results.contains { $0.record.path == retainedFile.path })
@@ -3267,7 +3824,7 @@ struct FileIndexTests {
 
         let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
         let reloadedDiagnostics = reloaded.currentDiagnostics()
-        #expect(reloadedDiagnostics.recordStoreKind == .mapped)
+        #expect(reloadedDiagnostics.recordStoreKind == .overlay)
         #expect(reloadedDiagnostics.virtualRowCount > 0)
         #expect(allIndexedPaths(in: reloaded) == allIndexedPaths(in: index))
 
@@ -4002,6 +4559,69 @@ struct FileIndexTests {
         #expect(response.executionProfile.scannedRowCount <= 75)
     }
 
+    @Test("sparse overlay initialization does not walk the base store")
+    func sparseOverlayUsesRankSelectRowMapping() {
+        let records = (0..<5).map { makeRecord(path: "/tmp/allthethings-store/Item\($0).txt") }
+        let added = makeRecord(path: "/tmp/allthethings-store/Added.txt")
+        let base = CountingRecordStore(records: records)
+        let overlay = OverlayRecordStore(base: base, upserts: [added], deletedRows: [1, 3])
+
+        #expect(base.recordCallCount == 0)
+        #expect(base.allRecordsCallCount == 0)
+        #expect(overlay.count == 4)
+        #expect((0..<overlay.count).map { overlay.path(at: $0) } == [
+            records[0].path,
+            records[2].path,
+            records[4].path,
+            added.path
+        ])
+        #expect(overlay.rowID(forPath: records[0].path) == 0)
+        #expect(overlay.rowID(forPath: records[1].path) == nil)
+        #expect(overlay.rowID(forPath: records[2].path) == 1)
+        #expect(overlay.rowID(forPath: records[4].path) == 2)
+        #expect(overlay.rowID(forPath: added.path) == 3)
+    }
+
+    @Test("repeated sparse updates flatten onto one base store")
+    func repeatedSparseUpdatesFlattenOntoOneBaseStore() {
+        let path = "/tmp/allthethings-store/Repeated.txt"
+        let base = CountingRecordStore(records: [makeRecord(path: path)])
+        var store: RecordStore = base
+
+        for version in 1...100 {
+            let existingRow = store.rowID(forPath: path)
+            store = OverlayRecordStore(
+                base: store,
+                upserts: [makeRecord(path: path, sizeBytes: UInt64(version))],
+                deletedRows: Set(existingRow.map { [$0] } ?? [])
+            )
+        }
+
+        guard let overlay = store as? OverlayRecordStore else {
+            Issue.record("Expected a flattened overlay store")
+            return
+        }
+        #expect(overlay.overlayCount == 2)
+        #expect(overlay.record(at: 0).sizeBytes == 100)
+        #expect(overlay.allRecords().map(\.path) == [path])
+        #expect(base.allRecordsCallCount == 1)
+    }
+
+    @Test("deleting a metadata replacement does not preserve its upsert")
+    func deletingMetadataReplacementRemovesPath() {
+        let path = "/tmp/allthethings-store/Replaced.txt"
+        let base = CountingRecordStore(records: [makeRecord(path: path)])
+        let replacing = ReplacingRecordStore(
+            base: base,
+            replacements: [0: makeRecord(path: path, sizeBytes: 42)]
+        )
+        let overlay = OverlayRecordStore(base: replacing, upserts: [], deletedRows: [0])
+
+        #expect(overlay.count == 0)
+        #expect(overlay.rowID(forPath: path) == nil)
+        #expect(overlay.allRecords().isEmpty)
+    }
+
     @Test("overlay allRecords uses base bulk materialization")
     func overlayAllRecordsUsesBaseBulkMaterialization() throws {
         let alpha = makeRecord(path: "/tmp/allthethings-store/Alpha.txt")
@@ -4014,7 +4634,7 @@ struct FileIndexTests {
 
         #expect(records.map(\.path) == [alpha.path, gamma.path])
         #expect(base.allRecordsCallCount == 1)
-        #expect(base.recordCallCount == 0)
+        #expect(base.recordCallCount == 1)
     }
 
     @Test("replacing allRecords uses base bulk materialization")
