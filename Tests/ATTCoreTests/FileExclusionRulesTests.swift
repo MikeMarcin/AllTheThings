@@ -493,6 +493,40 @@ struct FileExclusionRulesTests {
         }
 
         #expect(instrumentation.regexMatchCount == 0)
+        #expect(instrumentation.literalRuleFastRejectCount > reordered.count)
+        #expect(instrumentation.ruleMatchAttemptCount < reordered.count * 5)
+    }
+
+    @Test("literal candidate filtering supports more than 64 ordered rules")
+    func literalCandidateFilteringSupportsMoreThan64OrderedRules() {
+        let root = "/tmp/project"
+        let patterns = (0..<96).map { "noise-\($0)/" } + [
+            "!noise-95/keep.swift"
+        ]
+        let rules = FileExclusionRules(patterns: patterns)
+        let query = rules.makeQuery(roots: [root])
+        var instrumentation = FileExclusionQuery.Instrumentation()
+
+        for sample in [
+            (path: "\(root)/noise-2/drop.swift", isDirectory: false),
+            (path: "\(root)/noise-95/drop.swift", isDirectory: false),
+            (path: "\(root)/noise-95/keep.swift", isDirectory: false),
+            (path: "\(root)/Sources/App.swift", isDirectory: false)
+        ] {
+            let compiled = query.decision(
+                path: sample.path,
+                isDirectory: sample.isDirectory,
+                instrumentation: &instrumentation
+            )
+            let reference = rules.decision(
+                url: URL(fileURLWithPath: sample.path),
+                roots: [root],
+                isDirectory: sample.isDirectory
+            )
+            #expect(compiled == reference)
+        }
+
+        #expect(instrumentation.literalRuleFastRejectCount > 64)
     }
 
     @Test("compiled exclusion queries reuse ancestor work across event bursts")

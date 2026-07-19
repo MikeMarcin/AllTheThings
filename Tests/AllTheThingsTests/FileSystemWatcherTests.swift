@@ -809,13 +809,14 @@ struct FileSystemWatcherTests {
         #expect(routed.updatePaths == [filePath, missingPath])
     }
 
-    @Test("live FSEvents route exact files separately from broad directory scopes")
-    func liveFSEventsRouteExactFilesSeparatelyFromBroadDirectoryScopes() {
+    @Test("live FSEvents reserve recursive work for events that can change a subtree")
+    func liveFSEventsRouteExactAndRecursiveChangesSeparately() {
         let root = "/tmp/allthethings/root-a"
         let safeFile = "\(root)/Sources/App.swift"
         let assetDirectory = "\(root)/Assets"
         let coveredAsset = "\(assetDirectory)/sprite.png"
         let deletedFile = "\(root)/Deleted/Old.swift"
+        let renamedFile = "\(root)/Sources/Renamed.swift"
         let recursiveFile = "\(root)/Generated/output.txt"
 
         let routed = FSEventLiveRefreshScopeRouter.route(
@@ -833,21 +834,95 @@ struct FileSystemWatcherTests {
                     eventID: 4
                 ),
                 FileSystemEvent(
+                    path: renamedFile,
+                    flags: FSEventStreamEventFlags(kFSEventStreamEventFlagItemRenamed),
+                    eventID: 5
+                ),
+                FileSystemEvent(
                     path: recursiveFile,
                     flags: FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs),
-                    eventID: 5
+                    eventID: 6
                 )
             ],
             rootPaths: [root]
         )
 
-        #expect(routed.exactPaths == [safeFile])
-        #expect(Set(routed.directoryPaths) == [
+        #expect(Set(routed.exactPaths) == [
             assetDirectory,
-            "\(root)/Deleted",
-            "\(root)/Generated"
+            coveredAsset,
+            deletedFile,
+            renamedFile,
+            safeFile
         ])
         #expect(routed.recursivePaths == ["\(root)/Generated"])
+    }
+
+    @Test("directory create and rename events recursively discover incoming contents")
+    func directoryCreateAndRenameEventsRouteRecursively() {
+        let root = "/tmp/allthethings/root-a"
+        let createdDirectory = "\(root)/Created"
+        let createdChild = "\(createdDirectory)/Existing.txt"
+        let renamedDirectory = "\(root)/Renamed"
+        let replacedDirectory = "\(root)/Replaced"
+        let directoryFlags = FSEventStreamEventFlags(kFSEventStreamEventFlagItemIsDir)
+
+        let routed = FSEventLiveRefreshScopeRouter.route(
+            events: [
+                FileSystemEvent(
+                    path: createdDirectory,
+                    flags: directoryFlags
+                        | FSEventStreamEventFlags(kFSEventStreamEventFlagItemCreated),
+                    eventID: 1
+                ),
+                FileSystemEvent(
+                    path: renamedDirectory,
+                    flags: directoryFlags
+                        | FSEventStreamEventFlags(kFSEventStreamEventFlagItemRenamed),
+                    eventID: 2
+                ),
+                FileSystemEvent(path: createdChild, flags: 0, eventID: 3),
+                FileSystemEvent(
+                    path: replacedDirectory,
+                    flags: directoryFlags
+                        | FSEventStreamEventFlags(kFSEventStreamEventFlagItemRemoved)
+                        | FSEventStreamEventFlags(kFSEventStreamEventFlagItemCreated),
+                    eventID: 4
+                )
+            ],
+            rootPaths: [root]
+        )
+
+        #expect(routed.exactPaths.isEmpty)
+        #expect(Set(routed.recursivePaths) == [createdDirectory, renamedDirectory, replacedDirectory])
+    }
+
+    @Test("directory metadata and removal events stay exact")
+    func directoryMetadataAndRemovalEventsStayExact() {
+        let root = "/tmp/allthethings/root-a"
+        let metadataDirectory = "\(root)/MetadataOnly"
+        let removedDirectory = "\(root)/Removed"
+        let directoryFlags = FSEventStreamEventFlags(kFSEventStreamEventFlagItemIsDir)
+
+        let routed = FSEventLiveRefreshScopeRouter.route(
+            events: [
+                FileSystemEvent(
+                    path: metadataDirectory,
+                    flags: directoryFlags
+                        | FSEventStreamEventFlags(kFSEventStreamEventFlagItemInodeMetaMod),
+                    eventID: 1
+                ),
+                FileSystemEvent(
+                    path: removedDirectory,
+                    flags: directoryFlags
+                        | FSEventStreamEventFlags(kFSEventStreamEventFlagItemRemoved),
+                    eventID: 2
+                )
+            ],
+            rootPaths: [root]
+        )
+
+        #expect(Set(routed.exactPaths) == [metadataDirectory, removedDirectory])
+        #expect(routed.recursivePaths.isEmpty)
     }
 
     @Test("large scope bursts collapse with path-depth bounded work")
@@ -940,9 +1015,27 @@ struct FileSystemWatcherTests {
         )
 
         #expect(routed.exactPaths.isEmpty)
-        #expect(Set(routed.directoryPaths) == Set(roots))
         #expect(Set(routed.recursivePaths) == Set(roots))
-        #expect(!routed.directoryPaths.contains("/"))
+        #expect(!routed.recursivePaths.contains("/"))
+    }
+
+    @Test("root invalidation recursively refreshes the affected configured root")
+    func rootInvalidationRefreshesAffectedRootRecursively() {
+        let affectedRoot = "/Users/example/Documents"
+        let unaffectedRoot = "/Users/example/Downloads"
+        let routed = FSEventLiveRefreshScopeRouter.route(
+            events: [
+                FileSystemEvent(
+                    path: affectedRoot,
+                    flags: FSEventStreamEventFlags(kFSEventStreamEventFlagRootChanged),
+                    eventID: 101
+                )
+            ],
+            rootPaths: [affectedRoot, unaffectedRoot]
+        )
+
+        #expect(routed.exactPaths.isEmpty)
+        #expect(routed.recursivePaths == [affectedRoot])
     }
 
     @Test("ordinary live FSEvents outside configured roots are ignored")

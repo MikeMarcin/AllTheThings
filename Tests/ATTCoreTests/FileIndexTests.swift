@@ -1,4 +1,4 @@
-@testable import ATTCore
+@_spi(ATTInternal) @testable import ATTCore
 import Darwin
 import Foundation
 import Testing
@@ -290,6 +290,52 @@ struct FileIndexTests {
         #expect(!compiledPaths.contains(gitObject.path))
         #expect(!compiledPaths.contains(nodeModuleFile.path))
         #expect(!compiledPaths.contains(cacheFile.path))
+    }
+
+    @Test("full rebuild retries transient filesystem lookups")
+    func fullRebuildRetriesTransientFileSystemLookup() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: root) }
+
+        let file = root.appendingPathComponent("Transient.swift")
+        try "transient".write(to: file, atomically: true, encoding: .utf8)
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        defer { try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName)) }
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        index.failNextFileSystemLookupsForTesting(path: file.path)
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+
+        try await waitUntil(timeout: .seconds(10)) { !index.currentStats().isIndexing }
+
+        #expect(index.currentStats().phase == .ready)
+        #expect(allIndexedPaths(in: index).contains(file.path))
+    }
+
+    @Test("full rebuild fails instead of publishing a partial snapshot after exhausted lookup retries")
+    func fullRebuildDoesNotCompleteAfterExhaustedFileSystemLookupRetries() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: root) }
+
+        let file = root.appendingPathComponent("Unreadable.swift")
+        try "unreadable".write(to: file, atomically: true, encoding: .utf8)
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        defer { try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName)) }
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        index.failNextFileSystemLookupsForTesting(path: file.path, count: 10)
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+
+        try await waitUntil(timeout: .seconds(10)) { !index.currentStats().isIndexing }
+
+        #expect(index.currentStats().phase == .failed)
+        #expect(!allIndexedPaths(in: index).contains(file.path))
     }
 
     @Test("compiled exclusion mode matches legacy scoped update paths")
@@ -962,6 +1008,119 @@ struct FileIndexTests {
         }
     }
 
+    @Test("structural delta compaction deadline does not slide as changes continue")
+    func structuralDeltaCompactionScheduleDoesNotSlide() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: root) }
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        defer { try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName)) }
+        let index = FileIndex(
+            applicationName: applicationName,
+            loadsSnapshotImmediately: false,
+            largeOverlayPersistRecordLimit: 0,
+            largeOverlayPersistDelay: 60
+        )
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil(timeout: .seconds(10)) {
+            !index.currentStats().isIndexing
+                && index.currentDiagnostics().recordStoreKind == .mapped
+        }
+
+        let firstFile = root.appendingPathComponent("First.swift")
+        try "first".write(to: firstFile, atomically: true, encoding: .utf8)
+        let firstCompletion = CompletionFlag()
+        index.update(paths: [firstFile.path]) { firstCompletion.mark() }
+        try await waitUntil(timeout: .seconds(5)) {
+            firstCompletion.isMarked
+                && index.structuralDeltaCompactionScheduleForTesting() != nil
+        }
+        let firstSchedule = try #require(index.structuralDeltaCompactionScheduleForTesting())
+
+        let secondFile = root.appendingPathComponent("Second.swift")
+        try "second".write(to: secondFile, atomically: true, encoding: .utf8)
+        let secondCompletion = CompletionFlag()
+        index.update(paths: [secondFile.path]) { secondCompletion.mark() }
+        try await waitUntil(timeout: .seconds(5)) { secondCompletion.isMarked }
+        let secondSchedule = try #require(index.structuralDeltaCompactionScheduleForTesting())
+
+        #expect(secondSchedule.revision == firstSchedule.revision)
+        #expect(secondSchedule.scheduledAt == firstSchedule.scheduledAt)
+        #expect(
+            secondSchedule.writerConflictWarningDeadline
+                == firstSchedule.writerConflictWarningDeadline
+        )
+        #expect(index.search(SearchRequest(
+            query: "Second",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10).results.contains { $0.record.path == secondFile.path })
+    }
+
+    @Test("structural delta compaction is not postponed by queued background refreshes")
+    func structuralDeltaCompactionBypassesBackgroundRefreshBacklog() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        let blocker = root.appendingPathComponent("Blocker", isDirectory: true)
+        try fileManager.createDirectory(at: blocker, withIntermediateDirectories: true)
+        try "existing".write(
+            to: blocker.appendingPathComponent("Existing.swift"),
+            atomically: true,
+            encoding: .utf8
+        )
+        defer { try? fileManager.removeItem(at: root) }
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let support = supportDirectory(applicationName: applicationName)
+        defer { try? fileManager.removeItem(at: support) }
+        let index = FileIndex(
+            applicationName: applicationName,
+            loadsSnapshotImmediately: false,
+            largeOverlayPersistRecordLimit: 0,
+            largeOverlayPersistDelay: 0.2,
+            backgroundRefreshDrainBackoffDelay: 60,
+            backgroundDirectoryScanBudget: 0,
+            backgroundOptimizationPersistDelay: 60
+        )
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil(timeout: .seconds(10)) {
+            !index.currentStats().isIndexing
+                && index.currentDiagnostics().recordStoreKind == .mapped
+        }
+
+        let added = root.appendingPathComponent("Added.swift")
+        try "added".write(to: added, atomically: true, encoding: .utf8)
+        index.update(paths: [added.path], priority: .background)
+        try await waitUntil(timeout: .seconds(5)) {
+            index.currentDiagnostics().recordStoreKind == .overlay
+                && index.structuralDeltaCompactionScheduleForTesting() != nil
+        }
+
+        index.update(paths: [blocker.path], priority: .background)
+        try await waitUntil(timeout: .seconds(5)) {
+            index.currentDiagnostics().pendingBackgroundRefreshPathCount == 1
+        }
+        try await waitUntil(timeout: .seconds(10)) {
+            index.currentDiagnostics().recordStoreKind == .mapped
+                && !fileManager.fileExists(atPath: support
+                    .appendingPathComponent(StructuralDeltaStore.fileName)
+                    .path)
+        }
+        #expect(index.currentDiagnostics().pendingBackgroundRefreshPathCount == 1)
+        #expect(index.search(SearchRequest(
+            query: "Added",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10).results.contains { $0.record.path == added.path })
+
+        index.promoteBackgroundMaintenance()
+        try await waitUntil(timeout: .seconds(10)) {
+            index.currentDiagnostics().pendingRefreshPathCount == 0
+        }
+    }
+
     @Test("metadata-only updates persist sidecar without compacting mapped snapshot")
     func metadataOnlyUpdatesPersistSidecarWithoutCompactingMappedSnapshot() async throws {
         let fileManager = FileManager.default
@@ -1452,6 +1611,8 @@ struct FileIndexTests {
 
         #expect(policy.scanBudget == 1.5)
         #expect(policy.backoff == 60)
+        #expect(policy.visitLimit == 2_048)
+        #expect(policy.entryLimit == 8_192)
         #expect(policy.targetDutyCycle <= 0.025)
     }
 
@@ -1784,6 +1945,53 @@ struct FileIndexTests {
         #expect(completedSnapshot.usage.maintenance.background.operations > 0)
     }
 
+    @Test("background mode demotes queued interactive directory refreshes")
+    func backgroundModeDemotesQueuedInteractiveRefresh() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: root) }
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        defer { try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName)) }
+        let index = FileIndex(
+            applicationName: applicationName,
+            loadsSnapshotImmediately: false,
+            largeOverlayPersistRecordLimit: nil,
+            largeOverlayPersistDelay: nil,
+            backgroundRefreshDrainBackoffDelay: 60,
+            backgroundDirectoryScanBudget: 0,
+            backgroundOptimizationPersistDelay: 60
+        )
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil(timeout: .seconds(10)) { !index.currentStats().isIndexing }
+
+        let folder = root.appendingPathComponent("Deferred", isDirectory: true)
+        let child = folder.appendingPathComponent("Child.swift")
+        try fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
+        try "child".write(to: child, atomically: true, encoding: .utf8)
+        let completion = CompletionFlag()
+        index.update(paths: [folder.path], priority: .interactive) { completion.mark() }
+        index.setBackgroundMaintenanceEnabled(true)
+
+        try await waitUntil(timeout: .seconds(5)) {
+            index.currentDiagnostics().pendingBackgroundRefreshPathCount == 1
+                && index.pendingDirectoryRefreshStateForTesting(path: folder.path) != nil
+        }
+        #expect(!completion.isMarked)
+
+        index.setBackgroundMaintenanceEnabled(false)
+        index.promoteBackgroundMaintenance()
+        try await waitUntil(timeout: .seconds(10)) {
+            completion.isMarked
+                && index.search(SearchRequest(
+                    query: "Child",
+                    sort: SortSpec(column: .relevance, ascending: false)
+                ), maxResults: 10).results.contains { $0.record.path == child.path }
+        }
+    }
+
     @Test("background directory refresh resumes across bounded slices")
     func backgroundDirectoryRefreshResumesAcrossBoundedSlices() async throws {
         let fileManager = FileManager.default
@@ -2015,6 +2223,274 @@ struct FileIndexTests {
         ), maxResults: 10).results.contains { $0.record.path == lateFile.path })
     }
 
+    @Test("directory finalization resumes without rescanning or materializing retained paths")
+    func directoryFinalizationIsBoundedAndResumable() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        let folder = root.appendingPathComponent("Folder", isDirectory: true)
+        try fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: root) }
+
+        let files = try (0..<512).map { offset in
+            let file = folder.appendingPathComponent(
+                String(format: "Existing%04d.swift", offset)
+            )
+            try "existing".write(to: file, atomically: true, encoding: .utf8)
+            return file
+        }
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        defer { try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName)) }
+        let index = FileIndex(
+            applicationName: applicationName,
+            loadsSnapshotImmediately: false,
+            largeOverlayPersistRecordLimit: nil,
+            largeOverlayPersistDelay: nil,
+            backgroundRefreshDrainBackoffDelay: 60,
+            backgroundDirectoryScanBudget: 60,
+            backgroundDirectoryScanVisitLimit: 2_048,
+            backgroundDirectoryScanEntryLimit: 8_192,
+            backgroundDirectoryFinalizationLimit: 64,
+            backgroundOptimizationPersistDelay: 60
+        )
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil(timeout: .seconds(10)) { !index.currentStats().isIndexing }
+
+        for file in files.prefix(3) {
+            try fileManager.removeItem(at: file)
+        }
+
+        let completion = CompletionFlag()
+        index.update(paths: [folder.path], priority: .background) { completion.mark() }
+        try await waitUntil(timeout: .seconds(5)) {
+            index.pendingDirectoryFinalizationStateForTesting(path: folder.path) != nil
+        }
+
+        let initial = try #require(
+            index.pendingDirectoryFinalizationStateForTesting(path: folder.path)
+        )
+        let traversalWorkCount = initial.traversalWorkCount
+        var priorBaselineRowsVisited = 0
+        var maximumMaterializedDeletionPathCount = 0
+
+        for _ in 0..<20 where !completion.isMarked {
+            if let state = index.pendingDirectoryFinalizationStateForTesting(path: folder.path) {
+                #expect(state.traversalWorkCount == traversalWorkCount)
+                #expect(state.baselineRowsVisited >= priorBaselineRowsVisited)
+                #expect(state.baselineRowsVisited - priorBaselineRowsVisited <= 64)
+                #expect(state.materializedDeletionPathCount <= 3)
+                priorBaselineRowsVisited = state.baselineRowsVisited
+                maximumMaterializedDeletionPathCount = max(
+                    maximumMaterializedDeletionPathCount,
+                    state.materializedDeletionPathCount
+                )
+                let priorPhase = state.phase
+                index.resumePendingRefreshForTesting(path: folder.path)
+                try await waitUntil(timeout: .seconds(2)) {
+                    if completion.isMarked { return true }
+                    guard let nextState = index.pendingDirectoryFinalizationStateForTesting(
+                        path: folder.path
+                    ) else {
+                        return false
+                    }
+                    return nextState.baselineRowsVisited != priorBaselineRowsVisited
+                        || nextState.phase != priorPhase
+                }
+            }
+        }
+
+        try await waitUntil(timeout: .seconds(10)) { completion.isMarked }
+        #expect(maximumMaterializedDeletionPathCount == 3)
+        #expect(index.currentDiagnostics().pendingRefreshPathCount == 0)
+        for file in files.prefix(3) {
+            #expect(!index.search(SearchRequest(
+                query: file.deletingPathExtension().lastPathComponent,
+                sort: SortSpec(column: .relevance, ascending: false)
+            ), maxResults: 10).results.contains { $0.record.path == file.path })
+        }
+        #expect(index.search(SearchRequest(
+            query: "Existing0511",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10).results.contains { $0.record.path == files[511].path })
+    }
+
+    @Test("directory finalization drains unpublished additions with a stable cursor")
+    func directoryFinalizationResumesUnpublishedUpserts() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: root) }
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        defer { try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName)) }
+        let index = FileIndex(
+            applicationName: applicationName,
+            loadsSnapshotImmediately: false,
+            largeOverlayPersistRecordLimit: nil,
+            largeOverlayPersistDelay: nil,
+            backgroundRefreshDrainBackoffDelay: 60,
+            backgroundDirectoryScanBudget: 60,
+            backgroundDirectoryScanVisitLimit: 32,
+            backgroundDirectoryScanEntryLimit: 8_192,
+            backgroundDirectoryFinalizationLimit: 16,
+            backgroundOptimizationPersistDelay: 60
+        )
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil(timeout: .seconds(10)) { !index.currentStats().isIndexing }
+
+        let addedDirectory = root.appendingPathComponent("Added", isDirectory: true)
+        try fileManager.createDirectory(at: addedDirectory, withIntermediateDirectories: true)
+        for offset in 0..<220 {
+            try "added".write(
+                to: addedDirectory.appendingPathComponent(String(format: "Added%04d.swift", offset)),
+                atomically: true,
+                encoding: .utf8
+            )
+        }
+
+        let completion = CompletionFlag()
+        index.update(paths: [addedDirectory.path], priority: .background) { completion.mark() }
+        try await waitUntil(timeout: .seconds(5)) {
+            index.pendingDirectoryRefreshStateForTesting(path: addedDirectory.path) != nil
+        }
+
+        for _ in 0..<20
+        where index.pendingDirectoryFinalizationStateForTesting(path: addedDirectory.path) == nil {
+            let priorRecordCount = index.pendingDirectoryRefreshStateForTesting(
+                path: addedDirectory.path
+            )?.recordCount
+            index.resumePendingRefreshForTesting(path: addedDirectory.path)
+            try await waitUntil(timeout: .seconds(2)) {
+                if index.pendingDirectoryFinalizationStateForTesting(
+                    path: addedDirectory.path
+                ) != nil {
+                    return true
+                }
+                guard let state = index.pendingDirectoryRefreshStateForTesting(
+                    path: addedDirectory.path
+                ) else {
+                    return false
+                }
+                return state.recordCount != priorRecordCount
+            }
+        }
+
+        let initialFinalization = try #require(
+            index.pendingDirectoryFinalizationStateForTesting(path: addedDirectory.path)
+        )
+        let traversalWorkCount = initialFinalization.traversalWorkCount
+        var priorUpsertsVisited = initialFinalization.upsertsVisited
+        var maximumUpsertsVisited = priorUpsertsVisited
+
+        for _ in 0..<20 where !completion.isMarked {
+            index.resumePendingRefreshForTesting(path: addedDirectory.path)
+            try await waitUntil(timeout: .seconds(2)) {
+                if completion.isMarked { return true }
+                guard let state = index.pendingDirectoryFinalizationStateForTesting(
+                    path: addedDirectory.path
+                ) else {
+                    return false
+                }
+                return state.upsertsVisited != priorUpsertsVisited
+            }
+            guard let state = index.pendingDirectoryFinalizationStateForTesting(
+                path: addedDirectory.path
+            ) else {
+                continue
+            }
+            #expect(state.traversalWorkCount == traversalWorkCount)
+            #expect(state.upsertsVisited >= priorUpsertsVisited)
+            #expect(state.upsertsVisited - priorUpsertsVisited <= 16)
+            priorUpsertsVisited = state.upsertsVisited
+            maximumUpsertsVisited = max(maximumUpsertsVisited, state.upsertsVisited)
+        }
+
+        try await waitUntil(timeout: .seconds(10)) { completion.isMarked }
+        #expect(maximumUpsertsVisited >= 32)
+        #expect(index.search(SearchRequest(
+            query: "Added0219",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10).results.contains {
+            $0.record.path == addedDirectory.appendingPathComponent("Added0219.swift").path
+        })
+    }
+
+    @Test("newer exact events supersede deletion candidates prepared during finalization")
+    func exactEventSupersedesPreparedDirectoryDeletion() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        let folder = root.appendingPathComponent("Folder", isDirectory: true)
+        try fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: root) }
+
+        let recreated = folder.appendingPathComponent("000-Recreated.swift")
+        try "old".write(to: recreated, atomically: true, encoding: .utf8)
+        for offset in 0..<256 {
+            try "stable".write(
+                to: folder.appendingPathComponent(String(format: "Stable%04d.swift", offset)),
+                atomically: true,
+                encoding: .utf8
+            )
+        }
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        defer { try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName)) }
+        let index = FileIndex(
+            applicationName: applicationName,
+            loadsSnapshotImmediately: false,
+            largeOverlayPersistRecordLimit: nil,
+            largeOverlayPersistDelay: nil,
+            backgroundRefreshDrainBackoffDelay: 60,
+            backgroundDirectoryScanBudget: 60,
+            backgroundDirectoryScanVisitLimit: 2_048,
+            backgroundDirectoryScanEntryLimit: 8_192,
+            backgroundDirectoryFinalizationLimit: 64,
+            backgroundOptimizationPersistDelay: 60
+        )
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil(timeout: .seconds(10)) { !index.currentStats().isIndexing }
+
+        try fileManager.removeItem(at: recreated)
+        let ancestorCompletion = CompletionFlag()
+        index.update(paths: [folder.path], priority: .background) {
+            ancestorCompletion.mark()
+        }
+        try await waitUntil(timeout: .seconds(5)) {
+            index.pendingDirectoryFinalizationStateForTesting(path: folder.path)?
+                .materializedDeletionPathCount == 1
+        }
+
+        try "new content that must survive".write(
+            to: recreated,
+            atomically: true,
+            encoding: .utf8
+        )
+        let exactCompletion = CompletionFlag()
+        index.update(
+            exactPaths: [recreated.path],
+            recursivePaths: [],
+            priority: .background
+        ) {
+            exactCompletion.mark()
+        }
+        try await waitUntil(timeout: .seconds(5)) { exactCompletion.isMarked }
+
+        for _ in 0..<20 where !ancestorCompletion.isMarked {
+            index.resumePendingRefreshForTesting(path: folder.path)
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        try await waitUntil(timeout: .seconds(10)) { ancestorCompletion.isMarked }
+
+        let result = index.search(SearchRequest(
+            query: "000-Recreated",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10).results.first { $0.record.path == recreated.path }
+        #expect(result?.record.sizeBytes == UInt64("new content that must survive".utf8.count))
+    }
+
     @Test("transient path lookup and enumeration failures retry before releasing completion")
     func transientDirectoryFailuresRetainCompletion() async throws {
         let fileManager = FileManager.default
@@ -2056,6 +2532,85 @@ struct FileIndexTests {
                     query: "Created",
                     sort: SortSpec(column: .relevance, ascending: false)
                 ), maxResults: 10).results.contains { $0.record.path == created.path }
+        }
+    }
+
+    @Test("persistent child failures do not block healthy directory siblings")
+    func persistentChildFailuresDoNotBlockHealthySiblings() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: root) }
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        defer { try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName)) }
+        let index = FileIndex(
+            applicationName: applicationName,
+            loadsSnapshotImmediately: false,
+            largeOverlayPersistRecordLimit: nil,
+            largeOverlayPersistDelay: nil,
+            backgroundRefreshDrainBackoffDelay: 60,
+            backgroundDirectoryScanBudget: 60,
+            backgroundDirectoryScanVisitLimit: 1,
+            backgroundOptimizationPersistDelay: 60
+        )
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil(timeout: .seconds(10)) { !index.currentStats().isIndexing }
+
+        let folder = root.appendingPathComponent("Folder", isDirectory: true)
+        try fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
+        for offset in 0..<6 {
+            let branch = folder.appendingPathComponent("Branch\(offset)", isDirectory: true)
+            try fileManager.createDirectory(at: branch, withIntermediateDirectories: true)
+            try "healthy".write(
+                to: branch.appendingPathComponent("Marker\(offset).swift"),
+                atomically: true,
+                encoding: .utf8
+            )
+        }
+
+        let completion = CompletionFlag()
+        index.update(paths: [folder.path], priority: .background) { completion.mark() }
+        try await waitUntil(timeout: .seconds(5)) {
+            index.pendingDirectoryTraversalPathsForTesting(path: folder.path)?
+                .pending.count == 6
+        }
+
+        let initial = try #require(
+            index.pendingDirectoryTraversalPathsForTesting(path: folder.path)
+        )
+        let lookupFailure = try #require(initial.pending.last)
+        let enumerationFailure = try #require(initial.pending.dropLast().last)
+        let healthyBranch = try #require(initial.pending.dropLast(2).last)
+        let healthyOffset = try #require(Int(URL(fileURLWithPath: healthyBranch)
+            .lastPathComponent.dropFirst("Branch".count)))
+        let healthyMarker = URL(fileURLWithPath: healthyBranch)
+            .appendingPathComponent("Marker\(healthyOffset).swift")
+
+        index.failNextFileSystemLookupsForTesting(path: lookupFailure, count: 100)
+        index.failNextDirectoryUpdateEnumerationsForTesting(
+            path: enumerationFailure,
+            count: 100
+        )
+        index.promotePendingRefreshForTesting(path: folder.path)
+
+        try await waitUntil(timeout: .seconds(10)) {
+            guard let traversal = index.pendingDirectoryTraversalPathsForTesting(path: folder.path)
+            else { return false }
+            return Set(traversal.deferredRetries) == Set([lookupFailure, enumerationFailure])
+                && index.search(SearchRequest(
+                    query: healthyMarker.lastPathComponent,
+                    sort: SortSpec(column: .relevance, ascending: false)
+                ), maxResults: 10).results.contains { $0.record.path == healthyMarker.path }
+        }
+        #expect(!completion.isMarked)
+
+        index.failNextFileSystemLookupsForTesting(path: lookupFailure, count: 0)
+        index.failNextDirectoryUpdateEnumerationsForTesting(path: enumerationFailure, count: 0)
+        index.promotePendingRefreshForTesting(path: folder.path)
+        try await waitUntil(timeout: .seconds(10)) {
+            completion.isMarked && index.currentDiagnostics().pendingRefreshPathCount == 0
         }
     }
 
@@ -2231,6 +2786,111 @@ struct FileIndexTests {
             ), maxResults: 10)
             return index.currentDiagnostics().pendingRefreshPathCount == 0
                 && response.results.contains { $0.record.path == createdFile.path }
+        }
+    }
+
+    @Test("completed directory pass releases its receipt before a newer follow-up pass")
+    func completedDirectoryPassReleasesCoveredCompletion() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        let folder = root.appendingPathComponent("Folder", isDirectory: true)
+        try fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
+        for offset in 0..<40 {
+            try fileManager.createDirectory(
+                at: folder.appendingPathComponent("Child\(offset)", isDirectory: true),
+                withIntermediateDirectories: true
+            )
+        }
+        defer { try? fileManager.removeItem(at: root) }
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        defer { try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName)) }
+        let index = FileIndex(
+            applicationName: applicationName,
+            loadsSnapshotImmediately: false,
+            largeOverlayPersistRecordLimit: nil,
+            largeOverlayPersistDelay: nil,
+            backgroundRefreshDrainBackoffDelay: 0.02,
+            backgroundDirectoryScanBudget: 60,
+            backgroundDirectoryScanVisitLimit: 1,
+            backgroundOptimizationPersistDelay: 60
+        )
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil(timeout: .seconds(10)) { !index.currentStats().isIndexing }
+
+        let firstCompletion = CompletionFlag()
+        index.update(paths: [folder.path], priority: .background) { firstCompletion.mark() }
+        try await waitUntil(timeout: .seconds(5)) {
+            index.pendingDirectoryRefreshStateForTesting(path: folder.path) != nil
+        }
+
+        let followUpCompletion = CompletionFlag()
+        index.update(paths: [folder.path], priority: .background) { followUpCompletion.mark() }
+        try await waitUntil(timeout: .seconds(5)) {
+            index.pendingDirectoryRefreshStateForTesting(path: folder.path)?.requiresFollowUp == true
+        }
+
+        try await waitUntil(timeout: .seconds(10)) { firstCompletion.isMarked }
+        #expect(!followUpCompletion.isMarked)
+        #expect(index.pendingRefreshPathsForTesting().contains(folder.path))
+
+        index.promoteBackgroundMaintenance()
+        try await waitUntil(timeout: .seconds(10)) {
+            followUpCompletion.isMarked
+                && index.currentDiagnostics().pendingRefreshPathCount == 0
+        }
+    }
+
+    @Test("exact metadata events do not turn a recursive follow-up into another subtree scan")
+    func exactEventKeepsDirectoryFollowUpExact() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        let folder = root.appendingPathComponent("Folder", isDirectory: true)
+        try fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
+        for offset in 0..<20 {
+            try fileManager.createDirectory(
+                at: folder.appendingPathComponent("Child\(offset)", isDirectory: true),
+                withIntermediateDirectories: true
+            )
+        }
+        defer { try? fileManager.removeItem(at: root) }
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        defer { try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName)) }
+        let index = FileIndex(
+            applicationName: applicationName,
+            loadsSnapshotImmediately: false,
+            largeOverlayPersistRecordLimit: nil,
+            largeOverlayPersistDelay: nil,
+            backgroundRefreshDrainBackoffDelay: 60,
+            backgroundDirectoryScanBudget: 60,
+            backgroundDirectoryScanVisitLimit: 1,
+            backgroundOptimizationPersistDelay: 60
+        )
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil(timeout: .seconds(10)) { !index.currentStats().isIndexing }
+
+        index.update(paths: [folder.path], priority: .background)
+        try await waitUntil(timeout: .seconds(5)) {
+            index.pendingDirectoryRefreshStateForTesting(path: folder.path) != nil
+        }
+        index.update(
+            exactPaths: [folder.path],
+            recursivePaths: [],
+            priority: .background
+        )
+        try await waitUntil(timeout: .seconds(5)) {
+            index.pendingDirectoryRefreshStateForTesting(path: folder.path)?.requiresFollowUp == true
+        }
+        let state = try #require(index.pendingDirectoryRefreshStateForTesting(path: folder.path))
+        #expect(state.recursivelyScansDirectory)
+        #expect(!state.followUpRecursivelyScansDirectory)
+
+        index.promoteBackgroundMaintenance()
+        try await waitUntil(timeout: .seconds(10)) {
+            index.currentDiagnostics().pendingRefreshPathCount == 0
         }
     }
 
@@ -2605,6 +3265,68 @@ struct FileIndexTests {
             return keptResponse.results.contains { $0.record.path == kept.path }
                 && !deletedResponse.results.contains { $0.record.path == deleted.path }
         }
+    }
+
+    @Test("exact directory refresh updates only the directory record")
+    func exactDirectoryRefreshDoesNotTraverseChildren() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: root) }
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        defer { try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName)) }
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil(timeout: .seconds(10)) { !index.currentStats().isIndexing }
+
+        let directory = root.appendingPathComponent("Incoming", isDirectory: true)
+        let child = directory.appendingPathComponent("AlreadyPresent.swift")
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        try "child".write(to: child, atomically: true, encoding: .utf8)
+
+        let exactCompletion = CompletionFlag()
+        index.update(
+            exactPaths: [root.path + "/Unused/../Incoming"],
+            recursivePaths: [],
+            completion: { exactCompletion.mark() }
+        )
+        try await waitUntil(timeout: .seconds(5)) { exactCompletion.isMarked }
+        #expect(index.search(SearchRequest(
+            query: "Incoming",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10).results.contains { $0.record.path == directory.path })
+        #expect(index.search(SearchRequest(
+            query: "AlreadyPresent",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10).totalMatches == 0)
+
+        let exactChildCompletion = CompletionFlag()
+        index.update(
+            exactPaths: [directory.path, child.path],
+            recursivePaths: [],
+            completion: { exactChildCompletion.mark() }
+        )
+        try await waitUntil(timeout: .seconds(5)) { exactChildCompletion.isMarked }
+        #expect(index.search(SearchRequest(
+            query: "AlreadyPresent",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10).results.contains { $0.record.path == child.path })
+
+        let recursivelyDiscovered = directory.appendingPathComponent("DiscoveredRecursively.swift")
+        try "recursive".write(to: recursivelyDiscovered, atomically: true, encoding: .utf8)
+        let recursiveCompletion = CompletionFlag()
+        index.update(
+            exactPaths: [],
+            recursivePaths: [directory.path],
+            completion: { recursiveCompletion.mark() }
+        )
+        try await waitUntil(timeout: .seconds(5)) { recursiveCompletion.isMarked }
+        #expect(index.search(SearchRequest(
+            query: "DiscoveredRecursively",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10).results.contains { $0.record.path == recursivelyDiscovered.path })
     }
 
     @Test("updates outside configured roots are discarded without traversal")

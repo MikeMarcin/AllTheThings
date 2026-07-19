@@ -4,6 +4,9 @@ final class FileExclusionQuery {
     private let roots: [String]
     private let rules: [Rule]
     private let ancestorPropagatingRules: [(index: Int, rule: Rule)]
+    private let literalComponentRuleIndexes: [String: [Int]]
+    private var literalRuleCandidateGenerations: [UInt64]
+    private var literalRuleCandidateGeneration: UInt64 = 0
     private var ancestorRuleIndexCache: [String: Set<Int>] = [:]
 
     struct Instrumentation: Sendable, Equatable {
@@ -13,6 +16,8 @@ final class FileExclusionQuery {
         var regexMatchCount = 0
         var fastPathDecisionCount = 0
         var fastPruneDirectoryCount = 0
+        var ruleMatchAttemptCount = 0
+        var literalRuleFastRejectCount = 0
 
         init() {}
 
@@ -23,6 +28,8 @@ final class FileExclusionQuery {
             regexMatchCount += other.regexMatchCount
             fastPathDecisionCount += other.fastPathDecisionCount
             fastPruneDirectoryCount += other.fastPruneDirectoryCount
+            ruleMatchAttemptCount += other.ruleMatchAttemptCount
+            literalRuleFastRejectCount += other.literalRuleFastRejectCount
         }
     }
 
@@ -35,6 +42,13 @@ final class FileExclusionQuery {
         self.ancestorPropagatingRules = rules.enumerated().compactMap { index, rule in
             rule.propagatesThroughIgnoredAncestors ? (index, rule) : nil
         }
+        var literalComponentRuleIndexes: [String: [Int]] = [:]
+        for (index, rule) in rules.enumerated() {
+            guard let component = rule.indexedLiteralComponent else { continue }
+            literalComponentRuleIndexes[component, default: []].append(index)
+        }
+        self.literalComponentRuleIndexes = literalComponentRuleIndexes
+        self.literalRuleCandidateGenerations = Array(repeating: 0, count: rules.count)
     }
 
     func decision(path: String, isDirectory: Bool) -> FileExclusionRules.Decision {
@@ -50,6 +64,7 @@ final class FileExclusionQuery {
         instrumentation.compiledExclusionDecisionCount += 1
 
         let relativePaths = relativePathContexts(for: path, instrumentation: &instrumentation)
+        let literalCandidateGeneration = markLiteralRuleCandidates(in: relativePaths)
         var excluded = false
         var finalMatchingRuleIndex: Int?
         var finalMatchingRule: Rule?
@@ -60,6 +75,12 @@ final class FileExclusionQuery {
         )
 
         for (index, rule) in rules.enumerated() {
+            if rule.indexedLiteralComponent != nil,
+               literalRuleCandidateGenerations[index] != literalCandidateGeneration {
+                instrumentation.literalRuleFastRejectCount += 1
+                continue
+            }
+            instrumentation.ruleMatchAttemptCount += 1
             let matchesTarget = rule.matches(
                 relativePaths: relativePaths,
                 isDirectory: isDirectory,
@@ -92,6 +113,25 @@ final class FileExclusionQuery {
         }
 
         return .prune
+    }
+
+    private func markLiteralRuleCandidates(in relativePaths: [RelativePathContext]) -> UInt64 {
+        literalRuleCandidateGeneration &+= 1
+        if literalRuleCandidateGeneration == 0 {
+            literalRuleCandidateGenerations = Array(repeating: 0, count: rules.count)
+            literalRuleCandidateGeneration = 1
+        }
+
+        let generation = literalRuleCandidateGeneration
+        for relativePath in relativePaths {
+            for component in relativePath.lowercasedComponents {
+                guard let ruleIndexes = literalComponentRuleIndexes[component] else { continue }
+                for ruleIndex in ruleIndexes {
+                    literalRuleCandidateGenerations[ruleIndex] = generation
+                }
+            }
+        }
+        return generation
     }
 
     private func inheritedAncestorRuleIndexes(
@@ -207,6 +247,7 @@ private final class RelativePathContext {
     let value: String
     let components: [String]
     let lowercasedComponents: [String]
+    let componentASCII: [Bool]
     let prefixes: [String]
 
     private var rangeStrings: [RangeKey: String] = [:]
@@ -220,6 +261,7 @@ private final class RelativePathContext {
         instrumentation.componentSplitCount += 1
         components = value.split(separator: "/").map(String.init)
         lowercasedComponents = components.map { $0.lowercased() }
+        componentASCII = components.map { $0.unicodeScalars.allSatisfy(\.isASCII) }
 
         var prefixes: [String] = []
         var prefix = ""
@@ -242,7 +284,7 @@ private final class RelativePathContext {
     }
 
     func componentIsASCII(at index: Int) -> Bool {
-        components[index].unicodeScalars.allSatisfy(\.isASCII)
+        componentASCII[index]
     }
 
     func componentsAreASCII(in range: Range<Int>) -> Bool {
@@ -296,6 +338,7 @@ private final class Rule {
     private let containsSlash: Bool
     private let literalPrefix: String
     private let matcher: Matcher
+    let indexedLiteralComponent: String?
 
     var propagatesThroughIgnoredAncestors: Bool {
         !isNegated && !isDirectoryPattern && (containsSlash || isAnchored)
@@ -348,8 +391,9 @@ private final class Rule {
         isTraversalOnlyDirectoryReinclude = isNegated && isDirectoryPattern && !containsSlash && pattern == "*"
         literalPrefix = Self.literalPrefix(for: pattern)
 
+        let compiledMatcher: Matcher
         if Self.isLiteral(pattern) {
-            matcher = .literal(
+            compiledMatcher = .literal(
                 lowercasedValue: pattern.lowercased(),
                 lowercasedComponents: pattern.split(separator: "/").map { String($0).lowercased() }
             )
@@ -360,16 +404,24 @@ private final class Rule {
             ) else {
                 return nil
             }
-            matcher = .glob(glob, nonASCIIFallback: fallbackRegex)
+            compiledMatcher = .glob(glob, nonASCIIFallback: fallbackRegex)
         } else {
             do {
-                matcher = .regex(try NSRegularExpression(
+                compiledMatcher = .regex(try NSRegularExpression(
                     pattern: Self.regexPattern(for: pattern),
                     options: [.caseInsensitive]
                 ))
             } catch {
                 return nil
             }
+        }
+        matcher = compiledMatcher
+        if case .literal(let lowercasedValue, let lowercasedComponents) = compiledMatcher {
+            indexedLiteralComponent = lowercasedComponents.max {
+                $0.count < $1.count
+            } ?? lowercasedValue
+        } else {
+            indexedLiteralComponent = nil
         }
     }
 

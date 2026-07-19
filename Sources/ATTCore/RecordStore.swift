@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// Coalesces small writes while keeping the pending in-memory payload bounded.
@@ -322,6 +323,7 @@ protocol RecordStore: AnyObject, Sendable {
     func normalizedPath(at index: Int) -> String
     func parentRowID(at index: Int) -> Int?
     func subtreeEnd(at index: Int) -> Int
+    func makeSubtreeRowCursor(atPath path: String) -> RecordStoreSubtreeCursor
     func rowIDs(inSubtreeAtPath path: String) -> [Int]?
     func depth(at index: Int) -> Int
     func rootID(at index: Int) -> UInt16?
@@ -333,6 +335,138 @@ protocol RecordStore: AnyObject, Sendable {
     func normalizedName(at index: Int, contains token: String) -> Bool
     func normalizedName(at index: Int, contains tokenBytes: [UInt8]) -> Bool
     func isHiddenInPath(at index: Int, cache: inout [Int: Bool]) -> Bool
+}
+
+/// One bounded cursor step. When `includesEveryRow` is true, callers may
+/// consume `rowRange` directly with packed-word or SIMD operations.
+struct RecordStoreSubtreeRowBatch: Sendable {
+    let rowRange: Range<Int>
+    let includesEveryRow: Bool
+    let isComplete: Bool
+
+    private let pathFilterStore: RecordStore
+    private let subtreePath: String
+
+    fileprivate init(
+        rowRange: Range<Int>,
+        includesEveryRow: Bool,
+        isComplete: Bool,
+        pathFilterStore: RecordStore,
+        subtreePath: String
+    ) {
+        self.rowRange = rowRange
+        self.includesEveryRow = includesEveryRow
+        self.isComplete = isComplete
+        self.pathFilterStore = pathFilterStore
+        self.subtreePath = subtreePath
+    }
+
+    @discardableResult
+    func forEachMatchingRow(_ body: (Int) -> Void) -> Int {
+        if includesEveryRow {
+            for rowID in rowRange {
+                body(rowID)
+            }
+            return rowRange.count
+        }
+
+        var emittedRowCount = 0
+        for rowID in rowRange where RootAttributionMatcher.matches(
+            path: pathFilterStore.path(at: rowID),
+            rootPath: subtreePath
+        ) {
+            emittedRowCount += 1
+            body(rowID)
+        }
+        return emittedRowCount
+    }
+}
+
+/// Resumable row enumeration tied to one immutable record-store snapshot.
+///
+/// A cursor retains the store that created it. Contiguous stores enumerate row
+/// ranges directly; stores without subtree sidecars use a bounded path-filtered
+/// scan. The visit limit therefore bounds work even when few rows match.
+struct RecordStoreSubtreeCursor: Sendable {
+    fileprivate struct Segment: Sendable {
+        var nextRowID: Int
+        let endRowID: Int
+        let filtersByPath: Bool
+
+        init(_ range: Range<Int>, filtersByPath: Bool = false) {
+            self.nextRowID = range.lowerBound
+            self.endRowID = range.upperBound
+            self.filtersByPath = filtersByPath
+        }
+
+        var isEmpty: Bool { nextRowID >= endRowID }
+    }
+
+    private let retainedStore: RecordStore
+    private let pathFilterStore: RecordStore
+    private let subtreePath: String
+    private var currentSegment: Segment?
+    private var followingSegment: Segment?
+    private var finalSegment: Segment?
+
+    fileprivate init(
+        store: RecordStore,
+        subtreePath: String,
+        currentSegment: Segment?,
+        followingSegment: Segment? = nil,
+        finalSegment: Segment? = nil,
+        pathFilterStore: RecordStore? = nil
+    ) {
+        self.retainedStore = store
+        self.pathFilterStore = pathFilterStore ?? store
+        self.subtreePath = subtreePath
+        self.currentSegment = currentSegment
+        self.followingSegment = followingSegment
+        self.finalSegment = finalSegment
+        advancePastEmptySegment()
+    }
+
+    var isComplete: Bool { currentSegment == nil }
+
+    mutating func nextBatch(maximumVisitedRows limit: Int) -> RecordStoreSubtreeRowBatch? {
+        precondition(limit >= 0, "Subtree row visit limit must not be negative")
+        guard limit > 0, var segment = currentSegment else { return nil }
+
+        let lowerBound = segment.nextRowID
+        let upperBound = lowerBound + min(limit, segment.endRowID - lowerBound)
+        segment.nextRowID = upperBound
+        currentSegment = segment
+        advancePastEmptySegment()
+        return RecordStoreSubtreeRowBatch(
+            rowRange: lowerBound..<upperBound,
+            includesEveryRow: !segment.filtersByPath,
+            isComplete: isComplete,
+            pathFilterStore: pathFilterStore,
+            subtreePath: subtreePath
+        )
+    }
+
+    fileprivate func rebound(to store: RecordStore) -> Self {
+        Self(
+            store: store,
+            subtreePath: subtreePath,
+            currentSegment: currentSegment,
+            followingSegment: followingSegment,
+            finalSegment: finalSegment,
+            pathFilterStore: pathFilterStore
+        )
+    }
+
+    private mutating func advancePastEmptySegment() {
+        guard currentSegment?.isEmpty != false else { return }
+        currentSegment = followingSegment
+        followingSegment = finalSegment
+        finalSegment = nil
+        if currentSegment?.isEmpty != false {
+            currentSegment = followingSegment
+            followingSegment = nil
+        }
+    }
 }
 
 struct RecordSearchView: Sendable {
@@ -428,6 +562,13 @@ extension RecordStore {
         return rowID(forPath: record.directoryPath)
     }
     func subtreeEnd(at index: Int) -> Int { index + 1 }
+    func makeSubtreeRowCursor(atPath path: String) -> RecordStoreSubtreeCursor {
+        RecordStoreSubtreeCursor(
+            store: self,
+            subtreePath: path,
+            currentSegment: .init(0..<count, filtersByPath: true)
+        )
+    }
     func rowIDs(inSubtreeAtPath path: String) -> [Int]? {
         guard hasContiguousSubtreeRanges, let rowID = rowID(forPath: path) else { return nil }
         return Array(rowID..<subtreeEnd(at: rowID))
@@ -1013,6 +1154,37 @@ final class OverlayRecordStore: RecordStore {
         return visibleLowerBound(forBaseRowAtLeast: base.subtreeEnd(at: baseRow(forVisibleIndex: index)))
     }
 
+    func makeSubtreeRowCursor(atPath path: String) -> RecordStoreSubtreeCursor {
+        let baseSegment: RecordStoreSubtreeCursor.Segment?
+        if base.hasContiguousSubtreeRanges, let baseRow = base.rowID(forPath: path) {
+            let lowerBound = visibleLowerBound(forBaseRowAtLeast: baseRow)
+            let upperBound = visibleLowerBound(forBaseRowAtLeast: base.subtreeEnd(at: baseRow))
+            baseSegment = .init(lowerBound..<upperBound)
+        } else if !base.hasColumnarSidecars {
+            baseSegment = .init(0..<visibleBaseCount, filtersByPath: true)
+        } else {
+            baseSegment = nil
+        }
+
+        let upsertRanges = upsertSubtreeRanges(atPath: path)
+        func segment(for range: Range<Int>?) -> RecordStoreSubtreeCursor.Segment? {
+            range.map {
+                RecordStoreSubtreeCursor.Segment(
+                    (visibleBaseCount + $0.lowerBound)..<(visibleBaseCount + $0.upperBound)
+                )
+            }
+        }
+        let firstUpsertSegment = segment(for: upsertRanges.first)
+        let secondUpsertSegment = segment(for: upsertRanges.second)
+        return RecordStoreSubtreeCursor(
+            store: self,
+            subtreePath: path,
+            currentSegment: baseSegment,
+            followingSegment: firstUpsertSegment,
+            finalSegment: secondUpsertSegment
+        )
+    }
+
     func rowIDs(inSubtreeAtPath path: String) -> [Int]? {
         var rows: [Int] = []
         if let baseRows = base.rowIDs(inSubtreeAtPath: path) {
@@ -1025,38 +1197,19 @@ final class OverlayRecordStore: RecordStore {
         } else if !base.hasColumnarSidecars {
             for baseRow in 0..<base.count {
                 let candidatePath = base.path(at: baseRow)
-                guard candidatePath == path || candidatePath.hasPrefix(path + "/") else { continue }
+                guard RootAttributionMatcher.matches(path: candidatePath, rootPath: path) else { continue }
                 if let visibleRow = visibleIndex(forBaseRow: baseRow) {
                     rows.append(visibleRow)
                 }
             }
         }
 
-        func lowerBound(for value: String) -> Int {
-            var lower = 0
-            var upper = upserts.count
-            while lower < upper {
-                let middle = (lower + upper) / 2
-                if upserts[middle].path < value {
-                    lower = middle + 1
-                } else {
-                    upper = middle
-                }
-            }
-            return lower
+        let upsertRanges = upsertSubtreeRanges(atPath: path)
+        if let firstRange = upsertRanges.first {
+            rows.append(contentsOf: firstRange.map { visibleBaseCount + $0 })
         }
-
-        let exactOffset = lowerBound(for: path)
-        if exactOffset < upserts.count, upserts[exactOffset].path == path {
-            rows.append(visibleBaseCount + exactOffset)
-        }
-        let descendantPrefix = path + "/"
-        var offset = lowerBound(for: descendantPrefix)
-        while offset < upserts.count {
-            let candidatePath = upserts[offset].path
-            guard candidatePath.hasPrefix(descendantPrefix) else { break }
-            rows.append(visibleBaseCount + offset)
-            offset += 1
+        if let secondRange = upsertRanges.second {
+            rows.append(contentsOf: secondRange.map { visibleBaseCount + $0 })
         }
         return rows
     }
@@ -1160,6 +1313,38 @@ final class OverlayRecordStore: RecordStore {
         while lower < upper {
             let middle = (lower + upper) / 2
             if deletedRowsSorted[middle] < value {
+                lower = middle + 1
+            } else {
+                upper = middle
+            }
+        }
+        return lower
+    }
+
+    private func upsertSubtreeRanges(atPath path: String) -> (
+        first: Range<Int>?,
+        second: Range<Int>?
+    ) {
+        if path == "/" {
+            let range = upsertLowerBound(for: path)..<upsertLowerBound(for: "0")
+            return (range.isEmpty ? nil : range, nil)
+        }
+
+        let exactOffset = upsertLowerBound(for: path)
+        let exactRange = exactOffset < upserts.count && upserts[exactOffset].path == path
+            ? exactOffset..<(exactOffset + 1)
+            : nil
+
+        let descendantRange = upsertLowerBound(for: path + "/")..<upsertLowerBound(for: path + "0")
+        return (exactRange, descendantRange.isEmpty ? nil : descendantRange)
+    }
+
+    private func upsertLowerBound(for value: String) -> Int {
+        var lower = 0
+        var upper = upserts.count
+        while lower < upper {
+            let middle = (lower + upper) / 2
+            if upserts[middle].path < value {
                 lower = middle + 1
             } else {
                 upper = middle
@@ -1328,6 +1513,10 @@ final class ReplacingRecordStore: RecordStore {
         base.subtreeEnd(at: index)
     }
 
+    func makeSubtreeRowCursor(atPath path: String) -> RecordStoreSubtreeCursor {
+        base.makeSubtreeRowCursor(atPath: path).rebound(to: self)
+    }
+
     func rowIDs(inSubtreeAtPath path: String) -> [Int]? {
         base.rowIDs(inSubtreeAtPath: path)
     }
@@ -1446,6 +1635,7 @@ final class MappedRecordStore: RecordStore {
     private static let pathLookupHeaderSize = 24
     private static let pathLookupEntrySize = 16
     private static let virtualFlag: UInt8 = 1 << 3
+    private static let pathSeparator: UInt8 = 47
 
     private struct Row {
         let id: UInt64
@@ -1500,6 +1690,7 @@ final class MappedRecordStore: RecordStore {
     var hasContiguousSubtreeRanges: Bool { true }
     var storedVisibleCount: Int? { visibleCount }
     var storedResultCount: Int? { resultCount }
+    var pathMaterializationCountForTesting: Int { cache.pathCount }
 
     init(packageURL: URL, schemaVersion: Int = SnapshotLayout.schemaVersion) throws {
         self.schemaVersion = schemaVersion
@@ -1626,13 +1817,121 @@ final class MappedRecordStore: RecordStore {
             let entry = readLookupEntry(index)
             guard entry.hash == hash else { break }
             let rowID = Int(entry.rowID)
-            if rowID >= 0, rowID < count, self.path(at: rowID) == path {
+            if rowID >= 0, rowID < count, storedPath(at: rowID, equals: path) {
                 return rowID
             }
             index += 1
         }
 
         return nil
+    }
+
+    /// Confirms a path-lookup hash match without constructing the stored path.
+    ///
+    /// Package rows retain each name plus a parent row. Walking those components
+    /// backwards lets the common update path compare directly with the caller's
+    /// UTF-8 buffer, avoiding recursive string allocation and cache locking for
+    /// every existing filesystem entry.
+    private func storedPath(at rowID: Int, equals path: String) -> Bool {
+        if let result = path.utf8.withContiguousStorageIfAvailable({ pathBytes in
+            storedPath(at: rowID, equals: pathBytes)
+        }) {
+            return result
+        }
+
+        let pathBytes = Array(path.utf8)
+        return pathBytes.withUnsafeBufferPointer { buffer in
+            storedPath(at: rowID, equals: buffer)
+        }
+    }
+
+    private func storedPath(at initialRowID: Int, equals pathBytes: UnsafeBufferPointer<UInt8>) -> Bool {
+        stringsData.withUnsafeBytes { rawStrings in
+            let storedBytes = rawStrings.bindMemory(to: UInt8.self)
+            var rowID = initialRowID
+            var pathEnd = pathBytes.count
+
+            while true {
+                let row = readRow(rowID)
+                let nameLength = Int(row.nameLength)
+                guard nameLength <= pathEnd, row.nameOffset <= UInt64(Int.max) else {
+                    return false
+                }
+
+                let nameStart = pathEnd - nameLength
+                guard Self.bytesEqual(
+                    pathBytes,
+                    at: nameStart,
+                    storedBytes,
+                    at: Int(row.nameOffset),
+                    count: nameLength
+                ) else {
+                    return false
+                }
+                pathEnd = nameStart
+
+                if row.parent >= 0 {
+                    let parent = Int(row.parent)
+                    guard pathEnd > 0,
+                          pathBytes[pathEnd - 1] == Self.pathSeparator,
+                          parent >= 0,
+                          parent < rowID else {
+                        return false
+                    }
+                    pathEnd -= 1
+                    rowID = parent
+                    continue
+                }
+
+                guard row.baseDirectoryOffset <= UInt64(Int.max) else {
+                    return false
+                }
+                let directoryOffset = Int(row.baseDirectoryOffset)
+                let directoryLength = Int(row.baseDirectoryLength)
+                if directoryLength == 0 {
+                    return pathEnd == 0
+                }
+
+                if directoryLength == 1,
+                   directoryOffset < storedBytes.count,
+                   storedBytes[directoryOffset] == Self.pathSeparator {
+                    return pathEnd == 1 && pathBytes[0] == Self.pathSeparator
+                }
+
+                guard pathEnd > 0, pathBytes[pathEnd - 1] == Self.pathSeparator else {
+                    return false
+                }
+                pathEnd -= 1
+                return pathEnd == directoryLength && Self.bytesEqual(
+                    pathBytes,
+                    at: 0,
+                    storedBytes,
+                    at: directoryOffset,
+                    count: directoryLength
+                )
+            }
+        }
+    }
+
+    private static func bytesEqual(
+        _ lhs: UnsafeBufferPointer<UInt8>,
+        at lhsOffset: Int,
+        _ rhs: UnsafeBufferPointer<UInt8>,
+        at rhsOffset: Int,
+        count: Int
+    ) -> Bool {
+        guard count >= 0,
+              count <= lhs.count,
+              count <= rhs.count,
+              lhsOffset >= 0,
+              lhsOffset <= lhs.count - count,
+              rhsOffset >= 0,
+              rhsOffset <= rhs.count - count else {
+            return false
+        }
+        guard count > 0 else { return true }
+        guard let lhsBase = lhs.baseAddress, let rhsBase = rhs.baseAddress else { return false }
+        return memcmp(lhsBase.advanced(by: lhsOffset), rhsBase.advanced(by: rhsOffset), count) == 0
     }
 
     func allRecords() -> [FileRecord] {
@@ -1713,6 +2012,21 @@ final class MappedRecordStore: RecordStore {
         let end = Int(subtreeEndData.readInt32LE(at: columnOffset(for: index, stride: 4)))
         guard end > index, end <= count else { return index + 1 }
         return end
+    }
+
+    func makeSubtreeRowCursor(atPath path: String) -> RecordStoreSubtreeCursor {
+        guard let rowID = rowID(forPath: path) else {
+            return RecordStoreSubtreeCursor(
+                store: self,
+                subtreePath: path,
+                currentSegment: nil
+            )
+        }
+        return RecordStoreSubtreeCursor(
+            store: self,
+            subtreePath: path,
+            currentSegment: .init(rowID..<subtreeEnd(at: rowID))
+        )
     }
 
     func depth(at index: Int) -> Int {
@@ -2728,6 +3042,10 @@ private final class PathMaterializationCache: @unchecked Sendable {
 
     init(limit: Int) {
         self.limit = limit
+    }
+
+    var pathCount: Int {
+        lock.withLock { paths.count }
     }
 
     func path(for row: Int) -> String? {

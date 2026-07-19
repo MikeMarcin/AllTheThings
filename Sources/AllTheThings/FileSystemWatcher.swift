@@ -56,13 +56,27 @@ struct FileSystemEvent: Sendable {
         flags & FSEventStreamEventFlags(kFSEventStreamEventFlagItemIsDir) != 0
     }
 
-    var itemChangeRequiresDirectoryScope: Bool {
-        flags & FSEventStreamEventFlags(kFSEventStreamEventFlagItemRemoved) != 0
-            || flags & FSEventStreamEventFlags(kFSEventStreamEventFlagItemRenamed) != 0
+    var itemWasCreated: Bool {
+        flags & FSEventStreamEventFlags(kFSEventStreamEventFlagItemCreated) != 0
     }
 
-    var requiresDirectoryRefreshScope: Bool {
-        itemIsDirectory || requiresRecursiveRescan || itemChangeRequiresDirectoryScope
+    var itemWasRemoved: Bool {
+        flags & FSEventStreamEventFlags(kFSEventStreamEventFlagItemRemoved) != 0
+    }
+
+    var itemWasRenamed: Bool {
+        flags & FSEventStreamEventFlags(kFSEventStreamEventFlagItemRenamed) != 0
+    }
+
+    /// New and renamed directories can arrive with an already-populated subtree.
+    /// Coalescing can combine removal with creation or rename flags at one path;
+    /// recursive lookup remains cheap when that final path is absent.
+    var mayIntroduceDirectorySubtree: Bool {
+        itemIsDirectory && (itemWasCreated || itemWasRenamed)
+    }
+
+    var itemChangeRequiresDirectoryScope: Bool {
+        itemWasRemoved || itemWasRenamed
     }
 
     func merging(_ other: FileSystemEvent) -> FileSystemEvent {
@@ -664,11 +678,10 @@ struct FSEventReconciliationScopeRouting: Equatable, Sendable {
 
 struct FSEventLiveRefreshScopeRouting: Equatable, Sendable {
     let exactPaths: [String]
-    let directoryPaths: [String]
     let recursivePaths: [String]
 
     var isEmpty: Bool {
-        exactPaths.isEmpty && directoryPaths.isEmpty
+        exactPaths.isEmpty && recursivePaths.isEmpty
     }
 }
 
@@ -765,52 +778,48 @@ enum FSEventLiveRefreshScopeRouter {
     static func route(events: [FileSystemEvent], rootPaths: [String]) -> FSEventLiveRefreshScopeRouting {
         let rootMatcher = FSEventRootMatcher(rootPaths: rootPaths)
         var exactPaths = Set<String>()
-        var directoryScopes = Set<String>()
         var recursivePaths = Set<String>()
 
         for event in events {
             let path = event.path
             if event.invalidatesEntireStream {
-                directoryScopes.formUnion(rootMatcher.rootPaths)
                 recursivePaths.formUnion(rootMatcher.rootPaths)
                 continue
             }
 
             guard let rootPath = rootMatcher.matchingRoot(for: path) else {
                 if event.requiresRecursiveRescan {
-                    directoryScopes.formUnion(rootMatcher.rootPaths)
                     recursivePaths.formUnion(rootMatcher.rootPaths)
                 }
                 continue
             }
 
-            if event.requiresDirectoryRefreshScope {
-                let scope = directoryScope(for: event, path: path, rootPath: rootPath)
-                directoryScopes.insert(scope)
-                if event.requiresRecursiveRescan {
-                    recursivePaths.insert(scope)
-                }
+            if event.historyIsUnsafe {
+                recursivePaths.insert(rootPath)
+            } else if event.requiresRecursiveRescan {
+                recursivePaths.insert(recursiveScope(for: event, path: path, rootPath: rootPath))
+            } else if event.mayIntroduceDirectorySubtree {
+                recursivePaths.insert(path)
             } else {
                 exactPaths.insert(path)
             }
         }
 
-        var directoryScopeIndex = FSEventPathScopeIndex()
-        for scope in directoryScopes {
-            directoryScopeIndex.insert(scope)
+        var recursiveScopeIndex = FSEventPathScopeIndex()
+        for scope in recursivePaths {
+            recursiveScopeIndex.insert(scope)
         }
-        if !directoryScopes.isEmpty {
-            exactPaths = exactPaths.filter { !directoryScopeIndex.containsScope(covering: $0) }
+        if !recursivePaths.isEmpty {
+            exactPaths = exactPaths.filter { !recursiveScopeIndex.containsScope(covering: $0) }
         }
 
         return FSEventLiveRefreshScopeRouting(
             exactPaths: exactPaths.sorted(),
-            directoryPaths: directoryScopeIndex.collapsedScopes,
-            recursivePaths: recursivePaths.sorted()
+            recursivePaths: recursiveScopeIndex.collapsedScopes
         )
     }
 
-    private static func directoryScope(
+    private static func recursiveScope(
         for event: FileSystemEvent,
         path: String,
         rootPath: String
