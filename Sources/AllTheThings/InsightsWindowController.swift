@@ -6,7 +6,6 @@ import Darwin
 @MainActor
 final class InsightsWindowController: NSWindowController {
     static let defaultContentSize = NSSize(width: 900, height: 600)
-    static let minimumContentSize = NSSize(width: 720, height: 500)
     private static let screenMargin: CGFloat = 18
 
     init(
@@ -28,7 +27,7 @@ final class InsightsWindowController: NSWindowController {
 
         let window = InsightsWindow(
             contentRect: NSRect(origin: .zero, size: contentSize),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+            styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
@@ -37,11 +36,11 @@ final class InsightsWindowController: NSWindowController {
         window.titleVisibility = .hidden
         window.canHide = true
         window.isRestorable = false
-        window.contentMinSize = Self.clampedContentSize(
-            Self.minimumContentSize,
-            visibleFrame: initialVisibleFrame
-        )
+        window.contentMinSize = contentSize
+        window.contentMaxSize = contentSize
         window.contentViewController = viewController
+        // Auto Layout windows ignore content min/max sizes, so pin the canvas itself.
+        viewController.lockContentSize(contentSize)
         window.setContentSize(contentSize)
         Self.placeWindowForOpening(window)
 
@@ -233,6 +232,110 @@ enum InsightsEnergyRange: Int, CaseIterable {
     }
 }
 
+private enum InsightsActivityDetailMode: Int {
+    case activity
+    case maintenance
+}
+
+enum InsightsIndexReadinessDisplay {
+    static func state(stats: IndexStats, failureCount: UInt64) -> String {
+        guard failureCount == 0, stats.phase != .failed else {
+            return "Needs attention"
+        }
+
+        switch stats.phase {
+        case .idle:
+            return "Starting"
+        case .loading:
+            return "Loading"
+        case .scanning:
+            if stats.activityPresentation == .backgroundCatchUp {
+                return "Catching up"
+            }
+            if stats.isReconciling {
+                return "Reconciling"
+            }
+            if stats.isUpdating {
+                return "Updating"
+            }
+            return "Scanning"
+        case .optimizing:
+            return "Optimizing"
+        case .saving:
+            return "Saving"
+        case .ready:
+            return stats.optimizedCount < stats.searchableCount ? "Searchable" : "Ready"
+        case .failed:
+            return "Needs attention"
+        }
+    }
+
+    static func progressValue(completed: Int, total: Int) -> String {
+        let total = max(total, 0)
+        let completed = min(max(completed, 0), total)
+        guard total > 0 else { return "0" }
+        return "\(completed.formatted()) / \(total.formatted()) (\(percentString(completed: completed, total: total)))"
+    }
+
+    static func summaryDetail(stats: IndexStats) -> String {
+        "\(max(stats.searchableCount, 0).formatted()) searchable · \(percentString(completed: stats.optimizedCount, total: stats.searchableCount)) optimized"
+    }
+
+    static func percentString(completed: Int, total: Int) -> String {
+        guard total > 0 else { return "0%" }
+        let ratio = min(max(Double(completed) / Double(total), 0), 1)
+        return "\(Int((ratio * 100).rounded()))%"
+    }
+}
+
+enum InsightsLastUpdateDisplay {
+    static func title(_ summary: LastUpdateSummary) -> String {
+        summary.targetReached ? "Last Update" : "Update Attempt"
+    }
+
+    static func version(_ summary: LastUpdateSummary) -> String {
+        let rawVersion = (summary.targetReached ? summary.currentVersion : summary.targetVersion)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rawVersion.isEmpty, rawVersion != "unknown" else { return "Unknown version" }
+        return rawVersion.lowercased().hasPrefix("v") ? rawVersion : "v\(rawVersion)"
+    }
+
+    static func installPath(_ summary: LastUpdateSummary) -> String {
+        let assetType = summary.assetType?.uppercased() ?? "ARCHIVE"
+        let method = summary.installMethod ?? "install"
+        let warning = summary.cleanupWarning == true ? " · cleanup warning" : ""
+        return "\(assetType) → \(method)\(warning)"
+    }
+}
+
+enum InsightsIndexWorkState: String {
+    case deferred = "Deferred"
+    case optimizing = "Optimizing"
+    case catchingUp = "Catching up"
+    case queued = "Queued"
+    case finishing = "Finishing"
+    case idle = "Idle"
+}
+
+enum InsightsIndexWorkDisplay {
+    static func state(
+        stats: IndexStats,
+        live: IndexMaintenanceLiveDiagnostics,
+        activeIndexJobs: Int
+    ) -> InsightsIndexWorkState {
+        if stats.optimizedCount < stats.searchableCount {
+            return (live.deferredOptimizationDelay ?? 0) > 0 ? .deferred : .optimizing
+        }
+        if live.pendingBackgroundRefreshPathCount > 0 {
+            return .catchingUp
+        }
+        if live.pendingRefreshPathCount > 0 || live.pendingReconciliationScopeCount > 0 {
+            return .queued
+        }
+        return activeIndexJobs > 0 ? .finishing : .idle
+    }
+}
+
 private struct InsightsFact {
     let title: String
     let value: String
@@ -276,6 +379,14 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
     private let treemapView = InsightsTreemapView()
     private let indexFilesChartView = InsightsIndexFilesChartView()
     private let activityChartView = InsightsBarChartView()
+    private let maintenanceCostChartView = InsightsMaintenanceCostChartView()
+    private let activityDetailModeControl = NSSegmentedControl(
+        labels: ["Activity", "Maintenance"],
+        trackingMode: .selectOne,
+        target: nil,
+        action: nil
+    )
+    private let activityDetailsStack = NSStackView()
     private let activityFactsStack = NSStackView()
     private let energyRangeControl = NSSegmentedControl(
         labels: InsightsEnergyRange.allCases.map(\.title),
@@ -294,7 +405,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
     private let saveReportButton = NSButton()
     private let titlebarActionStack = NSStackView()
     private let healthTilesContainer = NSView()
-    private let lifetimeFactsStack = NSStackView()
+    private let readinessFactsStack = NSStackView()
 
     private var refreshTimer: Timer?
     private var latestSnapshot: IndexInsightsSnapshot?
@@ -312,6 +423,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
     private var activeTabPage: NSView?
     private var activeTabPageConstraints: [NSLayoutConstraint] = []
     private var titlebarTabsInstalled = false
+    private var lockedContentSizeConstraints: [NSLayoutConstraint] = []
 
     init(
         index: FileIndex,
@@ -366,6 +478,16 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         super.viewWillDisappear()
         isViewVisible = false
         stopPolling()
+    }
+
+    func lockContentSize(_ size: NSSize) {
+        _ = view
+        NSLayoutConstraint.deactivate(lockedContentSizeConstraints)
+        lockedContentSizeConstraints = [
+            contentView.widthAnchor.constraint(equalToConstant: size.width),
+            contentView.heightAnchor.constraint(equalToConstant: size.height)
+        ]
+        NSLayoutConstraint.activate(lockedContentSizeConstraints)
     }
 
     private func buildInterface() {
@@ -423,7 +545,8 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         configureFactsStack(storageFactsStack)
         configureFactsStack(activityFactsStack)
         configureFactsStack(energyFactsStack)
-        configureFactsStack(lifetimeFactsStack)
+        configureFactsStack(readinessFactsStack)
+        configureRowsStack(activityDetailsStack)
 
         overviewTilesContainer.translatesAutoresizingMaskIntoConstraints = false
         overviewTilesContainer.setAccessibilityIdentifier("Insights.SummaryTiles")
@@ -516,19 +639,49 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
 
         activityChartView.translatesAutoresizingMaskIntoConstraints = false
         activityChartView.setAccessibilityIdentifier("Insights.ActivityChart")
+        maintenanceCostChartView.translatesAutoresizingMaskIntoConstraints = false
+        maintenanceCostChartView.setAccessibilityIdentifier("Insights.MaintenanceCostChart")
+        maintenanceCostChartView.isHidden = true
+
+        activityDetailModeControl.translatesAutoresizingMaskIntoConstraints = false
+        activityDetailModeControl.segmentStyle = .separated
+        activityDetailModeControl.controlSize = .small
+        activityDetailModeControl.selectedSegment = InsightsActivityDetailMode.activity.rawValue
+        activityDetailModeControl.target = self
+        activityDetailModeControl.action = #selector(activityDetailModeDidChange(_:))
+        activityDetailModeControl.setAccessibilityIdentifier("Insights.ActivityDetailModeControl")
+        let activityModeRow = NSView()
+        activityModeRow.translatesAutoresizingMaskIntoConstraints = false
+        activityModeRow.addSubview(activityDetailModeControl)
+        NSLayoutConstraint.activate([
+            activityModeRow.heightAnchor.constraint(equalToConstant: 26),
+            activityDetailModeControl.centerXAnchor.constraint(equalTo: activityModeRow.centerXAnchor),
+            activityDetailModeControl.centerYAnchor.constraint(equalTo: activityModeRow.centerYAnchor),
+            activityDetailModeControl.widthAnchor.constraint(equalToConstant: 196),
+            activityDetailModeControl.heightAnchor.constraint(equalToConstant: 22)
+        ])
+        activityDetailsStack.addArrangedSubview(activityModeRow)
+        activityDetailsStack.addArrangedSubview(makeTableSeparator())
+        activityDetailsStack.addArrangedSubview(activityFactsStack)
         let activityFactsTable = makeFactTable(
-            containing: activityFactsStack,
+            containing: activityDetailsStack,
             accessibilityIdentifier: "Insights.ActivityFactsTable"
         )
         let activityBody = NSView()
         activityBody.translatesAutoresizingMaskIntoConstraints = false
         activityBody.addSubview(activityChartView)
+        activityBody.addSubview(maintenanceCostChartView)
         activityBody.addSubview(activityFactsTable)
         NSLayoutConstraint.activate([
             activityChartView.topAnchor.constraint(equalTo: activityBody.topAnchor),
             activityChartView.leadingAnchor.constraint(equalTo: activityBody.leadingAnchor),
             activityChartView.bottomAnchor.constraint(equalTo: activityBody.bottomAnchor),
             activityChartView.trailingAnchor.constraint(equalTo: activityFactsTable.leadingAnchor, constant: -14),
+
+            maintenanceCostChartView.topAnchor.constraint(equalTo: activityChartView.topAnchor),
+            maintenanceCostChartView.leadingAnchor.constraint(equalTo: activityChartView.leadingAnchor),
+            maintenanceCostChartView.trailingAnchor.constraint(equalTo: activityChartView.trailingAnchor),
+            maintenanceCostChartView.bottomAnchor.constraint(equalTo: activityChartView.bottomAnchor),
 
             activityFactsTable.centerYAnchor.constraint(equalTo: activityBody.centerYAnchor),
             activityFactsTable.topAnchor.constraint(greaterThanOrEqualTo: activityBody.topAnchor),
@@ -590,22 +743,22 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         healthTilesContainer.setAccessibilityIdentifier("Insights.HealthTiles")
         let healthContentView = NSView()
         healthContentView.translatesAutoresizingMaskIntoConstraints = false
-        let lifetimeFactsTable = makeFactTable(
-            containing: lifetimeFactsStack,
+        let readinessFactsTable = makeFactTable(
+            containing: readinessFactsStack,
             accessibilityIdentifier: "Insights.HealthFactsTable"
         )
         healthContentView.addSubview(healthTilesContainer)
-        healthContentView.addSubview(lifetimeFactsTable)
+        healthContentView.addSubview(readinessFactsTable)
         NSLayoutConstraint.activate([
             healthTilesContainer.topAnchor.constraint(equalTo: healthContentView.topAnchor),
             healthTilesContainer.leadingAnchor.constraint(equalTo: healthContentView.leadingAnchor),
             healthTilesContainer.bottomAnchor.constraint(equalTo: healthContentView.bottomAnchor),
 
-            lifetimeFactsTable.topAnchor.constraint(equalTo: healthContentView.topAnchor),
-            lifetimeFactsTable.leadingAnchor.constraint(equalTo: healthTilesContainer.trailingAnchor, constant: 14),
-            lifetimeFactsTable.trailingAnchor.constraint(equalTo: healthContentView.trailingAnchor),
-            lifetimeFactsTable.bottomAnchor.constraint(lessThanOrEqualTo: healthContentView.bottomAnchor),
-            lifetimeFactsTable.widthAnchor.constraint(equalTo: healthTilesContainer.widthAnchor)
+            readinessFactsTable.topAnchor.constraint(equalTo: healthContentView.topAnchor),
+            readinessFactsTable.leadingAnchor.constraint(equalTo: healthTilesContainer.trailingAnchor, constant: 14),
+            readinessFactsTable.trailingAnchor.constraint(equalTo: healthContentView.trailingAnchor),
+            readinessFactsTable.bottomAnchor.constraint(lessThanOrEqualTo: healthContentView.bottomAnchor),
+            readinessFactsTable.widthAnchor.constraint(equalTo: healthTilesContainer.widthAnchor)
         ])
         let healthCard = makeCard(containing: healthContentView)
         healthCard.setAccessibilityIdentifier("Insights.HealthCard")
@@ -764,6 +917,15 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         }
     }
 
+    @objc private func activityDetailModeDidChange(_ sender: NSSegmentedControl) {
+        guard let mode = InsightsActivityDetailMode(rawValue: sender.selectedSegment) else { return }
+        activityChartView.isHidden = mode != .activity
+        maintenanceCostChartView.isHidden = mode != .maintenance
+        if let latestSnapshot {
+            rebuildActivityFacts(latestSnapshot)
+        }
+    }
+
     private func showTab(_ tab: InsightsTab) {
         guard let page = tabPages[tab] else { return }
         selectedTab = tab
@@ -855,6 +1017,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         treemapView.roots = displayedRoots
         indexFilesChartView.items = displayedIndexFiles
         activityChartView.buckets = Array(snapshot.usage.dailyBuckets.suffix(30))
+        maintenanceCostChartView.buckets = Array(snapshot.usage.dailyBuckets.suffix(30))
         energyChartView.usage = snapshot.usage
         rootsTableView.reloadData()
 
@@ -868,7 +1031,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         rebuildActivityFacts(snapshot)
         rebuildEnergyInsights(snapshot)
         rebuildHealthGrid(snapshot)
-        rebuildLifetimeFacts(snapshot)
+        rebuildReadinessFacts(snapshot)
     }
 
     private func rebuildOverviewGrid(_ snapshot: IndexInsightsSnapshot, displayedRootCount: Int) {
@@ -887,10 +1050,46 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
                 detail: "\(durationString(todayEnergy.cpuTime)) CPU · \(wakeupsPerMinuteString(todayEnergy.wakeupsPerMinute))"
             ),
             makeMetricTile(title: "Memory", value: byteString(snapshot.usage.dailyBuckets.last?.memory.latestBytes ?? 0), detail: "latest sample"),
-            makeMetricTile(title: "Launches", value: snapshot.lifetime.launchCount.formatted(), detail: dateOnlyString(snapshot.lifetime.firstLaunchDate))
+            makeUpdateOrLaunchTile(snapshot)
         ]
 
         overviewTileConstraints = layoutTileGrid(tiles, in: overviewTilesContainer, columns: 2, rowGap: 8, columnGap: 10)
+    }
+
+    private func makeUpdateOrLaunchTile(_ snapshot: IndexInsightsSnapshot) -> NSView {
+        guard let summary = ReleaseUpdater.lastUpdateSummary(defaults: defaults) else {
+            return makeMetricTile(
+                title: "Launches",
+                value: snapshot.lifetime.launchCount.formatted(),
+                detail: dateOnlyString(snapshot.lifetime.firstLaunchDate)
+            )
+        }
+
+        let phases = [
+            ("Download", summary.downloadDuration),
+            ("Preparation", summary.preparationDuration),
+            ("Validation", summary.validationDuration),
+            ("Helper launch", summary.helperLaunchDuration),
+            ("Replacement", summary.replacementDuration)
+        ]
+        .compactMap { name, duration in
+            duration.map { "\(name) \(durationString($0))" }
+        }
+        let result = summary.targetReached ? "installed" : "target version not reached"
+        let tooltip = ([
+            "\(summary.assetName) \(result) \(relativeDateString(summary.completedAt)).",
+            "Total \(durationString(summary.totalDuration))."
+        ] + phases).joined(separator: " ")
+
+        let detail = summary.targetReached
+            ? "\(durationString(summary.totalDuration)) · \(InsightsLastUpdateDisplay.installPath(summary))"
+            : "\(durationString(summary.totalDuration)) · not installed"
+        return makeMetricTile(
+            title: InsightsLastUpdateDisplay.title(summary),
+            value: InsightsLastUpdateDisplay.version(summary),
+            detail: detail,
+            tooltip: tooltip
+        )
     }
 
     private func rebuildQueryPathPanel(_ snapshot: IndexInsightsSnapshot) {
@@ -920,9 +1119,12 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         let searches = snapshot.usage.allTimeSearches
         let health = snapshot.usage.health
         let failureCount = health.snapshotLoadFailures + health.persistFailures
-        let healthValue = failureCount == 0 ? "OK" : failureCount.formatted()
+        let healthValue = InsightsIndexReadinessDisplay.state(
+            stats: snapshot.stats,
+            failureCount: failureCount
+        )
         let healthDetail = failureCount == 0
-            ? "jobs \(snapshot.health.activeIndexJobs) · schema \(snapshot.health.schemaVersion)"
+            ? InsightsIndexReadinessDisplay.summaryDetail(stats: snapshot.stats)
             : "snapshot \(health.snapshotLoadFailures.formatted()) · persist \(health.persistFailures.formatted())"
 
         let tiles = [
@@ -939,13 +1141,13 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
             makeHealthTile(
                 title: "Rows Examined",
                 value: searches.candidateRowsExamined.formatted(),
-                detail: "\(searches.scannedRowsExamined.formatted()) full scan"
+                detail: "\(searches.scannedRowsExamined.formatted()) scanned rows"
             ),
             makeHealthTile(
-                title: "Index Health",
+                title: "Index Readiness",
                 value: healthValue,
                 detail: healthDetail,
-                isWarning: failureCount > 0
+                isWarning: failureCount > 0 || snapshot.stats.phase == .failed
             )
         ]
 
@@ -992,18 +1194,95 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
     }
 
     private func rebuildActivityFacts(_ snapshot: IndexInsightsSnapshot) {
+        let mode = InsightsActivityDetailMode(rawValue: activityDetailModeControl.selectedSegment) ?? .activity
+        if mode == .maintenance {
+            rebuildMaintenanceFacts(snapshot)
+            return
+        }
+
         let searches = snapshot.usage.allTimeSearches
         let health = snapshot.usage.health
         replaceFacts(in: activityFactsStack, with: [
-            InsightsFact("Completed", searches.completed.formatted()),
             InsightsFact("Fallbacks", searches.fallbackScans.formatted()),
+            InsightsFact("Stale Retries", searches.staleRetries.formatted()),
             InsightsFact("Avg Latency", durationString(searches.averageLatency)),
             InsightsFact("Max Latency", durationString(searches.maxLatency)),
-            InsightsFact("File Actions", totalFileActionString(snapshot.usage.allTimeFileActions)),
             InsightsFact("Index Updates", health.incrementalRefreshBatches.formatted()),
-            InsightsFact("Full Rebuilds", health.fullRebuilds.formatted()),
+            InsightsFact(
+                "Last Ready",
+                optionalDurationString(health.lastRebuildDuration),
+                tooltip: "Time from starting the most recent full scan until the complete snapshot became searchable."
+            ),
             InsightsFact("Last Refresh", optionalDurationString(health.lastRefreshDuration))
         ])
+    }
+
+    private func rebuildMaintenanceFacts(_ snapshot: IndexInsightsSnapshot) {
+        let buckets = Array(snapshot.usage.dailyBuckets.suffix(30))
+        let background = combinedBackgroundMaintenanceCounters(buckets: buckets)
+        let refresh = combinedBackgroundMaintenanceCounters(
+            buckets: buckets,
+            kinds: [.exactRefresh, .directoryRefresh]
+        )
+        let reconcile = combinedBackgroundMaintenanceCounters(buckets: buckets, kinds: [.reconcile])
+        let rebuild = combinedBackgroundMaintenanceCounters(buckets: buckets, kinds: [.fullRebuild])
+        let optimization = combinedBackgroundMaintenanceCounters(buckets: buckets, kinds: [.optimization])
+        let pathGrams = combinedBackgroundMaintenanceCounters(buckets: buckets, kinds: [.pathGramBuild])
+        let persistence = combinedBackgroundMaintenanceCounters(
+            buckets: buckets,
+            kinds: [.snapshotPersist, .metadataOverlayPersist]
+        )
+
+        replaceFacts(in: activityFactsStack, with: [
+            maintenanceFact("Background", counters: background),
+            maintenanceFact("Refresh", counters: refresh),
+            maintenanceFact("Reconcile", counters: reconcile),
+            maintenanceFact("Rebuild", counters: rebuild),
+            maintenanceFact("Optimization", counters: optimization),
+            maintenanceFact("Path Grams", counters: pathGrams),
+            maintenanceFact("Persistence", counters: persistence)
+        ])
+    }
+
+    private func combinedBackgroundMaintenanceCounters(
+        buckets: [DailyUsageBucket],
+        kinds: [IndexMaintenanceOperationKind]
+    ) -> IndexMaintenanceOperationCounters {
+        var combined = IndexMaintenanceOperationCounters()
+        for bucket in buckets {
+            for kind in kinds {
+                combined.add(bucket.maintenance.backgroundCounters(for: kind))
+            }
+        }
+        return combined
+    }
+
+    private func combinedBackgroundMaintenanceCounters(
+        buckets: [DailyUsageBucket]
+    ) -> IndexMaintenanceOperationCounters {
+        var combined = IndexMaintenanceOperationCounters()
+        for bucket in buckets {
+            combined.add(bucket.maintenance.background)
+        }
+        return combined
+    }
+
+    private func maintenanceFact(
+        _ title: String,
+        counters: IndexMaintenanceOperationCounters
+    ) -> InsightsFact {
+        guard counters.operations > 0 else {
+            return InsightsFact(
+                title,
+                "none",
+                tooltip: "No classified background work in the last 30 days. Older saved metrics may not include this breakdown."
+            )
+        }
+        return InsightsFact(
+            title,
+            "\(counters.operations.formatted()) · \(durationString(counters.approximateCPUTime)) CPU",
+            tooltip: "Background work in the last 30 days: \(durationString(counters.wallTime)) wall time, \(counters.records.formatted()) records, \(counters.visited.formatted()) visits, and \(counters.yieldedSlices.formatted()) yielded slices."
+        )
     }
 
     private func rebuildEnergyInsights(_ snapshot: IndexInsightsSnapshot) {
@@ -1014,8 +1293,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         let currentSample = usage.recentEnergySamples.last
         let dayRollups = energyRollups(inLast: 24 * 60 * 60, from: usage, referenceDate: now)
         let oneDay = energyBreakdown(rollups: dayRollups)
-        let live = snapshot.health.maintenance
-        let backlogValue = live.pendingRefreshPathCount + live.pendingReconciliationScopeCount
+        let indexWork = indexWorkSummary(snapshot)
         let currentSystemCPU = currentSample.map {
             InsightsEnergyCPUDisplay.systemLoadString($0.cpuLoad)
         } ?? "No samples"
@@ -1057,9 +1335,9 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
                 detail: "of system · \(durationString(oneDay.total.cpuTime)) CPU total"
             ),
             makeHealthTile(
-                title: "Energy Backlog",
-                value: live.pendingBackgroundRefreshPathCount.formatted(),
-                detail: "\(backlogValue.formatted()) queued · \(deferredMaintenanceDetail(live))"
+                title: "Index Work",
+                value: indexWork.value,
+                detail: indexWork.detail
             )
         ]
         energyTileConstraints = layoutTileGrid(tiles, in: energyTilesContainer, columns: 3, rowGap: 8, columnGap: 8)
@@ -1099,12 +1377,66 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         }
     }
 
-    private func rebuildLifetimeFacts(_ snapshot: IndexInsightsSnapshot) {
-        replaceFacts(in: lifetimeFactsStack, with: [
-            InsightsFact("First Launch", dateOnlyString(snapshot.lifetime.firstLaunchDate)),
-            InsightsFact("Launches", snapshot.lifetime.launchCount.formatted()),
-            InsightsFact("Version Seen", dateOnlyString(snapshot.lifetime.currentAppVersionFirstSeenDate)),
-            InsightsFact("Memory Today", memoryTodayString(snapshot.usage.dailyBuckets.last?.memory))
+    private func indexWorkSummary(_ snapshot: IndexInsightsSnapshot) -> (value: String, detail: String) {
+        let live = snapshot.health.maintenance
+        let queued = live.pendingRefreshPathCount + live.pendingReconciliationScopeCount
+        let state = InsightsIndexWorkDisplay.state(
+            stats: snapshot.stats,
+            live: live,
+            activeIndexJobs: snapshot.health.activeIndexJobs
+        )
+        switch state {
+        case .deferred, .optimizing:
+            return (
+                state.rawValue,
+                "\(InsightsIndexReadinessDisplay.percentString(completed: snapshot.stats.optimizedCount, total: snapshot.stats.searchableCount)) optimized · \(queued.formatted()) queued"
+            )
+        case .catchingUp:
+            return (state.rawValue, "\(queued.formatted()) queued · background refresh")
+        case .queued:
+            let work = live.pendingReconciliationScopeCount > 0 ? "reconciliation" : "refresh"
+            return (state.rawValue, "\(queued.formatted()) queued · \(work)")
+        case .finishing:
+            return (state.rawValue, "\(snapshot.health.activeIndexJobs.formatted()) active · \(queued.formatted()) queued")
+        case .idle:
+            return (state.rawValue, "\(queued.formatted()) queued · \(deferredMaintenanceDetail(live))")
+        }
+    }
+
+    private func rebuildReadinessFacts(_ snapshot: IndexInsightsSnapshot) {
+        let health = snapshot.usage.health
+        let failureCount = health.snapshotLoadFailures + health.persistFailures
+        let healthValue = failureCount == 0 ? "OK" : "\(failureCount.formatted()) failures"
+        replaceFacts(in: readinessFactsStack, with: [
+            InsightsFact(
+                "State",
+                InsightsIndexReadinessDisplay.state(stats: snapshot.stats, failureCount: failureCount),
+                tooltip: snapshot.stats.status
+            ),
+            InsightsFact(
+                "Searchable",
+                InsightsIndexReadinessDisplay.progressValue(
+                    completed: snapshot.stats.searchableCount,
+                    total: snapshot.stats.indexedCount
+                )
+            ),
+            InsightsFact(
+                "Optimized",
+                InsightsIndexReadinessDisplay.progressValue(
+                    completed: snapshot.stats.optimizedCount,
+                    total: snapshot.stats.searchableCount
+                ),
+                tooltip: "Searchable rows with complete name, component, and sort indexes."
+            ),
+            InsightsFact("Active Jobs", snapshot.health.activeIndexJobs.formatted()),
+            InsightsFact(
+                "Last Ready",
+                optionalDurationString(health.lastRebuildDuration),
+                tooltip: "Time from starting the most recent full scan until the complete snapshot became searchable."
+            ),
+            InsightsFact("Stale Retries", snapshot.usage.allTimeSearches.staleRetries.formatted()),
+            InsightsFact("Index Health", healthValue),
+            InsightsFact("Launches", snapshot.lifetime.launchCount.formatted())
         ])
     }
 
@@ -1830,7 +2162,12 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         return valueLabel
     }
 
-    private func makeMetricTile(title: String, value: String, detail: String) -> NSView {
+    private func makeMetricTile(
+        title: String,
+        value: String,
+        detail: String,
+        tooltip: String? = nil
+    ) -> NSView {
         let titleLabel = NSTextField(labelWithString: title)
         titleLabel.font = .systemFont(ofSize: 10, weight: .medium)
         titleLabel.textColor = .secondaryLabelColor
@@ -1853,6 +2190,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         allowHorizontalCompression(detailLabel)
 
         let stack = InsightsTileView(views: [titleLabel, valueLabel, detailLabel], style: .metric)
+        stack.toolTip = tooltip
         stack.spacing = 2
         stack.alignment = .leading
         stack.edgeInsets = NSEdgeInsets(top: 5, left: 9, bottom: 5, right: 9)
@@ -1924,10 +2262,6 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         return panel
     }
 
-    private func compactRouteSummary(_ counters: SearchUsageCounters) -> String {
-        InsightsQueryRouteSummary.compactRouteSummary(counters)
-    }
-
     private func verticalStack(_ views: [NSView], spacing: CGFloat) -> NSStackView {
         let stack = NSStackView(views: views)
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -1957,17 +2291,6 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
             return "\(Int((duration * 1_000).rounded())) ms"
         }
         return String(format: "%.2f s", duration)
-    }
-
-    private func cpuPerWallString(_ counters: IndexMaintenanceOperationCounters) -> String {
-        guard counters.wallTime > 0, counters.approximateCPUTime > 0 else {
-            return "0%"
-        }
-        let percent = counters.approximateCPUTime / counters.wallTime * 100
-        if percent < 10 {
-            return String(format: "%.1f%%", percent)
-        }
-        return "\(Int(percent.rounded()))%"
     }
 
     private func wakeupsPerMinuteString(_ value: Double) -> String {
@@ -2150,15 +2473,6 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
             return "checkpoint \(reason)"
         }
         return live.isFullReconciliationPending ? "full reconcile" : "no deferral"
-    }
-
-    private func totalFileActionString(_ actions: [FileActionMetric: UInt64]) -> String {
-        actions.values.reduce(UInt64(0), +).formatted()
-    }
-
-    private func memoryTodayString(_ memory: MemoryUsageCounters?) -> String {
-        guard let memory else { return "no samples" }
-        return "\(byteString(memory.dailyMinimumBytes)) - \(byteString(memory.dailyMaximumBytes))"
     }
 
     private func relativeDateString(_ date: Date) -> String {

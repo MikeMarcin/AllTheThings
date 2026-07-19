@@ -46,6 +46,7 @@ enum SnapshotLayout {
         static let rootOrder = "rootOrder.bin"
         static let namePostings = "namePostings.bin"
         static let componentPostings = "componentPostings.bin"
+        static let componentSupplementPostings = "componentSupplementPostings.bin"
         static let pathPostings = "pathPostings.bin"
         static let extensionPostings = "extensionPostings.bin"
         static let metadataOverlay = "metadataOverlay.bin"

@@ -30,6 +30,8 @@ struct DiagnosticsReportBuilderTests {
         #expect(report.contains("Approx CPU Time"))
         #expect(report.contains("directoryRefresh"))
         #expect(report.contains("Pending Refresh Paths: 2"))
+        #expect(report.contains("Searchable Rows: 10"))
+        #expect(report.contains("Optimized Rows: 10"))
         #expect(report.contains("mappedIndex: 1"))
         #expect(report.contains("mappedIndex: 1, avg"))
         #expect(report.contains("sidecar: 1"))
@@ -55,6 +57,45 @@ struct DiagnosticsReportBuilderTests {
         )
 
         #expect(report.contains(rootPath))
+    }
+
+    @Test("diagnostics report includes the retained update summary")
+    func diagnosticsReportIncludesRetainedUpdateSummary() throws {
+        let (defaults, suiteName) = try makeDefaults()
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        let summary = LastUpdateSummary(
+            completedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            targetVersion: "1.2.3",
+            currentVersion: "1.2.3",
+            targetReached: true,
+            assetName: "AllTheThings-1.2.3.zip",
+            assetType: "zip",
+            totalDuration: 12,
+            downloadDuration: 8,
+            preparationDuration: 1,
+            validationDuration: 2,
+            helperLaunchDuration: 0.1,
+            replacementDuration: 0.5,
+            installMethod: "move",
+            cleanupWarning: false
+        )
+        ReleaseUpdater.setLastUpdateSummaryDataForTesting(
+            try JSONEncoder().encode(summary),
+            defaults: defaults
+        )
+
+        let report = DiagnosticsReportBuilder.build(
+            snapshot: makeSnapshot(rootPath: "/tmp/root"),
+            defaults: defaults
+        )
+
+        #expect(report.contains("Update Target: 1.2.3 (reached: true)"))
+        #expect(report.contains("Update Asset Type: zip"))
+        #expect(report.contains("Update Install Method: move"))
+        #expect(report.contains("Update Cleanup Warning: false"))
     }
 
     private func makeSnapshot(rootPath: String) -> IndexInsightsSnapshot {

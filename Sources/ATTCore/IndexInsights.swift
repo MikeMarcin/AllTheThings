@@ -281,17 +281,20 @@ public struct IndexMaintenanceCostCounters: Codable, Equatable, Sendable {
     public var interactive: IndexMaintenanceOperationCounters
     public var background: IndexMaintenanceOperationCounters
     public var byKind: [IndexMaintenanceOperationKind: IndexMaintenanceOperationCounters]
+    public var backgroundByKind: [IndexMaintenanceOperationKind: IndexMaintenanceOperationCounters]
 
     public init(
         total: IndexMaintenanceOperationCounters = IndexMaintenanceOperationCounters(),
         interactive: IndexMaintenanceOperationCounters = IndexMaintenanceOperationCounters(),
         background: IndexMaintenanceOperationCounters = IndexMaintenanceOperationCounters(),
-        byKind: [IndexMaintenanceOperationKind: IndexMaintenanceOperationCounters] = [:]
+        byKind: [IndexMaintenanceOperationKind: IndexMaintenanceOperationCounters] = [:],
+        backgroundByKind: [IndexMaintenanceOperationKind: IndexMaintenanceOperationCounters] = [:]
     ) {
         self.total = total
         self.interactive = interactive
         self.background = background
         self.byKind = byKind
+        self.backgroundByKind = backgroundByKind
     }
 
     public mutating func record(_ metric: IndexMaintenanceOperationMetric) {
@@ -302,12 +305,43 @@ public struct IndexMaintenanceCostCounters: Codable, Equatable, Sendable {
             interactive.add(counters)
         case .background:
             background.add(counters)
+            backgroundByKind[metric.kind, default: IndexMaintenanceOperationCounters()].add(counters)
         }
         byKind[metric.kind, default: IndexMaintenanceOperationCounters()].add(counters)
     }
 
     public func counters(for kind: IndexMaintenanceOperationKind) -> IndexMaintenanceOperationCounters {
         byKind[kind] ?? IndexMaintenanceOperationCounters()
+    }
+
+    public func backgroundCounters(for kind: IndexMaintenanceOperationKind) -> IndexMaintenanceOperationCounters {
+        backgroundByKind[kind] ?? IndexMaintenanceOperationCounters()
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case total
+        case interactive
+        case background
+        case byKind
+        case backgroundByKind
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        total = try container.decodeIfPresent(IndexMaintenanceOperationCounters.self, forKey: .total)
+            ?? IndexMaintenanceOperationCounters()
+        interactive = try container.decodeIfPresent(IndexMaintenanceOperationCounters.self, forKey: .interactive)
+            ?? IndexMaintenanceOperationCounters()
+        background = try container.decodeIfPresent(IndexMaintenanceOperationCounters.self, forKey: .background)
+            ?? IndexMaintenanceOperationCounters()
+        byKind = try container.decodeIfPresent(
+            [IndexMaintenanceOperationKind: IndexMaintenanceOperationCounters].self,
+            forKey: .byKind
+        ) ?? [:]
+        backgroundByKind = try container.decodeIfPresent(
+            [IndexMaintenanceOperationKind: IndexMaintenanceOperationCounters].self,
+            forKey: .backgroundByKind
+        ) ?? [:]
     }
 }
 
