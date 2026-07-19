@@ -1,5 +1,6 @@
 import AppKit
 import ATTCore
+import CoreServices
 import QuartzCore
 import UniformTypeIdentifiers
 
@@ -402,6 +403,104 @@ enum SearchPreviewScheduling {
             return "alreadyDisplayed"
         }
         return nil
+    }
+}
+
+struct SearchRefreshGate {
+    private(set) var hasDeferredRefresh = false
+
+    mutating func request(isInteractive: Bool) -> Bool {
+        guard isInteractive else {
+            deferRefresh()
+            return false
+        }
+
+        return true
+    }
+
+    mutating func deferRefresh() {
+        hasDeferredRefresh = true
+    }
+
+    mutating func refreshDidStart() {
+        hasDeferredRefresh = false
+    }
+}
+
+struct FSEventCursorCommitQueue {
+    private struct Batch {
+        let advances: [String: UInt64]
+        var isReady: Bool
+    }
+
+    private var nextBatchID: UInt64 = 0
+    private var nextCommitID: UInt64 = 0
+    private var batches: [UInt64: Batch] = [:]
+
+    mutating func enqueue(_ advances: [String: UInt64]) -> UInt64? {
+        guard !advances.isEmpty else { return nil }
+        return enqueueBatch(advances)
+    }
+
+    mutating func enqueueBarrier() -> UInt64 {
+        enqueueBatch([:])
+    }
+
+    private mutating func enqueueBatch(_ advances: [String: UInt64]) -> UInt64 {
+        let batchID = nextBatchID
+        nextBatchID &+= 1
+        batches[batchID] = Batch(advances: advances, isReady: false)
+        return batchID
+    }
+
+    mutating func markReady(_ batchIDs: [UInt64]) -> [String: UInt64] {
+        for batchID in batchIDs where batches[batchID] != nil {
+            batches[batchID]?.isReady = true
+        }
+
+        var committed: [String: UInt64] = [:]
+        while let batch = batches[nextCommitID], batch.isReady {
+            for (root, eventID) in batch.advances {
+                committed[root] = max(committed[root] ?? 0, eventID)
+            }
+            batches.removeValue(forKey: nextCommitID)
+            nextCommitID &+= 1
+        }
+        return committed
+    }
+
+    mutating func removeAll() {
+        batches.removeAll(keepingCapacity: false)
+        nextCommitID = nextBatchID
+    }
+}
+
+struct FSEventCursorCommitGate {
+    private(set) var isSuspended = false
+    private var pendingAdvances: [String: UInt64] = [:]
+
+    mutating func suspend() {
+        isSuspended = true
+    }
+
+    mutating func accept(_ advances: [String: UInt64]) -> [String: UInt64] {
+        guard isSuspended else { return advances }
+        for (root, eventID) in advances {
+            pendingAdvances[root] = max(pendingAdvances[root] ?? 0, eventID)
+        }
+        return [:]
+    }
+
+    mutating func resume() -> [String: UInt64] {
+        isSuspended = false
+        let advances = pendingAdvances
+        pendingAdvances.removeAll(keepingCapacity: false)
+        return advances
+    }
+
+    mutating func reset() {
+        isSuspended = false
+        pendingAdvances.removeAll(keepingCapacity: false)
     }
 }
 
@@ -1054,10 +1153,11 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     private let index: FileIndex
     private let fseventCursorStore = FSEventCursorStore.default
-    private lazy var watcher = FileSystemWatcher(cursorStore: fseventCursorStore)
+    private lazy var watcher = FileSystemWatcher()
+    private lazy var applicationWatcher = FileSystemWatcher()
     private lazy var fseventReconciler = FSEventReconciliationCoordinator(cursorStore: fseventCursorStore)
     private let searchQueue = DispatchQueue(label: "att.search", qos: .userInitiated)
-    private let searchPreviewQueue = DispatchQueue(label: "att.search.preview", qos: .userInteractive, attributes: .concurrent)
+    private let searchPreviewQueue = DispatchQueue(label: "att.search.preview", qos: .userInteractive)
     private let explanationQueue = DispatchQueue(label: "att.search.explain", qos: .utility)
     private let fseventFilterQueue = DispatchQueue(label: "att.fsevents.filter", qos: .utility)
     private let applicationSearchCatalog = ApplicationSearchCatalog()
@@ -1101,6 +1201,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var pendingPreviewSearchToken: SearchCancellationToken?
     private var activeSearchFullFinished = false
     private var activeSearchNeedsRetryAfterPreview = false
+    private var pendingExactSearchRetrySignature: SearchSignature?
+    private var searchRefreshGate = SearchRefreshGate()
     private var explanationGeneration: UInt64 = 0
     private var activeExplanationToken = SearchCancellationToken()
     private var pendingExplanationKeys = Set<ExplanationCacheKey>()
@@ -1111,9 +1213,16 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var visibleColumns: Set<Column>
     private var indexedRoots: [URL]
     private var rootDisplayNames: [String: String] = [:]
-    private var pendingRawFSEvents: [FileSystemEvent] = []
+    private var pendingRawFSEventsByPath: [String: FileSystemEvent] = [:]
+    private var pendingRawFSEventCount = 0
     private var rawFSEventFilterDebounce: DispatchWorkItem?
     private var pendingFSEventsByPath: [String: FileSystemEvent] = [:]
+    private var pendingFSEventCursorBatchIDs: [UInt64] = []
+    private var fseventCursorCommitQueue = FSEventCursorCommitQueue()
+    private var fseventCursorEpoch: UInt64 = 0
+    private var activeFSEventCatchUpCursorBarrierID: UInt64?
+    private var activeFSEventCatchUpFinalUpdateID: UUID?
+    private var fseventCursorCommitGate = FSEventCursorCommitGate()
     private var eventDebounce: DispatchWorkItem?
     private var lastDroppedOnlyFSEventLogDate: Date?
     private var suppressedDroppedOnlyFSEventCount = 0
@@ -1122,8 +1231,15 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var activeFSEventReconciliationID: UUID?
     private var fseventCatchUpStartedAt: Date?
     private var pendingFSEventCatchUpRoots: [URL]?
-    private var activeFSEventScopedCatchUpBaseline: (rootPaths: [String], eventID: UInt64)?
-    private var queuedFSEventScopedCatchUpBaseline: (rootPaths: [String], eventID: UInt64)?
+    private struct ScopedFSEventCatchUpBaseline {
+        let rootPaths: [String]
+        let eventID: UInt64
+        let deferredUpdatePaths: [String]
+        let cursorEpoch: UInt64
+    }
+
+    private var activeFSEventScopedCatchUpBaseline: ScopedFSEventCatchUpBaseline?
+    private var queuedFSEventScopedCatchUpBaseline: ScopedFSEventCatchUpBaseline?
     private var memoryStatusTask: Task<Void, Never>?
     private var memoryStatusText = ProcessMemoryFormatter.label(for: ProcessMemorySampler.currentUsage())
     private var processResourceTask: Task<Void, Never>?
@@ -1236,7 +1352,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             case .interactive:
                 return .seconds(2)
             case .background:
-                return .seconds(30)
+                return .seconds(300)
             }
         }
 
@@ -1301,6 +1417,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     deinit {
         activeFSEventReplay?.cancel()
+        activeSearchToken?.cancel()
         searchStatusTimer?.invalidate()
         searchStatusTimer = nil
         memoryStatusTask?.cancel()
@@ -1395,8 +1512,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             object: nil
         )
 
+        ensureFSEventCatchUpCursorBarrier()
         applyEnergyMode(Self.currentEnergyMode(), force: true)
         startWatchingIfNeeded()
+        startApplicationWatchingIfNeeded()
         startMemoryStatusPolling()
         startProcessResourcePolling()
         updateScanSnapshotPublishingPreference()
@@ -2679,6 +2798,11 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func scheduleSearch(force: Bool = false) {
+        guard searchRefreshGate.request(isInteractive: energyMode == .interactive) else {
+            pendingSearchInputStartedAt = nil
+            return
+        }
+
         let queryText = currentSearchText()
         let appSearchQuery = ApplicationSearchQuery.parse(queryText)
         guard appSearchQuery != nil || !indexStats.isLoadingSnapshot else { return }
@@ -2716,11 +2840,13 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let redisplaysCurrentSignature = signature == displayedSearchSignature
 
         activeSearchToken?.cancel()
+        pendingExactSearchRetrySignature = nil
         pendingPreviewSearchToken = nil
         activeSearchFullFinished = false
         activeSearchNeedsRetryAfterPreview = false
         let token = SearchCancellationToken()
         activeSearchToken = token
+        searchRefreshGate.refreshDidStart()
         let searchStartedAt: Date
         if redisplaysCurrentSignature, initialQueryElapsed != nil {
             searchStartedAt = Date()
@@ -2966,7 +3092,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             pendingPreviewSearchToken = nil
         }
         if activeSearchFullFinished {
-            clearSearchTokenIfCurrent(token)
+            if !keepSearchRefiningWhileAwaitingExactRetry(signature: signature) {
+                clearSearchTokenIfCurrent(token)
+            }
         }
     }
 
@@ -2995,6 +3123,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         guard generationMatches, tokenMatches else { return false }
         activeSearchFullFinished = true
+        if budgetTimedOut, !retryAfterPreview {
+            pendingExactSearchRetrySignature = signature
+        }
         activeSearchNeedsRetryAfterPreview = retryAfterPreview
         if SearchRunReconciliation.fullCancellationKeepsSearchActive(
             hasPendingPreview: hasPendingPreview,
@@ -3008,8 +3139,21 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
 
         activeSearchNeedsRetryAfterPreview = false
-        clearSearchTokenIfCurrent(token)
+        if !keepSearchRefiningWhileAwaitingExactRetry(signature: signature) {
+            clearSearchTokenIfCurrent(token)
+        }
         return false
+    }
+
+    @discardableResult
+    private func keepSearchRefiningWhileAwaitingExactRetry(signature: SearchSignature) -> Bool {
+        guard pendingExactSearchRetrySignature == signature else { return false }
+        activeSearchToken = nil
+        isRefiningSearchResults = true
+        updateStatus()
+        updateLoadingOverlay()
+        updateMascotPersistentAnimation()
+        return true
     }
 
     private func logSearchPreviewScheduled(signature: SearchSignature, generation: UInt64) {
@@ -3191,6 +3335,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                 generation: queryGeneration
             )
             activeSearchFullFinished = true
+            token.cancel()
             pendingPreviewSearchToken = nil
             activeSearchToken = nil
             activeSearchNeedsRetryAfterPreview = false
@@ -3211,6 +3356,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         if isFinal {
             activeSearchFullFinished = true
+            token.cancel()
             pendingPreviewSearchToken = nil
             activeSearchToken = nil
             activeSearchNeedsRetryAfterPreview = false
@@ -3228,11 +3374,14 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             )
             if completesSearch {
                 let needsRetry = activeSearchNeedsRetryAfterPreview
+                let awaitsExactRetry = pendingExactSearchRetrySignature == signature
                 activeSearchNeedsRetryAfterPreview = false
                 activeSearchToken = nil
-                isRefiningSearchResults = false
-                activeSearchStartedAt = nil
-                stopSearchStatusTimer()
+                isRefiningSearchResults = awaitsExactRetry
+                if !awaitsExactRetry {
+                    activeSearchStartedAt = nil
+                    stopSearchStatusTimer()
+                }
                 if needsRetry, signature == scheduledSearchSignature {
                     DispatchQueue.main.async { [weak self] in
                         self?.scheduleSearch(force: true)
@@ -3305,6 +3454,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     private func suppressEmptySearchDuringIndexing(signature: SearchSignature) {
         scheduledSearchSignature = signature
+        pendingExactSearchRetrySignature = nil
         if activeSearchToken != nil {
             activeSearchToken?.cancel()
             activeSearchToken = nil
@@ -3366,6 +3516,20 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         refreshZeroRowRootRecoveryCandidatesIfNeeded(stats: stats)
         scheduleZeroRowRootRecoveryIfNeeded()
+
+        if let pendingExactSearchRetrySignature,
+           pendingExactSearchRetrySignature == scheduledSearchSignature {
+            let request = SearchRequest(
+                query: pendingExactSearchRetrySignature.query,
+                sort: pendingExactSearchRetrySignature.sort,
+                includeHidden: pendingExactSearchRetrySignature.includeHidden
+            )
+            if !shouldBudgetSearchDuringIndexing(request: request, stats: stats) {
+                self.pendingExactSearchRetrySignature = nil
+                scheduleSearch(force: true)
+                return
+            }
+        }
 
         if shouldForceSearchRefreshForSnapshotChange(previous: previousStats, current: stats) {
             scheduleSearch(force: true)
@@ -3826,6 +3990,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     @objc private func appSearchRootsDidChange(_ notification: Notification) {
         applicationSearchCatalog.invalidate()
+        startApplicationWatchingIfNeeded()
         guard ApplicationSearchQuery.parse(currentSearchText()) != nil else { return }
         scheduledSearchSignature = nil
         scheduleSearch(force: true)
@@ -3852,12 +4017,37 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             index.promoteBackgroundMaintenance()
             runFSEventsBackedReconciliation(roots: indexedRoots)
         }
+        if searchRefreshGate.hasDeferredRefresh {
+            scheduleSearch(force: true)
+        }
         guard !zeroRowRootRecoveryCandidatePaths.isEmpty else { return }
         scheduleZeroRowRootRecoveryIfNeeded()
     }
 
     @objc private func applicationDidResignActive(_ notification: Notification) {
+        deferActiveSearchUntilInteractive()
         applyEnergyMode(.background)
+    }
+
+    private func deferActiveSearchUntilInteractive() {
+        guard activeSearchToken != nil || pendingExactSearchRetrySignature != nil || isRefiningSearchResults else {
+            return
+        }
+
+        searchRefreshGate.deferRefresh()
+        activeSearchToken?.cancel()
+        activeSearchToken = nil
+        pendingExactSearchRetrySignature = nil
+        pendingPreviewSearchToken = nil
+        activeSearchFullFinished = false
+        activeSearchNeedsRetryAfterPreview = false
+        isRefiningSearchResults = false
+        activeSearchStartedAt = nil
+        queryGeneration &+= 1
+        stopSearchStatusTimer()
+        updateStatus()
+        updateLoadingOverlay()
+        updateMascotPersistentAnimation()
     }
 
     private static func currentEnergyMode() -> EnergyMode {
@@ -3874,6 +4064,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         energyMode = mode
         backgroundEnergyModeEnteredAt = mode == .background ? Date() : nil
         startWatchingIfNeeded()
+        startApplicationWatchingIfNeeded()
         reschedulePendingFSEventFlushIfNeeded()
         restartMemoryStatusPolling()
         resetProcessResourceBaseline()
@@ -3908,6 +4099,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private func rebuildIndexForCurrentSettings() {
         activeSearchToken?.cancel()
         activeSearchToken = nil
+        pendingExactSearchRetrySignature = nil
         pendingPreviewSearchToken = nil
         activeSearchFullFinished = false
         activeSearchNeedsRetryAfterPreview = false
@@ -4066,19 +4258,19 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func markFSEventBaselineIfNeeded(previous: IndexStats, current: IndexStats) {
-        guard previous.isIndexing, !current.isIndexing, current.phase == .ready else { return }
-        let completedFreshIndex = current.status.hasPrefix("Indexed") && !previous.resumedFromCheckpoint
-        let completedFullReconcile = current.status.hasPrefix("Reconciled")
-        guard completedFreshIndex || completedFullReconcile else { return }
+        guard
+            previous.isIndexing,
+            !current.isIndexing,
+            current.phase == .ready,
+            current.status.hasPrefix("Indexed"),
+            !previous.resumedFromCheckpoint
+        else {
+            return
+        }
 
         let rootPaths = rootPaths(index.allRoots())
         guard !rootPaths.isEmpty else { return }
-        if completedFreshIndex {
-            runFSEventsBackedReconciliation(roots: index.allRoots())
-        } else {
-            fseventCursorStore.markBaseline(for: rootPaths)
-            startWatchingIfNeeded()
-        }
+        runFSEventsBackedReconciliation(roots: index.allRoots())
     }
 
     private func activateQueuedFSEventCatchUpBaselineIfNeeded(previous: IndexStats, current: IndexStats) {
@@ -4109,9 +4301,84 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
 
         activeFSEventScopedCatchUpBaseline = nil
-        fseventCursorStore.markBaseline(for: baseline.rootPaths, eventID: baseline.eventID)
+        finishScopedFSEventCatchUp(baseline)
+    }
+
+    private func finishScopedFSEventCatchUp(_ baseline: ScopedFSEventCatchUpBaseline) {
+        guard !baseline.deferredUpdatePaths.isEmpty else {
+            commitFSEventCatchUpBaseline(
+                rootPaths: baseline.rootPaths,
+                eventID: baseline.eventID,
+                cursorEpoch: baseline.cursorEpoch
+            )
+            return
+        }
+
+        scheduleFSEventCatchUpFinalUpdate(paths: baseline.deferredUpdatePaths, baseline: baseline)
+    }
+
+    private func scheduleFSEventCatchUpFinalUpdate(
+        paths: [String],
+        baseline: ScopedFSEventCatchUpBaseline
+    ) {
+        let finalUpdateID = UUID()
+        activeFSEventCatchUpFinalUpdateID = finalUpdateID
+        index.update(paths: paths, priority: .background) {
+            [rootPaths = baseline.rootPaths, eventID = baseline.eventID, cursorEpoch = baseline.cursorEpoch, weak self] in
+            Task { @MainActor [weak self] in
+                self?.commitFSEventCatchUpBaseline(
+                    rootPaths: rootPaths,
+                    eventID: eventID,
+                    cursorEpoch: cursorEpoch,
+                    finalUpdateID: finalUpdateID
+                )
+            }
+        }
+    }
+
+    private func ensureFSEventCatchUpCursorBarrier() {
+        fseventCursorCommitGate.suspend()
+        guard activeFSEventCatchUpCursorBarrierID == nil else { return }
+        activeFSEventCatchUpCursorBarrierID = fseventCursorCommitQueue.enqueueBarrier()
+    }
+
+    private func commitFSEventCatchUpBaseline(
+        rootPaths: [String],
+        eventID: UInt64,
+        cursorEpoch: UInt64,
+        finalUpdateID: UUID? = nil
+    ) {
+        guard cursorEpoch == fseventCursorEpoch else { return }
+        if let finalUpdateID {
+            guard activeFSEventCatchUpFinalUpdateID == finalUpdateID else { return }
+            activeFSEventCatchUpFinalUpdateID = nil
+        }
+        fseventCursorStore.markBaseline(for: rootPaths, eventID: eventID)
+        if let barrierID = activeFSEventCatchUpCursorBarrierID {
+            activeFSEventCatchUpCursorBarrierID = nil
+            commitReadyFSEventCursorBatches([barrierID])
+        }
         startWatchingIfNeeded()
         scheduleZeroRowRootRecoveryIfNeeded()
+        runPendingFSEventCatchUpIfNeeded(stats: index.currentStats())
+        resumeFSEventCursorCommitsIfCatchUpFinished()
+    }
+
+    private func resumeFSEventCursorCommitsIfCatchUpFinished() {
+        guard
+            fseventCursorCommitGate.isSuspended,
+            activeFSEventReplay == nil,
+            activeFSEventReconciliationID == nil,
+            activeFSEventScopedCatchUpBaseline == nil,
+            queuedFSEventScopedCatchUpBaseline == nil,
+            activeFSEventCatchUpFinalUpdateID == nil,
+            activeFSEventCatchUpCursorBarrierID == nil,
+            pendingFSEventCatchUpRoots == nil
+        else {
+            return
+        }
+
+        fseventCursorStore.updateDeferred(fseventCursorCommitGate.resume())
     }
 
     private func runPendingFSEventCatchUpIfNeeded(stats: IndexStats) {
@@ -4120,6 +4387,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             !stats.isLoadingSnapshot,
             activeFSEventReplay == nil,
             activeFSEventReconciliationID == nil,
+            activeFSEventCatchUpFinalUpdateID == nil,
             let roots = pendingFSEventCatchUpRoots
         else {
             return
@@ -4133,7 +4401,11 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         guard AppSettings.indexingSetupCompleted(defaults: defaults), !indexedRoots.isEmpty else {
             rawFSEventFilterDebounce?.cancel()
             rawFSEventFilterDebounce = nil
-            pendingRawFSEvents.removeAll(keepingCapacity: false)
+            pendingRawFSEventsByPath.removeAll(keepingCapacity: false)
+            pendingRawFSEventCount = 0
+            pendingFSEventCursorBatchIDs.removeAll(keepingCapacity: false)
+            fseventCursorCommitQueue.removeAll()
+            fseventCursorEpoch &+= 1
             cancelFSEventCatchUp()
             watcher.stop()
             return
@@ -4144,13 +4416,41 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
     }
 
+    private func startApplicationWatchingIfNeeded() {
+        let roots = AppSettings.appSearchRoots(defaults: defaults)
+        guard !roots.isEmpty else {
+            applicationWatcher.stop()
+            return
+        }
+
+        let configuration = FileSystemWatcher.StreamConfiguration(
+            latency: energyMode == .interactive ? 1 : 5,
+            usesNoDefer: false
+        )
+        applicationWatcher.start(roots: roots, configuration: configuration) { @MainActor @Sendable [weak self] events in
+            self?.applicationSearchRootsDidChange(events, roots: roots)
+        }
+    }
+
+    private func applicationSearchRootsDidChange(_ events: [FileSystemEvent], roots: [URL]) {
+        guard ApplicationSearchEventFilter.shouldInvalidate(events: events, roots: roots) else { return }
+        applicationSearchCatalog.invalidate()
+        guard ApplicationSearchQuery.parse(currentSearchText()) != nil else { return }
+        scheduledSearchSignature = nil
+        scheduleSearch(force: true)
+    }
+
     private func prepareFSEventsForFreshIndexBuild() {
         rawFSEventFilterDebounce?.cancel()
         rawFSEventFilterDebounce = nil
-        pendingRawFSEvents.removeAll(keepingCapacity: false)
+        pendingRawFSEventsByPath.removeAll(keepingCapacity: false)
+        pendingRawFSEventCount = 0
         eventDebounce?.cancel()
         eventDebounce = nil
         pendingFSEventsByPath.removeAll(keepingCapacity: false)
+        pendingFSEventCursorBatchIDs.removeAll(keepingCapacity: false)
+        fseventCursorCommitQueue.removeAll()
+        fseventCursorEpoch &+= 1
         cancelFSEventCatchUp()
         fseventCursorStore.markBaseline(for: rootPaths(indexedRoots))
         startWatchingIfNeeded()
@@ -4167,6 +4467,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             return
         }
 
+        ensureFSEventCatchUpCursorBarrier()
         startWatchingIfNeeded()
         guard !indexStats.isIndexing, activeFSEventReplay == nil, activeFSEventReconciliationID == nil else {
             pendingFSEventCatchUpRoots = roots
@@ -4186,6 +4487,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
 
         let reconciliationID = UUID()
+        let cursorEpoch = fseventCursorEpoch
         activeFSEventReconciliationID = reconciliationID
         fseventCatchUpStartedAt = Date()
         DiagnosticLogger.shared.log(
@@ -4202,7 +4504,13 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         let exclusionRules = FileExclusionRules(patterns: index.allExclusionPatterns())
         activeFSEventReplay = fseventReconciler.reconcile(roots: roots, exclusions: exclusionRules) { @MainActor @Sendable [weak self] action in
-            guard let self, self.activeFSEventReconciliationID == reconciliationID else { return }
+            guard
+                let self,
+                self.activeFSEventReconciliationID == reconciliationID,
+                self.fseventCursorEpoch == cursorEpoch
+            else {
+                return
+            }
             self.activeFSEventReplay = nil
             self.activeFSEventReconciliationID = nil
             self.fseventCatchUpStartedAt = nil
@@ -4228,19 +4536,24 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                 )
                 if routedScopes.directoryPaths.isEmpty {
                     if routedScopes.updatePaths.isEmpty {
-                        self.fseventCursorStore.markBaseline(for: rootPaths, eventID: baselineEventID)
+                        self.commitFSEventCatchUpBaseline(
+                            rootPaths: rootPaths,
+                            eventID: baselineEventID,
+                            cursorEpoch: cursorEpoch
+                        )
                     } else {
-                        self.index.update(paths: routedScopes.updatePaths, priority: .background) { [fseventCursorStore = self.fseventCursorStore] in
-                            fseventCursorStore.markBaseline(for: rootPaths, eventID: baselineEventID)
-                        }
+                        self.scheduleFSEventCatchUpFinalUpdate(
+                            paths: routedScopes.updatePaths,
+                            baseline: ScopedFSEventCatchUpBaseline(
+                                rootPaths: rootPaths,
+                                eventID: baselineEventID,
+                                deferredUpdatePaths: routedScopes.updatePaths,
+                                cursorEpoch: cursorEpoch
+                            )
+                        )
                     }
-                    self.startWatchingIfNeeded()
                     self.updateStatus()
-                    self.scheduleZeroRowRootRecoveryIfNeeded()
                 } else {
-                    if !routedScopes.updatePaths.isEmpty {
-                        self.index.update(paths: routedScopes.updatePaths, priority: .background)
-                    }
                     let result = self.index.reconcileIndexedRootsInBackground(
                         rootURLs: routedScopes.directoryPaths.map { URL(fileURLWithPath: $0, isDirectory: true) },
                         activityPresentation: .backgroundCatchUp
@@ -4248,7 +4561,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                     self.handleScopedFSEventCatchUpRequestResult(
                         result,
                         roots: roots,
-                        baselineEventID: baselineEventID
+                        baselineEventID: baselineEventID,
+                        deferredUpdatePaths: routedScopes.updatePaths,
+                        cursorEpoch: cursorEpoch
                     )
                 }
             case let .upToDate(baselineEventID):
@@ -4259,11 +4574,13 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                         "baselineEventID": .publicUInt64(baselineEventID)
                     ]
                 )
-                self.fseventCursorStore.markBaseline(for: self.rootPaths(roots), eventID: baselineEventID)
-                self.startWatchingIfNeeded()
+                self.commitFSEventCatchUpBaseline(
+                    rootPaths: self.rootPaths(roots),
+                    eventID: baselineEventID,
+                    cursorEpoch: cursorEpoch
+                )
                 self.updateStatus()
-                self.scheduleZeroRowRootRecoveryIfNeeded()
-            case let .fullReconcile(paths):
+            case let .fullReconcile(paths, baselineEventID):
                 self.activeFSEventScopedCatchUpBaseline = nil
                 self.queuedFSEventScopedCatchUpBaseline = nil
                 DiagnosticLogger.shared.log(
@@ -4272,15 +4589,22 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                     event: "fsevents.reconciliationFullReconcile",
                     fields: [
                         "pathCount": .publicInt(paths?.count ?? 0),
+                        "baselineEventID": .publicUInt64(baselineEventID),
                         "paths": .pathArray(paths ?? [])
                     ]
                 )
                 self.index.recordRecursiveRescan()
                 let rootURLs = paths.map(self.pathsIncludingReadableZeroRowRecoveryCandidates)?
                     .map { URL(fileURLWithPath: $0, isDirectory: true) }
-                self.index.reconcileIndexedRootsInBackground(
+                let result = self.index.reconcileIndexedRootsInBackground(
                     rootURLs: rootURLs,
                     activityPresentation: .backgroundCatchUp
+                )
+                self.handleScopedFSEventCatchUpRequestResult(
+                    result,
+                    roots: roots,
+                    baselineEventID: baselineEventID,
+                    cursorEpoch: cursorEpoch
                 )
             }
         }
@@ -4289,7 +4613,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private func handleScopedFSEventCatchUpRequestResult(
         _ result: ReconciliationRequestResult,
         roots: [URL],
-        baselineEventID: UInt64
+        baselineEventID: UInt64,
+        deferredUpdatePaths: [String] = [],
+        cursorEpoch: UInt64
     ) {
         switch result {
         case .started:
@@ -4297,26 +4623,22 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             activeFSEventScopedCatchUpBaseline = mergedFSEventScopedCatchUpBaseline(
                 activeFSEventScopedCatchUpBaseline,
                 rootPaths: rootPaths,
-                eventID: baselineEventID
+                eventID: baselineEventID,
+                deferredUpdatePaths: deferredUpdatePaths,
+                cursorEpoch: cursorEpoch
             )
         case .queued:
             let rootPaths = rootPaths(roots)
             queuedFSEventScopedCatchUpBaseline = mergedFSEventScopedCatchUpBaseline(
                 queuedFSEventScopedCatchUpBaseline,
                 rootPaths: rootPaths,
-                eventID: baselineEventID
+                eventID: baselineEventID,
+                deferredUpdatePaths: deferredUpdatePaths,
+                cursorEpoch: cursorEpoch
             )
         case .coveredByActive:
             let rootPaths = rootPaths(roots)
-            if activeFSEventScopedCatchUpBaseline?.rootPaths == rootPaths {
-                activeFSEventScopedCatchUpBaseline = mergedFSEventScopedCatchUpBaseline(
-                    activeFSEventScopedCatchUpBaseline,
-                    rootPaths: rootPaths,
-                    eventID: baselineEventID
-                )
-            } else {
-                pendingFSEventCatchUpRoots = roots
-            }
+            pendingFSEventCatchUpRoots = roots
             DiagnosticLogger.shared.log(
                 category: "fsevents",
                 event: "fsevents.reconciliationSuppressedDuplicate",
@@ -4329,19 +4651,45 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                 ]
             )
         case .ignored:
-            break
+            DiagnosticLogger.shared.log(
+                level: .warning,
+                category: "fsevents",
+                event: "fsevents.reconciliationScopeIgnored",
+                fields: [
+                    "rootCount": .publicInt(roots.count),
+                    "baselineEventID": .publicUInt64(baselineEventID)
+                ]
+            )
         }
     }
 
     private func mergedFSEventScopedCatchUpBaseline(
-        _ existing: (rootPaths: [String], eventID: UInt64)?,
+        _ existing: ScopedFSEventCatchUpBaseline?,
         rootPaths: [String],
-        eventID: UInt64
-    ) -> (rootPaths: [String], eventID: UInt64) {
-        guard let existing, existing.rootPaths == rootPaths else {
-            return (rootPaths, eventID)
+        eventID: UInt64,
+        deferredUpdatePaths: [String],
+        cursorEpoch: UInt64
+    ) -> ScopedFSEventCatchUpBaseline {
+        guard
+            let existing,
+            existing.rootPaths == rootPaths,
+            existing.cursorEpoch == cursorEpoch
+        else {
+            return ScopedFSEventCatchUpBaseline(
+                rootPaths: rootPaths,
+                eventID: eventID,
+                deferredUpdatePaths: deferredUpdatePaths,
+                cursorEpoch: cursorEpoch
+            )
         }
-        return (rootPaths, max(existing.eventID, eventID))
+        return ScopedFSEventCatchUpBaseline(
+            rootPaths: rootPaths,
+            eventID: max(existing.eventID, eventID),
+            deferredUpdatePaths: Array(
+                Set(existing.deferredUpdatePaths).union(deferredUpdatePaths)
+            ).sorted(),
+            cursorEpoch: cursorEpoch
+        )
     }
 
     private func cancelFSEventCatchUp() {
@@ -4352,15 +4700,44 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         pendingFSEventCatchUpRoots = nil
         activeFSEventScopedCatchUpBaseline = nil
         queuedFSEventScopedCatchUpBaseline = nil
+        activeFSEventCatchUpFinalUpdateID = nil
+        fseventCursorCommitGate.reset()
+        if activeFSEventCatchUpCursorBarrierID != nil {
+            activeFSEventCatchUpCursorBarrierID = nil
+            fseventCursorCommitQueue.removeAll()
+            pendingFSEventCursorBatchIDs.removeAll(keepingCapacity: false)
+        }
     }
 
     private func coalesceFSEvents(_ events: [FileSystemEvent]) {
-        pendingRawFSEvents.append(contentsOf: events)
+        if events.contains(where: \.eventIDsWrapped) {
+            let roots = rootPaths(indexedRoots)
+            fseventCursorStore.invalidate(roots: roots)
+            fseventCursorCommitQueue.removeAll()
+            pendingFSEventCursorBatchIDs.removeAll(keepingCapacity: false)
+            fseventCursorEpoch &+= 1
+            cancelFSEventCatchUp()
+            DiagnosticLogger.shared.log(
+                level: .warning,
+                category: "fsevents",
+                event: "fsevents.cursorEpochReset",
+                fields: ["rootCount": .publicInt(roots.count)]
+            )
+        }
+
+        pendingRawFSEventCount += events.count
+        for event in events {
+            if let existing = pendingRawFSEventsByPath[event.path] {
+                pendingRawFSEventsByPath[event.path] = existing.merging(event)
+            } else {
+                pendingRawFSEventsByPath[event.path] = event
+            }
+        }
         scheduleRawFSEventFiltering()
     }
 
     private func scheduleRawFSEventFiltering() {
-        rawFSEventFilterDebounce?.cancel()
+        guard rawFSEventFilterDebounce == nil else { return }
         let workItem = DispatchWorkItem { [weak self] in
             self?.filterPendingRawFSEvents()
         }
@@ -4370,13 +4747,20 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     private func filterPendingRawFSEvents() {
         rawFSEventFilterDebounce = nil
-        let events = pendingRawFSEvents
-        pendingRawFSEvents.removeAll(keepingCapacity: true)
+        let events = Array(pendingRawFSEventsByPath.values)
+        let originalEventCount = pendingRawFSEventCount
+        pendingRawFSEventsByPath.removeAll(keepingCapacity: true)
+        pendingRawFSEventCount = 0
         guard !events.isEmpty else { return }
 
         let rootPaths = rootPaths(indexedRoots)
         let exclusionPatterns = index.allExclusionPatterns()
-        fseventFilterQueue.async { [events, rootPaths, exclusionPatterns] in
+        let cursorEpoch = fseventCursorEpoch
+        let wrappedBaselineEventID = events.contains(where: \.eventIDsWrapped)
+            ? UInt64(FSEventsGetCurrentEventId())
+            : nil
+        fseventFilterQueue.async {
+            [events, rootPaths, exclusionPatterns, wrappedBaselineEventID, cursorEpoch] in
             let filteredEvents = FSEventIndexFilter.indexableEvents(
                 events,
                 context: FSEventIndexFilter.Context(
@@ -4384,16 +4768,40 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                     exclusionPatterns: exclusionPatterns
                 )
             )
+            let cursorAdvances = FSEventCursorAdvances.latestByRoot(
+                events: events,
+                rootPaths: rootPaths,
+                wrappedBaselineEventID: wrappedBaselineEventID
+            )
             DispatchQueue.main.async { [weak self] in
-                self?.applyFilteredFSEvents(originalEventCount: events.count, filteredEvents: filteredEvents)
+                self?.applyFilteredFSEvents(
+                    originalEventCount: originalEventCount,
+                    filteredEvents: filteredEvents,
+                    cursorAdvances: cursorAdvances,
+                    cursorEpoch: cursorEpoch
+                )
             }
         }
     }
 
-    private func applyFilteredFSEvents(originalEventCount: Int, filteredEvents: [FileSystemEvent]) {
+    private func applyFilteredFSEvents(
+        originalEventCount: Int,
+        filteredEvents: [FileSystemEvent],
+        cursorAdvances: [String: UInt64],
+        cursorEpoch: UInt64
+    ) {
+        guard cursorEpoch == fseventCursorEpoch else { return }
+        let cursorBatchID = fseventCursorCommitQueue.enqueue(cursorAdvances)
         guard !filteredEvents.isEmpty else {
+            if let cursorBatchID {
+                commitReadyFSEventCursorBatches([cursorBatchID])
+            }
             logDroppedOnlyFSEventBatch(eventCount: originalEventCount)
             return
+        }
+
+        if let cursorBatchID {
+            pendingFSEventCursorBatchIDs.append(cursorBatchID)
         }
 
         flushSuppressedDroppedOnlyFSEventLogs()
@@ -4472,7 +4880,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func scheduleCoalescedFSEventFlush() {
-        eventDebounce?.cancel()
+        guard eventDebounce == nil else { return }
         let workItem = DispatchWorkItem { [weak self] in
             self?.flushCoalescedFSEvents()
         }
@@ -4481,10 +4889,14 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func reschedulePendingFSEventFlushIfNeeded() {
-        if rawFSEventFilterDebounce != nil, !pendingRawFSEvents.isEmpty {
+        if rawFSEventFilterDebounce != nil, !pendingRawFSEventsByPath.isEmpty {
+            rawFSEventFilterDebounce?.cancel()
+            rawFSEventFilterDebounce = nil
             scheduleRawFSEventFiltering()
         }
         guard eventDebounce != nil, !pendingFSEventsByPath.isEmpty else { return }
+        eventDebounce?.cancel()
+        eventDebounce = nil
         scheduleCoalescedFSEventFlush()
     }
 
@@ -4492,6 +4904,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         eventDebounce = nil
         let events = Array(pendingFSEventsByPath.values)
         pendingFSEventsByPath.removeAll(keepingCapacity: false)
+        let cursorBatchIDs = pendingFSEventCursorBatchIDs
+        pendingFSEventCursorBatchIDs.removeAll(keepingCapacity: false)
         guard !events.isEmpty else { return }
 
         let routedScopes = FSEventLiveRefreshScopeRouter.route(
@@ -4500,15 +4914,26 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         )
         let priority: IndexWorkPriority = energyMode == .background ? .background : .interactive
         playMascotTransient(.fileChanged)
-        if !routedScopes.exactPaths.isEmpty {
-            index.update(paths: routedScopes.exactPaths, priority: priority)
-        }
-        if !routedScopes.directoryPaths.isEmpty {
-            index.update(paths: routedScopes.directoryPaths, priority: priority)
-        }
         if !routedScopes.recursivePaths.isEmpty {
             index.recordRecursiveRescan()
         }
+        let updatePaths = routedScopes.exactPaths + routedScopes.directoryPaths
+        guard !updatePaths.isEmpty else {
+            commitReadyFSEventCursorBatches(cursorBatchIDs)
+            return
+        }
+
+        index.update(paths: updatePaths, priority: priority) { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.commitReadyFSEventCursorBatches(cursorBatchIDs)
+            }
+        }
+    }
+
+    private func commitReadyFSEventCursorBatches(_ batchIDs: [UInt64]) {
+        let advances = fseventCursorCommitQueue.markReady(batchIDs)
+        guard !advances.isEmpty else { return }
+        fseventCursorStore.updateDeferred(fseventCursorCommitGate.accept(advances))
     }
 
     private func startMemoryStatusPolling() {

@@ -492,6 +492,35 @@ struct FileIndexInsightsTests {
         #expect(persisted.maintenance.background.operations == 1)
     }
 
+    @Test("search and memory metrics are batched until flush")
+    func searchAndMemoryMetricsAreBatchedUntilFlush() throws {
+        let fileManager = FileManager.default
+        let applicationName = "AllTheThingsInsights-\(UUID().uuidString)"
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        defer {
+            index.flushUsageMetrics()
+            try? fileManager.removeItem(at: index.dataDirectoryURL)
+        }
+
+        let metricsURL = index.dataDirectoryURL.appendingPathComponent("index-metrics.json", isDirectory: false)
+        try? fileManager.removeItem(at: metricsURL)
+        index.replaceRecordsForTesting([makeRecord(path: "/tmp/Alpha.swift", size: 12)])
+        index.recordMemorySample(bytes: 64 * 1_024 * 1_024)
+        _ = index.search(SearchRequest(
+            query: "Alpha",
+            sort: SortSpec(column: .name, ascending: true)
+        ))
+
+        #expect(!fileManager.fileExists(atPath: metricsURL.path))
+        index.flushUsageMetrics()
+
+        let data = try Data(contentsOf: metricsURL)
+        let persisted = try JSONDecoder().decode(IndexUsageMetrics.self, from: data)
+        #expect(persisted.dailyBuckets.first?.memory.latestBytes == 64 * 1_024 * 1_024)
+        #expect(persisted.allTimeSearches.completed == 1)
+        #expect(!String(decoding: data, as: UTF8.self).contains("\n"))
+    }
+
     @Test("energy samples aggregate by mode rollup and day")
     func energySamplesAggregateByModeRollupAndDay() {
         var metrics = IndexUsageMetrics()

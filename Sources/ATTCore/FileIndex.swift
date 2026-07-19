@@ -578,17 +578,29 @@ public final class FileIndex: @unchecked Sendable {
     private static let largeOverlayChangedPathDefaultThreshold = 10_000
     private static let largeOverlayDrainBackoffDefaultDelay: TimeInterval = 5
     private static let backgroundRefreshBatchDefaultLimit = 64
-    private static let backgroundRefreshDrainBackoffDefaultDelay: TimeInterval = 15
+    private static let backgroundRefreshDrainBackoffDefaultDelay: TimeInterval = 60
     private static let backgroundDirectoryScanBudgetDefault: TimeInterval = 1.5
-    private static let backgroundDirectoryMaxDeferralDefault: TimeInterval = 30 * 60
     private static let backgroundOptimizationPersistDefaultDelay: TimeInterval = 300
     private static let metadataOverlayPersistDefaultDelay: TimeInterval = 30
     private static let metadataOverlayCheckpointDefaultDelay: TimeInterval = 300
     private static let metadataOverlayPersistDefaultLimit = 10_000
-    private static let usageMetricsMaintenanceSaveDefaultDelay: TimeInterval = 15
+    private static let usageMetricsMaintenanceSaveDefaultDelay: TimeInterval = 5 * 60
     private static let degradedSearchMaximumScanLimit = 25_000
     private static let previewIndexedCandidateScanLimit = 50_000
     private static let previewOrderedCandidateScanLimit = 25_000
+
+#if DEBUG
+    static var defaultBackgroundDirectoryMaintenancePolicyForTesting: (
+        scanBudget: TimeInterval,
+        backoff: TimeInterval,
+        targetDutyCycle: Double
+    ) {
+        let scanBudget = backgroundDirectoryScanBudgetDefault
+        let backoff = backgroundRefreshDrainBackoffDefaultDelay
+        return (scanBudget, backoff, scanBudget / (scanBudget + backoff))
+    }
+#endif
+
     public static let maximumIndexedRootCount = RootAttributionTable.maximumRootCount
     private static let memoryTelemetrySinkForTesting = MemoryTelemetrySinkBox()
 
@@ -2621,24 +2633,32 @@ public final class FileIndex: @unchecked Sendable {
             return candidates
         }
 
-        func candidateIndices(containing tokenBytes: [UInt8], field: FuzzyMatcher.QueryField) -> [Int32]? {
+        func candidateIndices(
+            containing tokenBytes: [UInt8],
+            field: FuzzyMatcher.QueryField,
+            shouldCancel: @Sendable () -> Bool = { false }
+        ) -> [Int32]? {
             switch field {
             case .name:
-                return candidateNameIndices(containing: tokenBytes)
+                return candidateNameIndices(containing: tokenBytes, shouldCancel: shouldCancel)
             case .path:
                 return candidatePathIndices(containing: tokenBytes)
             case .any:
                 guard
-                    let nameCandidates = candidateNameIndices(containing: tokenBytes),
+                    let nameCandidates = candidateNameIndices(containing: tokenBytes, shouldCancel: shouldCancel),
                     let pathCandidates = candidatePathIndices(containing: tokenBytes)
                 else {
                     return nil
                 }
-                return FileIndex.unionPostingLists(pathCandidates, nameCandidates)
+                return FileIndex.unionPostingLists(pathCandidates, nameCandidates, shouldCancel: shouldCancel)
             }
         }
 
-        private static func candidates(in postingIndex: MappedIntPostingIndex, keys: [Int]) -> [Int32]? {
+        private static func candidates(
+            in postingIndex: MappedIntPostingIndex,
+            keys: [Int],
+            shouldCancel: @Sendable () -> Bool = { false }
+        ) -> [Int32]? {
             guard !keys.isEmpty else { return nil }
 
             var postings: [[Int32]] = []
@@ -2656,10 +2676,13 @@ public final class FileIndex: @unchecked Sendable {
                 return postings[0]
             }
 
-            return FileIndex.intersectPostingLists(postings)
+            return FileIndex.intersectPostingLists(postings, shouldCancel: shouldCancel)
         }
 
-        func candidateNameIndices(containing tokenBytes: [UInt8]) -> [Int32]? {
+        func candidateNameIndices(
+            containing tokenBytes: [UInt8],
+            shouldCancel: @Sendable () -> Bool = { false }
+        ) -> [Int32]? {
             guard let nameGramIndex else { return nil }
 
             let keys = FileIndex.searchGramKeys(for: tokenBytes)
@@ -2680,28 +2703,51 @@ public final class FileIndex: @unchecked Sendable {
                 return postings[0]
             }
 
-            return FileIndex.intersectPostingLists(postings)
+            return FileIndex.intersectPostingLists(postings, shouldCancel: shouldCancel)
         }
 
-        func candidateNameIndices(containingAny tokenByteSets: [[UInt8]]) -> [Int32]? {
+        func candidateNameIndices(
+            containingAny tokenByteSets: [[UInt8]],
+            shouldCancel: @Sendable () -> Bool = { false }
+        ) -> [Int32]? {
             guard !tokenByteSets.isEmpty else { return nil }
 
             var candidates: [Int32] = []
             for tokenBytes in tokenByteSets {
-                guard let values = candidateNameIndices(containingAllBytes: tokenBytes) else {
+                guard let values = candidateNameIndices(
+                    containingAllBytes: tokenBytes,
+                    shouldCancel: shouldCancel
+                ) else {
                     return nil
                 }
-                candidates = FileIndex.unionPostingLists(candidates, values)
+                guard let merged = FileIndex.unionPostingLists(
+                    candidates,
+                    values,
+                    shouldCancel: shouldCancel
+                ) else {
+                    return nil
+                }
+                candidates = merged
             }
 
             return candidates
         }
 
-        func candidateNameIndices(containingAllBytes tokenBytes: [UInt8]) -> [Int32]? {
-            candidateIndices(in: nameGramIndex, containingAllBytes: tokenBytes)
+        func candidateNameIndices(
+            containingAllBytes tokenBytes: [UInt8],
+            shouldCancel: @Sendable () -> Bool = { false }
+        ) -> [Int32]? {
+            candidateIndices(
+                in: nameGramIndex,
+                containingAllBytes: tokenBytes,
+                shouldCancel: shouldCancel
+            )
         }
 
-        func candidateComponentIndices(containing tokenBytes: [UInt8]) -> [Int32]? {
+        func candidateComponentIndices(
+            containing tokenBytes: [UInt8],
+            shouldCancel: @Sendable () -> Bool = { false }
+        ) -> [Int32]? {
             guard let componentGramIndex else { return nil }
 
             let keys = FileIndex.searchGramKeys(for: tokenBytes)
@@ -2722,11 +2768,18 @@ public final class FileIndex: @unchecked Sendable {
                 return postings[0]
             }
 
-            return FileIndex.intersectPostingLists(postings)
+            return FileIndex.intersectPostingLists(postings, shouldCancel: shouldCancel)
         }
 
-        func candidateComponentIndices(containingAllBytes tokenBytes: [UInt8]) -> [Int32]? {
-            candidateIndices(in: componentGramIndex, containingAllBytes: tokenBytes)
+        func candidateComponentIndices(
+            containingAllBytes tokenBytes: [UInt8],
+            shouldCancel: @Sendable () -> Bool = { false }
+        ) -> [Int32]? {
+            candidateIndices(
+                in: componentGramIndex,
+                containingAllBytes: tokenBytes,
+                shouldCancel: shouldCancel
+            )
         }
 
         func candidatePathIndicesByScanning(containing token: String, shouldCancel: @Sendable () -> Bool) -> [Int32]? {
@@ -3079,7 +3132,11 @@ public final class FileIndex: @unchecked Sendable {
             return RowIntervalSet.build(intervals)
         }
 
-        private func candidateIndices(in postingIndex: MappedIntPostingIndex?, containingAllBytes tokenBytes: [UInt8]) -> [Int32]? {
+        private func candidateIndices(
+            in postingIndex: MappedIntPostingIndex?,
+            containingAllBytes tokenBytes: [UInt8],
+            shouldCancel: @Sendable () -> Bool = { false }
+        ) -> [Int32]? {
             guard let postingIndex, !tokenBytes.isEmpty else { return nil }
 
             var postings: [[Int32]] = []
@@ -3098,10 +3155,14 @@ public final class FileIndex: @unchecked Sendable {
                 return postings[0]
             }
 
-            return FileIndex.intersectPostingLists(postings)
+            return FileIndex.intersectPostingLists(postings, shouldCancel: shouldCancel)
         }
 
-        func candidateIndices(fileExtension token: String, mode: FuzzyMatcher.MatchMode) -> [Int32]? {
+        func candidateIndices(
+            fileExtension token: String,
+            mode: FuzzyMatcher.MatchMode,
+            shouldCancel: @Sendable () -> Bool = { false }
+        ) -> [Int32]? {
             guard !extensionIndex.isEmpty, !token.isEmpty else { return nil }
 
             switch mode {
@@ -3110,7 +3171,14 @@ public final class FileIndex: @unchecked Sendable {
             case .fuzzy:
                 var candidates: [Int32] = []
                 for (fileExtension, values) in extensionIndex where fileExtension == token || fileExtension.hasPrefix(token) {
-                    candidates = FileIndex.unionPostingLists(candidates, values)
+                    guard let merged = FileIndex.unionPostingLists(
+                        candidates,
+                        values,
+                        shouldCancel: shouldCancel
+                    ) else {
+                        return nil
+                    }
+                    candidates = merged
                 }
                 return candidates
             case .wildcard:
@@ -3120,13 +3188,24 @@ public final class FileIndex: @unchecked Sendable {
 
                 var candidates: [Int32] = []
                 for (fileExtension, values) in extensionIndex where FuzzyMatcher.wildcardMatches(fileExtension, pattern: token) {
-                    candidates = FileIndex.unionPostingLists(candidates, values)
+                    guard let merged = FileIndex.unionPostingLists(
+                        candidates,
+                        values,
+                        shouldCancel: shouldCancel
+                    ) else {
+                        return nil
+                    }
+                    candidates = merged
                 }
                 return candidates
             }
         }
 
-        func exactExtensionCandidatesForFastPath(token: String, mode: FuzzyMatcher.MatchMode) -> [Int32]? {
+        func exactExtensionCandidatesForFastPath(
+            token: String,
+            mode: FuzzyMatcher.MatchMode,
+            shouldCancel: @Sendable () -> Bool = { false }
+        ) -> [Int32]? {
             guard !extensionIndex.isEmpty, !token.isEmpty else { return nil }
 
             switch mode {
@@ -3136,7 +3215,14 @@ public final class FileIndex: @unchecked Sendable {
                 guard let alternatives = FuzzyMatcher.exactWildcardLiteralAlternatives(token) else { return nil }
                 var candidates: [Int32] = []
                 for alternative in alternatives {
-                    candidates = FileIndex.unionPostingLists(candidates, extensionIndex[alternative] ?? [])
+                    guard let merged = FileIndex.unionPostingLists(
+                        candidates,
+                        extensionIndex[alternative] ?? [],
+                        shouldCancel: shouldCancel
+                    ) else {
+                        return nil
+                    }
+                    candidates = merged
                 }
                 return candidates
             case .fuzzy:
@@ -3698,7 +3784,6 @@ public final class FileIndex: @unchecked Sendable {
     private var backgroundRefreshBatchLimitOverride: Int?
     private var backgroundRefreshDrainBackoffDelayOverride: TimeInterval?
     private var backgroundDirectoryScanBudgetOverride: TimeInterval?
-    private var backgroundDirectoryMaxDeferralOverride: TimeInterval?
     private var backgroundOptimizationPersistDelayOverride: TimeInterval?
     private var metadataOverlayPersistDelayOverride: TimeInterval?
     private var metadataOverlayCheckpointDelayOverride: TimeInterval?
@@ -3731,6 +3816,8 @@ public final class FileIndex: @unchecked Sendable {
     private var persistRevision: UInt64 = 0
     private var pendingRefreshPaths: [String: PendingRefreshWork] = [:]
     private var isRefreshDrainScheduled = false
+    private var scheduledRefreshDrainPriority: IndexWorkPriority?
+    private var refreshDrainScheduleGeneration: UInt64 = 0
     private var pendingReconciliationPaths = Set<String>()
     private var pendingReconciliationIncludesAllRoots = false
     private var pendingReconciliationPresentation: IndexActivityPresentation = .backgroundCatchUp
@@ -3784,7 +3871,6 @@ public final class FileIndex: @unchecked Sendable {
         self.backgroundRefreshBatchLimitOverride = nil
         self.backgroundRefreshDrainBackoffDelayOverride = nil
         self.backgroundDirectoryScanBudgetOverride = nil
-        self.backgroundDirectoryMaxDeferralOverride = nil
         self.backgroundOptimizationPersistDelayOverride = nil
         self.metadataOverlayPersistDelayOverride = nil
         self.metadataOverlayCheckpointDelayOverride = nil
@@ -3829,7 +3915,6 @@ public final class FileIndex: @unchecked Sendable {
         backgroundRefreshBatchLimit: Int? = nil,
         backgroundRefreshDrainBackoffDelay: TimeInterval? = nil,
         backgroundDirectoryScanBudget: TimeInterval? = nil,
-        backgroundDirectoryMaxDeferral: TimeInterval? = nil,
         backgroundOptimizationPersistDelay: TimeInterval? = nil,
         metadataOverlayPersistDelay: TimeInterval? = nil,
         metadataOverlayCheckpointDelay: TimeInterval? = nil,
@@ -3849,7 +3934,6 @@ public final class FileIndex: @unchecked Sendable {
         self.backgroundRefreshBatchLimitOverride = backgroundRefreshBatchLimit.map { max(1, $0) }
         self.backgroundRefreshDrainBackoffDelayOverride = backgroundRefreshDrainBackoffDelay.map { max(0, $0) }
         self.backgroundDirectoryScanBudgetOverride = backgroundDirectoryScanBudget.map { max(0, $0) }
-        self.backgroundDirectoryMaxDeferralOverride = backgroundDirectoryMaxDeferral.map { max(0, $0) }
         self.backgroundOptimizationPersistDelayOverride = backgroundOptimizationPersistDelay.map { max(0, $0) }
         self.metadataOverlayPersistDelayOverride = metadataOverlayPersistDelay.map { max(0, $0) }
         self.metadataOverlayCheckpointDelayOverride = metadataOverlayCheckpointDelay.map { max(0, $0) }
@@ -3865,19 +3949,19 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     public func recordAppLaunch(appVersion: String? = nil) {
-        updateUsageMetrics { metrics in
+        updateUsageMetricsDeferred { metrics in
             metrics.recordAppLaunch(appVersion: appVersion)
         }
     }
 
     public func recordFileAction(_ action: FileActionMetric) {
-        updateUsageMetrics { metrics in
+        updateUsageMetricsDeferred { metrics in
             metrics.recordFileAction(action)
         }
     }
 
     public func recordMemorySample(bytes: UInt64) {
-        updateUsageMetrics { metrics in
+        updateUsageMetricsDeferred { metrics in
             metrics.recordMemorySample(bytes: bytes)
         }
     }
@@ -3902,7 +3986,7 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     public func recordRecursiveRescan() {
-        updateUsageMetrics { metrics in
+        updateUsageMetricsDeferred { metrics in
             metrics.recordRecursiveRescan()
         }
     }
@@ -4089,7 +4173,9 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     public func flushUsageMetrics() {
-        savePendingUsageMetricsIfNeeded()
+        metricsSaveQueue.sync {
+            savePendingUsageMetricsIfNeeded()
+        }
     }
 
     public func currentRootInsights() -> [IndexRootInsight] {
@@ -4124,6 +4210,8 @@ public final class FileIndex: @unchecked Sendable {
         guard canClear else {
             throw ClearCachedIndexError.busy
         }
+
+        flushUsageMetrics()
 
         try indexQueue.sync {
             try removePersistedIndexFiles()
@@ -4336,7 +4424,26 @@ public final class FileIndex: @unchecked Sendable {
         priority: IndexWorkPriority = .interactive,
         completion: (@Sendable () -> Void)? = nil
     ) {
-        let paths = Set(rawPaths.map { URL(fileURLWithPath: $0).standardizedFileURL.path })
+        let requestedPaths = Set(rawPaths.map { URL(fileURLWithPath: $0).standardizedFileURL.path })
+        let rootPaths = lock.withLock { roots }
+        let paths = Set(requestedPaths.filter { path in
+            Self.path(path, isWithinAnyRoot: rootPaths)
+        })
+        let discardedPaths = requestedPaths.subtracting(paths)
+        if !discardedPaths.isEmpty {
+            DiagnosticLogger.shared.log(
+                level: .warning,
+                category: "index",
+                event: "index.updateDiscardedOutsideRoots",
+                fields: [
+                    "requestedPathCount": .publicInt(requestedPaths.count),
+                    "discardedPathCount": .publicInt(discardedPaths.count)
+                ],
+                diagnosticFields: [
+                    "paths": .pathArray(Array(discardedPaths))
+                ]
+            )
+        }
         guard !paths.isEmpty else {
             completion?()
             return
@@ -4368,11 +4475,23 @@ public final class FileIndex: @unchecked Sendable {
         scheduleUpdateDrainIfNeeded(delay: .milliseconds(150))
     }
 
+    private static func path(_ path: String, isWithinAnyRoot rootPaths: [String]) -> Bool {
+        rootPaths.contains { root in
+            root == "/" || path == root || path.hasPrefix(root + "/")
+        }
+    }
+
     public func refresh(paths rawPaths: [String]) {
         update(paths: rawPaths)
     }
 
     public func promoteBackgroundMaintenance() {
+        indexQueue.async { [weak self] in
+            self?.promoteBackgroundMaintenanceOnIndexQueue()
+        }
+    }
+
+    private func promoteBackgroundMaintenanceOnIndexQueue() {
         let promoted = lock.withLock { () -> (
             pendingPathCount: Int,
             hasPendingRefreshes: Bool,
@@ -4390,7 +4509,11 @@ public final class FileIndex: @unchecked Sendable {
                 && searchSnapshot.store.kind == .overlay
                 && !searchSnapshot.isOptimizedForSearch
 
-            return (promotedCount, !pendingRefreshPaths.isEmpty, shouldOptimizeSnapshot)
+            return (
+                promotedCount,
+                !pendingRefreshPaths.isEmpty,
+                shouldOptimizeSnapshot
+            )
         }
 
         guard promoted.pendingPathCount > 0 || promoted.shouldOptimizeSnapshot else { return }
@@ -4405,9 +4528,7 @@ public final class FileIndex: @unchecked Sendable {
         )
 
         if promoted.hasPendingRefreshes {
-            indexQueue.async { [weak self] in
-                self?.drainUpdateQueue()
-            }
+            scheduleUpdateDrainIfNeeded(delay: .milliseconds(0))
         } else if promoted.shouldOptimizeSnapshot {
             schedulePersist(delay: 0)
         }
@@ -4656,10 +4777,11 @@ public final class FileIndex: @unchecked Sendable {
 
         guard !shouldCancel() else { return nil }
 
-        let usesDegradedSearch = Self.shouldUseDegradedSearch(
-            snapshot: snapshot,
-            isRefreshActive: snapshotData.isRefreshActive
-        )
+        let usesDegradedSearch = request.mode == .interactivePreview
+            && Self.shouldUseDegradedSearch(
+                snapshot: snapshot,
+                isRefreshActive: snapshotData.isRefreshActive
+            )
         let exactEmptyQuerySortLimit = lock.withLock { exactEmptyQuerySortLimitOverride }
             ?? Self.exactEmptyQuerySortLimit
 
@@ -5176,7 +5298,10 @@ public final class FileIndex: @unchecked Sendable {
         let candidateIndices: [Int32]
         var indexesUsed: Set<SearchIndexUse>
         if let simpleNameQuery {
-            guard let nameCandidates = snapshot.candidateNameIndices(containing: Array(simpleNameQuery.token.utf8)) else {
+            guard let nameCandidates = snapshot.candidateNameIndices(
+                containing: Array(simpleNameQuery.token.utf8),
+                shouldCancel: shouldCancel
+            ) else {
                 return nil
             }
             candidateIndices = nameCandidates
@@ -5465,7 +5590,10 @@ public final class FileIndex: @unchecked Sendable {
             mode == .fuzzy || mode == .exact,
             !pattern.token.isEmpty,
             !tokenContainsPathSeparator(pattern.token),
-            let nameCandidates = snapshot.candidateNameIndices(containing: Array(pattern.token.utf8))
+            let nameCandidates = snapshot.candidateNameIndices(
+                containing: Array(pattern.token.utf8),
+                shouldCancel: shouldCancel
+            )
         else {
             return nil
         }
@@ -6087,7 +6215,10 @@ public final class FileIndex: @unchecked Sendable {
         var directNameCandidateCount = 0
         var usedNameGrams = false
         if field != .path {
-            guard let nameCandidates = snapshot.candidateNameIndices(containing: Array(pattern.token.utf8)) else {
+            guard let nameCandidates = snapshot.candidateNameIndices(
+                containing: Array(pattern.token.utf8),
+                shouldCancel: shouldCancel
+            ) else {
                 return modifiedPreviewResponseByScanningModifiedOrder(
                     snapshot: snapshot,
                     request: request,
@@ -6675,7 +6806,10 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         let tokenBytes = Array(pattern.token.utf8)
-        let nameCandidates = snapshot.candidateNameIndices(containing: tokenBytes)
+        let nameCandidates = snapshot.candidateNameIndices(
+            containing: tokenBytes,
+            shouldCancel: shouldCancel
+        )
 
         func visitCandidate(rowID: Int) {
             guard rowID >= 0, rowID < snapshot.count else { return }
@@ -6778,7 +6912,10 @@ public final class FileIndex: @unchecked Sendable {
         makeCandidate: (Int, MatchExplanation) -> RelevancePreviewCandidate,
         shouldCancel: @Sendable () -> Bool
     ) -> WeakPathPreviewAppendResult? {
-        guard let componentCandidates = snapshot.candidateComponentIndices(containing: Array(token.utf8)) else {
+        guard let componentCandidates = snapshot.candidateComponentIndices(
+            containing: Array(token.utf8),
+            shouldCancel: shouldCancel
+        ) else {
             return nil
         }
 
@@ -6871,7 +7008,10 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         let tokenBytes = Array(pattern.token.utf8)
-        let nameCandidates = snapshot.candidateNameIndices(containing: tokenBytes)
+        let nameCandidates = snapshot.candidateNameIndices(
+            containing: tokenBytes,
+            shouldCancel: shouldCancel
+        )
         let ascending = request.sort.ascending
         var heap: [NamePreviewCandidate] = []
         heap.reserveCapacity(maxResults)
@@ -7034,7 +7174,10 @@ public final class FileIndex: @unchecked Sendable {
 
         let token = pattern.token
         let tokenBytes = Array(token.utf8)
-        let nameCandidates = snapshot.candidateNameIndices(containing: tokenBytes)
+        let nameCandidates = snapshot.candidateNameIndices(
+            containing: tokenBytes,
+            shouldCancel: shouldCancel
+        )
         var candidateRows: [UInt8]?
         if let nameCandidates {
             var rows = Array(repeating: UInt8(0), count: snapshot.count)
@@ -7234,9 +7377,16 @@ public final class FileIndex: @unchecked Sendable {
                     shouldCancel: shouldCancel
                 )
             } else if mode == .fuzzy && (!isPreview || field == .name) {
-                nameCandidates = fuzzyNameCandidateIndices(snapshot: snapshot, tokenBytes: tokenBytes)
+                nameCandidates = fuzzyNameCandidateIndices(
+                    snapshot: snapshot,
+                    tokenBytes: tokenBytes,
+                    shouldCancel: shouldCancel
+                )
             } else {
-                nameCandidates = snapshot.candidateNameIndices(containing: tokenBytes)
+                nameCandidates = snapshot.candidateNameIndices(
+                    containing: tokenBytes,
+                    shouldCancel: shouldCancel
+                )
             }
 
             guard let nameCandidates else { return nil }
@@ -7589,7 +7739,13 @@ public final class FileIndex: @unchecked Sendable {
             pathCandidates = candidates
         }
 
-        let candidates = unionPostingLists(pathCandidates, nameCandidates)
+        guard let candidates = unionPostingLists(
+            pathCandidates,
+            nameCandidates,
+            shouldCancel: shouldCancel
+        ) else {
+            return nil
+        }
         guard !candidates.isEmpty else {
             let elapsed = Date().timeIntervalSince(started)
             return SearchResponse(
@@ -7639,7 +7795,11 @@ public final class FileIndex: @unchecked Sendable {
         tokenBytes: [UInt8],
         shouldCancel: @Sendable () -> Bool
     ) -> [Int32]? {
-        guard let candidates = fuzzyNameCandidateIndices(snapshot: snapshot, tokenBytes: tokenBytes) else {
+        guard let candidates = fuzzyNameCandidateIndices(
+            snapshot: snapshot,
+            tokenBytes: tokenBytes,
+            shouldCancel: shouldCancel
+        ) else {
             return nil
         }
 
@@ -7689,7 +7849,11 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         let tokenBytes = Array(pattern.token.utf8)
-        let exactNameCandidates = snapshot.candidateNameIndices(containing: tokenBytes) ?? []
+        let exactNameCandidates = snapshot.candidateNameIndices(
+            containing: tokenBytes,
+            shouldCancel: shouldCancel
+        ) ?? []
+        guard !shouldCancel() else { return nil }
         let exactPathCandidates: [Int32]
         var indexesUsed = Set<SearchIndexUse>()
         if field != .path {
@@ -7713,7 +7877,18 @@ public final class FileIndex: @unchecked Sendable {
                 }
             }
             guard let pathCandidates else { return nil }
-            exactPathCandidates = field == .any ? unionPostingLists(pathCandidates, exactNameCandidates) : pathCandidates
+            if field == .any {
+                guard let merged = unionPostingLists(
+                    pathCandidates,
+                    exactNameCandidates,
+                    shouldCancel: shouldCancel
+                ) else {
+                    return nil
+                }
+                exactPathCandidates = merged
+            } else {
+                exactPathCandidates = pathCandidates
+            }
         }
 
         guard exactPathCandidates.count >= max(maxResults, 1) || exactPathCandidates.count > 1_000 else {
@@ -7891,7 +8066,11 @@ public final class FileIndex: @unchecked Sendable {
         snapshotRevision: UInt64,
         shouldCancel: @Sendable () -> Bool
     ) -> SearchResponse? {
-        guard let candidates = exactExtensionFastPathCandidates(snapshot: snapshot, parsedQuery: parsedQuery) else {
+        guard let candidates = exactExtensionFastPathCandidates(
+            snapshot: snapshot,
+            parsedQuery: parsedQuery,
+            shouldCancel: shouldCancel
+        ) else {
             return nil
         }
 
@@ -7932,7 +8111,8 @@ public final class FileIndex: @unchecked Sendable {
 
     private static func exactExtensionFastPathCandidates(
         snapshot: SearchSnapshot,
-        parsedQuery: FuzzyMatcher.ParsedQuery
+        parsedQuery: FuzzyMatcher.ParsedQuery,
+        shouldCancel: @Sendable () -> Bool
     ) -> [Int32]? {
         guard
             parsedQuery.negative.isEmpty,
@@ -7950,7 +8130,11 @@ public final class FileIndex: @unchecked Sendable {
                 return nil
             }
             guard
-                let extensionCandidates = snapshot.exactExtensionCandidatesForFastPath(token: pattern.token, mode: mode),
+                let extensionCandidates = snapshot.exactExtensionCandidatesForFastPath(
+                    token: pattern.token,
+                    mode: mode,
+                    shouldCancel: shouldCancel
+                ),
                 let representativeExtension = FuzzyMatcher.exactWildcardLiteralAlternatives(pattern.token)?.first,
                 let explanation = FuzzyMatcher.extensionExplanation(representativeExtension, pattern: pattern, mode: mode)
             else {
@@ -7964,7 +8148,14 @@ public final class FileIndex: @unchecked Sendable {
             } else {
                 sharedQuality = explanation.quality
             }
-            candidates = unionPostingLists(candidates, extensionCandidates)
+            guard let merged = unionPostingLists(
+                candidates,
+                extensionCandidates,
+                shouldCancel: shouldCancel
+            ) else {
+                return nil
+            }
+            candidates = merged
         }
 
         return sharedQuality == nil ? nil : candidates
@@ -8817,7 +9008,7 @@ public final class FileIndex: @unchecked Sendable {
             }
 
             if let current = candidates {
-                candidates = intersectPostingLists(current, clauseCandidates)
+                candidates = intersectPostingLists(current, clauseCandidates, shouldCancel: shouldCancel)
             } else {
                 candidates = clauseCandidates
             }
@@ -8848,7 +9039,14 @@ public final class FileIndex: @unchecked Sendable {
             }
 
             foundUsableAlternative = true
-            candidates = unionPostingLists(candidates, alternativeCandidates)
+            guard let merged = unionPostingLists(
+                candidates,
+                alternativeCandidates,
+                shouldCancel: shouldCancel
+            ) else {
+                return nil
+            }
+            candidates = merged
         }
 
         return foundUsableAlternative ? candidates : nil
@@ -8863,7 +9061,11 @@ public final class FileIndex: @unchecked Sendable {
         case .kind(let token):
             return candidateIndices(snapshot: snapshot, kind: token, shouldCancel: shouldCancel)
         case .fileExtension(let pattern, let mode):
-            return snapshot.candidateIndices(fileExtension: pattern.token, mode: mode)
+            return snapshot.candidateIndices(
+                fileExtension: pattern.token,
+                mode: mode,
+                shouldCancel: shouldCancel
+            )
                 ?? candidateIndices(
                     snapshot: snapshot,
                     token: pattern.token,
@@ -9014,7 +9216,11 @@ public final class FileIndex: @unchecked Sendable {
             }
 
             if let current = candidates {
-                candidates = intersectPostingLists(current, fragmentCandidates)
+                candidates = intersectPostingLists(
+                    current,
+                    fragmentCandidates,
+                    shouldCancel: shouldCancel
+                )
             } else {
                 candidates = fragmentCandidates
             }
@@ -9035,7 +9241,7 @@ public final class FileIndex: @unchecked Sendable {
     ) -> [Int32]? {
         switch field {
         case .name:
-            return snapshot.candidateNameIndices(containing: fragment)
+            return snapshot.candidateNameIndices(containing: fragment, shouldCancel: shouldCancel)
         case .path:
             return pathSubstringCandidateIndices(
                 snapshot: snapshot,
@@ -9043,7 +9249,10 @@ public final class FileIndex: @unchecked Sendable {
                 shouldCancel: shouldCancel
             )
         case .any:
-            guard let nameCandidates = snapshot.candidateNameIndices(containing: fragment) else {
+            guard let nameCandidates = snapshot.candidateNameIndices(
+                containing: fragment,
+                shouldCancel: shouldCancel
+            ) else {
                 return nil
             }
             guard let pathCandidates = pathSubstringCandidateIndices(
@@ -9053,7 +9262,7 @@ public final class FileIndex: @unchecked Sendable {
             ) else {
                 return nil
             }
-            return unionPostingLists(pathCandidates, nameCandidates)
+            return unionPostingLists(pathCandidates, nameCandidates, shouldCancel: shouldCancel)
         }
     }
 
@@ -9129,7 +9338,7 @@ public final class FileIndex: @unchecked Sendable {
         let tokenBytes = Array(token.utf8)
         switch field {
         case .name:
-            return snapshot.candidateNameIndices(containing: tokenBytes)
+            return snapshot.candidateNameIndices(containing: tokenBytes, shouldCancel: shouldCancel)
         case .path:
             return pathSubstringCandidateIndices(
                 snapshot: snapshot,
@@ -9137,7 +9346,10 @@ public final class FileIndex: @unchecked Sendable {
                 shouldCancel: shouldCancel
             )
         case .any:
-            guard let nameCandidates = snapshot.candidateNameIndices(containing: tokenBytes) else {
+            guard let nameCandidates = snapshot.candidateNameIndices(
+                containing: tokenBytes,
+                shouldCancel: shouldCancel
+            ) else {
                 return nil
             }
             guard let pathCandidates = pathSubstringCandidateIndices(
@@ -9147,7 +9359,7 @@ public final class FileIndex: @unchecked Sendable {
             ) else {
                 return nil
             }
-            return unionPostingLists(pathCandidates, nameCandidates)
+            return unionPostingLists(pathCandidates, nameCandidates, shouldCancel: shouldCancel)
         }
     }
 
@@ -9193,7 +9405,11 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         let tokenBytes = Array(token.utf8)
-        let nameCandidates = fuzzyNameCandidateIndices(snapshot: snapshot, tokenBytes: tokenBytes)
+        let nameCandidates = fuzzyNameCandidateIndices(
+            snapshot: snapshot,
+            tokenBytes: tokenBytes,
+            shouldCancel: shouldCancel
+        )
 
         switch field {
         case .name:
@@ -9217,12 +9433,20 @@ public final class FileIndex: @unchecked Sendable {
             else {
                 return nil
             }
-            return unionPostingLists(pathCandidates, nameCandidates)
+            return unionPostingLists(pathCandidates, nameCandidates, shouldCancel: shouldCancel)
         }
     }
 
-    private static func fuzzyNameCandidateIndices(snapshot: SearchSnapshot, tokenBytes: [UInt8]) -> [Int32]? {
-        if let candidates = punctuatedFuzzyNameCandidateIndices(snapshot: snapshot, tokenBytes: tokenBytes) {
+    private static func fuzzyNameCandidateIndices(
+        snapshot: SearchSnapshot,
+        tokenBytes: [UInt8],
+        shouldCancel: @Sendable () -> Bool
+    ) -> [Int32]? {
+        if let candidates = punctuatedFuzzyNameCandidateIndices(
+            snapshot: snapshot,
+            tokenBytes: tokenBytes,
+            shouldCancel: shouldCancel
+        ) {
             return candidates
         }
 
@@ -9234,11 +9458,17 @@ public final class FileIndex: @unchecked Sendable {
         let allowedMissing = tokenBytes.count <= 5 ? 1 : 2
         let requiredCount = max(1, distinctBytes.count - allowedMissing)
         guard requiredCount >= 2 else {
-            return snapshot.candidateNameIndices(containingAllBytes: distinctBytes)
+            return snapshot.candidateNameIndices(
+                containingAllBytes: distinctBytes,
+                shouldCancel: shouldCancel
+            )
         }
 
         guard requiredCount < distinctBytes.count else {
-            return snapshot.candidateNameIndices(containingAllBytes: distinctBytes)
+            return snapshot.candidateNameIndices(
+                containingAllBytes: distinctBytes,
+                shouldCancel: shouldCancel
+            )
         }
 
         let requiredSubsets = byteSubsets(distinctBytes, count: requiredCount)
@@ -9246,16 +9476,26 @@ public final class FileIndex: @unchecked Sendable {
             return nil
         }
 
-        return snapshot.candidateNameIndices(containingAny: requiredSubsets)
+        return snapshot.candidateNameIndices(
+            containingAny: requiredSubsets,
+            shouldCancel: shouldCancel
+        )
     }
 
-    private static func punctuatedFuzzyNameCandidateIndices(snapshot: SearchSnapshot, tokenBytes: [UInt8]) -> [Int32]? {
+    private static func punctuatedFuzzyNameCandidateIndices(
+        snapshot: SearchSnapshot,
+        tokenBytes: [UInt8],
+        shouldCancel: @Sendable () -> Bool
+    ) -> [Int32]? {
         let separatorCount = tokenBytes.reduce(0) { count, byte in
             count + (isQueryComponentSeparatorByte(byte) ? 1 : 0)
         }
         guard separatorCount > 0 else { return nil }
 
-        guard let exactCandidates = snapshot.candidateNameIndices(containing: tokenBytes) else {
+        guard let exactCandidates = snapshot.candidateNameIndices(
+            containing: tokenBytes,
+            shouldCancel: shouldCancel
+        ) else {
             return nil
         }
 
@@ -9265,9 +9505,12 @@ public final class FileIndex: @unchecked Sendable {
             return exactCandidates
         }
 
-        let typoCandidates = snapshot.candidateNameIndices(containingAllBytes: distinctNonSeparatorBytes)
+        let typoCandidates = snapshot.candidateNameIndices(
+            containingAllBytes: distinctNonSeparatorBytes,
+            shouldCancel: shouldCancel
+        )
         guard let typoCandidates else { return nil }
-        return unionPostingLists(exactCandidates, typoCandidates)
+        return unionPostingLists(exactCandidates, typoCandidates, shouldCancel: shouldCancel)
     }
 
     private static func isQueryComponentSeparatorByte(_ byte: UInt8) -> Bool {
@@ -9513,29 +9756,45 @@ public final class FileIndex: @unchecked Sendable {
         return key
     }
 
-    private static func intersectPostingLists(_ postings: [[Int32]]) -> [Int32] {
+    private static func intersectPostingLists(
+        _ postings: [[Int32]],
+        shouldCancel: @Sendable () -> Bool = { false }
+    ) -> [Int32]? {
         guard var result = postings.first else {
             return []
         }
 
         for posting in postings.dropFirst() {
+            guard !shouldCancel() else { return nil }
             if result.isEmpty {
                 break
             }
-            result = intersectPostingLists(result, posting)
+            guard let intersection = intersectPostingLists(result, posting, shouldCancel: shouldCancel) else {
+                return nil
+            }
+            result = intersection
         }
 
         return result
     }
 
-    private static func intersectPostingLists(_ lhs: [Int32], _ rhs: [Int32]) -> [Int32] {
+    private static func intersectPostingLists(
+        _ lhs: [Int32],
+        _ rhs: [Int32],
+        shouldCancel: @Sendable () -> Bool = { false }
+    ) -> [Int32]? {
         var result: [Int32] = []
         result.reserveCapacity(min(lhs.count, rhs.count))
 
         var leftIndex = 0
         var rightIndex = 0
+        var comparisonCount = 0
 
         while leftIndex < lhs.count, rightIndex < rhs.count {
+            if comparisonCount & 255 == 0, shouldCancel() {
+                return nil
+            }
+            comparisonCount += 1
             let left = lhs[leftIndex]
             let right = rhs[rightIndex]
 
@@ -9553,7 +9812,11 @@ public final class FileIndex: @unchecked Sendable {
         return result
     }
 
-    private static func unionPostingLists(_ lhs: [Int32], _ rhs: [Int32]) -> [Int32] {
+    private static func unionPostingLists(
+        _ lhs: [Int32],
+        _ rhs: [Int32],
+        shouldCancel: @Sendable () -> Bool = { false }
+    ) -> [Int32]? {
         guard !lhs.isEmpty else { return rhs }
         guard !rhs.isEmpty else { return lhs }
 
@@ -9562,8 +9825,13 @@ public final class FileIndex: @unchecked Sendable {
 
         var leftIndex = 0
         var rightIndex = 0
+        var comparisonCount = 0
 
         while leftIndex < lhs.count, rightIndex < rhs.count {
+            if comparisonCount & 255 == 0, shouldCancel() {
+                return nil
+            }
+            comparisonCount += 1
             let left = lhs[leftIndex]
             let right = rhs[rightIndex]
 
@@ -9580,12 +9848,20 @@ public final class FileIndex: @unchecked Sendable {
             }
         }
 
-        if leftIndex < lhs.count {
-            result.append(contentsOf: lhs[leftIndex...])
+        while leftIndex < lhs.count {
+            if leftIndex & 255 == 0, shouldCancel() {
+                return nil
+            }
+            result.append(lhs[leftIndex])
+            leftIndex += 1
         }
 
-        if rightIndex < rhs.count {
-            result.append(contentsOf: rhs[rightIndex...])
+        while rightIndex < rhs.count {
+            if rightIndex & 255 == 0, shouldCancel() {
+                return nil
+            }
+            result.append(rhs[rightIndex])
+            rightIndex += 1
         }
 
         return result
@@ -11774,10 +12050,6 @@ public final class FileIndex: @unchecked Sendable {
         backgroundDirectoryScanBudgetOverride ?? Self.backgroundDirectoryScanBudgetDefault
     }
 
-    private func backgroundDirectoryMaxDeferral() -> TimeInterval {
-        backgroundDirectoryMaxDeferralOverride ?? Self.backgroundDirectoryMaxDeferralDefault
-    }
-
     private func backgroundOptimizationPersistDelay() -> TimeInterval {
         backgroundOptimizationPersistDelayOverride ?? Self.backgroundOptimizationPersistDefaultDelay
     }
@@ -11844,16 +12116,95 @@ public final class FileIndex: @unchecked Sendable {
         works.contains { $0.priority == .interactive }
     }
 
-    private func scheduleUpdateDrainIfNeeded(delay: DispatchTimeInterval) {
-        let scheduled = lock.withLock { () -> (shouldSchedule: Bool, pendingPathCount: Int, maximumBatchPathCount: Int) in
-            guard !pendingRefreshPaths.isEmpty, !isRefreshDrainScheduled else {
-                return (false, pendingRefreshPaths.count, Self.maximumRefreshBatchPaths)
+    private static func nonoverlappingRefreshBatch(
+        from works: Dictionary<String, PendingRefreshWork>.Values,
+        maximumCount: Int
+    ) -> [PendingRefreshWork] {
+        guard maximumCount > 0, !works.isEmpty else { return [] }
+
+        let allWorks = Array(works)
+        let queuedPaths = Set(allWorks.map(\.path))
+        var promotedAncestorPaths = Set<String>()
+        var unblockedWorks: [PendingRefreshWork] = []
+        unblockedWorks.reserveCapacity(min(allWorks.count, maximumCount))
+
+        for work in allWorks {
+            if let ancestor = highestQueuedAncestor(of: work.path, in: queuedPaths) {
+                if work.priority == .interactive {
+                    promotedAncestorPaths.insert(ancestor)
+                }
+                continue
             }
+            unblockedWorks.append(work)
+        }
+
+        for index in unblockedWorks.indices where promotedAncestorPaths.contains(unblockedWorks[index].path) {
+            unblockedWorks[index].promote()
+        }
+        unblockedWorks.sort { lhs, rhs in
+            if lhs.priority != rhs.priority {
+                return lhs.priority == .interactive
+            }
+            if lhs.firstQueuedAt != rhs.firstQueuedAt {
+                return lhs.firstQueuedAt < rhs.firstQueuedAt
+            }
+            return lhs.path < rhs.path
+        }
+        return Array(unblockedWorks.prefix(maximumCount))
+    }
+
+    private static func highestQueuedAncestor(of path: String, in queuedPaths: Set<String>) -> String? {
+        var candidate = (path as NSString).deletingLastPathComponent
+        var highestAncestor: String?
+        while !candidate.isEmpty, candidate != path {
+            if queuedPaths.contains(candidate) {
+                highestAncestor = candidate
+            }
+            guard candidate != "/" else { break }
+            let parent = (candidate as NSString).deletingLastPathComponent
+            guard parent != candidate else { break }
+            candidate = parent
+        }
+        return highestAncestor
+    }
+
+    private func scheduleUpdateDrainIfNeeded(delay: DispatchTimeInterval) {
+        let scheduled = lock.withLock { () -> (
+            shouldSchedule: Bool,
+            scheduleGeneration: UInt64,
+            pendingPathCount: Int,
+            maximumBatchPathCount: Int
+        ) in
+            guard !pendingRefreshPaths.isEmpty else {
+                return (false, refreshDrainScheduleGeneration, 0, Self.maximumRefreshBatchPaths)
+            }
+
+            let priority = Self.hasInteractiveRefreshWork(pendingRefreshPaths.values)
+                ? IndexWorkPriority.interactive
+                : .background
+            if isRefreshDrainScheduled {
+                guard scheduledRefreshDrainPriority == .background, priority == .interactive else {
+                    return (
+                        false,
+                        refreshDrainScheduleGeneration,
+                        pendingRefreshPaths.count,
+                        priority == .interactive ? Self.maximumRefreshBatchPaths : backgroundRefreshBatchLimit()
+                    )
+                }
+            }
+
+            refreshDrainScheduleGeneration &+= 1
             isRefreshDrainScheduled = true
-            let maximumBatchPathCount = Self.hasInteractiveRefreshWork(pendingRefreshPaths.values)
+            scheduledRefreshDrainPriority = priority
+            let maximumBatchPathCount = priority == .interactive
                 ? Self.maximumRefreshBatchPaths
                 : backgroundRefreshBatchLimit()
-            return (true, pendingRefreshPaths.count, maximumBatchPathCount)
+            return (
+                true,
+                refreshDrainScheduleGeneration,
+                pendingRefreshPaths.count,
+                maximumBatchPathCount
+            )
         }
 
         guard scheduled.shouldSchedule else { return }
@@ -11871,12 +12222,17 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         indexQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
-            self?.drainUpdateQueue()
+            self?.runScheduledUpdateDrain(generation: scheduled.scheduleGeneration)
         }
     }
 
-    private func drainUpdateQueue() {
+    private func runScheduledUpdateDrain(generation scheduledGeneration: UInt64) {
+        drainUpdateQueue(scheduledGeneration: scheduledGeneration)
+    }
+
+    private func drainUpdateQueue(scheduledGeneration: UInt64) {
         let drain = lock.withLock { () -> (
+            acceptedSchedule: Bool,
             works: [PendingRefreshWork],
             priority: IndexWorkPriority,
             pendingPathCountAfterBatch: Int,
@@ -11885,15 +12241,26 @@ public final class FileIndex: @unchecked Sendable {
             updating: Bool,
             phase: IndexPhase
         ) in
+            guard
+                isRefreshDrainScheduled,
+                refreshDrainScheduleGeneration == scheduledGeneration
+            else {
+                return (false, [], .interactive, pendingRefreshPaths.count, false, reconciling, updating, phase)
+            }
+
+            isRefreshDrainScheduled = false
+            scheduledRefreshDrainPriority = nil
             guard !indexing else {
-                isRefreshDrainScheduled = false
-                return ([], .interactive, pendingRefreshPaths.count, true, reconciling, updating, phase)
+                return (true, [], .interactive, pendingRefreshPaths.count, true, reconciling, updating, phase)
             }
 
             let batchLimit = Self.hasInteractiveRefreshWork(pendingRefreshPaths.values)
                 ? Self.maximumRefreshBatchPaths
                 : backgroundRefreshBatchLimit()
-            let batch = Array(pendingRefreshPaths.values.prefix(batchLimit))
+            let batch = Self.nonoverlappingRefreshBatch(
+                from: pendingRefreshPaths.values,
+                maximumCount: batchLimit
+            )
             for work in batch {
                 pendingRefreshPaths.removeValue(forKey: work.path)
             }
@@ -11901,8 +12268,8 @@ public final class FileIndex: @unchecked Sendable {
             if pendingRefreshPaths.isEmpty {
                 pendingRefreshPaths.removeAll(keepingCapacity: false)
             }
-            isRefreshDrainScheduled = false
             return (
+                true,
                 batch,
                 Self.refreshBatchPriority(batch),
                 pendingPathCountAfterBatch,
@@ -11912,6 +12279,8 @@ public final class FileIndex: @unchecked Sendable {
                 phase
             )
         }
+
+        guard drain.acceptedSchedule else { return }
 
         if drain.deferredByIndexing {
             DiagnosticLogger.shared.log(
@@ -11971,9 +12340,6 @@ public final class FileIndex: @unchecked Sendable {
             completedWorks = drain.works.filter { !deferredPaths.contains($0.path) }
         }
 
-        if updateResult.completionReady, updateResult.largeOverlay, !updateResult.reconciledDirectoryPrefixes.isEmpty {
-            completedWorks.append(contentsOf: prunePendingRefreshPaths(coveredBy: updateResult.reconciledDirectoryPrefixes))
-        }
         Self.completePendingRefreshWorks(completedWorks)
 
         let remainingPathCount = lock.withLock { pendingRefreshPaths.count }
@@ -12019,21 +12385,6 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
-    private func prunePendingRefreshPaths(coveredBy directoryPrefixes: [String]) -> [PendingRefreshWork] {
-        return lock.withLock {
-            let prunedPaths = Self.prunedPendingRefreshPaths(
-                Set(pendingRefreshPaths.keys),
-                coveredBy: directoryPrefixes
-            )
-            let removedWorks = pendingRefreshPaths.values.filter { !prunedPaths.contains($0.path) }
-            pendingRefreshPaths = pendingRefreshPaths.filter { prunedPaths.contains($0.key) }
-            if pendingRefreshPaths.isEmpty {
-                pendingRefreshPaths.removeAll(keepingCapacity: false)
-            }
-            return removedWorks
-        }
-    }
-
     private static func completePendingRefreshWorks(_ works: [PendingRefreshWork]) {
         for work in works {
             for completion in work.completions {
@@ -12042,35 +12393,12 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
-    static func prunedPendingRefreshPathsForTesting(_ paths: Set<String>, coveredBy directoryPrefixes: [String]) -> Set<String> {
-        prunedPendingRefreshPaths(paths, coveredBy: directoryPrefixes)
-    }
-
-    private static func prunedPendingRefreshPaths(_ paths: Set<String>, coveredBy directoryPrefixes: [String]) -> Set<String> {
-        let prefixes = directoryPrefixes
-            .filter { !$0.isEmpty }
-            .sorted { $0.count > $1.count }
-        guard !prefixes.isEmpty else { return paths }
-
-        return Set(paths.filter { path in
-            !prefixes.contains { prefix in
-                path == prefix || path.hasPrefix(prefix + "/")
-            }
-        })
-    }
-
     private func backgroundDirectoryScanDeadline(
-        for request: PendingRefreshWork,
+        for priority: IndexWorkPriority,
         startedAt: Date
     ) -> Date? {
-        guard request.priority == .background else { return nil }
-        let budget = backgroundDirectoryScanBudget()
-        let maximumDeferral = backgroundDirectoryMaxDeferral()
-        guard maximumDeferral > 0, startedAt.timeIntervalSince(request.firstQueuedAt) < maximumDeferral else {
-            let acceleratedBudget = max(budget, min(budget * 4, 5))
-            return startedAt.addingTimeInterval(acceleratedBudget)
-        }
-        return startedAt.addingTimeInterval(budget)
+        guard priority == .background else { return nil }
+        return startedAt.addingTimeInterval(backgroundDirectoryScanBudget())
     }
 
     private func updateNow(requests: [PendingRefreshWork]) -> RefreshUpdateResult {
@@ -12221,7 +12549,7 @@ public final class FileIndex: @unchecked Sendable {
                     if candidate.isDirectory, !candidate.isSymlink, decision.shouldDescend {
                         requestedDirectoryRefresh = true
                         let deadline = backgroundDirectoryScanDeadline(
-                            for: request,
+                            for: request.priority,
                             startedAt: updateStarted
                         )
                         let scannedRecords: [String: FileRecord]?
@@ -13950,10 +14278,11 @@ public final class FileIndex: @unchecked Sendable {
     private func beginIndexJob(_ name: String) -> Int {
         let activeJobs = lock.withLock { () -> Int in
             activeIndexJobs += 1
-            usageMetrics.recordActiveJobHighWaterMark(activeIndexJobs)
             return activeIndexJobs
         }
-        saveUsageMetricsSnapshot()
+        updateUsageMetricsDeferred { metrics in
+            metrics.recordActiveJobHighWaterMark(activeJobs)
+        }
         MemoryTelemetry.log("job.\(name).begin", activeIndexJobs: activeJobs)
         return activeJobs
     }
@@ -14247,6 +14576,10 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
+    func pendingRefreshPathsForTesting() -> Set<String> {
+        lock.withLock { Set(pendingRefreshPaths.keys) }
+    }
+
     func recordMaintenanceForTesting(_ metric: IndexMaintenanceOperationMetric) {
         recordMaintenance(metric)
     }
@@ -14385,55 +14718,55 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     private func recordSearchStarted(phase: SearchMetricPhase) {
-        updateUsageMetrics { metrics in
+        updateUsageMetricsDeferred { metrics in
             metrics.recordSearchStarted(phase: phase)
         }
     }
 
     private func recordSearchCompleted(_ profile: SearchExecutionProfile, phase: SearchMetricPhase) {
-        updateUsageMetrics { metrics in
+        updateUsageMetricsDeferred { metrics in
             metrics.recordSearchCompleted(profile, phase: phase)
         }
     }
 
     private func recordSearchCancelled(phase: SearchMetricPhase, elapsed: TimeInterval) {
-        updateUsageMetrics { metrics in
+        updateUsageMetricsDeferred { metrics in
             metrics.recordSearchCancelled(phase: phase, elapsed: elapsed)
         }
     }
 
     private func recordFullRebuild(duration: TimeInterval) {
-        updateUsageMetrics { metrics in
+        updateUsageMetricsDeferred { metrics in
             metrics.recordFullRebuild(duration: duration)
         }
     }
 
     private func recordIncrementalRefresh(duration: TimeInterval) {
-        updateUsageMetrics { metrics in
+        updateUsageMetricsDeferred { metrics in
             metrics.recordIncrementalRefresh(duration: duration)
         }
     }
 
     private func recordIndexingFailure() {
-        updateUsageMetrics { metrics in
+        updateUsageMetricsDeferred { metrics in
             metrics.recordIndexingFailure()
         }
     }
 
     private func recordSnapshotLoadFailure(corruptSnapshotRemoved: Bool) {
-        updateUsageMetrics { metrics in
+        updateUsageMetricsDeferred { metrics in
             metrics.recordSnapshotLoadFailure(corruptSnapshotRemoved: corruptSnapshotRemoved)
         }
     }
 
     private func recordPersistFailure() {
-        updateUsageMetrics { metrics in
+        updateUsageMetricsDeferred { metrics in
             metrics.recordPersistFailure()
         }
     }
 
     private func recordTempCleanup(count: UInt64) {
-        updateUsageMetrics { metrics in
+        updateUsageMetricsDeferred { metrics in
             metrics.recordTempCleanup(count: count)
         }
     }
@@ -14498,16 +14831,6 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
-    private func updateUsageMetrics(_ body: (inout IndexUsageMetrics) -> Void) {
-        let metrics = lock.withLock { () -> IndexUsageMetrics in
-            body(&usageMetrics)
-            usageMetrics.schemaVersion = IndexUsageMetrics.currentSchemaVersion
-            markUsageMetricsSavedWithoutLock()
-            return usageMetrics
-        }
-        Self.saveUsageMetrics(metrics, to: metricsURL, fileManager: fileManager)
-    }
-
     private func updateUsageMetricsDeferred(_ body: (inout IndexUsageMetrics) -> Void) {
         let shouldScheduleSave = lock.withLock { () -> Bool in
             body(&usageMetrics)
@@ -14520,14 +14843,6 @@ public final class FileIndex: @unchecked Sendable {
         if shouldScheduleSave {
             scheduleDeferredUsageMetricsSave()
         }
-    }
-
-    private func saveUsageMetricsSnapshot() {
-        let metrics = lock.withLock { () -> IndexUsageMetrics in
-            markUsageMetricsSavedWithoutLock()
-            return usageMetrics
-        }
-        Self.saveUsageMetrics(metrics, to: metricsURL, fileManager: fileManager)
     }
 
     private func scheduleDeferredUsageMetricsSave() {
@@ -14606,7 +14921,7 @@ public final class FileIndex: @unchecked Sendable {
         do {
             try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             let encoder = JSONEncoder()
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            encoder.outputFormatting = [.sortedKeys]
             let data = try encoder.encode(metrics)
             try data.write(to: url, options: .atomic)
         } catch {

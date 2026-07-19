@@ -3,6 +3,7 @@ import Foundation
 final class FileExclusionQuery {
     private let roots: [String]
     private let rules: [Rule]
+    private let ancestorPropagatingRules: [(index: Int, rule: Rule)]
     private var ancestorRuleIndexCache: [String: Set<Int>] = [:]
 
     struct Instrumentation: Sendable, Equatable {
@@ -29,7 +30,11 @@ final class FileExclusionQuery {
         self.roots = roots
             .map(Self.normalizedRootPath)
             .sorted { $0.count > $1.count }
-        self.rules = patterns.compactMap(Rule.init(rawPattern:))
+        let rules = patterns.compactMap(Rule.init(rawPattern:))
+        self.rules = rules
+        self.ancestorPropagatingRules = rules.enumerated().compactMap { index, rule in
+            rule.propagatesThroughIgnoredAncestors ? (index, rule) : nil
+        }
     }
 
     func decision(path: String, isDirectory: Bool) -> FileExclusionRules.Decision {
@@ -126,7 +131,7 @@ final class FileExclusionQuery {
             )
             : []
 
-        for (index, rule) in rules.enumerated() where !rule.isNegated {
+        for (index, rule) in ancestorPropagatingRules {
             instrumentation.ancestorMatchCheckCount += 1
             if rule.matches(
                 relativePath: relativePath,
@@ -224,6 +229,14 @@ private final class RelativePathContext {
         return false
     }
 
+    func componentIsASCII(at index: Int) -> Bool {
+        components[index].unicodeScalars.allSatisfy(\.isASCII)
+    }
+
+    func componentsAreASCII(in range: Range<Int>) -> Bool {
+        range.allSatisfy { componentIsASCII(at: $0) }
+    }
+
     func suffixMatches(_ lowercasedLiteralComponents: [String], endingAt end: Int) -> Bool {
         guard !lowercasedLiteralComponents.isEmpty else { return false }
         guard lowercasedLiteralComponents.count <= end else { return false }
@@ -271,6 +284,10 @@ private final class Rule {
     private let containsSlash: Bool
     private let literalPrefix: String
     private let matcher: Matcher
+
+    var propagatesThroughIgnoredAncestors: Bool {
+        !isNegated && !isDirectoryPattern && (containsSlash || isAnchored)
+    }
 
     init?(rawPattern: String) {
         var pattern = rawPattern.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -324,6 +341,14 @@ private final class Rule {
                 lowercasedValue: pattern.lowercased(),
                 lowercasedComponents: pattern.split(separator: "/").map { String($0).lowercased() }
             )
+        } else if let glob = NativeGlobMatcher(pattern: pattern) {
+            guard let fallbackRegex = try? NSRegularExpression(
+                pattern: Self.regexPattern(for: pattern),
+                options: [.caseInsensitive]
+            ) else {
+                return nil
+            }
+            matcher = .glob(glob, nonASCIIFallback: fallbackRegex)
         } else {
             do {
                 matcher = .regex(try NSRegularExpression(
@@ -446,6 +471,22 @@ private final class Rule {
         case .literal(let lowercasedValue, _):
             instrumentation.fastPathDecisionCount += 1
             return relativePath.componentMatches(lowercasedValue, in: 0..<matchableComponentCount)
+        case .glob(let glob, let nonASCIIFallback):
+            for index in 0..<matchableComponentCount {
+                if relativePath.componentIsASCII(at: index) {
+                    instrumentation.fastPathDecisionCount += 1
+                    if glob.matchesComponent(relativePath.lowercasedComponents[index]) {
+                        return true
+                    }
+                } else if matchesWholeString(
+                    relativePath.components[index],
+                    regex: nonASCIIFallback,
+                    instrumentation: &instrumentation
+                ) {
+                    return true
+                }
+            }
+            return false
         case .regex:
             for index in 0..<matchableComponentCount {
                 if matchesWholeString(
@@ -505,6 +546,30 @@ private final class Rule {
                 return false
             }
             return !isAnchored || lowercasedComponents.count == componentCount
+        case .glob(let glob, let nonASCIIFallback):
+            if matchesGlobPathCandidate(
+                glob,
+                nonASCIIFallback: nonASCIIFallback,
+                relativePath: relativePath,
+                range: 0..<componentCount,
+                instrumentation: &instrumentation
+            ) {
+                return true
+            }
+
+            guard !isAnchored, componentCount > 1 else { return false }
+            for index in 1..<componentCount {
+                if matchesGlobPathCandidate(
+                    glob,
+                    nonASCIIFallback: nonASCIIFallback,
+                    relativePath: relativePath,
+                    range: index..<componentCount,
+                    instrumentation: &instrumentation
+                ) {
+                    return true
+                }
+            }
+            return false
         case .regex:
             if matchesWholeString(
                 relativePath.prefixString(componentCount: componentCount),
@@ -532,9 +597,36 @@ private final class Rule {
         instrumentation: inout FileExclusionQuery.Instrumentation
     ) -> Bool {
         guard case .regex(let regex) = matcher else { return false }
+        return matchesWholeString(value, regex: regex, instrumentation: &instrumentation)
+    }
+
+    private func matchesWholeString(
+        _ value: String,
+        regex: NSRegularExpression,
+        instrumentation: inout FileExclusionQuery.Instrumentation
+    ) -> Bool {
         instrumentation.regexMatchCount += 1
         let range = NSRange(value.startIndex..<value.endIndex, in: value)
         return regex.firstMatch(in: value, options: [], range: range) != nil
+    }
+
+    private func matchesGlobPathCandidate(
+        _ glob: NativeGlobMatcher,
+        nonASCIIFallback: NSRegularExpression,
+        relativePath: RelativePathContext,
+        range: Range<Int>,
+        instrumentation: inout FileExclusionQuery.Instrumentation
+    ) -> Bool {
+        if relativePath.componentsAreASCII(in: range) {
+            instrumentation.fastPathDecisionCount += 1
+            return glob.matches(components: relativePath.lowercasedComponents, range: range)
+        }
+
+        return matchesWholeString(
+            relativePath.rangeString(start: range.lowerBound, end: range.upperBound),
+            regex: nonASCIIFallback,
+            instrumentation: &instrumentation
+        )
     }
 
     private static func isLiteral(_ pattern: String) -> Bool {
@@ -642,5 +734,150 @@ private final class Rule {
 
 private enum Matcher {
     case literal(lowercasedValue: String, lowercasedComponents: [String])
+    case glob(NativeGlobMatcher, nonASCIIFallback: NSRegularExpression)
     case regex(NSRegularExpression)
+}
+
+private struct NativeGlobMatcher {
+    private enum PathComponent {
+        case recursiveWildcard
+        case component(ComponentGlobMatcher)
+    }
+
+    private let pathComponents: [PathComponent]
+
+    init?(pattern: String) {
+        guard
+            pattern.unicodeScalars.allSatisfy(\.isASCII),
+            !pattern.contains("?"),
+            !pattern.contains("[")
+        else {
+            return nil
+        }
+
+        var pathComponents: [PathComponent] = []
+        var recursiveWildcardCount = 0
+        for component in pattern.split(separator: "/", omittingEmptySubsequences: false) {
+            let component = String(component).lowercased()
+            if component == "**" {
+                recursiveWildcardCount += 1
+                guard recursiveWildcardCount == 1 else { return nil }
+                pathComponents.append(.recursiveWildcard)
+            } else {
+                guard !component.contains("**") else { return nil }
+                let wildcardCount = component.reduce(into: 0) { count, character in
+                    if character == "*" {
+                        count += 1
+                    }
+                }
+                let hasSupportedWildcards = wildcardCount == 0
+                    || component == "*"
+                    || (wildcardCount == 1 && (component.hasPrefix("*") || component.hasSuffix("*")))
+                    || (wildcardCount == 2 && component.hasPrefix("*") && component.hasSuffix("*"))
+                guard hasSupportedWildcards else { return nil }
+                pathComponents.append(.component(ComponentGlobMatcher(pattern: component)))
+            }
+        }
+        guard !pathComponents.isEmpty else { return nil }
+        self.pathComponents = pathComponents
+    }
+
+    func matchesComponent(_ component: String) -> Bool {
+        guard pathComponents.count == 1 else { return false }
+        switch pathComponents[0] {
+        case .recursiveWildcard:
+            return true
+        case .component(let matcher):
+            return matcher.matches(component)
+        }
+    }
+
+    func matches(components: [String], range: Range<Int>) -> Bool {
+        matches(
+            components: components,
+            componentIndex: range.lowerBound,
+            componentEnd: range.upperBound,
+            patternIndex: 0
+        )
+    }
+
+    private func matches(
+        components: [String],
+        componentIndex: Int,
+        componentEnd: Int,
+        patternIndex: Int
+    ) -> Bool {
+        guard patternIndex < pathComponents.count else {
+            return componentIndex == componentEnd
+        }
+
+        switch pathComponents[patternIndex] {
+        case .component(let matcher):
+            guard componentIndex < componentEnd, matcher.matches(components[componentIndex]) else {
+                return false
+            }
+            return matches(
+                components: components,
+                componentIndex: componentIndex + 1,
+                componentEnd: componentEnd,
+                patternIndex: patternIndex + 1
+            )
+
+        case .recursiveWildcard:
+            guard componentIndex < componentEnd else { return false }
+            if patternIndex == pathComponents.count - 1 {
+                return true
+            }
+            for nextComponentIndex in (componentIndex + 1)...componentEnd where matches(
+                components: components,
+                componentIndex: nextComponentIndex,
+                componentEnd: componentEnd,
+                patternIndex: patternIndex + 1
+            ) {
+                return true
+            }
+            return false
+        }
+    }
+}
+
+private struct ComponentGlobMatcher {
+    private enum Kind {
+        case any
+        case exact(String)
+        case prefix(String)
+        case suffix(String)
+        case contains(String)
+    }
+
+    private let kind: Kind
+
+    init(pattern: String) {
+        if pattern == "*" {
+            kind = .any
+        } else if pattern.hasPrefix("*"), pattern.hasSuffix("*") {
+            kind = .contains(String(pattern.dropFirst().dropLast()))
+        } else if pattern.hasPrefix("*") {
+            kind = .suffix(String(pattern.dropFirst()))
+        } else if pattern.hasSuffix("*") {
+            kind = .prefix(String(pattern.dropLast()))
+        } else {
+            kind = .exact(pattern)
+        }
+    }
+
+    func matches(_ value: String) -> Bool {
+        switch kind {
+        case .any:
+            return true
+        case .exact(let literal):
+            return value == literal
+        case .prefix(let prefix):
+            return value.hasPrefix(prefix)
+        case .suffix(let suffix):
+            return value.hasSuffix(suffix)
+        case .contains(let fragment):
+            return value.contains(fragment)
+        }
+    }
 }

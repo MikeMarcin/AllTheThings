@@ -57,7 +57,7 @@ Select one or more rows, then use the toolbar, context menu, or app menus:
 
 ## Updates
 
-AllTheThings checks GitHub for new releases from `MikeMarcin/AllTheThings` once per day on launch. The primary release download is a Developer ID signed and Apple-notarized DMG, with a ZIP provided as a backup artifact. When an installable release archive is available, AllTheThings can download the update, replace the current app bundle, and relaunch the updated app. You can run a manual check from **AllTheThings > Check for Updates...** or disable automatic checks from **AllTheThings > Automatically Check for Updates**.
+AllTheThings checks GitHub for new releases from `MikeMarcin/AllTheThings` once per day on launch. The primary manual download is a Developer ID signed and Apple-notarized DMG, with a ZIP containing the same signed and notarized app. Automatic updates prefer the ZIP for faster installation and use the DMG as a compatibility fallback. When an installable release archive is available, AllTheThings can download the update, replace the current app bundle, and relaunch the updated app. You can run a manual check from **AllTheThings > Check for Updates...** or disable automatic checks from **AllTheThings > Automatically Check for Updates**.
 
 ## Privacy
 

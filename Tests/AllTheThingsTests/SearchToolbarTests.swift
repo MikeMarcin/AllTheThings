@@ -245,6 +245,74 @@ struct SearchToolbarTests {
         }
     }
 
+    @Test("background search refreshes coalesce until the app becomes interactive")
+    func backgroundSearchRefreshesCoalesceUntilInteractive() {
+        var gate = SearchRefreshGate()
+
+        let firstBackgroundRequestRuns = gate.request(isInteractive: false)
+        let secondBackgroundRequestRuns = gate.request(isInteractive: false)
+        #expect(!firstBackgroundRequestRuns)
+        #expect(!secondBackgroundRequestRuns)
+        #expect(gate.hasDeferredRefresh)
+        let interactiveRequestRuns = gate.request(isInteractive: true)
+        #expect(interactiveRequestRuns)
+        #expect(gate.hasDeferredRefresh)
+        gate.refreshDidStart()
+        #expect(!gate.hasDeferredRefresh)
+    }
+
+    @Test("FSEvent cursors commit completed batches in receipt order")
+    func fseventCursorBatchesCommitInOrder() throws {
+        var queue = FSEventCursorCommitQueue()
+        let root = "/tmp/allthethings/root-a"
+        let firstBatchID = queue.enqueue([root: 41])
+        let secondBatchID = queue.enqueue([root: 45])
+        let first = try #require(firstBatchID)
+        let second = try #require(secondBatchID)
+
+        #expect(queue.markReady([second]).isEmpty)
+        #expect(queue.markReady([first]) == [root: 45])
+    }
+
+    @Test("FSEvent catch-up barrier holds live cursors until repair completes")
+    func fseventCatchUpBarrierHoldsLiveCursors() throws {
+        var queue = FSEventCursorCommitQueue()
+        let root = "/tmp/allthethings/root-a"
+        let barrier = queue.enqueueBarrier()
+        let liveBatchID = queue.enqueue([root: 45])
+        let liveBatch = try #require(liveBatchID)
+
+        #expect(queue.markReady([liveBatch]).isEmpty)
+        #expect(queue.markReady([barrier]) == [root: 45])
+    }
+
+    @Test("FSEvent catch-up suspension holds batches queued before its barrier")
+    func fseventCatchUpSuspensionHoldsPreexistingBatches() {
+        var gate = FSEventCursorCommitGate()
+        let root = "/tmp/allthethings/root-a"
+
+        gate.suspend()
+        #expect(gate.accept([root: 41]).isEmpty)
+        #expect(gate.accept([root: 45]).isEmpty)
+        #expect(gate.resume() == [root: 45])
+        #expect(!gate.isSuspended)
+    }
+
+    @Test("FSEvent cursor epoch reset discards older queued batches")
+    func fseventCursorEpochResetDiscardsOlderBatches() throws {
+        var queue = FSEventCursorCommitQueue()
+        let root = "/tmp/allthethings/root-a"
+        let obsoleteBatchID = queue.enqueue([root: 10_000])
+        let obsoleteBatch = try #require(obsoleteBatchID)
+
+        queue.removeAll()
+        let resetBatchID = queue.enqueue([root: 20])
+        let resetBatch = try #require(resetBatchID)
+
+        #expect(queue.markReady([obsoleteBatch]).isEmpty)
+        #expect(queue.markReady([resetBatch]) == [root: 20])
+    }
+
     @Test("launch sort resets unless remember sort is enabled")
     func launchSortResetsUnlessRememberSortIsEnabled() throws {
         let (defaults, suiteName) = try makeDefaults()

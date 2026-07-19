@@ -12,6 +12,9 @@ final class ReleaseUpdater {
         static let automaticallyCheck = "ATTAutomaticallyCheckForUpdates"
         static let lastCheckDate = "ATTLastUpdateCheckDate"
         static let skippedReleaseTag = "ATTSkippedReleaseTag"
+        static let installStartedAt = "ATTUpdateInstallStartedAt"
+        static let installTargetVersion = "ATTUpdateInstallTargetVersion"
+        static let installAssetName = "ATTUpdateInstallAssetName"
     }
 
     private enum UpdateError: LocalizedError {
@@ -84,8 +87,8 @@ final class ReleaseUpdater {
         }
 
         var installAsset: GitHubAsset? {
-            assets.first(where: { $0.isDiskImage }) ??
-                assets.first(where: { $0.isZipArchive }) ??
+            assets.first(where: { $0.isZipArchive }) ??
+                assets.first(where: { $0.isDiskImage }) ??
                 assets.first(where: { $0.isDownloadableArchive })
         }
 
@@ -187,10 +190,29 @@ final class ReleaseUpdater {
         let workDirectory: URL
     }
 
+    private struct MountedDiskImage: Sendable {
+        let deviceIdentifier: String?
+        let mountPoint: URL
+
+        var detachTarget: String {
+            deviceIdentifier ?? mountPoint.path
+        }
+    }
+
+    private struct CommandResult: Sendable {
+        let standardOutput: String
+        let standardError: String
+
+        var combinedOutput: String {
+            [standardOutput, standardError].filter { !$0.isEmpty }.joined(separator: "\n")
+        }
+    }
+
     private nonisolated static let latestReleaseURL = URL(string: "https://api.github.com/repos/MikeMarcin/AllTheThings/releases/latest")!
     private nonisolated static let releasesURL = URL(string: "https://github.com/MikeMarcin/AllTheThings/releases")!
     private nonisolated static let checkInterval: TimeInterval = 24 * 60 * 60
     private nonisolated static let appName = "AllTheThings"
+    private nonisolated static let staleUpdateMinimumAge: TimeInterval = 60 * 60
 
     private let defaults: UserDefaults
     private var activeCheck: Task<Void, Never>?
@@ -211,6 +233,53 @@ final class ReleaseUpdater {
         defaults.register(defaults: [
             DefaultsKey.automaticallyCheck: true
         ])
+    }
+
+    func performLaunchMaintenance() {
+        recordCompletedInstallIfNeeded()
+        Task.detached(priority: .utility) {
+            Self.cleanupStaleUpdateMounts()
+        }
+    }
+
+    private func recordCompletedInstallIfNeeded() {
+        guard let startedAt = defaults.object(forKey: DefaultsKey.installStartedAt) as? Date else {
+            return
+        }
+
+        let targetVersion = defaults.string(forKey: DefaultsKey.installTargetVersion) ?? "unknown"
+        let assetName = defaults.string(forKey: DefaultsKey.installAssetName) ?? "unknown"
+        let currentVersion = currentBundleVersion()
+        var fields: [String: DiagnosticLogFieldValue] = [
+            "assetName": .publicString(assetName),
+            "targetVersion": .publicString(targetVersion),
+            "currentVersion": .publicString(currentVersion),
+            "targetReached": .publicBool(currentVersion == targetVersion),
+            "elapsed": .publicDouble(max(0, Date().timeIntervalSince(startedAt)))
+        ]
+
+        if let receipt = Self.loadInstallReceipt() {
+            if let method = receipt["installMethod"] {
+                fields["installMethod"] = .publicString(method)
+            }
+            if let duration = receipt["replacementDuration"].flatMap(Double.init) {
+                fields["replacementDuration"] = .publicDouble(duration)
+            }
+        }
+
+        DiagnosticLogger.shared.log(
+            category: "updates",
+            event: "updates.installCompleted",
+            fields: fields
+        )
+        clearPendingInstallTelemetry()
+        try? FileManager.default.removeItem(at: Self.installReceiptURL())
+    }
+
+    private func clearPendingInstallTelemetry() {
+        defaults.removeObject(forKey: DefaultsKey.installStartedAt)
+        defaults.removeObject(forKey: DefaultsKey.installTargetVersion)
+        defaults.removeObject(forKey: DefaultsKey.installAssetName)
     }
 
     func checkAutomaticallyIfNeeded(presentingWindow: NSWindow?) {
@@ -422,17 +491,31 @@ final class ReleaseUpdater {
     private func performInstall(asset: GitHubAsset) async throws {
         var workDirectory: URL?
         var shouldCleanUp = true
+        let installStartedAt = Date()
+
+        DiagnosticLogger.shared.log(
+            category: "updates",
+            event: "updates.installStarted",
+            fields: [
+                "assetName": .publicString(asset.name),
+                "assetType": .publicString(Self.assetTypeName(asset))
+            ]
+        )
 
         do {
             progressWindowController?.updateStatus("Downloading \(asset.name)...")
+            let downloadStartedAt = Date()
             let downloaded = try await Self.download(asset: asset)
             workDirectory = downloaded.workDirectory
+            logInstallPhase("download", startedAt: downloadStartedAt, asset: asset)
 
             try Task.checkCancellation()
             progressWindowController?.updateStatus("Preparing update...")
+            let preparationStartedAt = Date()
             let prepared = try await Task.detached(priority: .userInitiated) {
                 try Self.prepareDownloadedApp(downloaded: downloaded, asset: asset)
             }.value
+            logInstallPhase("preparation", startedAt: preparationStartedAt, asset: asset)
 
             try Task.checkCancellation()
             progressWindowController?.updateStatus("Validating update...")
@@ -442,7 +525,8 @@ final class ReleaseUpdater {
                 throw UpdateError.missingBundleIdentifier(currentAppURL)
             }
 
-            try await Task.detached(priority: .userInitiated) {
+            let validationStartedAt = Date()
+            let downloadedVersion = try await Task.detached(priority: .userInitiated) {
                 try Self.validatePreparedApp(
                     at: prepared.appURL,
                     expectedBundleIdentifier: currentBundleIdentifier,
@@ -450,6 +534,7 @@ final class ReleaseUpdater {
                     currentVersion: currentVersion
                 )
             }.value
+            logInstallPhase("validation", startedAt: validationStartedAt, asset: asset)
 
             try Self.preflightInstallPermissions(currentAppURL: currentAppURL)
 
@@ -458,21 +543,59 @@ final class ReleaseUpdater {
             let helperURL = try Self.writeInstallHelper(
                 preparedAppURL: prepared.appURL,
                 currentAppURL: currentAppURL,
-                workDirectory: prepared.workDirectory
+                workDirectory: prepared.workDirectory,
+                receiptURL: Self.installReceiptURL()
             )
-            try Self.launchInstallHelper(at: helperURL)
+            defaults.set(installStartedAt, forKey: DefaultsKey.installStartedAt)
+            defaults.set(downloadedVersion, forKey: DefaultsKey.installTargetVersion)
+            defaults.set(asset.name, forKey: DefaultsKey.installAssetName)
+            defaults.synchronize()
+            let helperStartedAt = Date()
+            do {
+                try Self.launchInstallHelper(at: helperURL)
+            } catch {
+                clearPendingInstallTelemetry()
+                throw error
+            }
+            logInstallPhase("helperLaunch", startedAt: helperStartedAt, asset: asset)
 
             shouldCleanUp = false
             defaults.removeObject(forKey: DefaultsKey.skippedReleaseTag)
+            defaults.synchronize()
             progressWindowController?.closeProgress()
             progressWindowController = nil
+            DiagnosticLogger.shared.flush()
             Darwin.exit(EXIT_SUCCESS)
         } catch {
+            DiagnosticLogger.shared.log(
+                level: .error,
+                category: "updates",
+                event: "updates.installFailed",
+                fields: [
+                    "assetName": .publicString(asset.name),
+                    "assetType": .publicString(Self.assetTypeName(asset)),
+                    "elapsed": .publicDouble(max(0, Date().timeIntervalSince(installStartedAt))),
+                    "error": .errorText(error.localizedDescription)
+                ]
+            )
             if shouldCleanUp, let workDirectory {
                 try? FileManager.default.removeItem(at: workDirectory)
             }
             throw error
         }
+    }
+
+    private func logInstallPhase(_ phase: String, startedAt: Date, asset: GitHubAsset) {
+        DiagnosticLogger.shared.log(
+            category: "updates",
+            event: "updates.installPhaseCompleted",
+            fields: [
+                "phase": .publicString(phase),
+                "assetName": .publicString(asset.name),
+                "assetType": .publicString(Self.assetTypeName(asset)),
+                "duration": .publicDouble(max(0, Date().timeIntervalSince(startedAt)))
+            ]
+        )
     }
 
     private nonisolated static func download(asset: GitHubAsset) async throws -> DownloadedAsset {
@@ -565,20 +688,21 @@ final class ReleaseUpdater {
         try fileManager.createDirectory(at: mountPoint, withIntermediateDirectories: true)
         try fileManager.createDirectory(at: payloadDirectory, withIntermediateDirectories: true)
 
-        _ = try runCommand("/usr/bin/hdiutil", arguments: [
+        let attachResult = try runCommandResult("/usr/bin/hdiutil", arguments: [
             "attach",
             downloaded.archiveURL.path,
             "-nobrowse",
             "-readonly",
+            "-plist",
             "-mountpoint",
             mountPoint.path
         ])
+        let mountedImage = mountedDiskImage(
+            fromAttachPlist: attachResult.standardOutput,
+            fallbackMountPoint: mountPoint
+        )
         defer {
-            _ = try? runCommand("/usr/bin/hdiutil", arguments: [
-                "detach",
-                mountPoint.path,
-                "-quiet"
-            ])
+            _ = detachDiskImageBestEffort(mountedImage)
         }
 
         let mountedAppURL = try findAppBundle(in: mountPoint)
@@ -596,7 +720,7 @@ final class ReleaseUpdater {
         expectedBundleIdentifier: String,
         currentAppURL: URL,
         currentVersion: String
-    ) throws {
+    ) throws -> String {
         guard let bundle = Bundle(url: appURL) else {
             throw UpdateError.appBundleNotFound
         }
@@ -621,6 +745,7 @@ final class ReleaseUpdater {
         }
 
         try validateCodeSignature(candidateURL: appURL, currentAppURL: currentAppURL)
+        return downloadedVersion
     }
 
     private nonisolated static func validateCodeSignature(candidateURL: URL, currentAppURL: URL) throws {
@@ -628,13 +753,8 @@ final class ReleaseUpdater {
         let currentCode = try staticCode(for: currentAppURL)
         let strictFlags = SecCSFlags(rawValue: kSecCSStrictValidate | kSecCSCheckAllArchitectures)
 
-        var status = SecStaticCodeCheckValidity(candidateCode, strictFlags, nil)
-        guard status == errSecSuccess else {
-            throw UpdateError.codeSignatureInvalid(candidateURL, status)
-        }
-
         var requirement: SecRequirement?
-        status = SecCodeCopyDesignatedRequirement(currentCode, SecCSFlags(), &requirement)
+        var status = SecCodeCopyDesignatedRequirement(currentCode, SecCSFlags(), &requirement)
         guard status == errSecSuccess, let requirement else {
             throw UpdateError.codeSignatureInvalid(currentAppURL, status)
         }
@@ -672,7 +792,8 @@ final class ReleaseUpdater {
     private nonisolated static func writeInstallHelper(
         preparedAppURL: URL,
         currentAppURL: URL,
-        workDirectory: URL
+        workDirectory: URL,
+        receiptURL: URL
     ) throws -> URL {
         let helperURL = workDirectory.appendingPathComponent("install-update.zsh", isDirectory: false)
         let processIdentifier = ProcessInfo.processInfo.processIdentifier
@@ -683,6 +804,8 @@ final class ReleaseUpdater {
         app_path=\(shellQuoted(currentAppURL.path))
         new_app=\(shellQuoted(preparedAppURL.path))
         work_dir=\(shellQuoted(workDirectory.path))
+        receipt_path=\(shellQuoted(receiptURL.path))
+        receipt_dir=\(shellQuoted(receiptURL.deletingLastPathComponent().path))
         pid=\(processIdentifier)
         backup_path="${app_path}.previous-update-$(date +%Y%m%d%H%M%S)"
         log_path="${work_dir}/install.log"
@@ -718,7 +841,26 @@ final class ReleaseUpdater {
                 /bin/mv "${app_path}" "${backup_path}"
             fi
 
-            if ! /usr/bin/ditto "${new_app}" "${app_path}"; then
+            replacement_started=$(/bin/date +%s)
+            install_method="copy"
+            installed=0
+            new_device=$(/usr/bin/stat -f %d "${new_app}" 2>/dev/null || true)
+            target_device=$(/usr/bin/stat -f %d "${app_path:h}" 2>/dev/null || true)
+            if [[ -n "${new_device}" && "${new_device}" == "${target_device}" ]]; then
+                if /bin/mv "${new_app}" "${app_path}"; then
+                    install_method="move"
+                    installed=1
+                fi
+            fi
+
+            if (( installed == 0 )); then
+                /bin/rm -rf "${app_path}"
+                if /usr/bin/ditto "${new_app}" "${app_path}"; then
+                    installed=1
+                fi
+            fi
+
+            if (( installed == 0 )); then
                 /bin/rm -rf "${app_path}"
                 if [[ -d "${backup_path}" ]]; then
                     /bin/mv "${backup_path}" "${app_path}"
@@ -728,7 +870,14 @@ final class ReleaseUpdater {
             fi
 
             /usr/bin/xattr -dr com.apple.quarantine "${app_path}" 2>/dev/null || true
+            replacement_finished=$(/bin/date +%s)
             /bin/rm -rf "${backup_path}"
+            receipt_tmp="${receipt_path}.tmp.$$"
+            /bin/mkdir -p "${receipt_dir}" 2>/dev/null || true
+            {
+                print -r -- "installMethod=${install_method}"
+                print -r -- "replacementDuration=$(( replacement_finished - replacement_started ))"
+            } > "${receipt_tmp}" 2>/dev/null && /bin/mv "${receipt_tmp}" "${receipt_path}" 2>/dev/null || true
             /usr/bin/open "${app_path}"
             /bin/rm -rf "${work_dir}"
         } >> "${log_path}" 2>&1
@@ -768,8 +917,196 @@ final class ReleaseUpdater {
         throw UpdateError.appBundleNotFound
     }
 
+    private nonisolated static func assetTypeName(_ asset: GitHubAsset) -> String {
+        if asset.isZipArchive { return "zip" }
+        if asset.isDiskImage { return "dmg" }
+        return "archive"
+    }
+
+    private nonisolated static func mountedDiskImage(
+        fromAttachPlist plist: String,
+        fallbackMountPoint: URL
+    ) -> MountedDiskImage {
+        let entities = propertyListDictionary(from: plist)?["system-entities"] as? [[String: Any]] ?? []
+        let mountedEntity = entities.first { entity in
+            (entity["mount-point"] as? String) == fallbackMountPoint.path
+        } ?? entities.first { $0["mount-point"] != nil }
+        let mountPoint = (mountedEntity?["mount-point"] as? String)
+            .map { URL(fileURLWithPath: $0, isDirectory: true) }
+            ?? fallbackMountPoint
+        return MountedDiskImage(
+            deviceIdentifier: mountedEntity?["dev-entry"] as? String,
+            mountPoint: mountPoint
+        )
+    }
+
+    private nonisolated static func mountedDiskImages(fromInfoPlist plist: String) -> [MountedDiskImage] {
+        guard let images = propertyListDictionary(from: plist)?["images"] as? [[String: Any]] else {
+            return []
+        }
+
+        return images.flatMap { image -> [MountedDiskImage] in
+            guard let entities = image["system-entities"] as? [[String: Any]] else { return [] }
+            return entities.compactMap { entity in
+                guard let mountPoint = entity["mount-point"] as? String else { return nil }
+                return MountedDiskImage(
+                    deviceIdentifier: entity["dev-entry"] as? String,
+                    mountPoint: URL(fileURLWithPath: mountPoint, isDirectory: true)
+                )
+            }
+        }
+    }
+
+    private nonisolated static func propertyListDictionary(from plist: String) -> [String: Any]? {
+        guard
+            let data = plist.data(using: .utf8),
+            let propertyList = try? PropertyListSerialization.propertyList(from: data, format: nil)
+        else {
+            return nil
+        }
+        return propertyList as? [String: Any]
+    }
+
+    @discardableResult
+    private nonisolated static func detachDiskImageBestEffort(
+        _ image: MountedDiskImage,
+        retryDelays: [TimeInterval] = [0, 0.25, 1],
+        commandRunner: (String, [String]) throws -> Void = { executable, arguments in
+            _ = try runCommand(executable, arguments: arguments)
+        },
+        sleeper: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) }
+    ) -> Bool {
+        var lastError: Error?
+
+        for delay in retryDelays {
+            if delay > 0 {
+                sleeper(delay)
+            }
+            do {
+                try commandRunner("/usr/bin/hdiutil", [
+                    "detach",
+                    image.detachTarget,
+                    "-quiet"
+                ])
+                return true
+            } catch {
+                lastError = error
+            }
+        }
+
+        DiagnosticLogger.shared.log(
+            level: .warning,
+            category: "updates",
+            event: "updates.diskImageDetachFailed",
+            fields: [
+                "attemptCount": .publicInt(retryDelays.count),
+                "error": .errorText(lastError?.localizedDescription ?? "Unknown detach error")
+            ],
+            diagnosticFields: [
+                "mountPoint": .path(image.mountPoint.path)
+            ]
+        )
+        return false
+    }
+
+    private nonisolated static func cleanupStaleUpdateMounts(
+        fileManager: FileManager = .default,
+        now: Date = Date()
+    ) {
+        guard let result = try? runCommandResult("/usr/bin/hdiutil", arguments: ["info", "-plist"]) else {
+            return
+        }
+
+        var handledTargets = Set<String>()
+        for image in mountedDiskImages(fromInfoPlist: result.standardOutput) {
+            guard handledTargets.insert(image.detachTarget).inserted else { continue }
+            guard let workDirectory = staleUpdateWorkDirectory(
+                for: image.mountPoint,
+                fileManager: fileManager,
+                now: now
+            ) else {
+                continue
+            }
+            guard detachDiskImageBestEffort(image) else { continue }
+            guard !isMounted(image.mountPoint) else { continue }
+
+            try? fileManager.removeItem(at: workDirectory)
+            DiagnosticLogger.shared.log(
+                category: "updates",
+                event: "updates.staleDiskImageDetached",
+                diagnosticFields: [
+                    "mountPoint": .path(image.mountPoint.path)
+                ]
+            )
+        }
+    }
+
+    private nonisolated static func staleUpdateWorkDirectory(
+        for mountPoint: URL,
+        fileManager: FileManager,
+        now: Date
+    ) -> URL? {
+        let temporaryDirectory = fileManager.temporaryDirectory.standardizedFileURL
+        let path = mountPoint.standardizedFileURL.path
+        let temporaryPrefix = temporaryDirectory.path.hasSuffix("/")
+            ? temporaryDirectory.path
+            : temporaryDirectory.path + "/"
+        guard !path.hasPrefix("/Volumes/"), path.hasPrefix(temporaryPrefix) else { return nil }
+
+        let relativePath = String(path.dropFirst(temporaryPrefix.count))
+        guard let directoryName = relativePath.split(separator: "/").first,
+              directoryName.hasPrefix("\(appName)-Update-") else {
+            return nil
+        }
+
+        let workDirectory = temporaryDirectory.appendingPathComponent(String(directoryName), isDirectory: true)
+        let values = try? workDirectory.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey])
+        let lastTouched = [values?.creationDate, values?.contentModificationDate].compactMap { $0 }.max()
+        guard let lastTouched,
+              now.timeIntervalSince(lastTouched) >= staleUpdateMinimumAge else {
+            return nil
+        }
+        return workDirectory
+    }
+
+    private nonisolated static func isMounted(_ mountPoint: URL) -> Bool {
+        guard let result = try? runCommandResult("/usr/bin/hdiutil", arguments: ["info", "-plist"]) else {
+            return true
+        }
+        return mountedDiskImages(fromInfoPlist: result.standardOutput).contains {
+            $0.mountPoint.standardizedFileURL == mountPoint.standardizedFileURL
+        }
+    }
+
+    private nonisolated static func installReceiptURL(fileManager: FileManager = .default) -> URL {
+        let supportRoot = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? fileManager.temporaryDirectory
+        return supportRoot
+            .appendingPathComponent(appName, isDirectory: true)
+            .appendingPathComponent("update-install-receipt.txt", isDirectory: false)
+    }
+
+    private nonisolated static func loadInstallReceipt(fileManager: FileManager = .default) -> [String: String]? {
+        guard let contents = try? String(contentsOf: installReceiptURL(fileManager: fileManager), encoding: .utf8) else {
+            return nil
+        }
+
+        return contents.split(whereSeparator: \.isNewline).reduce(into: [:]) { fields, line in
+            let pair = line.split(separator: "=", maxSplits: 1).map(String.init)
+            guard pair.count == 2 else { return }
+            fields[pair[0]] = pair[1]
+        }
+    }
+
     @discardableResult
     private nonisolated static func runCommand(_ executablePath: String, arguments: [String]) throws -> String {
+        try runCommandResult(executablePath, arguments: arguments).combinedOutput
+    }
+
+    private nonisolated static func runCommandResult(
+        _ executablePath: String,
+        arguments: [String]
+    ) throws -> CommandResult {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executablePath)
         process.arguments = arguments
@@ -804,16 +1141,16 @@ final class ReleaseUpdater {
 
         let output = outputBuffer.string()
         let error = errorBuffer.string()
-        let combinedOutput = [output, error].joined(separator: "\n")
+        let result = CommandResult(standardOutput: output, standardError: error)
         guard process.terminationStatus == 0 else {
             throw UpdateError.commandFailed(
                 command: URL(fileURLWithPath: executablePath).lastPathComponent,
                 status: process.terminationStatus,
-                output: combinedOutput
+                output: result.combinedOutput
             )
         }
 
-        return combinedOutput
+        return result
     }
 
     private final class CommandOutputBuffer: @unchecked Sendable {
@@ -834,6 +1171,75 @@ final class ReleaseUpdater {
     }
 
 #if DEBUG
+    nonisolated static func preferredAssetNameForTesting(_ assetNames: [String]) -> String? {
+        let assets = assetNames.map { name in
+            GitHubAsset(
+                name: name,
+                contentType: nil,
+                browserDownloadURL: URL(string: "https://example.test/\(name)")!
+            )
+        }
+        return GitHubRelease(
+            htmlURL: URL(string: "https://example.test/release")!,
+            tagName: "1.0.0",
+            name: nil,
+            draft: false,
+            prerelease: false,
+            publishedAt: nil,
+            assets: assets
+        ).installAsset?.name
+    }
+
+    nonisolated static func mountedDiskImageForTesting(
+        attachPlist: String,
+        fallbackMountPoint: URL
+    ) -> (deviceIdentifier: String?, mountPoint: URL) {
+        let image = mountedDiskImage(fromAttachPlist: attachPlist, fallbackMountPoint: fallbackMountPoint)
+        return (image.deviceIdentifier, image.mountPoint)
+    }
+
+    nonisolated static func detachDiskImageForTesting(
+        deviceIdentifier: String?,
+        mountPoint: URL,
+        failuresBeforeSuccess: Int
+    ) -> (succeeded: Bool, arguments: [[String]]) {
+        var arguments: [[String]] = []
+        let image = MountedDiskImage(deviceIdentifier: deviceIdentifier, mountPoint: mountPoint)
+        let succeeded = detachDiskImageBestEffort(
+            image,
+            retryDelays: [0, 0, 0],
+            commandRunner: { _, commandArguments in
+                arguments.append(commandArguments)
+                if arguments.count <= failuresBeforeSuccess {
+                    throw CocoaError(.fileWriteUnknown)
+                }
+            },
+            sleeper: { _ in }
+        )
+        return (succeeded, arguments)
+    }
+
+    nonisolated static func staleUpdateWorkDirectoryForTesting(
+        mountPoint: URL,
+        now: Date = Date()
+    ) -> URL? {
+        staleUpdateWorkDirectory(for: mountPoint, fileManager: .default, now: now)
+    }
+
+    nonisolated static func installHelperContentsForTesting(
+        preparedAppURL: URL,
+        currentAppURL: URL,
+        workDirectory: URL
+    ) throws -> String {
+        let helperURL = try writeInstallHelper(
+            preparedAppURL: preparedAppURL,
+            currentAppURL: currentAppURL,
+            workDirectory: workDirectory,
+            receiptURL: workDirectory.appendingPathComponent("receipt.txt")
+        )
+        return try String(contentsOf: helperURL, encoding: .utf8)
+    }
+
     nonisolated static func runCommandForTesting(_ executablePath: String, arguments: [String]) throws -> String {
         try runCommand(executablePath, arguments: arguments)
     }
