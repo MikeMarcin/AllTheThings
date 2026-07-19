@@ -371,6 +371,130 @@ struct FileExclusionRulesTests {
         #expect(!withReinclude.canPruneDirectoryComponentBeforeStat("buck-out"))
     }
 
+    @Test("compiled default globs avoid regex matching while preserving boundary semantics")
+    func compiledDefaultGlobsAvoidRegexMatching() {
+        let root = "/tmp/project"
+        let patterns = FileExclusionRules.defaultPatterns
+        let rules = FileExclusionRules(patterns: patterns)
+        let query = rules.makeQuery(roots: [root])
+        let samples: [(path: String, isDirectory: Bool, expected: FileExclusionRules.Decision)] = [
+            ("\(root)/Sources/Feature/Deep/App.swift", false, .index),
+            ("\(root)/.git/hooks", true, .skipButDescend),
+            ("\(root)/.git/hooks/pre-commit", false, .index),
+            ("\(root)/.git/objects/ab/cdef", false, .prune),
+            ("\(root)/.build/index/store", true, .index),
+            ("\(root)/.build/arm64/index/store", true, .prune),
+            ("\(root)/build/.tmp-cache", false, .index),
+            ("\(root)/build/generated/.tmp-cache", false, .prune),
+            ("\(root)/Objects/FOO.O", false, .prune),
+            ("\(root)/Example.APP/Contents/_CodeSignature", true, .prune)
+        ]
+        var instrumentation = FileExclusionQuery.Instrumentation()
+
+        for sample in samples {
+            let compiled = query.decision(
+                path: sample.path,
+                isDirectory: sample.isDirectory,
+                instrumentation: &instrumentation
+            )
+            let reference = rules.decision(
+                url: URL(fileURLWithPath: sample.path, isDirectory: sample.isDirectory),
+                roots: [root],
+                isDirectory: sample.isDirectory
+            )
+            #expect(compiled == reference)
+            #expect(compiled == sample.expected)
+        }
+
+        #expect(instrumentation.regexMatchCount == 0)
+        #expect(instrumentation.ancestorMatchCheckCount < patterns.count * samples.count)
+    }
+
+    @Test("compiled globs retain regex fallback for complex custom patterns")
+    func compiledGlobsRetainRegexFallback() {
+        let root = "/tmp/project"
+        let patterns = ["a*b", "foo/?ar", "[ab].txt"]
+        let rules = FileExclusionRules(patterns: patterns)
+        let query = rules.makeQuery(roots: [root])
+        var instrumentation = FileExclusionQuery.Instrumentation()
+
+        for path in ["\(root)/axxb", "\(root)/foo/bar", "\(root)/a.txt", "\(root)/keep.swift"] {
+            let compiled = query.decision(
+                path: path,
+                isDirectory: false,
+                instrumentation: &instrumentation
+            )
+            let reference = rules.decision(
+                url: URL(fileURLWithPath: path),
+                roots: [root],
+                isDirectory: false
+            )
+            #expect(compiled == reference)
+        }
+
+        #expect(instrumentation.regexMatchCount > 0)
+    }
+
+    @Test("compiled globs preserve standalone recursion and Unicode case folding")
+    func compiledGlobsPreserveEdgeCaseSemantics() {
+        let root = "/tmp/project"
+        let cases: [(patterns: [String], path: String)] = [
+            (["**"], "\(root)/Anything.swift"),
+            (["**/**/**/missing"], "\(root)/one/two/three/missing"),
+            (["*SS"], "\(root)/ß"),
+            (["*ß"], "\(root)/SS")
+        ]
+
+        for sample in cases {
+            let rules = FileExclusionRules(patterns: sample.patterns)
+            let query = rules.makeQuery(roots: [root])
+            var instrumentation = FileExclusionQuery.Instrumentation()
+            let compiled = query.decision(
+                path: sample.path,
+                isDirectory: false,
+                instrumentation: &instrumentation
+            )
+            let reference = rules.decision(
+                url: URL(fileURLWithPath: sample.path),
+                roots: [root],
+                isDirectory: false
+            )
+            #expect(compiled == reference)
+        }
+    }
+
+    @Test("compiled defaults remain fast after non-negated migration reordering")
+    func compiledDefaultsRemainFastAfterMigrationReordering() {
+        let defaults = FileExclusionRules.defaultPatterns
+        let reordered = Array(defaults.prefix(6)) + Array(defaults.dropFirst(6).reversed())
+        let root = "/tmp/project"
+        let rules = FileExclusionRules(patterns: reordered)
+        let query = rules.makeQuery(roots: [root])
+        var instrumentation = FileExclusionQuery.Instrumentation()
+
+        for path in [
+            "\(root)/Sources/App.swift",
+            "\(root)/node_modules/react/index.js",
+            "\(root)/.git/config",
+            "\(root)/.git/objects/ab/cdef",
+            "\(root)/Example.app/Contents/_CodeSignature/CodeResources"
+        ] {
+            let compiled = query.decision(
+                path: path,
+                isDirectory: false,
+                instrumentation: &instrumentation
+            )
+            let reference = rules.decision(
+                url: URL(fileURLWithPath: path),
+                roots: [root],
+                isDirectory: false
+            )
+            #expect(compiled == reference)
+        }
+
+        #expect(instrumentation.regexMatchCount == 0)
+    }
+
     private func assertCompiledQueryParity(
         patterns: [String],
         roots: [String],

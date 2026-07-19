@@ -56,6 +56,52 @@ struct FileSystemWatcherTests {
         #expect(store.eventID(for: rootB) == 100)
     }
 
+    @Test("live FSEvent cursor updates stay in memory until flush")
+    func liveFSEventCursorUpdatesAreDeferred() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        let cursorURL = directory.appendingPathComponent("fsevents-cursors.json", isDirectory: false)
+        defer {
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let root = "/tmp/allthethings/root-a"
+        let store = FSEventCursorStore(url: cursorURL, deferredUpdateInterval: 3_600)
+        store.updateDeferred([root: 123])
+
+        #expect(store.eventID(for: root) == 123)
+        #expect(FSEventCursorStore(url: cursorURL).eventID(for: root) == nil)
+
+        store.flushPendingUpdates()
+        #expect(FSEventCursorStore(url: cursorURL).eventID(for: root) == 123)
+    }
+
+    @Test("cursor invalidation accepts a wrapped event epoch")
+    func cursorInvalidationAcceptsWrappedEventEpoch() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        let cursorURL = directory.appendingPathComponent("fsevents-cursors.json", isDirectory: false)
+        defer {
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let root = "/tmp/allthethings/root-a"
+        let store = FSEventCursorStore(url: cursorURL, deferredUpdateInterval: 3_600)
+        store.markBaseline(for: [root], eventID: 10_000)
+        store.invalidate(roots: [root])
+        store.updateDeferred([root: 12])
+
+        #expect(store.eventID(for: root) == 12)
+        #expect(FSEventCursorStore(url: cursorURL).eventID(for: root) == nil)
+
+        store.flushPendingUpdates()
+        #expect(FSEventCursorStore(url: cursorURL).eventID(for: root) == 12)
+
+        store.updateDeferred([root: 15])
+        store.flushPendingUpdates()
+        #expect(FSEventCursorStore(url: cursorURL).eventID(for: root) == 15)
+    }
+
     @Test("FSEvent flags classify historical completion and unsafe history")
     func fseventFlagsClassifyReplayState() {
         let historyDone = FileSystemEvent(
@@ -94,6 +140,106 @@ struct FileSystemWatcherTests {
         #expect(interactive.flags & UInt32(kFSEventStreamCreateFlagNoDefer) != 0)
         #expect(background.flags & UInt32(kFSEventStreamCreateFlagNoDefer) == 0)
         #expect(background.flags & UInt32(kFSEventStreamCreateFlagFileEvents) != 0)
+        #expect(interactive.flags & UInt32(kFSEventStreamCreateFlagWatchRoot) != 0)
+        #expect(background.flags & UInt32(kFSEventStreamCreateFlagWatchRoot) != 0)
+    }
+
+    @Test("application catalog invalidates for stream-wide control events")
+    func applicationCatalogInvalidatesForStreamControlEvents() {
+        let root = URL(fileURLWithPath: "/Applications", isDirectory: true)
+        let dropped = FileSystemEvent(
+            path: "/",
+            flags: FSEventStreamEventFlags(kFSEventStreamEventFlagKernelDropped),
+            eventID: 44
+        )
+
+        #expect(ApplicationSearchEventFilter.shouldInvalidate(events: [dropped], roots: [root]))
+    }
+
+    @Test("cursor advances map unsafe stream events to every configured root")
+    func cursorAdvancesMapUnsafeEventsToConfiguredRoots() {
+        let roots = ["/Users/example/Desktop", "/Users/example/Documents"]
+        let events = [
+            FileSystemEvent(
+                path: "/",
+                flags: FSEventStreamEventFlags(kFSEventStreamEventFlagUserDropped),
+                eventID: 80
+            ),
+            FileSystemEvent(path: "\(roots[0])/Note.txt", flags: 0, eventID: 82)
+        ]
+
+        let advances = FSEventCursorAdvances.latestByRoot(events: events, rootPaths: roots)
+
+        #expect(advances[roots[0]] == 82)
+        #expect(advances[roots[1]] == 80)
+    }
+
+    @Test("wrapped cursor advances discard pre-wrap event IDs")
+    func wrappedCursorAdvancesDiscardPreWrapEventIDs() {
+        let roots = ["/Users/example/Desktop", "/Users/example/Documents"]
+        let advances = FSEventCursorAdvances.latestByRoot(
+            events: [
+                FileSystemEvent(path: roots[0], flags: 0, eventID: 10_000),
+                FileSystemEvent(
+                    path: "/",
+                    flags: FSEventStreamEventFlags(kFSEventStreamEventFlagEventIdsWrapped),
+                    eventID: 12
+                )
+            ],
+            rootPaths: roots,
+            wrappedBaselineEventID: 20
+        )
+
+        #expect(advances == [roots[0]: 20, roots[1]: 20])
+    }
+
+    @Test("wrapped cursor advances survive same-path event coalescing")
+    func wrappedCursorAdvancesSurviveSamePathCoalescing() {
+        let root = "/Users/example/Desktop"
+        let path = "\(root)/Note.txt"
+        let merged = FileSystemEvent(path: path, flags: 0, eventID: 10_000).merging(
+            FileSystemEvent(
+                path: path,
+                flags: FSEventStreamEventFlags(kFSEventStreamEventFlagEventIdsWrapped),
+                eventID: 12
+            )
+        )
+
+        let advances = FSEventCursorAdvances.latestByRoot(
+            events: [merged],
+            rootPaths: [root],
+            wrappedBaselineEventID: 20
+        )
+
+        #expect(merged.eventIDsWrapped)
+        #expect(advances == [root: 20])
+    }
+
+    @Test("recursive repair events bypass exclusions")
+    func recursiveRepairEventsBypassExclusions() {
+        let root = "/tmp/allthethings/root-a"
+        let mustScanPath = "\(root)/node_modules/acme/cache"
+        let wrappedPath = "\(root)/node_modules/other/cache"
+        let ordinaryExcludedPath = "\(root)/node_modules/ignored/file.js"
+        let filtered = FSEventIndexFilter.indexableEvents(
+            [
+                FileSystemEvent(
+                    path: mustScanPath,
+                    flags: FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs),
+                    eventID: 41
+                ),
+                FileSystemEvent(
+                    path: wrappedPath,
+                    flags: FSEventStreamEventFlags(kFSEventStreamEventFlagEventIdsWrapped),
+                    eventID: 42
+                ),
+                FileSystemEvent(path: ordinaryExcludedPath, flags: 0, eventID: 43)
+            ],
+            rootPaths: [root],
+            exclusionPatterns: FileExclusionRules.defaultPatterns
+        )
+
+        #expect(Set(filtered.map(\.eventID)) == [41, 42])
     }
 
     @Test("FSEvent reconciliation scopes normal historical file paths exactly")
@@ -347,6 +493,72 @@ struct FileSystemWatcherTests {
         #expect(filtered.last?.requiresRecursiveRescan == true)
     }
 
+    @Test("custom negated exclusions reinclude live FSEvents")
+    func customNegatedExclusionsReincludeLiveEvents() {
+        let root = URL(fileURLWithPath: "/tmp/allthethings/root-a", isDirectory: true)
+        let reIncludedPath = root.appendingPathComponent("node_modules/acme/Sources/App.js").path
+        let excludedPath = root.appendingPathComponent("node_modules/other/index.js").path
+        let patterns = ["node_modules/", "!node_modules/acme/**"]
+
+        let filtered = FSEventIndexFilter.indexableEvents(
+            [
+                FileSystemEvent(path: reIncludedPath, flags: 0, eventID: 41),
+                FileSystemEvent(path: excludedPath, flags: 0, eventID: 42)
+            ],
+            rootPaths: [root.path],
+            exclusionPatterns: patterns
+        )
+
+        #expect(filtered.map(\.path) == [reIncludedPath])
+    }
+
+    @Test("migrated default exclusion order retains the known fast path")
+    func migratedDefaultExclusionOrderRetainsKnownFastPath() {
+        let defaults = FileExclusionRules.defaultPatterns
+        let migratedOrder = Array(defaults.prefix(6)) + Array(defaults.dropFirst(6).reversed())
+
+        #expect(FSEventDefaultExclusionPolicy.matches(migratedOrder))
+        #expect(FSEventIndexFilter.Context(
+            rootPaths: ["/tmp/allthethings/root-a"],
+            exclusionPatterns: migratedOrder
+        ).usesKnownExclusionFastPath)
+        #expect(!FSEventDefaultExclusionPolicy.matches([
+            "node_modules/",
+            "!node_modules/acme/**"
+        ]))
+    }
+
+    @Test("custom negated exclusions reinclude historical FSEvents")
+    func customNegatedExclusionsReincludeHistoricalEvents() async {
+        let root = URL(fileURLWithPath: "/tmp/allthethings/root-a", isDirectory: true)
+        let reIncludedPath = root.appendingPathComponent("node_modules/acme/Sources/App.js").path
+        let store = memoryCursorStore()
+        store.markBaseline(for: [root.path], eventID: 40)
+        let source = FakeHistoryReplaySource(
+            events: [
+                FileSystemEvent(path: reIncludedPath, flags: 0, eventID: 41),
+                FileSystemEvent(
+                    path: root.path,
+                    flags: FSEventStreamEventFlags(kFSEventStreamEventFlagHistoryDone),
+                    eventID: 42
+                )
+            ],
+            completion: .completed
+        )
+        let coordinator = FSEventReconciliationCoordinator(
+            cursorStore: store,
+            replaySource: source,
+            currentEventID: { 42 }
+        )
+
+        let action = await actionFromCoordinator(
+            coordinator,
+            roots: [root],
+            exclusions: FileExclusionRules(patterns: ["node_modules/", "!node_modules/acme/**"])
+        )
+        #expect(action == .reconcile(paths: [reIncludedPath], baselineEventID: 42))
+    }
+
     @Test("known excluded FSEvent paths cover default generated churn")
     func knownExcludedFSEventPathsCoverDefaultGeneratedChurn() {
         let root = "/tmp/allthethings/root-a"
@@ -435,7 +647,7 @@ struct FileSystemWatcherTests {
             "\(root)/Deleted",
             "\(root)/Generated"
         ])
-        #expect(routed.recursivePaths == [recursiveFile])
+        #expect(routed.recursivePaths == ["\(root)/Generated"])
     }
 
     @Test("live FSEvents coalesce duplicate paths while preserving recursive flags")
@@ -460,6 +672,38 @@ struct FileSystemWatcherTests {
         #expect(filtered.first?.requiresRecursiveRescan == true)
     }
 
+    @Test("dropped live FSEvents rescan configured roots instead of the filesystem root")
+    func droppedLiveFSEventsRescanConfiguredRoots() {
+        let roots = [
+            "/Users/example/Desktop",
+            "/Users/example/Documents",
+            "/Users/example/Downloads"
+        ]
+        let flags = FSEventStreamEventFlags(kFSEventStreamEventFlagUserDropped)
+            | FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs)
+
+        let routed = FSEventLiveRefreshScopeRouter.route(
+            events: [FileSystemEvent(path: "/", flags: flags, eventID: 100)],
+            rootPaths: roots
+        )
+
+        #expect(routed.exactPaths.isEmpty)
+        #expect(Set(routed.directoryPaths) == Set(roots))
+        #expect(Set(routed.recursivePaths) == Set(roots))
+        #expect(!routed.directoryPaths.contains("/"))
+    }
+
+    @Test("ordinary live FSEvents outside configured roots are ignored")
+    func liveFSEventsOutsideConfiguredRootsAreIgnored() {
+        let routed = FSEventLiveRefreshScopeRouter.route(
+            events: [FileSystemEvent(path: "/tmp/unrelated.txt", flags: 0, eventID: 101)],
+            rootPaths: ["/Users/example/Documents"]
+        )
+
+        #expect(routed.isEmpty)
+        #expect(routed.recursivePaths.isEmpty)
+    }
+
     @Test("FSEvent reconciliation falls back when a cursor is missing")
     func fseventReconciliationFallsBackForMissingCursor() async {
         let root = URL(fileURLWithPath: "/tmp/allthethings/root-a", isDirectory: true)
@@ -470,7 +714,7 @@ struct FileSystemWatcherTests {
         )
 
         let action = await actionFromCoordinator(coordinator, roots: [root])
-        #expect(action == .fullReconcile(paths: nil))
+        #expect(action == .fullReconcile(paths: nil, baselineEventID: 50))
     }
 
     @Test("FSEvent reconciliation falls back for unsafe history")
@@ -500,7 +744,37 @@ struct FileSystemWatcherTests {
         )
 
         let action = await actionFromCoordinator(coordinator, roots: [root])
-        #expect(action == .fullReconcile(paths: [root.path]))
+        #expect(action == .fullReconcile(paths: [root.path], baselineEventID: 42))
+        #expect(store.eventID(for: root.path) == nil)
+
+        store.markBaseline(for: [root.path], eventID: 42)
+        #expect(store.eventID(for: root.path) == 42)
+    }
+
+    @Test("history completion cannot hide a dropped-stream flag")
+    func historyCompletionWithDroppedFlagStillFallsBack() async {
+        let root = URL(fileURLWithPath: "/tmp/allthethings/root-a", isDirectory: true)
+        let store = memoryCursorStore()
+        store.markBaseline(for: [root.path], eventID: 40)
+        let source = FakeHistoryReplaySource(
+            events: [
+                FileSystemEvent(
+                    path: "/",
+                    flags: FSEventStreamEventFlags(kFSEventStreamEventFlagHistoryDone)
+                        | FSEventStreamEventFlags(kFSEventStreamEventFlagUserDropped),
+                    eventID: 45
+                )
+            ],
+            completion: .completed
+        )
+        let coordinator = FSEventReconciliationCoordinator(
+            cursorStore: store,
+            replaySource: source,
+            currentEventID: { 45 }
+        )
+
+        let action = await actionFromCoordinator(coordinator, roots: [root])
+        #expect(action == .fullReconcile(paths: [root.path], baselineEventID: 45))
     }
 
     @Test("FSEvent reconciliation records up to date baselines")
@@ -525,7 +799,7 @@ struct FileSystemWatcherTests {
         )
 
         let action = await actionFromCoordinator(coordinator, roots: [root])
-        #expect(action == .upToDate(baselineEventID: 55))
+        #expect(action == .upToDate(baselineEventID: 40))
     }
 
     private func memoryCursorStore() -> FSEventCursorStore {
@@ -539,10 +813,11 @@ struct FileSystemWatcherTests {
     @MainActor
     private func actionFromCoordinator(
         _ coordinator: FSEventReconciliationCoordinator,
-        roots: [URL]
+        roots: [URL],
+        exclusions: FileExclusionRules = FileExclusionRules()
     ) async -> FSEventReconciliationAction {
         await withCheckedContinuation { continuation in
-            _ = coordinator.reconcile(roots: roots) { action in
+            _ = coordinator.reconcile(roots: roots, exclusions: exclusions) { action in
                 continuation.resume(returning: action)
             }
         }

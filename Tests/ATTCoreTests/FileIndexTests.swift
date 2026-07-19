@@ -1248,6 +1248,15 @@ struct FileIndexTests {
         }
     }
 
+    @Test("default background directory maintenance targets a 2.5 percent duty cycle")
+    func defaultBackgroundDirectoryMaintenanceHasBoundedDutyCycle() {
+        let policy = FileIndex.defaultBackgroundDirectoryMaintenancePolicyForTesting
+
+        #expect(policy.scanBudget == 1.5)
+        #expect(policy.backoff == 60)
+        #expect(policy.targetDutyCycle <= 0.025)
+    }
+
     @Test("background directory refresh yields and foreground promotion completes catch up")
     func backgroundDirectoryRefreshYieldsAndForegroundPromotionCompletesCatchUp() async throws {
         let fileManager = FileManager.default
@@ -1270,7 +1279,6 @@ struct FileIndexTests {
             largeOverlayPersistDelay: nil,
             backgroundRefreshDrainBackoffDelay: 60,
             backgroundDirectoryScanBudget: 0,
-            backgroundDirectoryMaxDeferral: 60,
             backgroundOptimizationPersistDelay: 60
         )
         index.replaceRootsAndRebuild([root], mode: .fresh)
@@ -1342,7 +1350,6 @@ struct FileIndexTests {
             largeOverlayPersistDelay: nil,
             backgroundRefreshDrainBackoffDelay: 0,
             backgroundDirectoryScanBudget: 0.005,
-            backgroundDirectoryMaxDeferral: 60,
             backgroundOptimizationPersistDelay: 60
         )
         index.replaceRootsAndRebuild([root], mode: .fresh)
@@ -1399,7 +1406,6 @@ struct FileIndexTests {
             largeOverlayPersistDelay: nil,
             backgroundRefreshDrainBackoffDelay: 60,
             backgroundDirectoryScanBudget: 0.01,
-            backgroundDirectoryMaxDeferral: 60,
             backgroundOptimizationPersistDelay: 60
         )
         index.replaceRootsAndRebuild([root], mode: .fresh)
@@ -1442,6 +1448,67 @@ struct FileIndexTests {
         }
     }
 
+    @Test("directory catch up retains descendant events queued after the scan starts")
+    func directoryCatchUpRetainsNewerDescendantEvents() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        let folder = root.appendingPathComponent("Folder", isDirectory: true)
+        try fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+        }
+
+        for offset in 0..<1_000 {
+            try "existing".write(
+                to: folder.appendingPathComponent("Existing\(offset).swift"),
+                atomically: true,
+                encoding: .utf8
+            )
+        }
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        defer {
+            try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName))
+        }
+        let index = FileIndex(
+            applicationName: applicationName,
+            loadsSnapshotImmediately: false,
+            largeOverlayPersistRecordLimit: nil,
+            largeOverlayPersistDelay: nil,
+            backgroundRefreshBatchLimit: 512,
+            backgroundRefreshDrainBackoffDelay: 0.2,
+            backgroundDirectoryScanBudget: 0.005,
+            backgroundOptimizationPersistDelay: 60
+        )
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil(timeout: .seconds(20)) {
+            !index.currentStats().isIndexing
+        }
+
+        index.update(paths: [folder.path], priority: .background)
+        try await waitUntil(timeout: .seconds(10)) {
+            index.pendingDirectoryRefreshStateForTesting(path: folder.path) != nil
+        }
+
+        let lateFile = folder.appendingPathComponent("LateEvent.swift")
+        try "late".write(to: lateFile, atomically: true, encoding: .utf8)
+        index.update(paths: [lateFile.path], priority: .background)
+
+        try await waitUntil(timeout: .seconds(20)) {
+            let pending = index.pendingRefreshPathsForTesting()
+            return !pending.contains(folder.path) && pending.contains(lateFile.path)
+        }
+
+        try await waitUntil(timeout: .seconds(10)) {
+            index.currentDiagnostics().pendingRefreshPathCount == 0
+                && index.search(SearchRequest(
+                    query: "LateEvent",
+                    sort: SortSpec(column: .relevance, ascending: false)
+                ), maxResults: 10).results.contains { $0.record.path == lateFile.path }
+        }
+    }
+
     @Test("automatic snapshot persistence waits for refresh backlog")
     func automaticSnapshotPersistenceWaitsForRefreshBacklog() async throws {
         let fileManager = FileManager.default
@@ -1469,7 +1536,6 @@ struct FileIndexTests {
             largeOverlayPersistDelay: nil,
             backgroundRefreshDrainBackoffDelay: 60,
             backgroundDirectoryScanBudget: 0,
-            backgroundDirectoryMaxDeferral: 60,
             backgroundOptimizationPersistDelay: 0.5
         )
         index.replaceRootsAndRebuild([root], mode: .fresh)
@@ -1601,25 +1667,6 @@ struct FileIndexTests {
         }
     }
 
-    @Test("large overlay drain pruning removes children under reconciled prefixes")
-    func largeOverlayDrainPruningRemovesChildrenUnderReconciledPrefixes() {
-        let folder = "/tmp/allthethings/Root/Folder"
-        let pending: Set<String> = [
-            folder,
-            "\(folder)/Child.swift",
-            "\(folder)/Nested/Grandchild.swift",
-            "/tmp/allthethings/Root/Folderish/Child.swift",
-            "/tmp/allthethings/Root/Sibling.swift"
-        ]
-
-        let pruned = FileIndex.prunedPendingRefreshPathsForTesting(pending, coveredBy: [folder])
-
-        #expect(pruned == [
-            "/tmp/allthethings/Root/Folderish/Child.swift",
-            "/tmp/allthethings/Root/Sibling.swift"
-        ])
-    }
-
     @Test("update applies optimized overlay so log and log.rb searches stay indexed")
     func updateAppliesOptimizedOverlaySoLogAndLogRBSearchesStayIndexed() async throws {
         let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
@@ -1670,7 +1717,10 @@ struct FileIndexTests {
             }
             records.append(makeRecord(path: path, modifiedTime: TimeInterval(row)))
         }
-        index.replaceRecordsForTesting(records)
+        index.replaceRecordsForTesting(
+            records,
+            roots: [URL(fileURLWithPath: "/tmp", isDirectory: true)]
+        )
 
         let before = index.currentStats()
         #expect(before.optimizedCount == before.indexedCount)
@@ -1762,6 +1812,51 @@ struct FileIndexTests {
             return keptResponse.results.contains { $0.record.path == kept.path }
                 && !deletedResponse.results.contains { $0.record.path == deleted.path }
         }
+    }
+
+    @Test("updates outside configured roots are discarded without traversal")
+    func updatesOutsideConfiguredRootsAreDiscarded() async throws {
+        let fileManager = FileManager.default
+        let base = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        let root = base.appendingPathComponent("Indexed", isDirectory: true)
+        let outside = base.appendingPathComponent("Outside", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: outside, withIntermediateDirectories: true)
+        try "outside".write(
+            to: outside.appendingPathComponent("OutsideOnly.swift"),
+            atomically: true,
+            encoding: .utf8
+        )
+        defer {
+            try? fileManager.removeItem(at: base)
+        }
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        defer {
+            try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName))
+        }
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil {
+            !index.currentStats().isIndexing
+        }
+        let before = index.currentDiagnostics()
+
+        await withCheckedContinuation { continuation in
+            index.update(paths: [outside.path]) {
+                continuation.resume()
+            }
+        }
+
+        let after = index.currentDiagnostics()
+        let response = index.search(SearchRequest(
+            query: "OutsideOnly",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10)
+        #expect(after.completedRefreshBatches == before.completedRefreshBatches)
+        #expect(after.pendingRefreshPathCount == 0)
+        #expect(response.totalMatches == 0)
     }
 
     @Test("search applies name sort to small result sets")
@@ -1993,6 +2088,16 @@ struct FileIndexTests {
         #expect(degraded.executionProfile.scannedRowCount == 25_000)
         #expect(degraded.executionProfile.scannedRowCount < recordCount)
         #expect(!degraded.executionProfile.didFallbackToFullScan)
+
+        let complete = index.search(SearchRequest(
+            query: "Needle",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10)
+
+        #expect(complete.totalMatches == 2)
+        #expect(Set(complete.results.map(\.record.path)) == [earlyNeedle, lateNeedle])
+        #expect(complete.executionProfile.scannedRowCount == recordCount)
+        #expect(complete.executionProfile.didFallbackToFullScan)
 
         index.replaceRecordsForTesting(records, buildsSearchStructures: true, phase: .ready)
         let optimized = index.search(SearchRequest(

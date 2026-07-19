@@ -12,10 +12,18 @@ struct FileSystemEvent: Sendable {
     }
 
     var historyIsUnsafe: Bool {
+        invalidatesEntireStream
+            || flags & FSEventStreamEventFlags(kFSEventStreamEventFlagRootChanged) != 0
+    }
+
+    var invalidatesEntireStream: Bool {
         flags & FSEventStreamEventFlags(kFSEventStreamEventFlagUserDropped) != 0
             || flags & FSEventStreamEventFlags(kFSEventStreamEventFlagKernelDropped) != 0
-            || flags & FSEventStreamEventFlags(kFSEventStreamEventFlagRootChanged) != 0
             || flags & FSEventStreamEventFlags(kFSEventStreamEventFlagEventIdsWrapped) != 0
+    }
+
+    var eventIDsWrapped: Bool {
+        flags & FSEventStreamEventFlags(kFSEventStreamEventFlagEventIdsWrapped) != 0
     }
 
     var requiresRecursiveRescan: Bool {
@@ -45,16 +53,84 @@ struct FileSystemEvent: Sendable {
     }
 }
 
+enum ApplicationSearchEventFilter {
+    static func shouldInvalidate(events: [FileSystemEvent], roots: [URL]) -> Bool {
+        let rootPaths = roots.map { $0.standardizedFileURL.path }
+        guard !rootPaths.isEmpty else { return false }
+        return events.contains { event in
+            if event.historyIsUnsafe {
+                return true
+            }
+            return rootPaths.contains { root in
+                event.path == root || event.path.hasPrefix(root + "/")
+            }
+        }
+    }
+}
+
+enum FSEventCursorAdvances {
+    static func latestByRoot(
+        events: [FileSystemEvent],
+        rootPaths: [String],
+        wrappedBaselineEventID: UInt64? = nil
+    ) -> [String: UInt64] {
+        guard !events.isEmpty, !rootPaths.isEmpty else { return [:] }
+
+        let rootPaths = rootPaths.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
+        if
+            let wrappedBaselineEventID,
+            events.contains(where: \.eventIDsWrapped)
+        {
+            return Dictionary(uniqueKeysWithValues: rootPaths.map { ($0, wrappedBaselineEventID) })
+        }
+
+        var latestByRoot: [String: UInt64] = [:]
+        for event in events {
+            if event.historyIsUnsafe {
+                for root in rootPaths {
+                    latestByRoot[root] = max(latestByRoot[root] ?? 0, UInt64(event.eventID))
+                }
+                continue
+            }
+
+            let path = URL(fileURLWithPath: event.path).standardizedFileURL.path
+            guard let root = rootPaths.first(where: { root in
+                root == "/" || path == root || path.hasPrefix(root + "/")
+            }) else {
+                continue
+            }
+            latestByRoot[root] = max(latestByRoot[root] ?? 0, UInt64(event.eventID))
+        }
+        return latestByRoot
+    }
+}
+
+enum FSEventDefaultExclusionPolicy {
+    private static let orderedRules = FileExclusionRules.defaultPatterns.filter(isOrderSensitive)
+
+    static func matches(_ patterns: [String]) -> Bool {
+        patterns.count == FileExclusionRules.defaultPatterns.count
+            && Set(patterns) == Set(FileExclusionRules.defaultPatterns)
+            && patterns.filter(isOrderSensitive) == orderedRules
+    }
+
+    private static func isOrderSensitive(_ pattern: String) -> Bool {
+        pattern == ".git/*" || pattern.hasPrefix("!")
+    }
+}
+
 enum FSEventIndexFilter {
     struct Context: Sendable {
         let rootPaths: [String]
         let exclusionPatterns: [String]
         let activePatterns: Set<String>
+        let usesKnownExclusionFastPath: Bool
 
         init(rootPaths: [String], exclusionPatterns: [String]) {
             self.rootPaths = rootPaths
             self.exclusionPatterns = exclusionPatterns
             activePatterns = Set(exclusionPatterns)
+            usesKnownExclusionFastPath = FSEventDefaultExclusionPolicy.matches(exclusionPatterns)
         }
     }
 
@@ -80,7 +156,12 @@ enum FSEventIndexFilter {
         filteredEvents.reserveCapacity(events.count)
 
         for event in events {
-            if isKnownExcludedEventPath(event.path, activePatterns: context.activePatterns) {
+            if event.requiresRecursiveRescan {
+                filteredEvents.append(event)
+                continue
+            }
+            if context.usesKnownExclusionFastPath,
+               isKnownExcludedEventPath(event.path, activePatterns: context.activePatterns) {
                 continue
             }
             if exclusions == nil {
@@ -341,18 +422,33 @@ struct FSEventLiveRefreshScopeRouting: Equatable, Sendable {
 
 enum FSEventLiveRefreshScopeRouter {
     static func route(events: [FileSystemEvent], rootPaths: [String]) -> FSEventLiveRefreshScopeRouting {
+        let rootPaths = rootPaths.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
         var exactPaths = Set<String>()
         var directoryScopes = Set<String>()
         var recursivePaths = Set<String>()
 
         for event in events {
             let path = URL(fileURLWithPath: event.path).standardizedFileURL.path
-            if event.requiresRecursiveRescan {
-                recursivePaths.insert(path)
+            if event.invalidatesEntireStream {
+                directoryScopes.formUnion(rootPaths)
+                recursivePaths.formUnion(rootPaths)
+                continue
+            }
+
+            guard pathIsWithinRoots(path, rootPaths: rootPaths) else {
+                if event.requiresRecursiveRescan {
+                    directoryScopes.formUnion(rootPaths)
+                    recursivePaths.formUnion(rootPaths)
+                }
+                continue
             }
 
             if event.requiresDirectoryRefreshScope {
-                directoryScopes.insert(directoryScope(for: event, standardizedPath: path, rootPaths: rootPaths))
+                let scope = directoryScope(for: event, standardizedPath: path, rootPaths: rootPaths)
+                directoryScopes.insert(scope)
+                if event.requiresRecursiveRescan {
+                    recursivePaths.insert(scope)
+                }
             } else {
                 exactPaths.insert(path)
             }
@@ -373,12 +469,16 @@ enum FSEventLiveRefreshScopeRouter {
         )
     }
 
+    private static func pathIsWithinRoots(_ path: String, rootPaths: [String]) -> Bool {
+        rootPaths.contains { pathIsWithinRoot(path, root: $0) }
+    }
+
     private static func directoryScope(
         for event: FileSystemEvent,
         standardizedPath: String,
         rootPaths: [String]
     ) -> String {
-        guard let root = rootPaths.first(where: { standardizedPath == $0 || standardizedPath.hasPrefix($0 + "/") }) else {
+        guard let root = rootPaths.first(where: { pathIsWithinRoot(standardizedPath, root: $0) }) else {
             return standardizedPath
         }
         guard standardizedPath != root else { return root }
@@ -387,16 +487,20 @@ enum FSEventLiveRefreshScopeRouter {
         }
 
         let parent = URL(fileURLWithPath: standardizedPath).deletingLastPathComponent().standardizedFileURL.path
-        guard parent != "/", parent == root || parent.hasPrefix(root + "/") else {
+        guard pathIsWithinRoot(parent, root: root) else {
             return root
         }
         return parent
     }
 
+    private static func pathIsWithinRoot(_ path: String, root: String) -> Bool {
+        root == "/" || path == root || path.hasPrefix(root + "/")
+    }
+
     private static func collapsedPaths(_ paths: Set<String>) -> [String] {
         var collapsed: [String] = []
         for path in paths.sorted(by: { $0.count < $1.count }) {
-            guard !collapsed.contains(where: { path == $0 || path.hasPrefix($0 + "/") }) else {
+            guard !collapsed.contains(where: { pathIsWithinRoot(path, root: $0) }) else {
                 continue
             }
             collapsed.append(path)
@@ -457,6 +561,7 @@ final class FileSystemWatcher {
         var flags: UInt32 {
             var flags = UInt32(kFSEventStreamCreateFlagUseCFTypes)
                 | UInt32(kFSEventStreamCreateFlagFileEvents)
+                | UInt32(kFSEventStreamCreateFlagWatchRoot)
             if usesNoDefer {
                 flags |= UInt32(kFSEventStreamCreateFlagNoDefer)
             }
@@ -465,15 +570,10 @@ final class FileSystemWatcher {
     }
 
     private let queue = DispatchQueue(label: "att.fsevents", qos: .utility)
-    private let cursorStore: FSEventCursorStore
     private var stream: FSEventStreamRef?
     private var eventHandler: (@MainActor @Sendable ([FileSystemEvent]) -> Void)?
     private var rootPaths: [String] = []
     private var streamConfiguration: StreamConfiguration?
-
-    init(cursorStore: FSEventCursorStore = .default) {
-        self.cursorStore = cursorStore
-    }
 
     deinit {
         stop()
@@ -534,37 +634,23 @@ final class FileSystemWatcher {
     }
 
     func stop() {
-        guard let stream else { return }
-        FSEventStreamStop(stream)
-        FSEventStreamInvalidate(stream)
-        FSEventStreamRelease(stream)
-        self.stream = nil
-        rootPaths = []
-        streamConfiguration = nil
+        if let stream {
+            FSEventStreamStop(stream)
+            FSEventStreamInvalidate(stream)
+            FSEventStreamRelease(stream)
+            self.stream = nil
+            rootPaths = []
+            streamConfiguration = nil
+        }
     }
 
     private func handle(events: [FileSystemEvent]) {
         guard !events.isEmpty else { return }
         guard let eventHandler else { return }
-        persistLatestEventIDs(from: events)
 
         Task { @MainActor in
             eventHandler(events)
         }
-    }
-
-    private func persistLatestEventIDs(from events: [FileSystemEvent]) {
-        guard !rootPaths.isEmpty else { return }
-
-        var latestByRoot: [String: UInt64] = [:]
-        for event in events {
-            guard let root = rootPaths.first(where: { event.path == $0 || event.path.hasPrefix($0 + "/") }) else {
-                continue
-            }
-            latestByRoot[root] = max(latestByRoot[root] ?? 0, UInt64(event.eventID))
-        }
-
-        cursorStore.update(latestByRoot)
     }
 }
 
@@ -612,7 +698,7 @@ final class FSEventStreamHistoryReplaySource: FSEventHistoryReplaySource {
 enum FSEventReconciliationAction: Equatable, Sendable {
     case reconcile(paths: [String], baselineEventID: UInt64)
     case upToDate(baselineEventID: UInt64)
-    case fullReconcile(paths: [String]?)
+    case fullReconcile(paths: [String]?, baselineEventID: UInt64)
 }
 
 final class FSEventReconciliationCoordinator: @unchecked Sendable {
@@ -647,16 +733,26 @@ final class FSEventReconciliationCoordinator: @unchecked Sendable {
 
         let cursors = cursorStore.eventIDs(for: rootPaths)
         guard cursors.count == rootPaths.count, let sinceEventID = cursors.values.min(), sinceEventID > 0 else {
-            Task { @MainActor in completion(.fullReconcile(paths: nil)) }
+            let baselineEventID = currentEventID()
+            Task { @MainActor in
+                completion(.fullReconcile(paths: nil, baselineEventID: baselineEventID))
+            }
             return nil
         }
 
-        let collector = FSEventHistoryReplayCollector(rootPaths: rootPaths, exclusions: exclusions)
+        let collector = FSEventHistoryReplayCollector(
+            rootPaths: rootPaths,
+            exclusions: exclusions,
+            baselineEventID: sinceEventID
+        )
         guard let session = replaySource.replay(
             roots: roots,
             sinceEventID: FSEventStreamEventId(sinceEventID),
             timeout: timeout,
-            eventHandler: { events in
+            eventHandler: { [cursorStore] events in
+                if events.contains(where: \.eventIDsWrapped) {
+                    cursorStore.invalidate(roots: rootPaths)
+                }
                 collector.ingest(events)
             },
             completion: { [currentEventID] result in
@@ -666,7 +762,10 @@ final class FSEventReconciliationCoordinator: @unchecked Sendable {
                 }
             }
         ) else {
-            Task { @MainActor in completion(.fullReconcile(paths: nil)) }
+            let baselineEventID = currentEventID()
+            Task { @MainActor in
+                completion(.fullReconcile(paths: nil, baselineEventID: baselineEventID))
+            }
             return nil
         }
 
@@ -680,18 +779,23 @@ private final class FSEventHistoryReplayCollector: @unchecked Sendable {
     private let rootPaths: [String]
     private let exclusions: FileExclusionRules
     private let activeExclusionPatterns: Set<String>
+    private let usesKnownExclusionFastPath: Bool
     private let lock = NSLock()
     private var reconciliationPaths = Set<String>()
     private var fallbackRootPaths = Set<String>()
     private var requiresGlobalFallback = false
+    private var invalidatedEntireStream = false
     private var sawHistoryDone = false
+    private var replayBaselineEventID: UInt64
     private var rawEventCount = 0
     private var droppedExcludedEventCount = 0
 
-    init(rootPaths: [String], exclusions: FileExclusionRules) {
+    init(rootPaths: [String], exclusions: FileExclusionRules, baselineEventID: UInt64) {
         self.rootPaths = rootPaths.sorted { $0.count > $1.count }
         self.exclusions = exclusions
+        replayBaselineEventID = baselineEventID
         activeExclusionPatterns = Set(exclusions.patterns)
+        usesKnownExclusionFastPath = FSEventDefaultExclusionPolicy.matches(exclusions.patterns)
     }
 
     func ingest(_ events: [FileSystemEvent]) {
@@ -701,8 +805,17 @@ private final class FSEventHistoryReplayCollector: @unchecked Sendable {
         rawEventCount += events.count
 
         for event in events {
+            replayBaselineEventID = max(replayBaselineEventID, UInt64(event.eventID))
             if event.historyReplayCompleted {
                 sawHistoryDone = true
+                if !event.historyIsUnsafe {
+                    continue
+                }
+            }
+
+            if event.invalidatesEntireStream {
+                invalidatedEntireStream = true
+                fallbackRootPaths.formUnion(rootPaths)
                 continue
             }
 
@@ -711,7 +824,13 @@ private final class FSEventHistoryReplayCollector: @unchecked Sendable {
                 continue
             }
 
-            if FSEventIndexFilter.isKnownExcludedEventPath(event.path, activePatterns: activeExclusionPatterns) {
+            if event.requiresRecursiveRescan {
+                fallbackRootPaths.insert(rootPath)
+                continue
+            }
+
+            if usesKnownExclusionFastPath,
+               FSEventIndexFilter.isKnownExcludedEventPath(event.path, activePatterns: activeExclusionPatterns) {
                 droppedExcludedEventCount += 1
                 continue
             }
@@ -728,22 +847,18 @@ private final class FSEventHistoryReplayCollector: @unchecked Sendable {
                 continue
             }
 
-            if event.historyIsUnsafe || event.requiresRecursiveRescan {
-                fallbackRootPaths.insert(rootPath)
-            } else {
-                guard reconciliationPaths.count < Self.maximumHistoricalReconciliationPaths else {
-                    let collapsedParentScopes = Set(reconciliationPaths.map {
-                        parentScope(for: $0, rootPath: matchingRoot(for: $0) ?? rootPath)
-                    })
-                    let collapsedPaths = Set(Self.collapsedPaths(collapsedParentScopes))
-                    if collapsedPaths.count < Self.maximumHistoricalReconciliationPaths {
-                        reconciliationPaths = collapsedPaths
-                    } else {
-                        reconciliationPaths.removeAll(keepingCapacity: false)
-                        requiresGlobalFallback = true
-                    }
-                    continue
+            guard reconciliationPaths.count < Self.maximumHistoricalReconciliationPaths else {
+                let collapsedParentScopes = Set(reconciliationPaths.map {
+                    parentScope(for: $0, rootPath: matchingRoot(for: $0) ?? rootPath)
+                })
+                let collapsedPaths = Set(Self.collapsedPaths(collapsedParentScopes))
+                if collapsedPaths.count < Self.maximumHistoricalReconciliationPaths {
+                    reconciliationPaths = collapsedPaths
+                } else {
+                    reconciliationPaths.removeAll(keepingCapacity: false)
+                    requiresGlobalFallback = true
                 }
+                continue
             }
         }
     }
@@ -758,21 +873,22 @@ private final class FSEventHistoryReplayCollector: @unchecked Sendable {
         let loggedRequiresGlobalFallback = requiresGlobalFallback
 
         if completion != .completed || !sawHistoryDone {
-            action = .fullReconcile(paths: nil)
+            action = .fullReconcile(paths: nil, baselineEventID: currentEventID)
             collapsedScopeCount = 0
         } else if requiresGlobalFallback {
-            action = .fullReconcile(paths: nil)
+            action = .fullReconcile(paths: nil, baselineEventID: currentEventID)
             collapsedScopeCount = 0
         } else if !fallbackRootPaths.isEmpty {
             let paths = Self.collapsedPaths(fallbackRootPaths.union(reconciliationPaths))
-            action = .fullReconcile(paths: paths)
+            let baselineEventID = invalidatedEntireStream ? currentEventID : replayBaselineEventID
+            action = .fullReconcile(paths: paths, baselineEventID: baselineEventID)
             collapsedScopeCount = paths.count
         } else if reconciliationPaths.isEmpty {
-            action = .upToDate(baselineEventID: currentEventID)
+            action = .upToDate(baselineEventID: replayBaselineEventID)
             collapsedScopeCount = 0
         } else {
             let paths = Self.collapsedPaths(reconciliationPaths)
-            action = .reconcile(paths: paths, baselineEventID: currentEventID)
+            action = .reconcile(paths: paths, baselineEventID: replayBaselineEventID)
             collapsedScopeCount = paths.count
         }
         lock.unlock()
@@ -971,17 +1087,34 @@ final class FSEventCursorStore: @unchecked Sendable {
 
     private let url: URL
     private let fileManager: FileManager
+    private let deferredUpdateInterval: TimeInterval
+    private let saveQueue = DispatchQueue(label: "att.fsevents.cursor-save", qos: .utility)
     private let lock = NSLock()
+    private var pendingUpdates: [String: UInt64] = [:]
+    private var pendingSave: DispatchWorkItem?
 
-    init(url: URL, fileManager: FileManager = .default) {
+    init(
+        url: URL,
+        fileManager: FileManager = .default,
+        deferredUpdateInterval: TimeInterval = 30
+    ) {
         self.url = url
         self.fileManager = fileManager
+        self.deferredUpdateInterval = deferredUpdateInterval
+    }
+
+    deinit {
+        flushPendingUpdates()
     }
 
     func eventID(for root: String) -> UInt64? {
         lock.lock()
         defer { lock.unlock() }
-        return load()[key(for: root)]
+        let key = key(for: root)
+        let persisted = load()[key]
+        let pending = pendingUpdates[key]
+        guard persisted != nil || pending != nil else { return nil }
+        return max(persisted ?? 0, pending ?? 0)
     }
 
     func eventIDs(for roots: [String]) -> [String: UInt64] {
@@ -991,9 +1124,11 @@ final class FSEventCursorStore: @unchecked Sendable {
         let cursors = load()
         var result: [String: UInt64] = [:]
         for root in roots {
-            if let eventID = cursors[key(for: root)] {
-                result[root] = eventID
-            }
+            let key = key(for: root)
+            let persisted = cursors[key]
+            let pending = pendingUpdates[key]
+            guard persisted != nil || pending != nil else { continue }
+            result[root] = max(persisted ?? 0, pending ?? 0)
         }
         return result
     }
@@ -1004,11 +1139,54 @@ final class FSEventCursorStore: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
 
+        pendingSave?.cancel()
+        pendingSave = nil
         var cursors = load()
+        merge(pendingUpdates, into: &cursors)
+        pendingUpdates.removeAll(keepingCapacity: true)
         for (root, eventID) in latestByRoot {
             let key = key(for: root)
             cursors[key] = max(cursors[key] ?? 0, eventID)
         }
+        save(cursors)
+    }
+
+    func updateDeferred(_ latestByRoot: [String: UInt64]) {
+        guard !latestByRoot.isEmpty else { return }
+
+        lock.lock()
+        for (root, eventID) in latestByRoot {
+            let key = key(for: root)
+            pendingUpdates[key] = max(pendingUpdates[key] ?? 0, eventID)
+        }
+        guard !pendingUpdates.isEmpty else {
+            lock.unlock()
+            return
+        }
+        guard pendingSave == nil else {
+            lock.unlock()
+            return
+        }
+
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.flushPendingUpdates()
+        }
+        pendingSave = workItem
+        lock.unlock()
+        saveQueue.asyncAfter(deadline: .now() + deferredUpdateInterval, execute: workItem)
+    }
+
+    func flushPendingUpdates() {
+        lock.lock()
+        defer { lock.unlock() }
+
+        pendingSave?.cancel()
+        pendingSave = nil
+        guard !pendingUpdates.isEmpty else { return }
+
+        var cursors = load()
+        merge(pendingUpdates, into: &cursors)
+        pendingUpdates.removeAll(keepingCapacity: true)
         save(cursors)
     }
 
@@ -1023,11 +1201,21 @@ final class FSEventCursorStore: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
 
+        pendingSave?.cancel()
+        pendingSave = nil
         var cursors = load()
         for root in roots {
-            cursors.removeValue(forKey: key(for: root))
+            let key = key(for: root)
+            cursors.removeValue(forKey: key)
+            pendingUpdates.removeValue(forKey: key)
         }
         save(cursors)
+    }
+
+    private func merge(_ updates: [String: UInt64], into cursors: inout [String: UInt64]) {
+        for (key, eventID) in updates {
+            cursors[key] = max(cursors[key] ?? 0, eventID)
+        }
     }
 
     private func load() -> [String: UInt64] {

@@ -248,6 +248,37 @@ struct ApplicationSearchCatalogTests {
         ))
         #expect(response.results.map(\.record.name) == ["Later.app"])
     }
+
+    @Test("application root events invalidate a cached catalog")
+    func applicationRootEventsInvalidateCachedCatalog() throws {
+        let fixture = try AppCatalogFixture()
+        defer { fixture.remove() }
+
+        let catalog = ApplicationSearchCatalog()
+        let initial = try #require(catalog.search(
+            queryText: "",
+            roots: [fixture.root],
+            sort: SortSpec(column: .name, ascending: true),
+            maxResults: 100
+        ))
+        #expect(initial.results.isEmpty)
+
+        let installedApp = try fixture.makeApp("NewlyInstalled.app")
+        let events = [FileSystemEvent(path: installedApp.path, flags: 0, eventID: 1)]
+        #expect(ApplicationSearchEventFilter.shouldInvalidate(events: events, roots: [fixture.root]))
+
+        catalog.invalidate()
+        let refreshed = try #require(catalog.search(
+            queryText: "",
+            roots: [fixture.root],
+            sort: SortSpec(column: .name, ascending: true),
+            maxResults: 100
+        ))
+        #expect(refreshed.results.map(\.record.name) == ["NewlyInstalled.app"])
+
+        let unrelated = [FileSystemEvent(path: "/tmp/Elsewhere/App.app", flags: 0, eventID: 2)]
+        #expect(!ApplicationSearchEventFilter.shouldInvalidate(events: unrelated, roots: [fixture.root]))
+    }
 }
 
 private struct AppCatalogFixture {

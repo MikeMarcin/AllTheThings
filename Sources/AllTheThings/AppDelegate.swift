@@ -94,6 +94,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSear
     @MainActor
     private func finishLaunching() {
         configureDiagnosticLogging()
+        ReleaseUpdater.shared.performLaunchMaintenance()
         configureMainMenu()
         applyMenuBarIconSetting()
         let launchedAsLoginItem = Self.launchedAsLoginItem()
@@ -201,6 +202,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSear
     func applicationWillTerminate(_ notification: Notification) {
         DiagnosticLogger.shared.log(category: "app", event: "app.terminate")
         fileIndex.flushUsageMetrics()
+        FSEventCursorStore.default.flushPendingUpdates()
         DiagnosticLogger.shared.flush()
     }
 
