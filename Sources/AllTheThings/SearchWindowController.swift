@@ -326,6 +326,29 @@ enum SearchRunReconciliation {
         generationMatches && tokenMatches
     }
 
+    nonisolated static func searchTimingIsActive(
+        hasActiveSearch: Bool,
+        isRefiningSearchResults: Bool
+    ) -> Bool {
+        hasActiveSearch || isRefiningSearchResults
+    }
+
+    nonisolated static func refiningSearchStartedAt(
+        isAlreadyRefining: Bool,
+        activeSearchStartedAt: Date?,
+        now: Date
+    ) -> Date {
+        isAlreadyRefining ? (activeSearchStartedAt ?? now) : now
+    }
+
+    nonisolated static func previewNeedsRefresh(
+        displayedSnapshotRevision: UInt64?,
+        currentSnapshotRevision: UInt64
+    ) -> Bool {
+        guard let displayedSnapshotRevision else { return false }
+        return displayedSnapshotRevision != currentSnapshotRevision
+    }
+
     nonisolated static func fullCancellationKeepsSearchActive(
         hasPendingPreview: Bool,
         tokenCancelled: Bool
@@ -390,7 +413,8 @@ enum SearchPreviewScheduling {
         appSearchActive: Bool,
         trimmedQuery: String,
         sortColumn: SortColumn,
-        signatureAlreadyDisplayed: Bool
+        signatureAlreadyDisplayed: Bool,
+        displayedSnapshotIsCurrent: Bool
     ) -> String? {
         if appSearchActive {
             return "applicationSearch"
@@ -399,7 +423,7 @@ enum SearchPreviewScheduling {
             return "emptyQuery"
         }
         _ = sortColumn
-        if signatureAlreadyDisplayed {
+        if signatureAlreadyDisplayed, displayedSnapshotIsCurrent {
             return "alreadyDisplayed"
         }
         return nil
@@ -1269,6 +1293,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var pendingExplanationKeys = Set<ExplanationCacheKey>()
     private var scheduledSearchSignature: SearchSignature?
     private var displayedSearchSignature: SearchSignature?
+    private var displayedSearchSnapshotRevision: UInt64?
     private var statusPreviewSearchText: String?
     private var sortSpec: SortSpec
     private var visibleColumns: Set<Column>
@@ -2910,7 +2935,11 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         searchRefreshGate.refreshDidStart()
         let searchStartedAt: Date
         if redisplaysCurrentSignature, initialQueryElapsed != nil {
-            searchStartedAt = Date()
+            searchStartedAt = SearchRunReconciliation.refiningSearchStartedAt(
+                isAlreadyRefining: isRefiningSearchResults,
+                activeSearchStartedAt: activeSearchStartedAt,
+                now: Date()
+            )
             activeSearchStartedAt = searchStartedAt
             isRefiningSearchResults = true
             hasFinalSearchTiming = false
@@ -2948,7 +2977,11 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             appSearchActive: appSearchQuery != nil,
             trimmedQuery: trimmedQuery,
             sortColumn: request.sort.column,
-            signatureAlreadyDisplayed: signature == displayedSearchSignature
+            signatureAlreadyDisplayed: signature == displayedSearchSignature,
+            displayedSnapshotIsCurrent: !SearchRunReconciliation.previewNeedsRefresh(
+                displayedSnapshotRevision: displayedSearchSnapshotRevision,
+                currentSnapshotRevision: indexStats.snapshotRevision
+            )
         )
         let shouldRunPreviewSearch = previewSkipReason == nil
         let previewRequest = SearchRequest(
@@ -3075,7 +3108,11 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                         budgetTimedOut: budgetTimeout.didTimeOut,
                         retryAfterPreview: shouldRetry
                     )
-                    if shouldRetry, !keptPendingPreview {
+                    let shouldRefreshPreview = SearchRunReconciliation.previewNeedsRefresh(
+                        displayedSnapshotRevision: self.displayedSearchSnapshotRevision,
+                        currentSnapshotRevision: self.indexStats.snapshotRevision
+                    )
+                    if !keptPendingPreview, shouldRetry || shouldRefreshPreview {
                         self.scheduleSearch(force: true)
                     }
                 }
@@ -3460,6 +3497,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         totalMatches = response.totalMatches
         queryElapsed = elapsed
         displayedSearchSignature = signature
+        displayedSearchSnapshotRevision = response.snapshotRevision
         tableView.reloadData()
         scheduleVisibleExplanations()
         updateStatus(refreshesMemory: isFinal)
@@ -3539,6 +3577,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             hasFinalSearchTiming = false
             activeSearchStartedAt = nil
             displayedSearchSignature = signature
+            displayedSearchSnapshotRevision = indexStats.snapshotRevision
             tableView.reloadData()
             updateStatus()
             updateActionButtons()
@@ -4168,6 +4207,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         stopSearchStatusTimer()
         scheduledSearchSignature = nil
         displayedSearchSignature = nil
+        displayedSearchSnapshotRevision = nil
         results.removeAll(keepingCapacity: true)
         totalMatches = 0
         queryElapsed = 0
@@ -5092,7 +5132,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         guard searchStatusTimer == nil else { return }
         let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
-                guard let self, self.activeSearchToken != nil else { return }
+                guard let self, SearchRunReconciliation.searchTimingIsActive(
+                    hasActiveSearch: self.activeSearchToken != nil,
+                    isRefiningSearchResults: self.isRefiningSearchResults
+                ) else { return }
                 self.updateActiveSearchElapsed()
                 self.updateStatus()
             }
@@ -5107,7 +5150,15 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func updateActiveSearchElapsed(now: Date = Date()) {
-        guard activeSearchToken != nil, let activeSearchStartedAt else { return }
+        guard
+            SearchRunReconciliation.searchTimingIsActive(
+                hasActiveSearch: activeSearchToken != nil,
+                isRefiningSearchResults: isRefiningSearchResults
+            ),
+            let activeSearchStartedAt
+        else {
+            return
+        }
         queryElapsed = max(now.timeIntervalSince(activeSearchStartedAt), 0)
     }
 
