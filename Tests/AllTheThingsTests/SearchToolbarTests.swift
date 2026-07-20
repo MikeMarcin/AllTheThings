@@ -215,6 +215,47 @@ struct SearchToolbarTests {
         ))
     }
 
+    @Test("search retry timing remains active while refining")
+    func searchRetryTimingRemainsActiveWhileRefining() {
+        #expect(SearchRunReconciliation.searchTimingIsActive(
+            hasActiveSearch: true,
+            isRefiningSearchResults: false
+        ))
+        #expect(SearchRunReconciliation.searchTimingIsActive(
+            hasActiveSearch: false,
+            isRefiningSearchResults: true
+        ))
+        #expect(!SearchRunReconciliation.searchTimingIsActive(
+            hasActiveSearch: false,
+            isRefiningSearchResults: false
+        ))
+
+        let initialStart = Date(timeIntervalSinceReferenceDate: 100)
+        let retryTime = Date(timeIntervalSinceReferenceDate: 200)
+        #expect(SearchRunReconciliation.refiningSearchStartedAt(
+            isAlreadyRefining: true,
+            activeSearchStartedAt: initialStart,
+            now: retryTime
+        ) == initialStart)
+        #expect(SearchRunReconciliation.refiningSearchStartedAt(
+            isAlreadyRefining: false,
+            activeSearchStartedAt: initialStart,
+            now: retryTime
+        ) == retryTime)
+    }
+
+    @Test("search previews refresh after the snapshot advances")
+    func searchPreviewsRefreshAfterSnapshotAdvances() {
+        #expect(SearchRunReconciliation.previewNeedsRefresh(
+            displayedSnapshotRevision: 41,
+            currentSnapshotRevision: 42
+        ))
+        #expect(!SearchRunReconciliation.previewNeedsRefresh(
+            displayedSnapshotRevision: 42,
+            currentSnapshotRevision: 42
+        ))
+    }
+
     @Test("search run reconciliation keeps pending previews applyable")
     func searchRunReconciliationKeepsPendingPreviewsApplyable() {
         #expect(SearchRunReconciliation.fullCancellationKeepsSearchActive(
@@ -240,9 +281,28 @@ struct SearchToolbarTests {
                 appSearchActive: false,
                 trimmedQuery: "test",
                 sortColumn: sortColumn,
-                signatureAlreadyDisplayed: false
+                signatureAlreadyDisplayed: false,
+                displayedSnapshotIsCurrent: true
             ) == nil)
         }
+    }
+
+    @Test("search preview scheduling refreshes a displayed query for a newer snapshot")
+    func searchPreviewSchedulingRefreshesDisplayedQueryForNewerSnapshot() {
+        #expect(SearchPreviewScheduling.skipReason(
+            appSearchActive: false,
+            trimmedQuery: "siftworkspace",
+            sortColumn: .size,
+            signatureAlreadyDisplayed: true,
+            displayedSnapshotIsCurrent: false
+        ) == nil)
+        #expect(SearchPreviewScheduling.skipReason(
+            appSearchActive: false,
+            trimmedQuery: "siftworkspace",
+            sortColumn: .size,
+            signatureAlreadyDisplayed: true,
+            displayedSnapshotIsCurrent: true
+        ) == "alreadyDisplayed")
     }
 
     @Test("preview scheduler replaces queued work with the latest request")
