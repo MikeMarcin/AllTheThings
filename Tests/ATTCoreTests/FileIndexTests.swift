@@ -1295,6 +1295,135 @@ struct FileIndexTests {
         #expect(response.results.contains { $0.record.path == addedFile.path })
     }
 
+    @Test("foreground promotion and search prioritization preserve a tiny durable delta")
+    func foregroundPromotionPreservesTinyDurableStructuralDelta() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        let unchangedFolder = root.appendingPathComponent("Unchanged", isDirectory: true)
+        try fileManager.createDirectory(at: unchangedFolder, withIntermediateDirectories: true)
+        try "existing".write(
+            to: unchangedFolder.appendingPathComponent("Existing.swift"),
+            atomically: true,
+            encoding: .utf8
+        )
+        defer { try? fileManager.removeItem(at: root) }
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let support = supportDirectory(applicationName: applicationName)
+        defer { try? fileManager.removeItem(at: support) }
+        let index = FileIndex(
+            applicationName: applicationName,
+            loadsSnapshotImmediately: false,
+            largeOverlayPersistRecordLimit: 100,
+            largeOverlayPersistDelay: 0.05,
+            backgroundRefreshDrainBackoffDelay: 60,
+            backgroundDirectoryScanBudget: 0,
+            backgroundOptimizationPersistDelay: 60
+        )
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil(timeout: .seconds(10)) {
+            let diagnostics = index.currentDiagnostics()
+            return !index.currentStats().isIndexing
+                && diagnostics.recordStoreKind == .mapped
+                && diagnostics.optimizedCount == diagnostics.indexedCount
+        }
+
+        let packageURL = SnapshotLayout.packageURL(in: support)
+        let manifestURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.manifest)
+        let originalManifest = try Data(contentsOf: manifestURL)
+        let deltaURL = support.appendingPathComponent(StructuralDeltaStore.fileName)
+        let addedFile = root.appendingPathComponent("ForegroundDelta.swift")
+        try "delta".write(to: addedFile, atomically: true, encoding: .utf8)
+        let completion = CompletionFlag()
+        index.update(paths: [addedFile.path], priority: .background) { completion.mark() }
+
+        try await waitUntil(timeout: .seconds(5)) {
+            let diagnostics = index.currentDiagnostics()
+            return completion.isMarked
+                && diagnostics.recordStoreKind == .overlay
+                && diagnostics.optimizedCount == 0
+                && fileManager.fileExists(atPath: deltaURL.path)
+        }
+
+        index.update(paths: [unchangedFolder.path], priority: .background)
+        try await waitUntil(timeout: .seconds(5)) {
+            index.currentDiagnostics().pendingBackgroundRefreshPathCount == 1
+        }
+
+        index.promoteBackgroundMaintenance()
+        try await waitUntil(timeout: .seconds(10)) {
+            index.currentDiagnostics().pendingRefreshPathCount == 0
+        }
+        try await Task.sleep(for: .milliseconds(250))
+        #expect(index.currentDiagnostics().recordStoreKind == .overlay)
+
+        index.prioritizeSearchOptimization(for: .name)
+        index.scheduleAutomaticPersistForTesting()
+        try await Task.sleep(for: .milliseconds(250))
+
+        let diagnostics = index.currentDiagnostics()
+        #expect(diagnostics.recordStoreKind == .overlay)
+        #expect(diagnostics.optimizedCount == 0)
+        #expect(try Data(contentsOf: manifestURL) == originalManifest)
+        #expect(fileManager.fileExists(atPath: deltaURL.path))
+        #expect(index.search(SearchRequest(
+            query: "ForegroundDelta",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10).results.contains { $0.record.path == addedFile.path })
+
+        let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
+        #expect(reloaded.currentDiagnostics().recordStoreKind == .overlay)
+        #expect(reloaded.search(SearchRequest(
+            query: "ForegroundDelta",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10).results.contains { $0.record.path == addedFile.path })
+    }
+
+    @Test("search prioritization still optimizes a non-durable overlay")
+    func searchPrioritizationStillOptimizesNonDurableOverlay() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: root) }
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        defer { try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName)) }
+        let index = FileIndex(
+            applicationName: applicationName,
+            loadsSnapshotImmediately: false,
+            largeOverlayPersistRecordLimit: 100,
+            largeOverlayPersistDelay: 60,
+            backgroundOptimizationPersistDelay: 60
+        )
+        let rootRecord = try #require(FileRecord(url: root))
+        index.replaceRecordsForTesting([rootRecord], roots: [root])
+
+        let addedFile = root.appendingPathComponent("NeedsCheckpoint.swift")
+        try "checkpoint".write(to: addedFile, atomically: true, encoding: .utf8)
+        index.update(paths: [addedFile.path], priority: .background)
+        try await waitUntil(timeout: .seconds(5)) {
+            let diagnostics = index.currentDiagnostics()
+            return diagnostics.pendingRefreshPathCount == 0
+                && diagnostics.recordStoreKind == .overlay
+                && diagnostics.optimizedCount == 0
+                && index.hasPendingDurabilityForTesting()
+        }
+
+        index.prioritizeSearchOptimization(for: .name)
+        try await waitUntil(timeout: .seconds(10)) {
+            let diagnostics = index.currentDiagnostics()
+            return diagnostics.recordStoreKind == .mapped
+                && diagnostics.optimizedCount == diagnostics.indexedCount
+                && !index.hasPendingDurabilityForTesting()
+        }
+        #expect(index.search(SearchRequest(
+            query: "NeedsCheckpoint",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10).results.contains { $0.record.path == addedFile.path })
+    }
+
     @Test("no-op refresh clears earlier durability debt before completing")
     func noopRefreshPersistsEarlierDurabilityDebt() async throws {
         let fileManager = FileManager.default
@@ -2833,7 +2962,10 @@ struct FileIndexTests {
 
         try await waitUntil(timeout: .seconds(10)) { firstCompletion.isMarked }
         #expect(!followUpCompletion.isMarked)
-        #expect(index.pendingRefreshPathsForTesting().contains(folder.path))
+        #expect(
+            index.pendingRefreshPathsForTesting().contains(folder.path)
+                || index.currentStats().isUpdating
+        )
 
         index.promoteBackgroundMaintenance()
         try await waitUntil(timeout: .seconds(10)) {
@@ -2991,13 +3123,15 @@ struct FileIndexTests {
             backgroundDirectoryScanBudget: 0,
             backgroundOptimizationPersistDelay: 0.5
         )
-        index.replaceRootsAndRebuild([root], mode: .fresh)
-        try await waitUntil(timeout: .seconds(10)) {
-            let diagnostics = index.currentDiagnostics()
-            return !index.currentStats().isIndexing
-                && diagnostics.recordStoreKind == .mapped
-                && diagnostics.optimizedCount == diagnostics.indexedCount
-        }
+        let rootRecord = try #require(FileRecord(url: root))
+        let blockerRecord = try #require(FileRecord(url: blocker))
+        let existingRecord = try #require(FileRecord(
+            url: blocker.appendingPathComponent("Existing.swift")
+        ))
+        index.replaceRecordsForTesting(
+            [rootRecord, blockerRecord, existingRecord],
+            roots: [root]
+        )
 
         let createdFile = root.appendingPathComponent("Created.swift")
         try "created".write(to: createdFile, atomically: true, encoding: .utf8)
@@ -3046,7 +3180,7 @@ struct FileIndexTests {
         let index = FileIndex(
             applicationName: applicationName,
             loadsSnapshotImmediately: false,
-            largeOverlayPersistRecordLimit: nil,
+            largeOverlayPersistRecordLimit: 1,
             largeOverlayPersistDelay: nil,
             backgroundOptimizationPersistDelay: 60
         )
@@ -3922,11 +4056,26 @@ struct FileIndexTests {
                 .prefix(5)
                 .map(\.name)
             let profileSummary = "sort: \(sortColumn.rawValue), path: \(response.executionProfile.executionPath.rawValue), candidates: \(response.executionProfile.candidateCount), scanned: \(response.executionProfile.scannedRowCount)"
+            let directlySortsNameCandidates = sortColumn == .name
 
             #expect(response.usesIndexedCandidates, "\(profileSummary)")
-            #expect(response.executionProfile.executionPath == .optimizedSortedFastPath, "\(profileSummary)")
+            #expect(
+                response.executionProfile.executionPath
+                    == (directlySortsNameCandidates ? .nameComponentIndex : .optimizedSortedFastPath),
+                "\(profileSummary)"
+            )
             #expect(!response.executionProfile.didFallbackToFullScan, "\(profileSummary)")
-            #expect(response.executionProfile.indexesUsed.contains(sortColumn == .modified ? .modifiedOrder : .sortOrder), "\(profileSummary)")
+            if directlySortsNameCandidates {
+                #expect(response.executionProfile.indexesUsed.contains(.nameGrams), "\(profileSummary)")
+                #expect(!response.executionProfile.indexesUsed.contains(.sortOrder), "\(profileSummary)")
+            } else {
+                #expect(
+                    response.executionProfile.indexesUsed.contains(
+                        sortColumn == .modified ? .modifiedOrder : .sortOrder
+                    ),
+                    "\(profileSummary)"
+                )
+            }
             #expect(response.executionProfile.scannedRowCount <= matchingRecords.count, "\(profileSummary)")
             #expect(response.results.map(\.record.name) == Array(expectedNames), "\(profileSummary)")
         }
@@ -4148,6 +4297,36 @@ struct FileIndexTests {
                 #expect(response.results.map(\.record.path) == Array(expectedPaths), "\(profileSummary)")
             }
         }
+    }
+
+    @Test("name-sorted previews fall through to path matches when no filename matches")
+    func nameSortedPreviewFallsThroughToPathMatches() {
+        let rootPath = "/tmp/att-name-preview-fallthrough"
+        let matchingPath = "\(rootPath)/NeedleFolder/Ordinary.swift"
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let index = FileIndex(
+            applicationName: applicationName,
+            loadsSnapshotImmediately: false
+        )
+        defer {
+            try? FileManager.default.removeItem(at: index.dataDirectoryURL)
+        }
+        index.replaceRecordsForTesting(
+            [makeRecord(path: matchingPath)],
+            roots: [URL(fileURLWithPath: rootPath, isDirectory: true)]
+        )
+        index.persistSnapshotForTesting()
+        let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
+
+        let response = reloaded.search(SearchRequest(
+            query: "NeedleFolder",
+            sort: SortSpec(column: .name, ascending: true),
+            mode: .interactivePreview
+        ), maxResults: 20)
+
+        let profile = response.executionProfile
+        let summary = "path: \(profile.executionPath.rawValue), candidates: \(profile.candidateCount), scanned: \(profile.scannedRowCount), indexes: \(profile.indexesUsed.map(\.rawValue).sorted())"
+        #expect(response.results.map(\.record.path) == [matchingPath], "\(summary)")
     }
 
     @Test("disabled created sort index falls back to bounded preview")

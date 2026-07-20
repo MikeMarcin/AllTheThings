@@ -1016,11 +1016,11 @@ struct MemoryBudgetTests {
         #expect(response.results.first?.record.name == "search-000000.swift")
         #expect(response.results.last?.record.name == "search-000074.swift")
         #expect(response.usesIndexedCandidates)
-        #expect(response.executionProfile.executionPath == .optimizedSortedFastPath)
+        #expect(response.executionProfile.executionPath == .nameComponentIndex)
         #expect(response.executionProfile.indexesUsed.contains(.nameGrams))
         #expect(!response.executionProfile.indexesUsed.contains(.pathGrams))
         #expect(!response.executionProfile.didFallbackToFullScan)
-        #expect(response.executionProfile.scannedRowCount <= recordCount + matchingRows)
+        #expect(response.executionProfile.scannedRowCount <= response.executionProfile.candidateCount)
     }
 
     @Test("large relevance previews do not fall back while waiting for name postings")

@@ -5015,6 +5015,7 @@ public final class FileIndex: @unchecked Sendable {
             let shouldOptimizeSnapshot = !indexing
                 && searchSnapshot.store.kind == .overlay
                 && !searchSnapshot.isOptimizedForSearch
+                && !hasDurableStructuralDeltaBelowCompactionThresholdWithoutLock()
             if shouldOptimizeSnapshot, !pendingRefreshPaths.isEmpty {
                 optimizesSnapshotAfterPromotedRefreshDrain = true
             }
@@ -5053,6 +5054,7 @@ public final class FileIndex: @unchecked Sendable {
                     && activeDeferredOptimizationRevision == nil
                     && searchSnapshot.store.kind != .mapped
                     && !searchSnapshot.isOptimizedForSearch
+                    && !hasDurableStructuralDeltaBelowCompactionThresholdWithoutLock()
                     && searchSnapshot.resultCount > 0,
                 shouldBuildSortOrder: !indexing
                     && !reconciling
@@ -5250,10 +5252,30 @@ public final class FileIndex: @unchecked Sendable {
         recordSearchStarted(phase: metricPhase)
         var didCompleteSearch = false
 
-        func finish(_ response: SearchResponse) -> SearchResponse {
+        func finish(_ response: SearchResponse) -> SearchResponse? {
+            guard !shouldCancel() else { return nil }
+            let completedElapsed = Date().timeIntervalSince(started)
+            let profile = response.executionProfile
+            let completedResponse = SearchResponse(
+                results: response.results,
+                totalMatches: response.totalMatches,
+                elapsed: completedElapsed,
+                snapshotRevision: response.snapshotRevision,
+                usesIndexedCandidates: response.usesIndexedCandidates,
+                executionProfile: SearchExecutionProfile(
+                    executionPath: profile.executionPath,
+                    indexesUsed: profile.indexesUsed,
+                    candidateCount: profile.candidateCount,
+                    scannedRowCount: profile.scannedRowCount,
+                    didFallbackToFullScan: profile.didFallbackToFullScan,
+                    wasCancelled: profile.wasCancelled,
+                    wasStaleRetry: profile.wasStaleRetry,
+                    elapsed: completedElapsed
+                )
+            )
             didCompleteSearch = true
-            recordSearchCompleted(response.executionProfile, phase: metricPhase)
-            return response
+            recordSearchCompleted(completedResponse.executionProfile, phase: metricPhase)
+            return completedResponse
         }
 
         defer {
@@ -5755,7 +5777,7 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         return finish(SearchResponse(
-            results: Self.materialize(matches, from: snapshot),
+            results: Self.materialize(matches, from: snapshot, shouldCancel: shouldCancel),
             totalMatches: total,
             elapsed: elapsed,
             snapshotRevision: snapshotRevision,
@@ -5942,7 +5964,7 @@ public final class FileIndex: @unchecked Sendable {
 
         let elapsed = Date().timeIntervalSince(started)
         return SearchResponse(
-            results: materialize(matches.map(\.match), from: snapshot),
+            results: materialize(matches.map(\.match), from: snapshot, shouldCancel: shouldCancel),
             totalMatches: total,
             elapsed: elapsed,
             snapshotRevision: snapshotRevision,
@@ -6041,7 +6063,7 @@ public final class FileIndex: @unchecked Sendable {
 
         let elapsed = Date().timeIntervalSince(started)
         return SearchResponse(
-            results: materialize(selected.matches, from: snapshot),
+            results: materialize(selected.matches, from: snapshot, shouldCancel: shouldCancel),
             totalMatches: selected.matches.count,
             elapsed: elapsed,
             snapshotRevision: snapshotRevision,
@@ -6190,7 +6212,7 @@ public final class FileIndex: @unchecked Sendable {
 
         let elapsed = Date().timeIntervalSince(started)
         return SearchResponse(
-            results: materialize(selected.matches, from: snapshot),
+            results: materialize(selected.matches, from: snapshot, shouldCancel: shouldCancel),
             totalMatches: visibleNameCandidateCount,
             elapsed: elapsed,
             snapshotRevision: snapshotRevision,
@@ -6337,7 +6359,7 @@ public final class FileIndex: @unchecked Sendable {
             indexesUsed.insert(.visibleBitset)
         }
         return SearchResponse(
-            results: materialize(matches, from: snapshot),
+            results: materialize(matches, from: snapshot, shouldCancel: shouldCancel),
             totalMatches: request.mode == .interactivePreview ? markedCandidateCount : totalMatches,
             elapsed: elapsed,
             snapshotRevision: snapshotRevision,
@@ -6452,7 +6474,7 @@ public final class FileIndex: @unchecked Sendable {
 
         let elapsed = Date().timeIntervalSince(started)
         return SearchResponse(
-            results: materialize(matches, from: snapshot),
+            results: materialize(matches, from: snapshot, shouldCancel: shouldCancel),
             totalMatches: total,
             elapsed: elapsed,
             snapshotRevision: snapshotRevision,
@@ -6524,7 +6546,7 @@ public final class FileIndex: @unchecked Sendable {
 
         let elapsed = Date().timeIntervalSince(started)
         return SearchResponse(
-            results: materialize(matches, from: snapshot),
+            results: materialize(matches, from: snapshot, shouldCancel: shouldCancel),
             totalMatches: total,
             elapsed: elapsed,
             snapshotRevision: snapshotRevision,
@@ -6674,15 +6696,92 @@ public final class FileIndex: @unchecked Sendable {
         token.filter { $0 != "*" && $0 != "?" && $0 != "[" && $0 != "]" && $0 != "!" && $0 != "^" }
     }
 
-    private static func materialize(_ matches: [SearchMatch], from snapshot: SearchSnapshot) -> [SearchResult] {
-        matches.map {
-            SearchResult(
-                record: snapshot.record(at: $0.rowID),
-                score: $0.score,
-                match: $0.match,
-                rootPath: snapshot.rootPath(at: $0.rowID)
-            )
+    private static func materialize(
+        _ matches: [SearchMatch],
+        from snapshot: SearchSnapshot,
+        shouldCancel: @Sendable () -> Bool
+    ) -> [SearchResult] {
+        // Search cancellation is monotonic. The outer finish step rechecks it
+        // before accepting the empty sentinel returned by a cancelled pass.
+        guard !shouldCancel() else { return [] }
+
+        var results: [SearchResult] = []
+        results.reserveCapacity(matches.count)
+        for (offset, match) in matches.enumerated() {
+            if offset.isMultiple(of: 32), shouldCancel() {
+                return []
+            }
+            results.append(SearchResult(
+                record: snapshot.record(at: match.rowID),
+                score: match.score,
+                match: match.match,
+                rootPath: snapshot.rootPath(at: match.rowID)
+            ))
         }
+        return shouldCancel() ? [] : results
+    }
+
+    private static func cancellableSorted<Element>(
+        _ values: [Element],
+        by areInIncreasingOrder: (Element, Element) -> Bool,
+        shouldCancel: @Sendable () -> Bool
+    ) -> [Element]? {
+        guard !shouldCancel() else { return nil }
+        guard values.count > 1 else { return values }
+
+        var source = values
+        var destination = values
+        var width = 1
+        var operationCount = 0
+
+        func cancellationRequested() -> Bool {
+            defer { operationCount += 1 }
+            return operationCount.isMultiple(of: 256) && shouldCancel()
+        }
+
+        while width < source.count {
+            var runStart = 0
+            while runStart < source.count {
+                let middle = min(runStart + width, source.count)
+                let runEnd = min(middle + width, source.count)
+                var left = runStart
+                var right = middle
+                var output = runStart
+
+                while left < middle, right < runEnd {
+                    if cancellationRequested() { return nil }
+                    if areInIncreasingOrder(source[right], source[left]) {
+                        destination[output] = source[right]
+                        right += 1
+                    } else {
+                        destination[output] = source[left]
+                        left += 1
+                    }
+                    output += 1
+                }
+
+                while left < middle {
+                    if cancellationRequested() { return nil }
+                    destination[output] = source[left]
+                    left += 1
+                    output += 1
+                }
+
+                while right < runEnd {
+                    if cancellationRequested() { return nil }
+                    destination[output] = source[right]
+                    right += 1
+                    output += 1
+                }
+
+                runStart = runEnd
+            }
+
+            swap(&source, &destination)
+            width *= 2
+        }
+
+        return shouldCancel() ? nil : source
     }
 
     private static func fastModifiedInteractivePreviewSearch(
@@ -6830,7 +6929,7 @@ public final class FileIndex: @unchecked Sendable {
         guard !shouldCancel() else { return nil }
         let elapsed = Date().timeIntervalSince(started)
         return SearchResponse(
-            results: materialize(matches, from: snapshot),
+            results: materialize(matches, from: snapshot, shouldCancel: shouldCancel),
             totalMatches: matches.count,
             elapsed: elapsed,
             snapshotRevision: snapshotRevision,
@@ -6896,7 +6995,7 @@ public final class FileIndex: @unchecked Sendable {
             indexesUsed.insert(.visibleBitset)
         }
         return SearchResponse(
-            results: materialize(matches, from: snapshot),
+            results: materialize(matches, from: snapshot, shouldCancel: shouldCancel),
             totalMatches: matches.count,
             elapsed: elapsed,
             snapshotRevision: snapshotRevision,
@@ -6993,7 +7092,7 @@ public final class FileIndex: @unchecked Sendable {
             indexesUsed.insert(.visibleBitset)
         }
         return SearchResponse(
-            results: materialize(matches, from: snapshot),
+            results: materialize(matches, from: snapshot, shouldCancel: shouldCancel),
             totalMatches: total,
             elapsed: elapsed,
             snapshotRevision: snapshotRevision,
@@ -7083,7 +7182,7 @@ public final class FileIndex: @unchecked Sendable {
                 indexesUsed.insert(.visibleBitset)
             }
             return SearchResponse(
-                results: materialize(matches, from: snapshot),
+                results: materialize(matches, from: snapshot, shouldCancel: shouldCancel),
                 totalMatches: matches.count,
                 elapsed: elapsed,
                 snapshotRevision: snapshotRevision,
@@ -7129,7 +7228,7 @@ public final class FileIndex: @unchecked Sendable {
             indexesUsed.insert(.visibleBitset)
         }
         return SearchResponse(
-            results: materialize(matches, from: snapshot),
+            results: materialize(matches, from: snapshot, shouldCancel: shouldCancel),
             totalMatches: matches.count,
             elapsed: elapsed,
             snapshotRevision: snapshotRevision,
@@ -7251,7 +7350,7 @@ public final class FileIndex: @unchecked Sendable {
                 indexesUsed.insert(.visibleBitset)
             }
             return SearchResponse(
-                results: materialize(matches, from: snapshot),
+                results: materialize(matches, from: snapshot, shouldCancel: shouldCancel),
                 totalMatches: max(totalNameMatches, matches.count),
                 elapsed: elapsed,
                 snapshotRevision: snapshotRevision,
@@ -7631,7 +7730,7 @@ public final class FileIndex: @unchecked Sendable {
             indexesUsed.insert(.visibleBitset)
         }
         return SearchResponse(
-            results: materialize(matches, from: snapshot),
+            results: materialize(matches, from: snapshot, shouldCancel: shouldCancel),
             totalMatches: totalNameMatches,
             elapsed: elapsed,
             snapshotRevision: snapshotRevision,
@@ -7681,6 +7780,63 @@ public final class FileIndex: @unchecked Sendable {
             containing: tokenBytes,
             shouldCancel: shouldCancel
         )
+        let directCandidateLimit = maxResults > Int.max / 4 ? Int.max : maxResults * 4
+        if let nameCandidates, nameCandidates.count <= directCandidateLimit {
+            var matches: [SearchMatch] = []
+            matches.reserveCapacity(min(nameCandidates.count, maxResults))
+            var total = 0
+
+            for (offset, candidate) in nameCandidates.enumerated() {
+                if offset.isMultiple(of: 512), shouldCancel() {
+                    return nil
+                }
+                let rowID = Int(candidate)
+                guard rowID >= 0, rowID < snapshot.count else { continue }
+                guard snapshot.store.isResultRow(at: rowID) else { continue }
+                guard request.includeHidden || snapshot.isVisible(at: rowID) else { continue }
+                guard let explanation = cheapLiteralNameExplanation(
+                    snapshot: snapshot,
+                    rowID: rowID,
+                    token: token,
+                    mode: mode
+                ) else {
+                    continue
+                }
+                total += 1
+                matches.append(SearchMatch(rowID: rowID, score: explanation.score, match: explanation))
+            }
+
+            guard !matches.isEmpty else { return nil }
+            guard let sortedMatches = cancellableSorted(
+                matches,
+                by: { compare($0, $1, snapshot: snapshot, sort: request.sort, queryIsEmpty: false) },
+                shouldCancel: shouldCancel
+            ) else { return nil }
+            matches = sortedMatches
+            if matches.count > maxResults {
+                matches.removeSubrange(maxResults..<matches.count)
+            }
+
+            let elapsed = Date().timeIntervalSince(started)
+            var indexesUsed: Set<SearchIndexUse> = [.nameGrams]
+            if !request.includeHidden {
+                indexesUsed.insert(.visibleBitset)
+            }
+            return SearchResponse(
+                results: materialize(matches, from: snapshot, shouldCancel: shouldCancel),
+                totalMatches: total,
+                elapsed: elapsed,
+                snapshotRevision: snapshotRevision,
+                usesIndexedCandidates: true,
+                executionProfile: SearchExecutionProfile(
+                    executionPath: .nameComponentIndex,
+                    indexesUsed: indexesUsed,
+                    candidateCount: nameCandidates.count,
+                    scannedRowCount: nameCandidates.count,
+                    elapsed: elapsed
+                )
+            )
+        }
         var candidateRows: [UInt8]?
         if let nameCandidates {
             var rows = Array(repeating: UInt8(0), count: snapshot.count)
@@ -7794,7 +7950,7 @@ public final class FileIndex: @unchecked Sendable {
             indexesUsed.insert(.visibleBitset)
         }
         return SearchResponse(
-            results: materialize(matches, from: snapshot),
+            results: materialize(matches, from: snapshot, shouldCancel: shouldCancel),
             totalMatches: matches.count,
             elapsed: elapsed,
             snapshotRevision: snapshotRevision,
@@ -7949,7 +8105,7 @@ public final class FileIndex: @unchecked Sendable {
             let elapsed = Date().timeIntervalSince(started)
             let candidateCount = rowSet.intervals.reduce(0) { $0 + max($1.end - $1.start, 0) }
             return SearchResponse(
-                results: materialize(selected.matches, from: snapshot),
+                results: materialize(selected.matches, from: snapshot, shouldCancel: shouldCancel),
                 totalMatches: selected.total,
                 elapsed: elapsed,
                 snapshotRevision: snapshotRevision,
@@ -8075,7 +8231,7 @@ public final class FileIndex: @unchecked Sendable {
         let elapsed = Date().timeIntervalSince(started)
         let candidateCount = rowSet.intervals.reduce(0) { $0 + max($1.end - $1.start, 0) }
         return SearchResponse(
-            results: materialize(matches, from: snapshot),
+            results: materialize(matches, from: snapshot, shouldCancel: shouldCancel),
             totalMatches: total,
             elapsed: elapsed,
             snapshotRevision: snapshotRevision,
@@ -8279,7 +8435,7 @@ public final class FileIndex: @unchecked Sendable {
 
         let elapsed = Date().timeIntervalSince(started)
         return SearchResponse(
-            results: materialize(selected.matches, from: snapshot),
+            results: materialize(selected.matches, from: snapshot, shouldCancel: shouldCancel),
             totalMatches: selected.total,
             elapsed: elapsed,
             snapshotRevision: snapshotRevision,
@@ -8473,7 +8629,7 @@ public final class FileIndex: @unchecked Sendable {
 
             let elapsed = Date().timeIntervalSince(started)
             return SearchResponse(
-                results: materialize(selected.matches, from: snapshot),
+                results: materialize(selected.matches, from: snapshot, shouldCancel: shouldCancel),
                 totalMatches: selected.total,
                 elapsed: elapsed,
                 snapshotRevision: snapshotRevision,
@@ -8514,7 +8670,7 @@ public final class FileIndex: @unchecked Sendable {
 
             let elapsed = Date().timeIntervalSince(started)
             return SearchResponse(
-                results: materialize(selected.matches, from: snapshot),
+                results: materialize(selected.matches, from: snapshot, shouldCancel: shouldCancel),
                 totalMatches: selected.total,
                 elapsed: elapsed,
                 snapshotRevision: snapshotRevision,
@@ -8546,7 +8702,7 @@ public final class FileIndex: @unchecked Sendable {
 
         let elapsed = Date().timeIntervalSince(started)
         return SearchResponse(
-            results: materialize(selected.matches, from: snapshot),
+            results: materialize(selected.matches, from: snapshot, shouldCancel: shouldCancel),
             totalMatches: selected.total,
             elapsed: elapsed,
             snapshotRevision: snapshotRevision,
@@ -8597,7 +8753,7 @@ public final class FileIndex: @unchecked Sendable {
             indexesUsed.insert(.visibleBitset)
         }
         return SearchResponse(
-            results: materialize(selected.matches, from: snapshot),
+            results: materialize(selected.matches, from: snapshot, shouldCancel: shouldCancel),
             totalMatches: selected.total,
             elapsed: elapsed,
             snapshotRevision: snapshotRevision,
@@ -9430,7 +9586,7 @@ public final class FileIndex: @unchecked Sendable {
         guard !shouldCancel() else { return nil }
         let elapsed = Date().timeIntervalSince(started)
         return SearchResponse(
-            results: materialize(matches, from: snapshot),
+            results: materialize(matches, from: snapshot, shouldCancel: shouldCancel),
             totalMatches: total,
             elapsed: elapsed,
             snapshotRevision: snapshotRevision,
@@ -13449,6 +13605,7 @@ public final class FileIndex: @unchecked Sendable {
                 return !indexing
                     && searchSnapshot.store.kind == .overlay
                     && !searchSnapshot.isOptimizedForSearch
+                    && !hasDurableStructuralDeltaBelowCompactionThresholdWithoutLock()
             }
             if shouldOptimize {
                 schedulePersist(delay: 0)
@@ -14988,12 +15145,21 @@ public final class FileIndex: @unchecked Sendable {
         )
     }
 
+    private func structuralDeltaCompactionThreshold(for delta: StructuralDelta) -> Int {
+        largeOverlayPersistRecordLimitOverride
+            ?? max(10_000, delta.baseIdentity.recordCount / 50)
+    }
+
+    private func hasDurableStructuralDeltaBelowCompactionThresholdWithoutLock() -> Bool {
+        guard !hasUnpersistedSnapshotChanges, let structuralDelta else { return false }
+        return structuralDelta.changeCount < structuralDeltaCompactionThreshold(for: structuralDelta)
+    }
+
     private func scheduleStructuralDeltaCompactionIfNeeded(_ snapshot: SearchSnapshot) {
         let deltaState = lock.withLock { structuralDelta }
         guard let deltaState else { return }
 
-        let threshold = largeOverlayPersistRecordLimitOverride
-            ?? max(10_000, deltaState.baseIdentity.recordCount / 50)
+        let threshold = structuralDeltaCompactionThreshold(for: deltaState)
         guard deltaState.changeCount >= threshold else {
             DiagnosticLogger.shared.log(
                 category: "index",
@@ -15203,6 +15369,18 @@ public final class FileIndex: @unchecked Sendable {
         case metadataOverlayCheckpoint
     }
 
+    private func automaticPersistSuppression(
+        for mode: PersistMode
+    ) -> (changeCount: Int, threshold: Int)? {
+        guard case .automatic = mode else { return nil }
+        return lock.withLock {
+            guard !hasUnpersistedSnapshotChanges, let structuralDelta else { return nil }
+            let threshold = structuralDeltaCompactionThreshold(for: structuralDelta)
+            guard structuralDelta.changeCount < threshold else { return nil }
+            return (structuralDelta.changeCount, threshold)
+        }
+    }
+
     private enum StructuralDeltaPersistenceResult: Equatable {
         case saved
         case unavailable
@@ -15317,6 +15495,18 @@ public final class FileIndex: @unchecked Sendable {
 
         indexQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self, self.isPersistRevisionCurrent(revision) else { return }
+            if let suppression = self.automaticPersistSuppression(for: mode) {
+                DiagnosticLogger.shared.log(
+                    category: "index",
+                    event: "index.snapshotPersistSkipped",
+                    fields: [
+                        "changeCount": .publicInt(suppression.changeCount),
+                        "reason": .publicString("durableStructuralDelta"),
+                        "threshold": .publicInt(suppression.threshold)
+                    ]
+                )
+                return
+            }
             if self.deferScheduledPersistIfMaintenanceIsPending(mode: mode, priority: priority) {
                 return
             }
@@ -16907,6 +17097,10 @@ public final class FileIndex: @unchecked Sendable {
         _ = indexQueue.sync {
             persistSnapshot(schedulesPathGramBuild: false)
         }
+    }
+
+    func scheduleAutomaticPersistForTesting(delay: TimeInterval = 0) {
+        schedulePersist(delay: delay)
     }
 
     func pendingDirectoryRefreshStateForTesting(
