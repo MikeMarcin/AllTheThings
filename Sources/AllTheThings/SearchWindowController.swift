@@ -406,6 +406,65 @@ enum SearchPreviewScheduling {
     }
 }
 
+final class SearchPreviewScheduler: @unchecked Sendable {
+    typealias Work = @Sendable () -> Void
+    typealias Enqueue = @Sendable (@escaping Work) -> Void
+
+    private let lock = NSLock()
+    private let enqueue: Enqueue
+    private var isRunning = false
+    private var pendingWork: Work?
+
+    init(queue: DispatchQueue) {
+        enqueue = { work in
+            queue.async(execute: work)
+        }
+    }
+
+    init(enqueue: @escaping Enqueue) {
+        self.enqueue = enqueue
+    }
+
+    func schedule(_ work: @escaping Work) {
+        let workToStart = lock.withLock { () -> Work? in
+            guard !isRunning else {
+                pendingWork = work
+                return nil
+            }
+
+            isRunning = true
+            return work
+        }
+
+        if let workToStart {
+            start(workToStart)
+        }
+    }
+
+    private func start(_ work: @escaping Work) {
+        enqueue { [weak self] in
+            work()
+            self?.workDidFinish()
+        }
+    }
+
+    private func workDidFinish() {
+        let nextWork = lock.withLock { () -> Work? in
+            guard let pendingWork else {
+                isRunning = false
+                return nil
+            }
+
+            self.pendingWork = nil
+            return pendingWork
+        }
+
+        if let nextWork {
+            start(nextWork)
+        }
+    }
+}
+
 struct SearchRefreshGate {
     private(set) var hasDeferredRefresh = false
 
@@ -1157,7 +1216,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private lazy var applicationWatcher = FileSystemWatcher()
     private lazy var fseventReconciler = FSEventReconciliationCoordinator(cursorStore: fseventCursorStore)
     private let searchQueue = DispatchQueue(label: "att.search", qos: .userInitiated)
-    private let searchPreviewQueue = DispatchQueue(label: "att.search.preview", qos: .userInteractive)
+    private let searchPreviewScheduler = SearchPreviewScheduler(
+        queue: DispatchQueue(label: "att.search.preview", qos: .userInteractive)
+    )
     private let explanationQueue = DispatchQueue(label: "att.search.explain", qos: .utility)
     private let fseventFilterQueue = DispatchQueue(label: "att.fsevents.filter", qos: .utility)
     private let applicationSearchCatalog = ApplicationSearchCatalog()
@@ -2902,7 +2963,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         if shouldRunPreviewSearch {
             pendingPreviewSearchToken = token
             logSearchPreviewScheduled(signature: signature, generation: generation)
-            searchPreviewQueue.async { [weak self] in
+            searchPreviewScheduler.schedule { [weak self] in
                 guard !token.isCancelled else {
                     DispatchQueue.main.async { [weak self] in
                         self?.logSearchPreviewRejected(

@@ -245,6 +245,48 @@ struct SearchToolbarTests {
         }
     }
 
+    @Test("preview scheduler replaces queued work with the latest request")
+    func previewSchedulerReplacesQueuedWorkWithLatestRequest() throws {
+        let executor = ManualSearchPreviewExecutor()
+        let recorder = SearchPreviewWorkRecorder()
+        let scheduler = SearchPreviewScheduler(enqueue: executor.enqueue)
+
+        scheduler.schedule { recorder.run(1) }
+        scheduler.schedule { recorder.run(2) }
+        scheduler.schedule { recorder.run(3) }
+
+        #expect(executor.queuedCount == 1)
+        try executor.runNext()
+        #expect(executor.queuedCount == 1)
+        try executor.runNext()
+
+        #expect(executor.queuedCount == 0)
+        #expect(recorder.completedWork == [1, 3])
+        #expect(recorder.maximumConcurrentWork == 1)
+    }
+
+    @Test("preview scheduler never starts pending work concurrently")
+    func previewSchedulerNeverStartsPendingWorkConcurrently() throws {
+        let executor = ManualSearchPreviewExecutor()
+        let recorder = SearchPreviewWorkRecorder()
+        let scheduler = SearchPreviewScheduler(enqueue: executor.enqueue)
+
+        scheduler.schedule {
+            recorder.begin(1)
+            scheduler.schedule { recorder.run(2) }
+            recorder.observeQueuedWork(executor.queuedCount)
+            recorder.end(1)
+        }
+
+        try executor.runNext()
+        #expect(recorder.observedQueuedWork == [0])
+        #expect(executor.queuedCount == 1)
+        try executor.runNext()
+
+        #expect(recorder.completedWork == [1, 2])
+        #expect(recorder.maximumConcurrentWork == 1)
+    }
+
     @Test("background search refreshes coalesce until the app becomes interactive")
     func backgroundSearchRefreshesCoalesceUntilInteractive() {
         var gate = SearchRefreshGate()
@@ -514,5 +556,62 @@ struct SearchToolbarTests {
         let defaults = try #require(UserDefaults(suiteName: suiteName))
         defaults.removePersistentDomain(forName: suiteName)
         return (defaults, suiteName)
+    }
+}
+
+private final class ManualSearchPreviewExecutor: @unchecked Sendable {
+    private let lock = NSLock()
+    private var queuedWork: [SearchPreviewScheduler.Work] = []
+
+    var queuedCount: Int {
+        lock.withLock { queuedWork.count }
+    }
+
+    func enqueue(_ work: @escaping SearchPreviewScheduler.Work) {
+        lock.withLock {
+            queuedWork.append(work)
+        }
+    }
+
+    func runNext() throws {
+        let work = lock.withLock { () -> SearchPreviewScheduler.Work? in
+            guard !queuedWork.isEmpty else { return nil }
+            return queuedWork.removeFirst()
+        }
+        try #require(work)()
+    }
+}
+
+private final class SearchPreviewWorkRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var activeWork = 0
+    private(set) var completedWork: [Int] = []
+    private(set) var maximumConcurrentWork = 0
+    private(set) var observedQueuedWork: [Int] = []
+
+    func run(_ identifier: Int) {
+        begin(identifier)
+        end(identifier)
+    }
+
+    func begin(_ identifier: Int) {
+        _ = identifier
+        lock.withLock {
+            activeWork += 1
+            maximumConcurrentWork = max(maximumConcurrentWork, activeWork)
+        }
+    }
+
+    func end(_ identifier: Int) {
+        lock.withLock {
+            activeWork -= 1
+            completedWork.append(identifier)
+        }
+    }
+
+    func observeQueuedWork(_ count: Int) {
+        lock.withLock {
+            observedQueuedWork.append(count)
+        }
     }
 }

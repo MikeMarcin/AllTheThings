@@ -241,6 +241,8 @@ struct FileIndexInsightsTests {
 
         #expect(previewResponse.executionProfile.elapsed >= 0)
         #expect(response.executionProfile.elapsed >= 0)
+        #expect(previewResponse.executionProfile.elapsed == previewResponse.elapsed)
+        #expect(response.executionProfile.elapsed == response.elapsed)
         #expect(response.executionProfile.executionPath != .unprofiled)
 
         let usage = index.currentInsightsSnapshot().usage
