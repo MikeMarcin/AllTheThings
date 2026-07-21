@@ -116,8 +116,35 @@ public struct FileRecord: Codable, Hashable, Identifiable, Sendable {
     }
 
     public static func pathIsHidden(_ path: String) -> Bool {
-        URL(fileURLWithPath: path).pathComponents.contains { component in
-            component.hasPrefix(".") && component != "." && component != ".."
+        var componentLength = 0
+        var componentStartsWithDot = false
+        var secondByteIsDot = false
+
+        func componentIsHidden() -> Bool {
+            componentStartsWithDot
+                && componentLength > 1
+                && !(componentLength == 2 && secondByteIsDot)
         }
+
+        for byte in path.utf8 {
+            if byte == UInt8(ascii: "/") {
+                if componentIsHidden() {
+                    return true
+                }
+                componentLength = 0
+                componentStartsWithDot = false
+                secondByteIsDot = false
+                continue
+            }
+
+            if componentLength == 0 {
+                componentStartsWithDot = byte == UInt8(ascii: ".")
+            } else if componentLength == 1 {
+                secondByteIsDot = byte == UInt8(ascii: ".")
+            }
+            componentLength += 1
+        }
+
+        return componentIsHidden()
     }
 }

@@ -883,6 +883,8 @@ struct FileIndexTests {
         let rootRecord = try #require(FileRecord(url: root))
         let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)", loadsSnapshotImmediately: false)
         index.replaceRecordsForTesting([rootRecord], roots: [root])
+        let slicesBefore = index.currentInsightsSnapshot().usage.maintenance
+            .counters(for: .backgroundSlice).yieldedSlices
 
         let firstResult = index.reconcileIndexedRootsInBackground(
             rootURLs: [folder],
@@ -909,6 +911,175 @@ struct FileIndexTests {
                 && stats.status.hasPrefix("Caught up")
                 && response.results.contains { $0.record.path == changedFile.path }
         }
+        #expect(index.currentInsightsSnapshot().usage.maintenance
+            .counters(for: .backgroundSlice).yieldedSlices == slicesBefore)
+    }
+
+    @Test("reconciliation obeys the background duty cycle and resumes in foreground")
+    func reconciliationObeysBackgroundDutyCycleAndResumesInForeground() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        let existingFile = root.appendingPathComponent("Existing.txt")
+        try "existing".write(to: existingFile, atomically: true, encoding: .utf8)
+        defer { try? fileManager.removeItem(at: root) }
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        defer { try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName)) }
+        let index = FileIndex(
+            applicationName: applicationName,
+            loadsSnapshotImmediately: false,
+            largeOverlayPersistRecordLimit: nil,
+            largeOverlayPersistDelay: nil,
+            backgroundRefreshDrainBackoffDelay: 60,
+            backgroundDirectoryScanBudget: 0,
+            backgroundOptimizationPersistDelay: 60
+        )
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil(timeout: .seconds(10)) { !index.currentStats().isIndexing }
+
+        let createdFile = root.appendingPathComponent("CreatedWhileAway.txt")
+        try "created".write(to: createdFile, atomically: true, encoding: .utf8)
+        let slicesBefore = index.currentInsightsSnapshot().usage.maintenance
+            .counters(for: .backgroundSlice).yieldedSlices
+
+        index.setBackgroundMaintenanceEnabled(true)
+        defer { index.setBackgroundMaintenanceEnabled(false) }
+        #expect(index.reconcileIndexedRootsInBackground(rootURLs: [root]) == .started)
+
+        try await waitUntil(timeout: .seconds(5)) {
+            index.currentStats().isReconciling
+                && index.currentInsightsSnapshot().usage.maintenance
+                    .counters(for: .backgroundSlice).yieldedSlices > slicesBefore
+        }
+        #expect(index.search(SearchRequest(
+            query: "CreatedWhileAway",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10).totalMatches == 0)
+
+        index.setBackgroundMaintenanceEnabled(false)
+        try await waitUntil(timeout: .seconds(10)) {
+            !index.currentStats().isIndexing
+                && index.search(SearchRequest(
+                    query: "CreatedWhileAway",
+                    sort: SortSpec(column: .relevance, ascending: false)
+                ), maxResults: 10).results.contains { $0.record.path == createdFile.path }
+        }
+
+        let scanWork = index.currentDiagnostics().scanFrontierMetrics
+        #expect(scanWork.retainedRecordDictionaryCount < index.currentStats().indexedCount)
+        #expect(index.currentInsightsSnapshot().usage.maintenance
+            .counters(for: .reconcile).yieldedSlices > 0)
+    }
+
+    @Test("explicit promotion resumes a parked background reconciliation")
+    func explicitPromotionResumesParkedBackgroundReconciliation() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        try "existing".write(
+            to: root.appendingPathComponent("Existing.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        defer { try? fileManager.removeItem(at: root) }
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        defer { try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName)) }
+        let index = FileIndex(
+            applicationName: applicationName,
+            loadsSnapshotImmediately: false,
+            largeOverlayPersistRecordLimit: nil,
+            largeOverlayPersistDelay: nil,
+            backgroundRefreshDrainBackoffDelay: 60,
+            backgroundDirectoryScanBudget: 0,
+            backgroundOptimizationPersistDelay: 60
+        )
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil(timeout: .seconds(10)) { !index.currentStats().isIndexing }
+
+        let createdFile = root.appendingPathComponent("CreatedBeforePromotion.txt")
+        try "created".write(to: createdFile, atomically: true, encoding: .utf8)
+        let slicesBefore = index.currentInsightsSnapshot().usage.maintenance
+            .counters(for: .backgroundSlice).yieldedSlices
+
+        index.setBackgroundMaintenanceEnabled(true)
+        defer { index.setBackgroundMaintenanceEnabled(false) }
+        #expect(index.reconcileIndexedRootsInBackground(rootURLs: [root]) == .started)
+        try await waitUntil(timeout: .seconds(5)) {
+            index.currentInsightsSnapshot().usage.maintenance
+                .counters(for: .backgroundSlice).yieldedSlices > slicesBefore
+        }
+
+        index.promoteBackgroundMaintenance()
+        try await waitUntil(timeout: .seconds(5)) {
+            !index.currentStats().isIndexing
+                && index.search(SearchRequest(
+                    query: "CreatedBeforePromotion",
+                    sort: SortSpec(column: .relevance, ascending: false)
+                ), maxResults: 10).results.contains { $0.record.path == createdFile.path }
+        }
+    }
+
+    @Test("a root rebuild promptly cancels a parked background reconciliation")
+    func rootRebuildCancelsParkedBackgroundReconciliation() async throws {
+        let fileManager = FileManager.default
+        let originalRoot = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)-original", isDirectory: true)
+        let replacementRoot = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)-replacement", isDirectory: true)
+        try fileManager.createDirectory(at: originalRoot, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: replacementRoot, withIntermediateDirectories: true)
+        try "original".write(
+            to: originalRoot.appendingPathComponent("Original.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let replacementFile = replacementRoot.appendingPathComponent("Replacement.txt")
+        try "replacement".write(to: replacementFile, atomically: true, encoding: .utf8)
+        defer {
+            try? fileManager.removeItem(at: originalRoot)
+            try? fileManager.removeItem(at: replacementRoot)
+        }
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        defer { try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName)) }
+        let index = FileIndex(
+            applicationName: applicationName,
+            loadsSnapshotImmediately: false,
+            largeOverlayPersistRecordLimit: nil,
+            largeOverlayPersistDelay: nil,
+            backgroundRefreshDrainBackoffDelay: 60,
+            backgroundDirectoryScanBudget: 0,
+            backgroundOptimizationPersistDelay: 60
+        )
+        index.replaceRootsAndRebuild([originalRoot], mode: .fresh)
+        try await waitUntil(timeout: .seconds(10)) { !index.currentStats().isIndexing }
+
+        let slicesBefore = index.currentInsightsSnapshot().usage.maintenance
+            .counters(for: .backgroundSlice).yieldedSlices
+        index.setBackgroundMaintenanceEnabled(true)
+        defer { index.setBackgroundMaintenanceEnabled(false) }
+        #expect(index.reconcileIndexedRootsInBackground(
+            activityPresentation: .backgroundCatchUp
+        ) == .started)
+        try await waitUntil(timeout: .seconds(5)) {
+            index.currentInsightsSnapshot().usage.maintenance
+                .counters(for: .backgroundSlice).yieldedSlices > slicesBefore
+        }
+
+        index.replaceRootsAndRebuild([replacementRoot], mode: .fresh)
+        try await waitUntil(timeout: .seconds(5)) {
+            !index.currentStats().isIndexing
+                && index.search(SearchRequest(
+                    query: "Replacement",
+                    sort: SortSpec(column: .relevance, ascending: false)
+                ), maxResults: 10).results.contains { $0.record.path == replacementFile.path }
+        }
+        #expect(index.allRoots().map(\.standardizedFileURL.path) == [replacementRoot.standardizedFileURL.path])
+        #expect(index.currentDiagnostics().activeIndexJobs == 0)
     }
 
     @Test("partially overlapping reconciliation queues only uncovered catch up scopes")
@@ -5064,7 +5235,7 @@ struct FileIndexTests {
         #expect(scanWork.checkpointSnapshotCount == 0)
         #expect(scanWork.finalSnapshotCount == 0)
         #expect(scanWork.finalSnapshotRowCount == 0)
-        #expect(scanWork.retainedRecordDictionaryCount >= 1_501)
+        #expect(scanWork.retainedRecordDictionaryCount == 0)
     }
 
     @Test("loaded snapshots reconcile changes made while app was closed")
@@ -5330,6 +5501,7 @@ struct FileIndexTests {
                 && $0.heapPageCount == 0
         })
         #expect(!capturedMemoryEvents.contains { $0.event == "reconcile.heapStore.build.end" })
+        #expect(index.currentDiagnostics().scanFrontierMetrics.retainedRecordDictionaryCount <= 4)
     }
 
     @Test("directory entry decoding reads only record name bytes")
