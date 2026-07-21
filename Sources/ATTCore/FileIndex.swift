@@ -1568,10 +1568,64 @@ public final class FileIndex: @unchecked Sendable {
     private struct ScanResult {
         let records: [String: FileRecord]
         let store: HeapPagedRecordStore?
+        let reconciliationDelta: ReconciliationScanDelta?
         let recordCount: Int
         let visited: Int
+        let yieldedSlices: Int
         let frontierMetrics: ScanFrontierMetrics
         let exclusionInstrumentation: FileExclusionQuery.Instrumentation
+    }
+
+    private struct ReconciliationScanDelta {
+        let observedBaselineRows: PackedRowBitSet
+        let upserts: [String: FileRecord]
+        let recordCount: Int
+    }
+
+    /// Collects only the information needed to diff a reconciliation scan.
+    /// Calls are serialized by `ConcurrentScanState`, so the million-row scan
+    /// does not need a second lock or a dictionary containing every FileRecord.
+    private final class ReconciliationScanAccumulator: @unchecked Sendable {
+        private let baselineStore: RecordStore
+        private var observedBaselineRows: PackedRowBitSet
+        private var upserts: [String: FileRecord] = [:]
+        private var recordCount = 0
+
+        init(baselineStore: RecordStore) {
+            self.baselineStore = baselineStore
+            observedBaselineRows = PackedRowBitSet(bitCount: baselineStore.count)
+            upserts.reserveCapacity(4_096)
+        }
+
+        @discardableResult
+        func append(_ record: FileRecord) -> Bool {
+            if let rowID = baselineStore.rowID(forPath: record.path) {
+                let isFirstObservation = observedBaselineRows.insert(rowID)
+                if FileIndex.storedRecord(baselineStore, at: rowID, matches: record) {
+                    upserts.removeValue(forKey: record.path)
+                } else {
+                    upserts[record.path] = record
+                }
+                if isFirstObservation {
+                    recordCount += 1
+                }
+                return isFirstObservation
+            }
+
+            let isFirstObservation = upserts.updateValue(record, forKey: record.path) == nil
+            if isFirstObservation {
+                recordCount += 1
+            }
+            return isFirstObservation
+        }
+
+        func result() -> ReconciliationScanDelta {
+            ReconciliationScanDelta(
+                observedBaselineRows: observedBaselineRows,
+                upserts: upserts,
+                recordCount: recordCount
+            )
+        }
     }
 
     private struct MaintenanceMeasurement {
@@ -1696,14 +1750,18 @@ public final class FileIndex: @unchecked Sendable {
 
     private final class ConcurrentScanState: @unchecked Sendable {
         private let condition = NSCondition()
+        private let onTerminalState: @Sendable () -> Void
         private var pendingDirectories: [URL] = []
         private var knownDirectoryPaths: Set<String>
         private var activeDirectories: Set<String> = []
         private var completedDirectories: Set<String>
+        private let tracksCompletedDirectories: Bool
         private var shouldStop = false
         private var records: [String: FileRecord]?
         private let builder: HeapPagedRecordStore.Builder?
+        private let reconciliationAccumulator: ReconciliationScanAccumulator?
         private var visited = 0
+        private var yieldedSlices = 0
         private var lastStatusPublishedCount = 0
         private var lastStatusPublishedAt = Date.distantPast
         private var lastPublishedCount = 0
@@ -1721,9 +1779,18 @@ public final class FileIndex: @unchecked Sendable {
             operationStartedAt: Date,
             lastCheckpointCount: Int = 0,
             lastCheckpointAt: Date? = nil,
-            buildsRecordStore: Bool = true
+            buildsRecordStore: Bool = true,
+            reconciliationBaselineStore: RecordStore? = nil,
+            tracksCompletedDirectories: Bool = true,
+            onTerminalState: @escaping @Sendable () -> Void = {}
         ) {
+            precondition(
+                !buildsRecordStore || reconciliationBaselineStore == nil,
+                "A scan cannot build a record store and a reconciliation delta at the same time."
+            )
             self.completedDirectories = completedDirectories
+            self.tracksCompletedDirectories = tracksCompletedDirectories
+            self.onTerminalState = onTerminalState
             knownDirectoryPaths = completedDirectories
             self.operationStartedAt = operationStartedAt
             checkpointSchedule = ScanCheckpointSchedule(
@@ -1732,7 +1799,10 @@ public final class FileIndex: @unchecked Sendable {
                 lastCheckpointAt: lastCheckpointAt
             )
             builder = buildsRecordStore ? HeapPagedRecordStore.Builder(reservedCapacity: reservedCapacity, roots: roots) : nil
-            if buildsRecordStore {
+            reconciliationAccumulator = reconciliationBaselineStore.map {
+                ReconciliationScanAccumulator(baselineStore: $0)
+            }
+            if buildsRecordStore || reconciliationBaselineStore != nil {
                 records = nil
             } else {
                 var recordsByPath: [String: FileRecord] = [:]
@@ -1784,9 +1854,25 @@ public final class FileIndex: @unchecked Sendable {
 
         func markStopped() {
             condition.lock()
+            let newlyStopped = !shouldStop
             shouldStop = true
             condition.broadcast()
             condition.unlock()
+            if newlyStopped {
+                onTerminalState()
+            }
+        }
+
+        func isStoppedOrComplete() -> Bool {
+            condition.lock()
+            defer { condition.unlock() }
+            return shouldStop || (pendingDirectories.isEmpty && activeDirectories.isEmpty)
+        }
+
+        func isComplete() -> Bool {
+            condition.lock()
+            defer { condition.unlock() }
+            return pendingDirectories.isEmpty && activeDirectories.isEmpty
         }
 
         func nextDirectory() -> URL? {
@@ -1833,15 +1919,21 @@ public final class FileIndex: @unchecked Sendable {
             frontierMetrics.finishCallCount += 1
             for directory in directories {
                 activeDirectories.remove(directory.path)
-                completedDirectories.insert(directory.path)
+                if tracksCompletedDirectories {
+                    completedDirectories.insert(directory.path)
+                }
             }
             frontierMetrics.finishedDirectoryCount += UInt64(directories.count)
-            if shouldStop || (pendingDirectories.isEmpty && activeDirectories.isEmpty) {
+            let reachedTerminalState = shouldStop || (pendingDirectories.isEmpty && activeDirectories.isEmpty)
+            if reachedTerminalState {
                 condition.broadcast()
             } else {
                 condition.signal()
             }
             condition.unlock()
+            if reachedTerminalState {
+                onTerminalState()
+            }
         }
 
         func append(_ batch: [FileRecord]) {
@@ -1856,11 +1948,23 @@ public final class FileIndex: @unchecked Sendable {
             condition.unlock()
         }
 
+        func recordYieldedSlice() {
+            condition.lock()
+            yieldedSlices += 1
+            condition.unlock()
+        }
+
         private func appendRecordWithoutLock(_ record: FileRecord) {
             if let builder {
                 let previousCount = builder.count
                 builder.append(record)
                 if builder.count > previousCount {
+                    visited += 1
+                }
+                return
+            }
+            if let reconciliationAccumulator {
+                if reconciliationAccumulator.append(record) {
                     visited += 1
                 }
                 return
@@ -1938,7 +2042,10 @@ public final class FileIndex: @unchecked Sendable {
             condition.lock()
             defer { condition.unlock() }
             let store = builder?.snapshot(includesPathIndex: true)
-            frontierMetrics.retainedRecordDictionaryCount = records?.count ?? 0
+            let reconciliationDelta = reconciliationAccumulator?.result()
+            frontierMetrics.retainedRecordDictionaryCount = records?.count
+                ?? reconciliationDelta?.upserts.count
+                ?? 0
             if let store {
                 frontierMetrics.finalSnapshotCount += 1
                 frontierMetrics.finalSnapshotRowCount += UInt64(store.count)
@@ -1947,8 +2054,13 @@ public final class FileIndex: @unchecked Sendable {
                 ScanResult(
                     records: records ?? [:],
                     store: store,
-                    recordCount: store?.count ?? records?.count ?? 0,
+                    reconciliationDelta: reconciliationDelta,
+                    recordCount: store?.count
+                        ?? reconciliationDelta?.recordCount
+                        ?? records?.count
+                        ?? 0,
                     visited: visited,
+                    yieldedSlices: yieldedSlices,
                     frontierMetrics: frontierMetrics,
                     exclusionInstrumentation: exclusionInstrumentation
                 ),
@@ -4167,6 +4279,7 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     private let lock = NSLock()
+    private let backgroundReconciliationCondition = NSCondition()
     private let fileManager: FileManager
     private let supportDirectory: URL
     private let snapshotURL: URL
@@ -4238,6 +4351,7 @@ public final class FileIndex: @unchecked Sendable {
     private var refreshDrainScheduleGeneration: UInt64 = 0
     private var refreshServiceSequence: UInt64 = 0
     private var backgroundMaintenanceEnteredAt: Date?
+    private var promotedReconciliationGeneration: UInt64?
     private var optimizesSnapshotAfterPromotedRefreshDrain = false
     private var pendingReconciliationPaths = Set<String>()
     private var pendingReconciliationIncludesAllRoots = false
@@ -4710,6 +4824,7 @@ public final class FileIndex: @unchecked Sendable {
             resumedFromCheckpoint = false
             return generation
         }
+        wakeBackgroundReconciliation()
 
         publishStats()
 
@@ -4971,6 +5086,9 @@ public final class FileIndex: @unchecked Sendable {
     public func setBackgroundMaintenanceEnabled(_ enabled: Bool) {
         let changed = lock.withLock { () -> Bool in
             let wasEnabled = backgroundMaintenanceEnteredAt != nil
+            if enabled {
+                promotedReconciliationGeneration = nil
+            }
             guard wasEnabled != enabled else { return false }
 
             backgroundMaintenanceEnteredAt = enabled ? Date() : nil
@@ -4985,6 +5103,7 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         guard changed else { return }
+        wakeBackgroundReconciliation()
         DiagnosticLogger.shared.log(
             category: "index",
             event: "index.backgroundMaintenanceModeChanged",
@@ -4993,6 +5112,15 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     public func promoteBackgroundMaintenance() {
+        // A reconciliation owns indexQueue while its scan workers are parked.
+        // Mark it as promoted and wake its workers synchronously; the queued
+        // refresh promotion below cannot run until they have released the queue.
+        lock.withLock {
+            if indexing, reconciling {
+                promotedReconciliationGeneration = generation
+            }
+        }
+        wakeBackgroundReconciliation()
         indexQueue.async { [weak self] in
             self?.promoteBackgroundMaintenanceOnIndexQueue()
         }
@@ -10987,6 +11115,8 @@ public final class FileIndex: @unchecked Sendable {
             publishesScanStatus: true,
             publishesIntermediateSnapshots: false,
             buildsRecordStore: previousSnapshot.count == 0,
+            reconciliationBaselineStore: previousSnapshot.count == 0 ? nil : previousStore,
+            throttlesWhenBackgrounded: true,
             workerCount: Self.refreshScanWorkerCount(),
             workerQoS: .utility,
             progress: { _, _, _ in }
@@ -11012,7 +11142,11 @@ public final class FileIndex: @unchecked Sendable {
         guard isCurrentGeneration(currentGeneration) else { return }
         recordScanFrontierMetrics(scanResult.frontierMetrics, generation: currentGeneration)
         let scanMetrics = scanResult.store.map { Self.countOnlyMetrics(for: $0) }
-            ?? Self.metrics(for: scanResult.records.values)
+            ?? RecordCollectionMetrics(
+                recordCount: scanResult.recordCount,
+                totalPathBytes: 0,
+                maxPathBytes: 0
+            )
         MemoryTelemetry.log(
             "reconcile.scan.finished",
             records: scanMetrics,
@@ -11041,10 +11175,14 @@ public final class FileIndex: @unchecked Sendable {
                 memoryTelemetryContext: telemetryContext
             )
         } else {
+            guard let reconciliationDelta = scanResult.reconciliationDelta else {
+                failIndexing("Could not build reconciliation delta.", generation: currentGeneration)
+                return
+            }
             guard applyReconciliationDelta(
                 previousSnapshot: previousSnapshot,
                 scannedRootPaths: scannedRootPaths,
-                scanRecords: scanResult.records,
+                scanDelta: reconciliationDelta,
                 generation: currentGeneration,
                 completionStatusPrefix: activityPresentation == .backgroundCatchUp ? "Caught up" : "Reconciled",
                 operationStartedAt: started,
@@ -11062,6 +11200,7 @@ public final class FileIndex: @unchecked Sendable {
             paths: rootURLs.count,
             records: finalRecordCount,
             visited: scanResult.visited,
+            yieldedSlices: scanResult.yieldedSlices,
             exclusionInstrumentation: scanResult.exclusionInstrumentation
         ))
         DiagnosticLogger.shared.log(
@@ -11078,24 +11217,13 @@ public final class FileIndex: @unchecked Sendable {
     private func applyReconciliationDelta(
         previousSnapshot: SearchSnapshot,
         scannedRootPaths: [String],
-        scanRecords: [String: FileRecord],
+        scanDelta: ReconciliationScanDelta,
         generation currentGeneration: UInt64,
         completionStatusPrefix: String,
         operationStartedAt: Date,
         memoryTelemetryContext: MemoryTelemetryContext
     ) -> Bool {
-        var upserts: [String: FileRecord] = [:]
-        upserts.reserveCapacity(min(scanRecords.count, 4_096))
-        for (offset, record) in scanRecords.values.enumerated() {
-            if offset.isMultiple(of: 4_096), !isCurrentGeneration(currentGeneration) {
-                return false
-            }
-            if let rowID = previousSnapshot.store.rowID(forPath: record.path),
-               Self.storedRecord(previousSnapshot.store, at: rowID, matches: record) {
-                continue
-            }
-            upserts[record.path] = record
-        }
+        let upserts = scanDelta.upserts
 
         let reconcilesAllRows = Set(scannedRootPaths) == Set(lock.withLock { roots })
         var deletedRows = Set<Int>()
@@ -11105,8 +11233,7 @@ public final class FileIndex: @unchecked Sendable {
                     return false
                 }
                 guard previousSnapshot.store.isResultRow(at: rowID) else { continue }
-                let path = previousSnapshot.store.path(at: rowID)
-                if scanRecords[path] == nil {
+                if !scanDelta.observedBaselineRows.contains(rowID) {
                     deletedRows.insert(rowID)
                 }
             }
@@ -11128,7 +11255,8 @@ public final class FileIndex: @unchecked Sendable {
                     }
                     guard previousSnapshot.store.isResultRow(at: rowID) else { continue }
                     let path = previousSnapshot.store.path(at: rowID)
-                    if (path == scope || path.hasPrefix(scope + "/")), scanRecords[path] == nil {
+                    if (path == scope || path.hasPrefix(scope + "/")),
+                       !scanDelta.observedBaselineRows.contains(rowID) {
                         deletedRows.insert(rowID)
                     }
                 }
@@ -11175,7 +11303,7 @@ public final class FileIndex: @unchecked Sendable {
                     category: "index",
                     event: "index.reconcileDeltaNoop",
                     fields: [
-                        "scannedRecordCount": .publicInt(scanRecords.count),
+                        "scannedRecordCount": .publicInt(scanDelta.recordCount),
                         "reconciledScopeCount": .publicInt(scannedRootPaths.count),
                         "durationSeconds": .publicDouble(Date().timeIntervalSince(operationStartedAt))
                     ]
@@ -11324,6 +11452,8 @@ public final class FileIndex: @unchecked Sendable {
         publishesScanStatus: Bool = true,
         publishesIntermediateSnapshots: Bool = true,
         buildsRecordStore: Bool = true,
+        reconciliationBaselineStore: RecordStore? = nil,
+        throttlesWhenBackgrounded: Bool = false,
         workerCount: Int,
         workerQoS: DispatchQoS.QoSClass,
         progress: @escaping @Sendable (_ store: HeapPagedRecordStore, _ visited: Int, _ force: Bool) -> Void
@@ -11358,7 +11488,12 @@ public final class FileIndex: @unchecked Sendable {
             operationStartedAt: operationStartedAt,
             lastCheckpointCount: checkpoint?.state.recordCount ?? 0,
             lastCheckpointAt: checkpoint?.state.savedAt,
-            buildsRecordStore: buildsRecordStore
+            buildsRecordStore: buildsRecordStore,
+            reconciliationBaselineStore: reconciliationBaselineStore,
+            tracksCompletedDirectories: writesCheckpoints,
+            onTerminalState: { [weak self] in
+                self?.wakeBackgroundReconciliation()
+            }
         )
 
         let publish: @Sendable (_ result: ScanProgress?, _ force: Bool) -> Void = { result, force in
@@ -11394,6 +11529,23 @@ public final class FileIndex: @unchecked Sendable {
                     generation: currentGeneration
                 )
             }
+        }
+        let recordBackgroundYield: @Sendable (TimeInterval) -> Void = { [weak self] delay in
+            state.recordYieldedSlice()
+            self?.recordMaintenance(IndexMaintenanceOperationMetric(
+                kind: .backgroundSlice,
+                priority: .background,
+                yieldedSlices: 1,
+                deferredPaths: 1
+            ))
+            DiagnosticLogger.shared.log(
+                category: "index",
+                event: "index.backgroundReconciliationSlice",
+                fields: [
+                    "delaySeconds": .publicDouble(delay),
+                    "workerCount": .publicInt(workerCount)
+                ]
+            )
         }
 
         if checkpoint == nil {
@@ -11458,11 +11610,26 @@ public final class FileIndex: @unchecked Sendable {
                     exclusionInstrumentationAccumulator.add(workerInstrumentation)
                 }
                 let volumeNameCache = ScanVolumeNameCache()
+                var backgroundSliceStartedAt = Date()
+                var recordsSinceThrottleCheck = 0
 
                 var batch: [FileRecord] = []
                 batch.reserveCapacity(256)
 
                 scanLoop: while true {
+                    guard self.pauseBackgroundReconciliationIfNeeded(
+                        enabled: throttlesWhenBackgrounded,
+                        generation: currentGeneration,
+                        workerCount: workerCount,
+                        sliceStartedAt: &backgroundSliceStartedAt,
+                        isStoppedOrComplete: state.isStoppedOrComplete,
+                        onYield: recordBackgroundYield
+                    ) else {
+                        if !state.isComplete() {
+                            state.markStopped()
+                        }
+                        break
+                    }
                     let directories = state.nextDirectories(maxCount: claimBatchSize)
                     guard !directories.isEmpty else { break }
 
@@ -11496,6 +11663,23 @@ public final class FileIndex: @unchecked Sendable {
                             if !self.isCurrentGeneration(currentGeneration) {
                                 state.markStopped()
                                 return false
+                            }
+                            recordsSinceThrottleCheck += 1
+                            if recordsSinceThrottleCheck >= 256 {
+                                recordsSinceThrottleCheck = 0
+                                guard self.pauseBackgroundReconciliationIfNeeded(
+                                    enabled: throttlesWhenBackgrounded,
+                                    generation: currentGeneration,
+                                    workerCount: workerCount,
+                                    sliceStartedAt: &backgroundSliceStartedAt,
+                                    isStoppedOrComplete: state.isStoppedOrComplete,
+                                    onYield: recordBackgroundYield
+                                ) else {
+                                    if !state.isComplete() {
+                                        state.markStopped()
+                                    }
+                                    return false
+                                }
                             }
 
                             autoreleasepool {
@@ -12928,6 +13112,7 @@ public final class FileIndex: @unchecked Sendable {
             activeOperationStartedAt = nil
             resumedFromCheckpoint = false
         }
+        wakeBackgroundReconciliation()
         recordIndexingFailure()
         publishStats()
     }
@@ -13124,6 +13309,75 @@ public final class FileIndex: @unchecked Sendable {
 
     private func backgroundDirectoryScanBudget() -> TimeInterval {
         backgroundDirectoryScanBudgetOverride ?? Self.backgroundDirectoryScanBudgetDefault
+    }
+
+    private func pauseBackgroundReconciliationIfNeeded(
+        enabled: Bool,
+        generation currentGeneration: UInt64,
+        workerCount: Int,
+        sliceStartedAt: inout Date,
+        isStoppedOrComplete: @Sendable () -> Bool,
+        onYield: @Sendable (TimeInterval) -> Void
+    ) -> Bool {
+        guard !isStoppedOrComplete() else { return false }
+        guard enabled else { return isCurrentGeneration(currentGeneration) }
+
+        let initialState = lock.withLock {
+            (
+                isCurrent: generation == currentGeneration,
+                backgroundEnteredAt: backgroundMaintenanceEnteredAt,
+                isPromoted: promotedReconciliationGeneration == currentGeneration
+            )
+        }
+        guard initialState.isCurrent else { return false }
+        guard !initialState.isPromoted else { return true }
+        guard initialState.backgroundEnteredAt != nil else { return true }
+
+        backgroundReconciliationCondition.lock()
+        defer { backgroundReconciliationCondition.unlock() }
+
+        while true {
+            guard !isStoppedOrComplete() else { return false }
+            let state = lock.withLock {
+                (
+                    isCurrent: generation == currentGeneration,
+                    backgroundEnteredAt: backgroundMaintenanceEnteredAt,
+                    isPromoted: promotedReconciliationGeneration == currentGeneration
+                )
+            }
+            guard state.isCurrent else { return false }
+            guard !state.isPromoted else { return true }
+            guard let backgroundEnteredAt = state.backgroundEnteredAt else { return true }
+
+            let now = Date()
+            let effectiveSliceStart = max(sliceStartedAt, backgroundEnteredAt)
+            let perWorkerBudget = backgroundDirectoryScanBudget() / Double(max(workerCount, 1))
+            guard now.timeIntervalSince(effectiveSliceStart) >= perWorkerBudget else {
+                return true
+            }
+
+            let delay = backgroundRefreshDrainBackoffDelay()
+            onYield(delay)
+            guard delay > 0 else {
+                sliceStartedAt = Date()
+                return true
+            }
+
+            let resumeDate = now.addingTimeInterval(delay)
+            while Date() < resumeDate {
+                if backgroundReconciliationCondition.wait(until: resumeDate) {
+                    break
+                }
+            }
+            guard !isStoppedOrComplete() else { return false }
+            sliceStartedAt = Date()
+        }
+    }
+
+    private func wakeBackgroundReconciliation() {
+        backgroundReconciliationCondition.lock()
+        backgroundReconciliationCondition.broadcast()
+        backgroundReconciliationCondition.unlock()
     }
 
     private func backgroundDirectoryScanVisitLimit(for priority: IndexWorkPriority) -> Int? {

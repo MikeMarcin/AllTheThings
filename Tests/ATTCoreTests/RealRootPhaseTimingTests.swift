@@ -962,10 +962,10 @@ struct RealRootPhaseTimingTests {
             ? "transient_spike"
             : "retained_or_plateau"
         let attribution: String
-        if operation == "backgroundCatchUpScopedReconcile" {
-            attribution = "Compare peak_label with memory_events; peaks near previousRecords or merge events indicate whole-index materialization during scoped catch-up."
+        if operation.contains("ScopedReconcile") {
+            attribution = "Compare peak_label with memory_events; reconciliation should retain only its seen-row bitset and changed records."
         } else if operation.contains("Reconcile") {
-            attribution = "Compare with scoped catch-up output; full-root reconcile should avoid previous snapshot materialization."
+            attribution = "Full-root reconciliation should retain only its seen-row bitset and changed records, not every scanned record."
         } else {
             attribution = "Use as baseline for scan, mapped-store write, search-structure build, and allocator retention."
         }
