@@ -664,6 +664,7 @@ public final class FileIndex: @unchecked Sendable {
     private static let degradedSearchMaximumScanLimit = 25_000
     private static let previewIndexedCandidateScanLimit = 50_000
     private static let previewOrderedCandidateScanLimit = 25_000
+    private static let pendingRefreshSearchResultLimit = 64
 
 #if DEBUG
     static var defaultBackgroundDirectoryMaintenancePolicyForTesting: (
@@ -5370,6 +5371,271 @@ public final class FileIndex: @unchecked Sendable {
         snapshot.prefersDegradedSearch || isRefreshActive
     }
 
+    private static func matchingSearchResult(
+        rowID: Int,
+        snapshot: SearchSnapshot,
+        request: SearchRequest,
+        parsedQuery: FuzzyMatcher.ParsedQuery
+    ) -> SearchResult? {
+        guard
+            snapshot.store.isResultRow(at: rowID),
+            request.includeHidden || snapshot.isVisible(at: rowID),
+            let explanation = FuzzyMatcher.explain(
+                record: snapshot.view(at: rowID),
+                parsedQuery: parsedQuery
+            )
+        else {
+            return nil
+        }
+        return SearchResult(
+            record: snapshot.record(at: rowID),
+            score: explanation.score,
+            match: explanation,
+            rootPath: snapshot.rootPath(at: rowID)
+        )
+    }
+
+    private static func sortAndLimit(
+        _ results: inout [SearchResult],
+        request: SearchRequest,
+        maxResults: Int
+    ) {
+        results.sort { compare($0, $1, sort: request.sort, queryIsEmpty: false) }
+        if results.count > maxResults {
+            results.removeSubrange(maxResults..<results.count)
+        }
+    }
+
+    private static func responseByMergingRefreshResults(
+        _ response: SearchResponse,
+        results: [SearchResult],
+        totalMatches: Int,
+        additionalCandidateCount: Int,
+        additionalScanCount: Int
+    ) -> SearchResponse {
+        let profile = response.executionProfile
+        return SearchResponse(
+            results: results,
+            totalMatches: max(totalMatches, 0),
+            elapsed: response.elapsed,
+            snapshotRevision: response.snapshotRevision,
+            usesIndexedCandidates: response.usesIndexedCandidates,
+            executionProfile: SearchExecutionProfile(
+                executionPath: profile.executionPath,
+                indexesUsed: profile.indexesUsed,
+                candidateCount: profile.candidateCount + additionalCandidateCount,
+                scannedRowCount: profile.scannedRowCount + additionalScanCount,
+                didFallbackToFullScan: profile.didFallbackToFullScan,
+                wasCancelled: profile.wasCancelled,
+                wasStaleRetry: profile.wasStaleRetry,
+                elapsed: profile.elapsed
+            )
+        )
+    }
+
+    private static func mergingOverlayChanges(
+        into response: SearchResponse,
+        searchedSnapshot: SearchSnapshot,
+        currentSnapshot: SearchSnapshot,
+        request: SearchRequest,
+        parsedQuery: FuzzyMatcher.ParsedQuery,
+        maxResults: Int,
+        shouldCancel: @Sendable () -> Bool
+    ) -> SearchResponse? {
+        // The optimized fallback belongs to the overlay's base snapshot. Reconcile
+        // its fast results with changed rows so previews never present stale data.
+        guard
+            searchedSnapshot.store !== currentSnapshot.store,
+            let overlay = currentSnapshot.store as? OverlayRecordStore
+        else {
+            return response
+        }
+
+        var resultsByPath: [String: SearchResult] = [:]
+        resultsByPath.reserveCapacity(response.results.count + min(overlay.upsertRowRange.count, maxResults))
+
+        for (offset, result) in response.results.enumerated() {
+            if offset.isMultiple(of: 32), shouldCancel() {
+                return nil
+            }
+            guard
+                let rowID = currentSnapshot.store.rowID(forPath: result.record.path),
+                let currentResult = matchingSearchResult(
+                    rowID: rowID,
+                    snapshot: currentSnapshot,
+                    request: request,
+                    parsedQuery: parsedQuery
+                )
+            else {
+                continue
+            }
+            resultsByPath[currentResult.record.path] = currentResult
+        }
+
+        var removedMatchCount = 0
+        let deletedResultPaths = overlay.deletedResultPaths
+        for (offset, path) in deletedResultPaths.enumerated() {
+            if offset.isMultiple(of: 64), shouldCancel() {
+                return nil
+            }
+            guard
+                let rowID = searchedSnapshot.store.rowID(forPath: path),
+                matchingSearchResult(
+                    rowID: rowID,
+                    snapshot: searchedSnapshot,
+                    request: request,
+                    parsedQuery: parsedQuery
+                ) != nil
+            else {
+                continue
+            }
+            removedMatchCount += 1
+        }
+
+        var addedMatchCount = 0
+        for (offset, rowID) in overlay.upsertRowRange.enumerated() {
+            if offset.isMultiple(of: 64), shouldCancel() {
+                return nil
+            }
+            guard let result = matchingSearchResult(
+                rowID: rowID,
+                snapshot: currentSnapshot,
+                request: request,
+                parsedQuery: parsedQuery
+            ) else {
+                continue
+            }
+
+            addedMatchCount += 1
+            guard maxResults > 0 else { continue }
+            resultsByPath[result.record.path] = result
+        }
+
+        guard !shouldCancel() else { return nil }
+        var results = Array(resultsByPath.values)
+        sortAndLimit(&results, request: request, maxResults: maxResults)
+
+        let overlayScanCount = overlay.upsertRowRange.count + deletedResultPaths.count
+        return responseByMergingRefreshResults(
+            response,
+            results: results,
+            totalMatches: max(response.totalMatches - removedMatchCount + addedMatchCount, 0),
+            additionalCandidateCount: overlay.upsertRowRange.count,
+            additionalScanCount: overlayScanCount
+        )
+    }
+
+    private func mergingPendingExactRefreshes(
+        into response: SearchResponse,
+        pendingExactPaths: [String],
+        currentSnapshot: SearchSnapshot,
+        rootPaths: [String],
+        request: SearchRequest,
+        parsedQuery: FuzzyMatcher.ParsedQuery,
+        maxResults: Int,
+        shouldCancel: @Sendable () -> Bool
+    ) -> SearchResponse? {
+        // Exact FSEvents can wait behind a long reconciliation. Match their paths
+        // cheaply, then stat only a bounded candidate set before exposing results.
+        guard !pendingExactPaths.isEmpty, maxResults > 0 else { return response }
+
+        var candidates: [SearchResult] = []
+        let candidateLimit = min(maxResults, Self.pendingRefreshSearchResultLimit)
+        for (offset, path) in pendingExactPaths.enumerated() {
+            if offset.isMultiple(of: 64), shouldCancel() {
+                return nil
+            }
+            guard currentSnapshot.store.rowID(forPath: path) == nil else { continue }
+
+            let record = Self.pendingRefreshSearchCandidate(path: path)
+            guard let explanation = FuzzyMatcher.explain(record: record, parsedQuery: parsedQuery) else {
+                continue
+            }
+            let rootPath = rootPaths.first {
+                RootAttributionMatcher.matches(path: path, rootPath: $0)
+            }
+            candidates.append(SearchResult(
+                record: record,
+                score: explanation.score,
+                match: explanation,
+                rootPath: rootPath
+            ))
+            if candidates.count > candidateLimit * 5 {
+                Self.sortAndLimit(&candidates, request: request, maxResults: candidateLimit)
+            }
+        }
+
+        guard !candidates.isEmpty else { return response }
+        Self.sortAndLimit(&candidates, request: request, maxResults: candidateLimit)
+
+        let volumeNameCache = ScanVolumeNameCache()
+        var pendingResults: [SearchResult] = []
+        pendingResults.reserveCapacity(candidates.count)
+        for (offset, candidate) in candidates.enumerated() {
+            if offset.isMultiple(of: 16), shouldCancel() {
+                return nil
+            }
+            let url = URL(fileURLWithPath: candidate.record.path)
+            guard case let .record(materialized) = retryingFileSystemRecordLookup(
+                for: url,
+                volumeNameCache: volumeNameCache
+            ) else {
+                continue
+            }
+            let record = materialized.record
+            guard
+                request.includeHidden || !record.isHidden,
+                let explanation = FuzzyMatcher.explain(record: record, parsedQuery: parsedQuery)
+            else {
+                continue
+            }
+            pendingResults.append(SearchResult(
+                record: record,
+                score: explanation.score,
+                match: explanation,
+                rootPath: candidate.rootPath
+            ))
+        }
+
+        guard !pendingResults.isEmpty else { return response }
+        var resultsByPath = Dictionary(uniqueKeysWithValues: response.results.map { ($0.record.path, $0) })
+        var addedResultCount = 0
+        for result in pendingResults {
+            if resultsByPath.updateValue(result, forKey: result.record.path) == nil {
+                addedResultCount += 1
+            }
+        }
+        var results = Array(resultsByPath.values)
+        Self.sortAndLimit(&results, request: request, maxResults: maxResults)
+
+        return Self.responseByMergingRefreshResults(
+            response,
+            results: results,
+            totalMatches: response.totalMatches + addedResultCount,
+            additionalCandidateCount: pendingExactPaths.count,
+            additionalScanCount: pendingExactPaths.count
+        )
+    }
+
+    private static func pendingRefreshSearchCandidate(path: String) -> FileRecord {
+        let name = (path as NSString).lastPathComponent
+        return FileRecord(
+            id: FileRecord.stableID(for: path),
+            path: path,
+            name: name,
+            directoryPath: (path as NSString).deletingLastPathComponent,
+            fileExtension: (name as NSString).pathExtension.lowercased(),
+            sizeBytes: 0,
+            modifiedTime: 0,
+            createdTime: nil,
+            isDirectory: false,
+            isHidden: FileRecord.pathIsHidden(path),
+            volumeName: "",
+            normalizedName: FuzzyMatcher.normalize(name),
+            normalizedPath: FuzzyMatcher.normalize(path)
+        )
+    }
+
     public func search(
         _ request: SearchRequest,
         maxResults: Int = 2_000,
@@ -5380,16 +5646,70 @@ public final class FileIndex: @unchecked Sendable {
         recordSearchStarted(phase: metricPhase)
         var didCompleteSearch = false
 
+        let trimmedQuery = request.query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parsedQuery = FuzzyMatcher.parse(trimmedQuery)
+        let boundedMaxResults = max(maxResults, 0)
+
+        let snapshotData = lock.withLock {
+            let currentSnapshot = searchSnapshot
+            let fallbackSnapshot = optimizedSearchFallbackSnapshot
+            let shouldUseOptimizedFallback = !trimmedQuery.isEmpty
+                && request.mode == .interactivePreview
+                && !currentSnapshot.isOptimizedForSearch
+                && fallbackSnapshot?.isOptimizedForSearch == true
+                && (fallbackSnapshot?.resultCount ?? 0) > 0
+            return (
+                snapshot: shouldUseOptimizedFallback ? (fallbackSnapshot ?? currentSnapshot) : currentSnapshot,
+                currentSnapshot: currentSnapshot,
+                pendingExactPaths: pendingRefreshPaths.values.compactMap {
+                    $0.recursivelyScansDirectory ? nil : $0.path
+                },
+                rootPaths: roots,
+                revision: searchSnapshotRevision,
+                optimizedSortColumns: optimizedSortColumns,
+                canPromoteSortedOrder: !indexing && !reconciling && !updating && !isRefreshDrainScheduled && pendingRefreshPaths.isEmpty,
+                hasDeferredOptimization: deferredOptimizationReason != nil,
+                isRefreshActive: reconciling || updating || isRefreshDrainScheduled || !pendingRefreshPaths.isEmpty
+            )
+        }
+        var snapshot = snapshotData.snapshot
+        var snapshotRevision = snapshotData.revision
+
         func finish(_ response: SearchResponse) -> SearchResponse? {
             guard !shouldCancel() else { return nil }
+            guard let overlayMergedResponse = Self.mergingOverlayChanges(
+                into: response,
+                searchedSnapshot: snapshot,
+                currentSnapshot: snapshotData.currentSnapshot,
+                request: request,
+                parsedQuery: parsedQuery,
+                maxResults: boundedMaxResults,
+                shouldCancel: shouldCancel
+            ) else {
+                return nil
+            }
+            guard let mergedResponse = mergingPendingExactRefreshes(
+                into: overlayMergedResponse,
+                pendingExactPaths: snapshotData.pendingExactPaths,
+                currentSnapshot: snapshotData.currentSnapshot,
+                rootPaths: snapshotData.rootPaths,
+                request: request,
+                parsedQuery: parsedQuery,
+                maxResults: boundedMaxResults,
+                shouldCancel: shouldCancel
+            ) else {
+                return nil
+            }
+            guard !shouldCancel() else { return nil }
+
             let completedElapsed = Date().timeIntervalSince(started)
-            let profile = response.executionProfile
+            let profile = mergedResponse.executionProfile
             let completedResponse = SearchResponse(
-                results: response.results,
-                totalMatches: response.totalMatches,
+                results: mergedResponse.results,
+                totalMatches: mergedResponse.totalMatches,
                 elapsed: completedElapsed,
-                snapshotRevision: response.snapshotRevision,
-                usesIndexedCandidates: response.usesIndexedCandidates,
+                snapshotRevision: mergedResponse.snapshotRevision,
+                usesIndexedCandidates: mergedResponse.usesIndexedCandidates,
                 executionProfile: SearchExecutionProfile(
                     executionPath: profile.executionPath,
                     indexesUsed: profile.indexesUsed,
@@ -5411,30 +5731,6 @@ public final class FileIndex: @unchecked Sendable {
                 recordSearchCancelled(phase: metricPhase, elapsed: Date().timeIntervalSince(started))
             }
         }
-
-        let trimmedQuery = request.query.trimmingCharacters(in: .whitespacesAndNewlines)
-        let parsedQuery = FuzzyMatcher.parse(trimmedQuery)
-        let boundedMaxResults = max(maxResults, 0)
-
-        let snapshotData = lock.withLock {
-            let currentSnapshot = searchSnapshot
-            let fallbackSnapshot = optimizedSearchFallbackSnapshot
-            let shouldUseOptimizedFallback = !trimmedQuery.isEmpty
-                && request.mode == .interactivePreview
-                && !currentSnapshot.isOptimizedForSearch
-                && fallbackSnapshot?.isOptimizedForSearch == true
-                && (fallbackSnapshot?.resultCount ?? 0) > 0
-            return (
-                snapshot: shouldUseOptimizedFallback ? (fallbackSnapshot ?? currentSnapshot) : currentSnapshot,
-                revision: searchSnapshotRevision,
-                optimizedSortColumns: optimizedSortColumns,
-                canPromoteSortedOrder: !indexing && !reconciling && !updating && !isRefreshDrainScheduled && pendingRefreshPaths.isEmpty,
-                hasDeferredOptimization: deferredOptimizationReason != nil,
-                isRefreshActive: reconciling || updating || isRefreshDrainScheduled || !pendingRefreshPaths.isEmpty
-            )
-        }
-        var snapshot = snapshotData.snapshot
-        var snapshotRevision = snapshotData.revision
 
         guard !shouldCancel() else { return nil }
 

@@ -983,6 +983,12 @@ final class OverlayRecordStore: RecordStore {
     var storedResultCount: Int? { resultCount }
     var storedRootAttribution: RootAttributionTable? { rootAttribution }
     var schemaVersion: Int { base.schemaVersion }
+    var upsertRowRange: Range<Int> { visibleBaseCount..<count }
+    var deletedResultPaths: [String] {
+        deletedRowsSorted.compactMap { rowID in
+            base.isResultRow(at: rowID) ? base.path(at: rowID) : nil
+        }
+    }
 
     init(base requestedBase: RecordStore, upserts incomingUpserts: [FileRecord], deletedRows incomingDeletedRows: Set<Int>) {
         let replacingStore = requestedBase as? ReplacingRecordStore
