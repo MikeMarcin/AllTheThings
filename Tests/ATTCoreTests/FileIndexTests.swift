@@ -953,10 +953,21 @@ struct FileIndexTests {
                 && index.currentInsightsSnapshot().usage.maintenance
                     .counters(for: .backgroundSlice).yieldedSlices > slicesBefore
         }
-        #expect(index.search(SearchRequest(
+        index.update(
+            exactPaths: [createdFile.path],
+            recursivePaths: [],
+            priority: .background
+        )
+        try await waitUntil(timeout: .seconds(5)) {
+            index.pendingRefreshPathsForTesting().contains(createdFile.path)
+        }
+        let pendingResponse = index.search(SearchRequest(
             query: "CreatedWhileAway",
-            sort: SortSpec(column: .relevance, ascending: false)
-        ), maxResults: 10).totalMatches == 0)
+            sort: SortSpec(column: .relevance, ascending: false),
+            mode: .interactivePreview
+        ), maxResults: 10)
+        #expect(pendingResponse.totalMatches == 1)
+        #expect(pendingResponse.results.map(\.record.path) == [createdFile.path])
 
         index.setBackgroundMaintenanceEnabled(false)
         try await waitUntil(timeout: .seconds(10)) {
@@ -4078,6 +4089,8 @@ struct FileIndexTests {
         }
         let lateNeedle = root.appendingPathComponent("Stable/zzzz-AitoNeedle.swift").path
         records.append(makeRecord(path: lateNeedle, modifiedTime: 40_000))
+        let removedNeedle = changedFolder.appendingPathComponent("RemovedNeedle.swift").path
+        records.append(makeRecord(path: removedNeedle, modifiedTime: 40_001))
 
         index.replaceRecordsForTesting(records, roots: [root])
         let optimizedResponse = index.search(SearchRequest(
@@ -4113,6 +4126,24 @@ struct FileIndexTests {
             #expect(response.totalMatches == 1, "\(profileSummary)")
             #expect(response.results.map { $0.record.path } == [lateNeedle], "\(profileSummary)")
         }
+
+        let addedResponse = index.search(SearchRequest(
+            query: "Changed.swift",
+            sort: SortSpec(column: .relevance, ascending: false),
+            mode: .interactivePreview
+        ), maxResults: 10)
+        #expect(addedResponse.usesIndexedCandidates)
+        #expect(addedResponse.totalMatches == 1)
+        #expect(addedResponse.results.map(\.record.path) == [changedFile.path])
+
+        let removedResponse = index.search(SearchRequest(
+            query: "RemovedNeedle",
+            sort: SortSpec(column: .relevance, ascending: false),
+            mode: .interactivePreview
+        ), maxResults: 10)
+        #expect(removedResponse.usesIndexedCandidates)
+        #expect(removedResponse.totalMatches == 0)
+        #expect(removedResponse.results.isEmpty)
     }
 
     @Test("broad preview searches are bounded for every sort column")
