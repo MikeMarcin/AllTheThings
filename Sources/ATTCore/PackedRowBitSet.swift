@@ -45,6 +45,20 @@ struct PackedRowBitSet: Sendable {
         return words[wordIndex] & mask != 0
     }
 
+    func forEachSetIndex(_ body: (Int) -> Void) {
+        for (wordIndex, word) in words.enumerated() where word != 0 {
+            var remaining = word
+            while remaining != 0 {
+                let offset = remaining.trailingZeroBitCount
+                let index = (wordIndex << 6) + offset
+                if index < bitCount {
+                    body(index)
+                }
+                remaining &= remaining - 1
+            }
+        }
+    }
+
     /// Visits unset indices in ascending order. Returns `false` when the visitor stops the pass.
     ///
     /// Interior 256-bit spans are inverted and checked four words at a time. Sparse unset words

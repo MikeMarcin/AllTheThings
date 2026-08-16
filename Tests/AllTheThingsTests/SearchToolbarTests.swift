@@ -170,6 +170,16 @@ struct SearchToolbarTests {
 
     @Test("search timing presentation stays available independent of query text")
     func searchTimingPresentationStaysAvailableIndependentOfQueryText() {
+        #expect(SearchWindowPresentation.shownResultsText(
+            resultCount: 3,
+            totalMatches: 3,
+            completeness: .partial
+        ) == "3 shown • refining")
+        #expect(SearchWindowPresentation.shownResultsText(
+            resultCount: 3,
+            totalMatches: 8,
+            completeness: .complete
+        ) == "3 shown / 8 matches")
         #expect(SearchWindowPresentation.shouldShowSearchElapsedText(
             displayedSearchSignatureIsSet: true,
             queryElapsed: 0.042,
@@ -272,6 +282,19 @@ struct SearchToolbarTests {
         ))
         #expect(SearchRunReconciliation.previewApplicationCompletesSearch(fullSearchAlreadyFinished: true))
         #expect(!SearchRunReconciliation.previewApplicationCompletesSearch(fullSearchAlreadyFinished: false))
+    }
+
+    @Test("deferred exact retry stops timing after its preview finishes")
+    func deferredExactRetryStopsTimingAfterPreviewFinishes() {
+        #expect(SearchRunReconciliation.fullCancellationKeepsSearchActive(
+            hasPendingPreview: true,
+            tokenCancelled: false
+        ))
+        #expect(SearchRunReconciliation.previewApplicationCompletesSearch(fullSearchAlreadyFinished: true))
+        #expect(!SearchRunReconciliation.searchTimingIsActive(
+            hasActiveSearch: false,
+            isRefiningSearchResults: false
+        ))
     }
 
     @Test("search preview scheduling allows sortable columns")

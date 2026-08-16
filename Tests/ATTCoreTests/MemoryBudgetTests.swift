@@ -1301,6 +1301,98 @@ struct MemoryBudgetTests {
         }
     }
 
+    @Test("opt-in composite structural-delta search benchmark")
+    func optInCompositeStructuralDeltaSearchBenchmark() {
+        guard
+            let rawCount = ProcessInfo.processInfo.environment["ATT_COMPOSITE_SEARCH_BENCH_RECORDS"],
+            let recordCount = Int(rawCount),
+            recordCount > 0
+        else {
+            return
+        }
+
+        let deltaCount = max(
+            Int(ProcessInfo.processInfo.environment["ATT_COMPOSITE_SEARCH_BENCH_DELTA"] ?? "50000") ?? 50_000,
+            1
+        )
+        let index = FileIndex(
+            applicationName: "AllTheThingsCompositeSearchBench-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        defer { try? FileManager.default.removeItem(at: index.dataDirectoryURL) }
+
+        var records = makeSyntheticRecords(count: recordCount)
+        let selectiveBasePath = "/tmp/allthethings-memory/selective/FVS-0048-base.swift"
+        records[records.count - 1] = makeRecord(path: selectiveBasePath)
+        index.replaceRecordsForTesting(records)
+        let replacementCount = min(deltaCount / 2, records.count)
+        var upserts = records.prefix(replacementCount).map { record in
+            FileRecord(
+                id: record.id,
+                path: record.path,
+                name: record.name,
+                directoryPath: record.directoryPath,
+                fileExtension: record.fileExtension,
+                sizeBytes: record.sizeBytes + 1,
+                modifiedTime: record.modifiedTime + 1,
+                createdTime: record.createdTime,
+                isDirectory: record.isDirectory,
+                isHidden: record.isHidden,
+                volumeName: record.volumeName,
+                normalizedName: record.normalizedName,
+                normalizedPath: record.normalizedPath
+            )
+        }
+        upserts.append(contentsOf: (replacementCount..<deltaCount).map { offset in
+            let path = offset == replacementCount
+                ? "/tmp/allthethings-memory/added/FVS-0048-delta.swift"
+                : "/tmp/allthethings-memory/added/Added\(offset).swift"
+            return makeRecord(path: path)
+        })
+        index.applyStructuralOverlayForTesting(upserts: upserts, tombstonedPaths: [])
+
+        let query = "FVS-0048"
+        let previewRequest = SearchRequest(
+            query: query,
+            sort: SortSpec(column: .name, ascending: true),
+            mode: .interactivePreview
+        )
+        let exactRequest = SearchRequest(
+            query: query,
+            sort: SortSpec(column: .name, ascending: true)
+        )
+        for _ in 0..<5 {
+            _ = index.search(previewRequest, maxResults: 20)
+            _ = index.search(exactRequest, maxResults: 20)
+        }
+
+        var previewSamples: [TimeInterval] = []
+        var exactSamples: [TimeInterval] = []
+        for _ in 0..<20 {
+            previewSamples.append(index.search(previewRequest, maxResults: 20).elapsed)
+            exactSamples.append(index.search(exactRequest, maxResults: 20).elapsed)
+        }
+        previewSamples.sort()
+        exactSamples.sort()
+        let percentileIndex = Int(Double(previewSamples.count - 1) * 0.95)
+        let previewP95 = previewSamples[percentileIndex]
+        let exactP95 = exactSamples[percentileIndex]
+        let previewProfile = index.search(previewRequest, maxResults: 20).executionProfile
+        let exactProfile = index.search(exactRequest, maxResults: 20).executionProfile
+        let previewLimit = (Double(ProcessInfo.processInfo.environment["ATT_COMPOSITE_PREVIEW_MAX_MS"] ?? "50") ?? 50) / 1_000
+        let exactLimit = (Double(ProcessInfo.processInfo.environment["ATT_COMPOSITE_EXACT_MAX_MS"] ?? "250") ?? 250) / 1_000
+
+        print(
+            "ATT_COMPOSITE_SEARCH_BENCH_RECORDS=\(recordCount) delta=\(deltaCount) "
+                + "preview_p95_ms=\(Int(previewP95 * 1_000)) exact_p95_ms=\(Int(exactP95 * 1_000)) "
+                + "preview_candidates=\(previewProfile.candidateCount) preview_scanned=\(previewProfile.scannedRowCount) "
+                + "exact_candidates=\(exactProfile.candidateCount) exact_scanned=\(exactProfile.scannedRowCount) "
+                + "exact_fallback=\(exactProfile.didFallbackToFullScan)"
+        )
+        #expect(previewP95 < previewLimit)
+        #expect(exactP95 < exactLimit)
+    }
+
     private func makeSyntheticRecords(count: Int, directoryPadding: String = "") -> [FileRecord] {
         var records: [FileRecord] = []
         records.reserveCapacity(count)
