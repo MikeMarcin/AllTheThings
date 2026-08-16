@@ -636,6 +636,7 @@ struct ScanCheckpointSchedule: Sendable {
 
 public final class FileIndex: @unchecked Sendable {
     private static let maximumRefreshBatchPaths = 512
+    private static let maximumPendingRefreshPaths = 4_096
     private static let primaryPublishRecordInterval = 25_000
     private static let primaryPublishTimeInterval: TimeInterval = 1
     private static let scanStatusPublishRecordInterval = 1_000
@@ -2184,17 +2185,23 @@ public final class FileIndex: @unchecked Sendable {
                 self.visibleCount = extensionData.visibleCount
                 let sortedByModified = Self.makeModifiedDescending(store: store)
                 self.modifiedDescending = sortedByModified
-                let sortedByModifiedAscending = Array(sortedByModified.reversed())
+                let sortedByModifiedAscending = Self.makeModifiedAscending(
+                    from: sortedByModified,
+                    store: store
+                )
                 self.modifiedAscending = sortedByModifiedAscending
                 let sortedByName = Self.makeNameAscending(store: store)
                 self.nameAscending = sortedByName
-                self.nameDescending = Array(sortedByName.reversed())
+                self.nameDescending = Self.makeNameDescending(from: sortedByName, store: store)
                 let visibleSortedByModified = Self.makeVisibleModifiedDescending(
                     modifiedDescending: sortedByModified,
                     store: store
                 )
                 self.visibleModifiedDescending = visibleSortedByModified
-                self.visibleModifiedAscending = Array(visibleSortedByModified.reversed())
+                self.visibleModifiedAscending = Self.makeModifiedAscending(
+                    from: visibleSortedByModified,
+                    store: store
+                )
                 self.sortOrdersAscending = Self.makeAdditionalSortOrdersAscending(
                     store: store,
                     optimizedSortColumns: optimizedSortColumns,
@@ -2269,17 +2276,23 @@ public final class FileIndex: @unchecked Sendable {
                 self.visibleCount = extensionData.visibleCount
                 let sortedByModified = Self.makeModifiedDescending(store: store)
                 self.modifiedDescending = sortedByModified
-                let sortedByModifiedAscending = Array(sortedByModified.reversed())
+                let sortedByModifiedAscending = Self.makeModifiedAscending(
+                    from: sortedByModified,
+                    store: store
+                )
                 self.modifiedAscending = sortedByModifiedAscending
                 let sortedByName = Self.makeNameAscending(store: store)
                 self.nameAscending = sortedByName
-                self.nameDescending = Array(sortedByName.reversed())
+                self.nameDescending = Self.makeNameDescending(from: sortedByName, store: store)
                 let visibleSortedByModified = Self.makeVisibleModifiedDescending(
                     modifiedDescending: sortedByModified,
                     store: store
                 )
                 self.visibleModifiedDescending = visibleSortedByModified
-                self.visibleModifiedAscending = Array(visibleSortedByModified.reversed())
+                self.visibleModifiedAscending = Self.makeModifiedAscending(
+                    from: visibleSortedByModified,
+                    store: store
+                )
                 self.sortOrdersAscending = Self.makeAdditionalSortOrdersAscending(
                     store: store,
                     optimizedSortColumns: optimizedSortColumns,
@@ -2351,12 +2364,15 @@ public final class FileIndex: @unchecked Sendable {
             let expectedModifiedCount = store.storedResultCount ?? store.count
             if let modifiedDescending = persistedStructures.modifiedDescending, modifiedDescending.count == expectedModifiedCount {
                 self.modifiedDescending = modifiedDescending
-                let modifiedAscending = Array(modifiedDescending.reversed())
+                let modifiedAscending = Self.makeModifiedAscending(from: modifiedDescending, store: store)
                 self.modifiedAscending = modifiedAscending
                 let visibleModifiedDescending = persistedStructures.visibleModifiedDescending
                     ?? Self.makeVisibleModifiedDescending(modifiedDescending: modifiedDescending, store: store)
                 self.visibleModifiedDescending = visibleModifiedDescending
-                self.visibleModifiedAscending = Array(visibleModifiedDescending.reversed())
+                self.visibleModifiedAscending = Self.makeModifiedAscending(
+                    from: visibleModifiedDescending,
+                    store: store
+                )
                 if nameGramIndex != nil, componentGramIndex != nil {
                     let persistedNameOrder = optimizedSortColumns.contains(.name)
                         ? persistedStructures.sortOrdersAscending[.name]
@@ -2368,7 +2384,7 @@ public final class FileIndex: @unchecked Sendable {
                         sortedByName = Self.makeNameAscending(store: store)
                     }
                     self.nameAscending = sortedByName
-                    self.nameDescending = Array(sortedByName.reversed())
+                    self.nameDescending = Self.makeNameDescending(from: sortedByName, store: store)
                     self.sortOrdersAscending = Self.makeAdditionalSortOrdersAscending(
                         store: store,
                         optimizedSortColumns: optimizedSortColumns,
@@ -2427,29 +2443,28 @@ public final class FileIndex: @unchecked Sendable {
             self.store = store
             self.prefersDegradedSearch = prefersDegradedSearch
             self.modifiedDescending = modifiedDescending
-            self.modifiedAscending = Array(modifiedDescending.reversed())
+            self.modifiedAscending = Self.makeModifiedAscending(from: modifiedDescending, store: store)
             let expectedNameOrderCount = store.storedResultCount ?? store.count
             if !hasSortedOrder {
                 self.nameAscending = []
                 self.nameDescending = []
             } else if let nameAscending, nameAscending.count == expectedNameOrderCount {
                 self.nameAscending = nameAscending
-                if let nameDescending, nameDescending.count == expectedNameOrderCount {
-                    self.nameDescending = nameDescending
-                } else {
-                    self.nameDescending = Array(nameAscending.reversed())
-                }
+                self.nameDescending = Self.makeNameDescending(from: nameAscending, store: store)
             } else {
                 let sortedByName = Self.makeNameAscending(store: store)
                 self.nameAscending = sortedByName
-                self.nameDescending = Array(sortedByName.reversed())
+                self.nameDescending = Self.makeNameDescending(from: sortedByName, store: store)
             }
             let visibleModifiedDescending = Self.makeVisibleModifiedDescending(
                 modifiedDescending: modifiedDescending,
                 store: store
             )
             self.visibleModifiedDescending = visibleModifiedDescending
-            self.visibleModifiedAscending = Array(visibleModifiedDescending.reversed())
+            self.visibleModifiedAscending = Self.makeModifiedAscending(
+                from: visibleModifiedDescending,
+                store: store
+            )
             self.sortOrdersAscending = hasSortedOrder ? sortOrdersAscending : [:]
             self.visibleSortOrdersAscending = [:]
             self.gramIndex = gramIndex
@@ -2906,7 +2921,13 @@ public final class FileIndex: @unchecked Sendable {
                 guard optimizedSortColumns.contains(sort.column) else { return nil }
                 guard let ascendingOrder = additionalSortOrderAscending(for: sort.column) else { return nil }
                 if includeHidden {
-                    return sort.ascending ? ascendingOrder : Array(ascendingOrder.reversed())
+                    return sort.ascending
+                        ? ascendingOrder
+                        : Self.makeAdditionalSortOrderDescending(
+                            from: ascendingOrder,
+                            store: store,
+                            column: sort.column
+                        )
                 }
                 return visibleOrder(for: sort.column, ascendingOrder: ascendingOrder, ascending: sort.ascending)
             case .relevance:
@@ -3068,14 +3089,26 @@ public final class FileIndex: @unchecked Sendable {
         private func visibleOrder(for column: SortColumn, ascendingOrder: [Int], ascending: Bool) -> [Int] {
             let visibleAscending = sortOrderLock.withLock { visibleSortOrdersAscending[column] }
             if let visibleAscending {
-                return ascending ? visibleAscending : Array(visibleAscending.reversed())
+                return ascending
+                    ? visibleAscending
+                    : Self.makeAdditionalSortOrderDescending(
+                        from: visibleAscending,
+                        store: store,
+                        column: column
+                    )
             }
 
             let computed = ascendingOrder.filter { store.isVisible(at: $0) }
             sortOrderLock.withLock {
                 visibleSortOrdersAscending[column] = computed
             }
-            return ascending ? computed : Array(computed.reversed())
+            return ascending
+                ? computed
+                : Self.makeAdditionalSortOrderDescending(
+                    from: computed,
+                    store: store,
+                    column: column
+                )
         }
 
         func candidatePathIndices(containing tokenBytes: [UInt8]) -> [Int32]? {
@@ -3459,7 +3492,7 @@ public final class FileIndex: @unchecked Sendable {
 
             let directMatches = Set(directRows.map(Int.init))
             var memo = Array(repeating: Int8(-1), count: count)
-            var pathContainsCache: [Int: Bool] = [:]
+            var pathContainsCache: [String: [Int: Bool]] = [:]
 
             func pathMatches(at rowID: Int) -> Bool {
                 if directMatches.contains(rowID) {
@@ -3477,7 +3510,11 @@ public final class FileIndex: @unchecked Sendable {
                 }
 
                 guard let parent = store.parentRowID(at: rowID) else {
-                    let matches = store.normalizedPath(at: rowID, contains: token, cache: &pathContainsCache)
+                    let matches = store.normalizedPath(
+                        at: rowID,
+                        contains: token,
+                        cache: &pathContainsCache[token, default: [:]]
+                    )
                     memo[rowID] = matches ? 1 : 0
                     return matches
                 }
@@ -3682,9 +3719,15 @@ public final class FileIndex: @unchecked Sendable {
                     return nil
                 }
 
-                return RowIntervalSet.build(candidates.map { candidate in
+                return RowIntervalSet.build(candidates.compactMap { candidate in
                     let rowID = Int(candidate)
-                    return RowInterval(start: rowID, end: rowID + 1)
+                    let directoryMatches = shortFuzzy
+                        ? FileIndex.shortFuzzyPathComponentMatches(
+                            store.normalizedDirectoryPath(at: rowID),
+                            tokenBytes: tokenBytes
+                        )
+                        : store.normalizedDirectoryPath(at: rowID).contains(token)
+                    return directoryMatches ? RowInterval(start: rowID, end: rowID + 1) : nil
                 })
             }
 
@@ -3693,7 +3736,9 @@ public final class FileIndex: @unchecked Sendable {
             for candidate in directRows {
                 let rowID = Int(candidate)
                 let end = max(rowID + 1, min(store.subtreeEnd(at: rowID), count))
-                intervals.append(RowInterval(start: rowID, end: end))
+                if rowID + 1 < end {
+                    intervals.append(RowInterval(start: rowID + 1, end: end))
+                }
             }
 
             return RowIntervalSet.build(intervals)
@@ -3849,6 +3894,7 @@ public final class FileIndex: @unchecked Sendable {
                 let row: Int
                 let modifiedTime: TimeInterval
                 let normalizedName: String
+                let path: String
             }
 
             var keys: [SortKey] = []
@@ -3857,7 +3903,8 @@ public final class FileIndex: @unchecked Sendable {
                 keys.append(SortKey(
                     row: row,
                     modifiedTime: store.modifiedTime(at: row),
-                    normalizedName: store.normalizedName(at: row)
+                    normalizedName: store.normalizedName(at: row),
+                    path: store.path(at: row)
                 ))
             }
 
@@ -3868,30 +3915,103 @@ public final class FileIndex: @unchecked Sendable {
                 if $0.normalizedName != $1.normalizedName {
                     return $0.normalizedName < $1.normalizedName
                 }
-                return $0.row < $1.row
+                return $0.path < $1.path
             }
             return keys.map(\.row)
+        }
+
+        private static func makeModifiedAscending(from descending: [Int], store: RecordStore) -> [Int] {
+            reversingPrimaryGroups(in: descending) {
+                store.modifiedTime(at: $0) == store.modifiedTime(at: $1)
+            }
         }
 
         private static func makeNameAscending(store: RecordStore) -> [Int] {
             struct SortKey {
                 let row: Int
                 let normalizedName: String
+                let path: String
             }
 
             var keys: [SortKey] = []
             keys.reserveCapacity(store.count)
             for row in 0..<store.count where store.isResultRow(at: row) {
-                keys.append(SortKey(row: row, normalizedName: store.normalizedName(at: row)))
+                keys.append(SortKey(
+                    row: row,
+                    normalizedName: store.normalizedName(at: row),
+                    path: store.path(at: row)
+                ))
             }
 
             keys.sort {
                 if $0.normalizedName != $1.normalizedName {
                     return $0.normalizedName < $1.normalizedName
                 }
-                return $0.row < $1.row
+                return $0.path < $1.path
             }
             return keys.map(\.row)
+        }
+
+        private static func makeNameDescending(from ascending: [Int], store: RecordStore) -> [Int] {
+            reversingPrimaryGroups(in: ascending) {
+                store.normalizedName(at: $0) == store.normalizedName(at: $1)
+            }
+        }
+
+        private static func makeAdditionalSortOrderDescending(
+            from ascending: [Int],
+            store: RecordStore,
+            column: SortColumn
+        ) -> [Int] {
+            reversingPrimaryGroups(in: ascending) { lhs, rhs in
+                switch column {
+                case .name:
+                    return store.normalizedName(at: lhs) == store.normalizedName(at: rhs)
+                case .path:
+                    return store.normalizedPath(at: lhs) == store.normalizedPath(at: rhs)
+                case .modified:
+                    return store.modifiedTime(at: lhs) == store.modifiedTime(at: rhs)
+                case .created:
+                    return (store.createdTime(at: lhs) ?? 0) == (store.createdTime(at: rhs) ?? 0)
+                case .size:
+                    return store.sizeBytes(at: lhs) == store.sizeBytes(at: rhs)
+                case .fileExtension:
+                    return store.fileExtension(at: lhs) == store.fileExtension(at: rhs)
+                case .kind:
+                    return kindName(
+                        isDirectory: store.isDirectory(at: lhs),
+                        fileExtension: store.fileExtension(at: lhs)
+                    ) == kindName(
+                        isDirectory: store.isDirectory(at: rhs),
+                        fileExtension: store.fileExtension(at: rhs)
+                    )
+                case .volume:
+                    return store.volumeName(at: lhs) == store.volumeName(at: rhs)
+                case .root:
+                    return store.rootPath(at: lhs) == store.rootPath(at: rhs)
+                case .relevance:
+                    return false
+                }
+            }
+        }
+
+        private static func reversingPrimaryGroups(
+            in order: [Int],
+            primaryValuesEqual: (Int, Int) -> Bool
+        ) -> [Int] {
+            var reversedGroups: [Int] = []
+            reversedGroups.reserveCapacity(order.count)
+            var groupEnd = order.count
+            while groupEnd > 0 {
+                var groupStart = groupEnd - 1
+                while groupStart > 0,
+                      primaryValuesEqual(order[groupStart - 1], order[groupEnd - 1]) {
+                    groupStart -= 1
+                }
+                reversedGroups.append(contentsOf: order[groupStart..<groupEnd])
+                groupEnd = groupStart
+            }
+            return reversedGroups
         }
 
         private static func makeAdditionalSortOrdersAscending(
@@ -4058,7 +4178,7 @@ public final class FileIndex: @unchecked Sendable {
             case .name:
                 return makeNameAscending(store: store)
             case .modified:
-                return Array(makeModifiedDescending(store: store).reversed())
+                return makeModifiedAscending(from: makeModifiedDescending(store: store), store: store)
             case .relevance:
                 return []
             }
@@ -4386,10 +4506,11 @@ public final class FileIndex: @unchecked Sendable {
     private let checkpointURL: URL
     private let metricsURL: URL
     private let structuralDeltaStore: StructuralDeltaStore
-    private let indexQueue = DispatchQueue(label: "att.index.work", qos: .utility)
+    private let indexQueue = DispatchQueue(label: "att.index.work", qos: .userInitiated)
     private let checkpointQueue = DispatchQueue(label: "att.index.checkpoint", qos: .utility)
     private let metricsSaveQueue = DispatchQueue(label: "att.index.metrics", qos: .utility)
     private let checkpointPersistenceLock = NSLock()
+    private let snapshotPackageLock = NSLock()
     private let storageInsightsLock = NSLock()
     private var largeOverlayPersistRecordLimitOverride: Int?
     private var largeOverlayPersistDelayOverride: TimeInterval?
@@ -5474,9 +5595,12 @@ public final class FileIndex: @unchecked Sendable {
         for records: [FileRecord],
         segmentIndex: Int
     ) -> [String: DeltaRowOwner] {
-        Dictionary(uniqueKeysWithValues: records.enumerated().map {
-            ($0.element.path, DeltaRowOwner(segmentIndex: segmentIndex, rowID: $0.offset))
-        })
+        var owners: [String: DeltaRowOwner] = [:]
+        owners.reserveCapacity(records.count)
+        for (rowID, record) in records.enumerated() {
+            owners[record.path] = DeltaRowOwner(segmentIndex: segmentIndex, rowID: rowID)
+        }
+        return owners
     }
 
     private static func sharesRowIdentity(_ snapshot: SearchSnapshot, with store: RecordStore) -> Bool {
@@ -5697,6 +5821,43 @@ public final class FileIndex: @unchecked Sendable {
         // cheaply, then stat only a bounded candidate set before exposing results.
         guard !pendingExactPaths.isEmpty, maxResults > 0 else { return response }
 
+        let pendingPathSet = Set(pendingExactPaths)
+        let volumeNameCache = ScanVolumeNameCache()
+        var refreshedResults: [SearchResult] = []
+        refreshedResults.reserveCapacity(response.results.count)
+        var removedResultCount = 0
+        var refreshedResultCount = 0
+        for result in response.results {
+            guard pendingPathSet.contains(result.record.path) else {
+                refreshedResults.append(result)
+                continue
+            }
+            if refreshedResultCount.isMultiple(of: 16), shouldCancel() { return nil }
+            refreshedResultCount += 1
+            switch retryingFileSystemRecordLookup(
+                for: result.record.url,
+                volumeNameCache: volumeNameCache
+            ) {
+            case .missing:
+                removedResultCount += 1
+            case .retry:
+                refreshedResults.append(result)
+            case .record(let materialized):
+                let record = materialized.record
+                guard request.includeHidden || !record.isHidden,
+                      let explanation = FuzzyMatcher.explain(record: record, parsedQuery: parsedQuery) else {
+                    removedResultCount += 1
+                    continue
+                }
+                refreshedResults.append(SearchResult(
+                    record: record,
+                    score: explanation.score,
+                    match: explanation,
+                    rootPath: result.rootPath
+                ))
+            }
+        }
+
         var candidates: [SearchResult] = []
         let candidateLimit = min(maxResults, Self.pendingRefreshSearchResultLimit)
         for (offset, path) in pendingExactPaths.enumerated() {
@@ -5723,10 +5884,19 @@ public final class FileIndex: @unchecked Sendable {
             }
         }
 
-        guard !candidates.isEmpty else { return response }
+        guard !candidates.isEmpty else {
+            guard removedResultCount > 0 || refreshedResultCount > 0 else { return response }
+            Self.sortAndLimit(&refreshedResults, request: request, maxResults: maxResults)
+            return Self.responseByMergingRefreshResults(
+                response,
+                results: refreshedResults,
+                totalMatches: response.totalMatches - removedResultCount,
+                additionalCandidateCount: refreshedResultCount,
+                additionalScanCount: refreshedResultCount
+            )
+        }
         Self.sortAndLimit(&candidates, request: request, maxResults: candidateLimit)
 
-        let volumeNameCache = ScanVolumeNameCache()
         var pendingResults: [SearchResult] = []
         pendingResults.reserveCapacity(candidates.count)
         for (offset, candidate) in candidates.enumerated() {
@@ -5755,8 +5925,20 @@ public final class FileIndex: @unchecked Sendable {
             ))
         }
 
-        guard !pendingResults.isEmpty else { return response }
-        var resultsByPath = Dictionary(uniqueKeysWithValues: response.results.map { ($0.record.path, $0) })
+        guard !pendingResults.isEmpty else {
+            Self.sortAndLimit(&refreshedResults, request: request, maxResults: maxResults)
+            return Self.responseByMergingRefreshResults(
+                response,
+                results: refreshedResults,
+                totalMatches: response.totalMatches - removedResultCount,
+                additionalCandidateCount: pendingExactPaths.count,
+                additionalScanCount: pendingExactPaths.count
+            )
+        }
+        var resultsByPath: [String: SearchResult] = [:]
+        for result in refreshedResults {
+            resultsByPath[result.record.path] = result
+        }
         var addedResultCount = 0
         for result in pendingResults {
             if resultsByPath.updateValue(result, forKey: result.record.path) == nil {
@@ -5769,7 +5951,7 @@ public final class FileIndex: @unchecked Sendable {
         return Self.responseByMergingRefreshResults(
             response,
             results: results,
-            totalMatches: response.totalMatches + addedResultCount,
+            totalMatches: response.totalMatches - removedResultCount + addedResultCount,
             additionalCandidateCount: pendingExactPaths.count,
             additionalScanCount: pendingExactPaths.count
         )
@@ -5829,7 +6011,7 @@ public final class FileIndex: @unchecked Sendable {
         let executionPath: SearchExecutionPath
         switch request.mode {
         case .interactivePreview:
-            segments = [state.base]
+            segments = [state.base] + state.deltaSegments
             completeness = .partial
             executionPath = .indexedBasePreview
         case .complete:
@@ -5847,15 +6029,42 @@ public final class FileIndex: @unchecked Sendable {
         for (index, segment) in segments.enumerated() {
             guard !shouldCancel(), isCurrentCompositeGeneration() else { return nil }
             let segmentStarted = Date()
-            guard let response = searchSingleSnapshot(
-                request,
-                maxResults: boundedMaxResults,
-                snapshotOverride: segment.snapshot,
-                snapshotRevisionOverride: snapshotRevision,
-                recordsMetrics: false,
-                shouldCancel: shouldCancel
-            ) else {
-                return nil
+            let emptyPreviewIndexes = request.mode == .interactivePreview && index > 0
+                ? Self.emptyCompositePreviewIndexes(
+                    snapshot: segment.snapshot,
+                    parsedQuery: parsedQuery,
+                    shouldCancel: shouldCancel
+                )
+                : nil
+            let response: SearchResponse
+            if let emptyPreviewIndexes {
+                let elapsed = Date().timeIntervalSince(segmentStarted)
+                response = SearchResponse(
+                    results: [],
+                    totalMatches: 0,
+                    elapsed: elapsed,
+                    snapshotRevision: snapshotRevision,
+                    usesIndexedCandidates: true,
+                    executionProfile: SearchExecutionProfile(
+                        executionPath: .indexedCandidateIntersection,
+                        indexesUsed: emptyPreviewIndexes,
+                        candidateCount: 0,
+                        scannedRowCount: 0,
+                        elapsed: elapsed
+                    )
+                )
+            } else {
+                guard let searched = searchSingleSnapshot(
+                    request,
+                    maxResults: boundedMaxResults,
+                    snapshotOverride: segment.snapshot,
+                    snapshotRevisionOverride: snapshotRevision,
+                    recordsMetrics: false,
+                    shouldCancel: shouldCancel
+                ) else {
+                    return nil
+                }
+                response = searched
             }
             let latency = Date().timeIntervalSince(segmentStarted)
             segmentLatencies.append(latency)
@@ -5948,21 +6157,19 @@ public final class FileIndex: @unchecked Sendable {
             )
         )
 
-        if request.mode == .complete {
-            guard let refreshed = mergingPendingExactRefreshes(
-                into: response,
-                pendingExactPaths: pendingExactPaths,
-                currentSnapshot: state.logicalSnapshot,
-                rootPaths: rootPaths,
-                request: request,
-                parsedQuery: parsedQuery,
-                maxResults: boundedMaxResults,
-                shouldCancel: shouldCancel
-            ) else {
-                return nil
-            }
-            response = refreshed
+        guard let refreshed = mergingPendingExactRefreshes(
+            into: response,
+            pendingExactPaths: pendingExactPaths,
+            currentSnapshot: state.logicalSnapshot,
+            rootPaths: rootPaths,
+            request: request,
+            parsedQuery: parsedQuery,
+            maxResults: boundedMaxResults,
+            shouldCancel: shouldCancel
+        ) else {
+            return nil
         }
+        response = refreshed
 
         guard !shouldCancel(), isCurrentCompositeGeneration() else { return nil }
         let elapsed = Date().timeIntervalSince(started)
@@ -5985,7 +6192,7 @@ public final class FileIndex: @unchecked Sendable {
         )
         var diagnosticFields: [String: DiagnosticLogFieldValue] = [
             "segmentCount": .publicInt(segments.count),
-            "deltaSegmentCount": .publicInt(request.mode == .complete ? state.deltaSegments.count : 0),
+            "deltaSegmentCount": .publicInt(max(segments.count - 1, 0)),
             "maskedRowCount": .publicInt(state.maskedRowCount),
             "baseLatencySeconds": .publicDouble(baseLatency),
             "deltaLatencySeconds": .publicDouble(deltaLatency),
@@ -6110,9 +6317,17 @@ public final class FileIndex: @unchecked Sendable {
 
             let completedElapsed = Date().timeIntervalSince(started)
             let profile = mergedResponse.executionProfile
+            var completedResults = mergedResponse.results
+            if request.mode == .interactivePreview {
+                completedResults.sort {
+                    Self.compare($0, $1, sort: request.sort, queryIsEmpty: parsedQuery.isEmpty)
+                }
+            }
             let completedResponse = SearchResponse(
-                results: mergedResponse.results,
-                totalMatches: mergedResponse.totalMatches,
+                results: completedResults,
+                totalMatches: request.mode == .interactivePreview
+                    ? completedResults.count
+                    : mergedResponse.totalMatches,
                 elapsed: completedElapsed,
                 snapshotRevision: mergedResponse.snapshotRevision,
                 usesIndexedCandidates: mergedResponse.usesIndexedCandidates,
@@ -6454,18 +6669,6 @@ public final class FileIndex: @unchecked Sendable {
                 return finish(fastResponse)
             }
 
-            if let fastResponse = Self.fastExactExtensionSearch(
-                snapshot: snapshot,
-                request: request,
-                parsedQuery: parsedQuery,
-                maxResults: boundedMaxResults,
-                started: started,
-                snapshotRevision: snapshotRevision,
-                shouldCancel: shouldCancel
-            ) {
-                return finish(fastResponse)
-            }
-
             if let sortedNamePreviewResponse = Self.optimizedSortedNamePreviewSearch(
                 snapshot: snapshot,
                 request: request,
@@ -6492,7 +6695,8 @@ public final class FileIndex: @unchecked Sendable {
                 return finish(sortedPreviewResponse)
             }
 
-            if Self.shouldUseBoundedPreviewCandidateSearch(request: request),
+            if request.mode == .interactivePreview,
+               Self.usesAdditionalSortOrder(request.sort.column),
                let cheapIndexedResponse = Self.cheapIndexedCandidateSearch(
                 snapshot: snapshot,
                 request: request,
@@ -6619,16 +6823,6 @@ public final class FileIndex: @unchecked Sendable {
         ))
     }
 
-    private static func shouldUseBoundedPreviewCandidateSearch(request: SearchRequest) -> Bool {
-        guard request.mode == .interactivePreview else { return false }
-        switch request.sort.column {
-        case .path, .created, .size, .fileExtension, .kind, .volume, .root:
-            return true
-        case .relevance, .name, .modified:
-            return false
-        }
-    }
-
     private static func usesAdditionalSortOrder(_ column: SortColumn) -> Bool {
         switch column {
         case .path, .created, .size, .fileExtension, .kind, .volume, .root:
@@ -6649,29 +6843,41 @@ public final class FileIndex: @unchecked Sendable {
         shouldCancel: @Sendable () -> Bool
     ) -> SearchResponse? {
         guard
+            request.mode == .interactivePreview,
             maxResults > 0,
             !parsedQuery.isEmpty,
             usesAdditionalSortOrder(request.sort.column)
-                || (request.sort.column == .modified && request.mode == .interactivePreview)
+                || request.sort.column == .modified
         else {
             return nil
         }
 
-        let simpleNameQuery = request.mode == .interactivePreview
-            ? simpleNamePreviewQuery(parsedQuery)
-            : nil
+        var simpleNameQuery = simpleNamePreviewQuery(parsedQuery)
 
         let candidateIndices: [Int32]
         var indexesUsed: Set<SearchIndexUse>
-        if let simpleNameQuery {
+        if let query = simpleNameQuery {
             guard let nameCandidates = snapshot.candidateNameIndices(
-                containing: Array(simpleNameQuery.token.utf8),
+                containing: Array(query.token.utf8),
                 shouldCancel: shouldCancel
             ) else {
                 return nil
             }
-            candidateIndices = nameCandidates
-            indexesUsed = [.nameGrams]
+            if nameCandidates.isEmpty {
+                simpleNameQuery = nil
+                guard let candidates = Self.candidateIndices(
+                    snapshot: snapshot,
+                    parsedQuery: parsedQuery,
+                    shouldCancel: shouldCancel
+                ) else {
+                    return nil
+                }
+                candidateIndices = candidates
+                indexesUsed = indexUses(for: parsedQuery)
+            } else {
+                candidateIndices = nameCandidates
+                indexesUsed = [.nameGrams]
+            }
         } else {
             guard let candidates = Self.candidateIndices(
                 snapshot: snapshot,
@@ -6683,13 +6889,16 @@ public final class FileIndex: @unchecked Sendable {
             candidateIndices = candidates
             indexesUsed = indexUses(for: parsedQuery)
         }
+        if snapshot.gramIndex == nil, snapshot.pathGramShards.isEmpty {
+            indexesUsed.remove(.pathGrams)
+        }
 
         indexesUsed.insert(request.sort.column == .modified ? .modifiedOrder : .sortOrder)
         if !request.includeHidden {
             indexesUsed.insert(.visibleBitset)
         }
 
-        if candidateIndices.isEmpty {
+        guard !candidateIndices.isEmpty else {
             let elapsed = Date().timeIntervalSince(started)
             return SearchResponse(
                 results: [],
@@ -6707,8 +6916,7 @@ public final class FileIndex: @unchecked Sendable {
             )
         }
 
-        if request.mode == .interactivePreview,
-           candidateIndices.count > max(1_000, maxResults * 50),
+        if candidateIndices.count > max(1_000, maxResults * 50),
            let orderedResponse = optimizedSortedOrderScanSearch(
                snapshot: snapshot,
                request: request,
@@ -6736,13 +6944,19 @@ public final class FileIndex: @unchecked Sendable {
         var matches: [RankedSearchMatch] = []
         matches.reserveCapacity(min(maxResults, candidateIndices.count))
         let trimThreshold = max(maxResults * 8, 256)
-        var total = 0
         var scannedRows = 0
-        var pathContainsCache: [Int: Bool] = [:]
+        var pathContainsCache: [String: [Int: Bool]] = [:]
 
         func sortAndLimitMatches() {
             matches.sort { lhs, rhs in
-                lhs.rank < rhs.rank
+                let lhsQuality = lhs.match.match?.quality
+                    ?? MatchQuality(matchClass: .metadata, scoreBin: 0)
+                let rhsQuality = rhs.match.match?.quality
+                    ?? MatchQuality(matchClass: .metadata, scoreBin: 0)
+                if lhsQuality != rhsQuality {
+                    return lhsQuality > rhsQuality
+                }
+                return lhs.rank < rhs.rank
             }
             if matches.count > maxResults {
                 matches.removeSubrange(maxResults..<matches.count)
@@ -6770,19 +6984,16 @@ public final class FileIndex: @unchecked Sendable {
                     token: simpleNameQuery.token,
                     mode: simpleNameQuery.mode
                 )
-            } else if request.mode == .interactivePreview {
+            } else {
                 explanation = cheapDegradedExplanation(
                     snapshot: snapshot,
                     rowID: rowID,
                     parsedQuery: parsedQuery,
                     pathContainsCache: &pathContainsCache
                 )
-            } else {
-                explanation = FuzzyMatcher.explain(record: snapshot.view(at: rowID), parsedQuery: parsedQuery)
             }
 
             guard let explanation else { continue }
-            total += 1
             matches.append(RankedSearchMatch(
                 rank: rank,
                 match: SearchMatch(rowID: rowID, score: explanation.score, match: explanation)
@@ -6798,7 +7009,7 @@ public final class FileIndex: @unchecked Sendable {
         let elapsed = Date().timeIntervalSince(started)
         return SearchResponse(
             results: materialize(matches.map(\.match), from: snapshot, shouldCancel: shouldCancel),
-            totalMatches: total,
+            totalMatches: matches.count,
             elapsed: elapsed,
             snapshotRevision: snapshotRevision,
             usesIndexedCandidates: true,
@@ -6841,25 +7052,9 @@ public final class FileIndex: @unchecked Sendable {
             markedCandidateCount += 1
         }
 
-        guard markedCandidateCount > 0 else {
-            let elapsed = Date().timeIntervalSince(started)
-            return SearchResponse(
-                results: [],
-                totalMatches: 0,
-                elapsed: elapsed,
-                snapshotRevision: snapshotRevision,
-                usesIndexedCandidates: true,
-                executionProfile: SearchExecutionProfile(
-                    executionPath: .optimizedSortedFastPath,
-                    indexesUsed: indexesUsed,
-                    candidateCount: candidateIndices.count,
-                    scannedRowCount: 0,
-                    elapsed: elapsed
-                )
-            )
-        }
+        guard markedCandidateCount > 0 else { return nil }
 
-        var pathContainsCache: [Int: Bool] = [:]
+        var pathContainsCache: [String: [Int: Bool]] = [:]
         let scanLimit = max(Self.previewOrderedCandidateScanLimit, maxResults * 500)
         guard let selected = orderedCandidatePreviewSelection(
             snapshot: snapshot,
@@ -6932,6 +7127,64 @@ public final class FileIndex: @unchecked Sendable {
         return (pattern.token, mode)
     }
 
+    private static func directLiteralCandidates(
+        snapshot: SearchSnapshot,
+        parsedQuery: FuzzyMatcher.ParsedQuery,
+        shouldCancel: @Sendable () -> Bool
+    ) -> [Int32]? {
+        guard
+            parsedQuery.negative.isEmpty,
+            parsedQuery.positive.count == 1,
+            let clause = parsedQuery.positive.first,
+            clause.alternatives.count == 1,
+            let part = clause.alternatives.first,
+            case .text(let field, let pattern, let mode) = part,
+            field != .path,
+            mode == .fuzzy || mode == .exact,
+            !pattern.token.isEmpty,
+            !tokenContainsPathSeparator(pattern.token),
+            let nameCandidates = snapshot.candidateNameIndices(
+                containing: Array(pattern.token.utf8),
+                shouldCancel: shouldCancel
+            )
+        else {
+            return nil
+        }
+
+        guard field == .any else { return nameCandidates }
+        guard let pathCandidates = pathSubstringCandidateIndices(
+            snapshot: snapshot,
+            token: pattern.token,
+            shouldCancel: shouldCancel
+        ) else {
+            return nil
+        }
+        return unionPostingLists(pathCandidates, nameCandidates, shouldCancel: shouldCancel)
+    }
+
+    private static func emptyCompositePreviewIndexes(
+        snapshot: SearchSnapshot,
+        parsedQuery: FuzzyMatcher.ParsedQuery,
+        shouldCancel: @Sendable () -> Bool
+    ) -> Set<SearchIndexUse>? {
+        guard !parsedQuery.isEmpty else { return nil }
+        if let directCandidates = directLiteralCandidates(
+            snapshot: snapshot,
+            parsedQuery: parsedQuery,
+            shouldCancel: shouldCancel
+        ) {
+            return directCandidates.isEmpty ? [.nameGrams, .pathGrams] : nil
+        }
+        guard let candidates = candidateIndices(
+            snapshot: snapshot,
+            parsedQuery: parsedQuery,
+            shouldCancel: shouldCancel
+        ) else {
+            return nil
+        }
+        return candidates.isEmpty ? indexUses(for: parsedQuery) : nil
+    }
+
     private static func optimizedSortedNamePreviewSearch(
         snapshot: SearchSnapshot,
         request: SearchRequest,
@@ -6970,23 +7223,7 @@ public final class FileIndex: @unchecked Sendable {
             indexesUsed.insert(.visibleBitset)
         }
 
-        if nameCandidates.isEmpty {
-            let elapsed = Date().timeIntervalSince(started)
-            return SearchResponse(
-                results: [],
-                totalMatches: 0,
-                elapsed: elapsed,
-                snapshotRevision: snapshotRevision,
-                usesIndexedCandidates: true,
-                executionProfile: SearchExecutionProfile(
-                    executionPath: .optimizedSortedFastPath,
-                    indexesUsed: indexesUsed,
-                    candidateCount: 0,
-                    scannedRowCount: 0,
-                    elapsed: elapsed
-                )
-            )
-        }
+        guard !nameCandidates.isEmpty else { return nil }
 
         var nameRows = Array(repeating: UInt8(0), count: snapshot.count)
         var visibleNameCandidateCount = 0
@@ -7003,23 +7240,7 @@ public final class FileIndex: @unchecked Sendable {
             visibleNameCandidateCount += 1
         }
 
-        guard visibleNameCandidateCount > 0 else {
-            let elapsed = Date().timeIntervalSince(started)
-            return SearchResponse(
-                results: [],
-                totalMatches: 0,
-                elapsed: elapsed,
-                snapshotRevision: snapshotRevision,
-                usesIndexedCandidates: true,
-                executionProfile: SearchExecutionProfile(
-                    executionPath: .optimizedSortedFastPath,
-                    indexesUsed: indexesUsed,
-                    candidateCount: nameCandidates.count,
-                    scannedRowCount: 0,
-                    elapsed: elapsed
-                )
-            )
-        }
+        guard visibleNameCandidateCount > 0 else { return nil }
 
         guard let selected = orderedCandidatePreviewSelection(
             snapshot: snapshot,
@@ -7073,7 +7294,7 @@ public final class FileIndex: @unchecked Sendable {
         guard
             maxResults > 0,
             !parsedQuery.isEmpty,
-            request.mode == .interactivePreview || usesAdditionalSortOrder(request.sort.column),
+            request.mode == .interactivePreview,
             let orderedRows = snapshot.orderedIndices(
                 for: request.sort,
                 queryIsEmpty: false,
@@ -7089,27 +7310,11 @@ public final class FileIndex: @unchecked Sendable {
             return nil
         }
 
-        if request.mode == .interactivePreview, candidateIndices.count <= max(1_000, maxResults * 50) {
+        if candidateIndices.count <= max(1_000, maxResults * 50) {
             return nil
         }
 
-        if candidateIndices.isEmpty {
-            let elapsed = Date().timeIntervalSince(started)
-            return SearchResponse(
-                results: [],
-                totalMatches: 0,
-                elapsed: elapsed,
-                snapshotRevision: snapshotRevision,
-                usesIndexedCandidates: true,
-                executionProfile: SearchExecutionProfile(
-                    executionPath: executionPath(forIndexedCandidateQuery: parsedQuery),
-                    indexesUsed: indexUses(for: parsedQuery),
-                    candidateCount: 0,
-                    scannedRowCount: 0,
-                    elapsed: elapsed
-                )
-            )
-        }
+        guard !candidateIndices.isEmpty else { return nil }
 
         var included = Array(repeating: UInt8(0), count: snapshot.count)
         var markedCandidateCount = 0
@@ -7127,36 +7332,13 @@ public final class FileIndex: @unchecked Sendable {
             markedCandidateCount += 1
         }
 
-        guard markedCandidateCount > 0 else {
-            let elapsed = Date().timeIntervalSince(started)
-            return SearchResponse(
-                results: [],
-                totalMatches: 0,
-                elapsed: elapsed,
-                snapshotRevision: snapshotRevision,
-                usesIndexedCandidates: true,
-                executionProfile: SearchExecutionProfile(
-                    executionPath: .optimizedSortedFastPath,
-                    indexesUsed: indexUses(for: parsedQuery).union([.sortOrder]),
-                    candidateCount: candidateIndices.count,
-                    scannedRowCount: 0,
-                    elapsed: elapsed
-                )
-            )
-        }
+        guard markedCandidateCount > 0 else { return nil }
 
         var matches: [SearchMatch] = []
         matches.reserveCapacity(min(maxResults, markedCandidateCount))
-        var pathContainsCache: [Int: Bool] = [:]
+        var pathContainsCache: [String: [Int: Bool]] = [:]
         var scannedRows = 0
-        var totalMatches = 0
-        let scanLimit: Int
-        switch request.mode {
-        case .interactivePreview:
-            scanLimit = min(orderedRows.count, max(Self.previewOrderedCandidateScanLimit, maxResults * 500))
-        case .complete:
-            scanLimit = orderedRows.count
-        }
+        let scanLimit = min(orderedRows.count, max(Self.previewOrderedCandidateScanLimit, maxResults * 500))
 
         for (offset, rowID) in orderedRows.prefix(scanLimit).enumerated() {
             if offset.isMultiple(of: 512), shouldCancel() {
@@ -7175,11 +7357,10 @@ public final class FileIndex: @unchecked Sendable {
                 continue
             }
 
-            totalMatches += 1
             if matches.count < maxResults {
                 matches.append(SearchMatch(rowID: rowID, score: explanation.score, match: explanation))
             }
-            if request.mode == .interactivePreview, matches.count == maxResults {
+            if matches.count == maxResults {
                 break
             }
         }
@@ -7193,7 +7374,7 @@ public final class FileIndex: @unchecked Sendable {
         }
         return SearchResponse(
             results: materialize(matches, from: snapshot, shouldCancel: shouldCancel),
-            totalMatches: request.mode == .interactivePreview ? markedCandidateCount : totalMatches,
+            totalMatches: matches.count,
             elapsed: elapsed,
             snapshotRevision: snapshotRevision,
             usesIndexedCandidates: true,
@@ -7225,6 +7406,7 @@ public final class FileIndex: @unchecked Sendable {
         snapshotRevision: UInt64,
         shouldCancel: @Sendable () -> Bool
     ) -> SearchResponse? {
+        guard request.mode == .interactivePreview else { return nil }
         guard let candidateIndices = candidateIndices(
             snapshot: snapshot,
             parsedQuery: parsedQuery,
@@ -7234,27 +7416,8 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         let indexesUsed = indexUses(for: parsedQuery)
-        guard request.mode == .interactivePreview else {
-            return nil
-        }
 
-        if candidateIndices.isEmpty {
-            let elapsed = Date().timeIntervalSince(started)
-            return SearchResponse(
-                results: [],
-                totalMatches: 0,
-                elapsed: elapsed,
-                snapshotRevision: snapshotRevision,
-                usesIndexedCandidates: true,
-                executionProfile: SearchExecutionProfile(
-                    executionPath: executionPath(forIndexedCandidateQuery: parsedQuery),
-                    indexesUsed: indexesUsed,
-                    candidateCount: 0,
-                    scannedRowCount: 0,
-                    elapsed: elapsed
-                )
-            )
-        }
+        guard !candidateIndices.isEmpty else { return nil }
 
         let scanLimit = min(candidateIndices.count, max(Self.previewIndexedCandidateScanLimit, maxResults * 500))
 
@@ -7263,7 +7426,7 @@ public final class FileIndex: @unchecked Sendable {
         let trimThreshold = maxResults > 0 ? maxResults * 5 : 0
         var total = 0
         var scannedRows = 0
-        var pathContainsCache: [Int: Bool] = [:]
+        var pathContainsCache: [String: [Int: Bool]] = [:]
 
         func sortAndLimitMatches() {
             guard maxResults > 0 else { return }
@@ -7337,7 +7500,7 @@ public final class FileIndex: @unchecked Sendable {
         let trimThreshold = maxResults > 0 ? maxResults * 5 : 0
         var total = 0
         var scannedRows = 0
-        var pathContainsCache: [Int: Bool] = [:]
+        var pathContainsCache: [String: [Int: Bool]] = [:]
 
         func sortAndLimitMatches() {
             guard maxResults > 0 else { return }
@@ -7398,7 +7561,7 @@ public final class FileIndex: @unchecked Sendable {
         snapshot: SearchSnapshot,
         rowID: Int,
         parsedQuery: FuzzyMatcher.ParsedQuery,
-        pathContainsCache: inout [Int: Bool]
+        pathContainsCache: inout [String: [Int: Bool]]
     ) -> MatchExplanation? {
         guard !parsedQuery.isEmpty else { return nil }
 
@@ -7434,10 +7597,18 @@ public final class FileIndex: @unchecked Sendable {
             }
         }
 
-        guard let best else { return nil }
         let depthPenalty = min(snapshot.store.path(at: rowID).filter { $0 == "/" }.count * 4, 120)
         let hiddenPenalty = snapshot.store.isHidden(at: rowID) ? 35 : 0
         let finalScore = totalScore - depthPenalty - hiddenPenalty
+        if parsedQuery.positive.isEmpty {
+            return MatchExplanation(
+                matchClass: .metadata,
+                score: finalScore,
+                field: .name,
+                reason: "Did not match excluded terms"
+            )
+        }
+        guard let best else { return nil }
         return MatchExplanation(
             matchClass: best.matchClass,
             score: finalScore,
@@ -7451,7 +7622,7 @@ public final class FileIndex: @unchecked Sendable {
         snapshot: SearchSnapshot,
         rowID: Int,
         clause: FuzzyMatcher.QueryClause,
-        pathContainsCache: inout [Int: Bool]
+        pathContainsCache: inout [String: [Int: Bool]]
     ) -> MatchExplanation? {
         var best: MatchExplanation?
         for alternative in clause.alternatives {
@@ -7476,10 +7647,19 @@ public final class FileIndex: @unchecked Sendable {
         snapshot: SearchSnapshot,
         rowID: Int,
         part: FuzzyMatcher.QueryPart,
-        pathContainsCache: inout [Int: Bool]
+        pathContainsCache: inout [String: [Int: Bool]]
     ) -> MatchExplanation? {
         switch part {
         case .text(let field, let pattern, let mode):
+            if mode == .wildcard {
+                return FuzzyMatcher.explain(
+                    record: snapshot.view(at: rowID),
+                    parsedQuery: FuzzyMatcher.ParsedQuery(
+                        positive: [FuzzyMatcher.QueryClause(alternatives: [part])],
+                        negative: []
+                    )
+                )
+            }
             let token = mode == .wildcard ? cheapWildcardLiteralToken(pattern.token) : pattern.token
             guard !token.isEmpty else { return nil }
             if field != .path,
@@ -7492,7 +7672,11 @@ public final class FileIndex: @unchecked Sendable {
                 return nameExplanation
             }
             if field != .name,
-               snapshot.store.normalizedPath(at: rowID, contains: token, cache: &pathContainsCache) {
+               snapshot.store.normalizedDirectoryPath(
+                   at: rowID,
+                   contains: token,
+                   cache: &pathContainsCache[token, default: [:]]
+               ) {
                 return cheapIndexedPathExplanation(
                     snapshot: snapshot,
                     rowID: rowID,
@@ -7503,7 +7687,7 @@ public final class FileIndex: @unchecked Sendable {
             return nil
         case .fileExtension(let pattern, let mode):
             return FuzzyMatcher.extensionExplanation(
-                snapshot.store.fileExtension(at: rowID),
+                record: snapshot.view(at: rowID),
                 pattern: pattern,
                 mode: mode
             )
@@ -7710,7 +7894,7 @@ public final class FileIndex: @unchecked Sendable {
             indexesUsed.insert(.visibleBitset)
         }
 
-        var pathContainsCache: [Int: Bool] = [:]
+        var pathContainsCache: [String: [Int: Bool]] = [:]
         let pathScanLimit = field == .path ? max(maxResults * 25, 20_000) : max(maxResults * 4, 8_000)
         var selectedRows = Set<Int>()
         selectedRows.reserveCapacity(maxResults)
@@ -7741,13 +7925,18 @@ public final class FileIndex: @unchecked Sendable {
             {
                 explanation = nameExplanation
             } else if field != .name,
-                      snapshot.store.normalizedPath(at: rowID, contains: pattern.token, cache: &pathContainsCache) {
-                explanation = cheapIndexedPathExplanation(
+                      snapshot.store.normalizedDirectoryPath(
+                          at: rowID,
+                          contains: pattern.token,
+                          cache: &pathContainsCache[pattern.token, default: [:]]
+                      ),
+                      let pathExplanation = cheapIndexedPathExplanation(
                     snapshot: snapshot,
                     rowID: rowID,
                     token: pattern.token,
                     mode: mode
-                )
+                ) {
+                explanation = pathExplanation
             } else {
                 continue
             }
@@ -7967,28 +8156,7 @@ public final class FileIndex: @unchecked Sendable {
             nameRows[rowID] = 1
         }
 
-        guard !visibleNameCandidateRows.isEmpty else {
-            guard !shouldCancel() else { return nil }
-            let elapsed = Date().timeIntervalSince(started)
-            var indexesUsed: Set<SearchIndexUse> = [.nameGrams, .modifiedOrder]
-            if !request.includeHidden {
-                indexesUsed.insert(.visibleBitset)
-            }
-            return SearchResponse(
-                results: [],
-                totalMatches: 0,
-                elapsed: elapsed,
-                snapshotRevision: snapshotRevision,
-                usesIndexedCandidates: true,
-                executionProfile: SearchExecutionProfile(
-                    executionPath: .optimizedSortedFastPath,
-                    indexesUsed: indexesUsed,
-                    candidateCount: nameCandidates.count,
-                    scannedRowCount: 0,
-                    elapsed: elapsed
-                )
-            )
-        }
+        guard !visibleNameCandidateRows.isEmpty else { return nil }
 
         if visibleNameCandidateRows.count <= maxResults {
             var matches: [SearchMatch] = []
@@ -8372,12 +8540,12 @@ public final class FileIndex: @unchecked Sendable {
                 guard request.includeHidden || snapshot.isVisible(at: rowID) else { return true }
                 guard selectedRows.insert(rowID).inserted else { return true }
 
-                let explanation = cheapIndexedPathExplanation(
+                guard let explanation = cheapIndexedPathExplanation(
                     snapshot: snapshot,
                     rowID: rowID,
                     token: token,
                     mode: mode
-                )
+                ) else { return true }
                 appendCandidate(makeCandidate(rowID, explanation))
                 if heapCount() == maxResults {
                     return false
@@ -8823,6 +8991,7 @@ public final class FileIndex: @unchecked Sendable {
     ) -> SearchResponse? {
         guard
             snapshot.store.schemaVersion >= SnapshotLayout.schemaVersion,
+            request.mode == .interactivePreview,
             request.sort.column == .name,
             maxResults > 0,
             parsedQuery.negative.isEmpty,
@@ -8906,22 +9075,7 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         let rowSet = RowIntervalSet.build(intervals)
-        guard !rowSet.isEmpty else {
-            let elapsed = Date().timeIntervalSince(started)
-            return SearchResponse(
-                results: [],
-                totalMatches: 0,
-                elapsed: elapsed,
-                snapshotRevision: snapshotRevision,
-                usesIndexedCandidates: true,
-                executionProfile: SearchExecutionProfile(
-                    executionPath: .optimizedSortedFastPath,
-                    indexesUsed: [.nameGrams, .componentGrams],
-                    candidateCount: 0,
-                    elapsed: elapsed
-                )
-            )
-        }
+        guard !rowSet.isEmpty else { return nil }
 
         if let selected = nameSortedComponentPathIntervalMatches(
             snapshot: snapshot,
@@ -8986,13 +9140,13 @@ public final class FileIndex: @unchecked Sendable {
                         mode: mode
                     ) {
                     explanation = nameExplanation
-                } else if field != .name {
-                    explanation = cheapIndexedPathExplanation(
+                } else if field != .name, let pathExplanation = cheapIndexedPathExplanation(
                         snapshot: snapshot,
                         rowID: rowID,
                         token: pattern.token,
                         mode: mode
-                    )
+                    ) {
+                    explanation = pathExplanation
                 } else {
                     continue
                 }
@@ -9037,13 +9191,15 @@ public final class FileIndex: @unchecked Sendable {
                         mode: mode
                     ) {
                         explanation = nameExplanation
-                    } else {
-                        explanation = cheapIndexedPathExplanation(
+                    } else if let pathExplanation = cheapIndexedPathExplanation(
                             snapshot: snapshot,
                             rowID: rowID,
                             token: pattern.token,
                             mode: mode
-                        )
+                        ) {
+                        explanation = pathExplanation
+                    } else {
+                        continue
                     }
 
                     matches.append(SearchMatch(rowID: rowID, score: explanation.score, match: explanation))
@@ -9145,13 +9301,7 @@ public final class FileIndex: @unchecked Sendable {
             )
         }
 
-        guard mode == .fuzzy else { return nil }
-        return MatchExplanation(
-            matchClass: .near,
-            score: 5_500,
-            field: .name,
-            reason: "Name nearly matched \"\(token)\""
-        )
+        return nil
     }
 
     private static func cheapIndexedPathExplanation(
@@ -9159,7 +9309,8 @@ public final class FileIndex: @unchecked Sendable {
         rowID: Int,
         token: String,
         mode: FuzzyMatcher.MatchMode
-    ) -> MatchExplanation {
+    ) -> MatchExplanation? {
+        guard snapshot.store.normalizedDirectoryPath(at: rowID).contains(token) else { return nil }
         let base = mode == .exact ? 3_900 : 3_500
         return MatchExplanation(
             matchClass: .weakPath,
@@ -9183,6 +9334,7 @@ public final class FileIndex: @unchecked Sendable {
         shouldCancel: @Sendable () -> Bool
     ) -> SearchResponse? {
         guard
+            request.mode == .interactivePreview,
             request.sort.column == .name,
             maxResults > 0,
             parsedQuery.negative.isEmpty,
@@ -9238,22 +9390,7 @@ public final class FileIndex: @unchecked Sendable {
         ) else {
             return nil
         }
-        guard !candidates.isEmpty else {
-            let elapsed = Date().timeIntervalSince(started)
-            return SearchResponse(
-                results: [],
-                totalMatches: 0,
-                elapsed: elapsed,
-                snapshotRevision: snapshotRevision,
-                usesIndexedCandidates: true,
-                executionProfile: SearchExecutionProfile(
-                    executionPath: .nameComponentIndex,
-                    indexesUsed: [.nameGrams, .componentGrams],
-                    candidateCount: 0,
-                    elapsed: elapsed
-                )
-            )
-        }
+        guard !candidates.isEmpty else { return nil }
 
         guard let selected = nameSortedPathSubstringMatches(
             snapshot: snapshot,
@@ -9326,6 +9463,7 @@ public final class FileIndex: @unchecked Sendable {
         shouldCancel: @Sendable () -> Bool
     ) -> SearchResponse? {
         guard
+            request.mode == .interactivePreview,
             snapshot.nameGramIndex != nil,
             parsedQuery.negative.isEmpty,
             parsedQuery.positive.count == 1,
@@ -9621,8 +9759,9 @@ public final class FileIndex: @unchecked Sendable {
             guard case .fileExtension(let pattern, let mode) = alternative else {
                 return nil
             }
+            guard !pattern.token.contains(".") else { return nil }
             guard
-                let extensionCandidates = snapshot.exactExtensionCandidatesForFastPath(
+                var extensionCandidates = snapshot.exactExtensionCandidatesForFastPath(
                     token: pattern.token,
                     mode: mode,
                     shouldCancel: shouldCancel
@@ -9631,6 +9770,32 @@ public final class FileIndex: @unchecked Sendable {
                 let explanation = FuzzyMatcher.extensionExplanation(representativeExtension, pattern: pattern, mode: mode)
             else {
                 return nil
+            }
+
+            if mode == .exact {
+                let dotfileName = "." + pattern.token
+                guard let dotfileCandidates = snapshot.candidateNameIndices(
+                    containing: Array(dotfileName.utf8),
+                    shouldCancel: shouldCancel
+                ) else {
+                    return nil
+                }
+                let exactDotfiles = dotfileCandidates.filter { candidate in
+                    let rowID = Int(candidate)
+                    return rowID >= 0
+                        && rowID < snapshot.count
+                        && snapshot.store.isResultRow(at: rowID)
+                        && snapshot.store.fileExtension(at: rowID).isEmpty
+                        && snapshot.store.normalizedName(at: rowID) == dotfileName
+                }
+                guard let merged = unionPostingLists(
+                    extensionCandidates,
+                    exactDotfiles,
+                    shouldCancel: shouldCancel
+                ) else {
+                    return nil
+                }
+                extensionCandidates = merged
             }
 
             if let quality = sharedQuality {
@@ -9843,12 +10008,12 @@ public final class FileIndex: @unchecked Sendable {
             guard snapshot.store.isResultRow(at: rowID) else { continue }
             guard request.includeHidden || snapshot.isVisible(at: rowID) else { continue }
 
-            let explanation = cheapIndexedPathExplanation(
+            guard let explanation = cheapIndexedPathExplanation(
                 snapshot: snapshot,
                 rowID: rowID,
                 token: token,
                 mode: mode
-            )
+            ) else { continue }
             matches.append(SearchMatch(rowID: rowID, score: explanation.score, match: explanation))
             if matches.count == maxResults {
                 break
@@ -10023,12 +10188,12 @@ public final class FileIndex: @unchecked Sendable {
             guard rowMarkers[rowID] & candidateMask != 0 else { continue }
             guard rowMarkers[rowID] & directNameMask == 0 else { continue }
 
-            let explanation = cheapIndexedPathExplanation(
+            guard let explanation = cheapIndexedPathExplanation(
                 snapshot: snapshot,
                 rowID: rowID,
                 token: token,
                 mode: mode
-            )
+            ) else { continue }
             matches.append(SearchMatch(rowID: rowID, score: explanation.score, match: explanation))
             if matches.count == maxResults {
                 break
@@ -10095,6 +10260,9 @@ public final class FileIndex: @unchecked Sendable {
         matches.reserveCapacity(min(maxResults, total))
         let trimThreshold = max(maxResults * 5, 128)
         var scannedRows = 0
+        let relevanceCandidates = request.mode == .interactivePreview
+            ? candidates.prefix(max(Self.previewIndexedCandidateScanLimit, maxResults * 500))
+            : candidates.prefix(candidates.count)
 
         func sortAndLimitMatches() {
             matches.sort {
@@ -10105,7 +10273,7 @@ public final class FileIndex: @unchecked Sendable {
             }
         }
 
-        for (offset, candidate) in candidates.enumerated() {
+        for (offset, candidate) in relevanceCandidates.enumerated() {
             if offset.isMultiple(of: 512), shouldCancel() {
                 return nil
             }
@@ -10553,14 +10721,15 @@ public final class FileIndex: @unchecked Sendable {
         case .kind(let token):
             return candidateIndices(snapshot: snapshot, kind: token, shouldCancel: shouldCancel)
         case .fileExtension(let pattern, let mode):
+            let terminalExtension = pattern.token.split(separator: ".").last.map(String.init) ?? pattern.token
             return snapshot.candidateIndices(
-                fileExtension: pattern.token,
+                fileExtension: terminalExtension,
                 mode: mode,
                 shouldCancel: shouldCancel
             )
                 ?? candidateIndices(
                     snapshot: snapshot,
-                    token: pattern.token,
+                    token: terminalExtension,
                     mode: mode,
                     allowsFuzzyPrefix: true,
                     shouldCancel: shouldCancel
@@ -10637,7 +10806,11 @@ public final class FileIndex: @unchecked Sendable {
             guard snapshot.store.isResultRow(at: rowID) else { continue }
 
             if snapshot.store.isDirectory(at: rowID) {
-                if "folder".hasPrefix(token) || "directory".hasPrefix(token) || "dir".hasPrefix(token) {
+                let isApplication = snapshot.store.fileExtension(at: rowID) == "app"
+                if (isApplication && ("app".hasPrefix(token) || "application".hasPrefix(token)))
+                    || "folder".hasPrefix(token)
+                    || "directory".hasPrefix(token)
+                    || "dir".hasPrefix(token) {
                     candidates.append(Int32(rowID))
                 }
             } else if "file".hasPrefix(token) {
@@ -10997,10 +11170,22 @@ public final class FileIndex: @unchecked Sendable {
             return exactCandidates
         }
 
-        let typoCandidates = snapshot.candidateNameIndices(
-            containingAllBytes: distinctNonSeparatorBytes,
-            shouldCancel: shouldCancel
-        )
+        let allowedMissing = tokenBytes.count <= 5 ? 1 : 2
+        let requiredCount = max(1, distinctNonSeparatorBytes.count - allowedMissing)
+        let typoCandidates: [Int32]?
+        if requiredCount < distinctNonSeparatorBytes.count {
+            let requiredSubsets = byteSubsets(distinctNonSeparatorBytes, count: requiredCount)
+            guard !requiredSubsets.isEmpty, requiredSubsets.count <= 256 else { return nil }
+            typoCandidates = snapshot.candidateNameIndices(
+                containingAny: requiredSubsets,
+                shouldCancel: shouldCancel
+            )
+        } else {
+            typoCandidates = snapshot.candidateNameIndices(
+                containingAllBytes: distinctNonSeparatorBytes,
+                shouldCancel: shouldCancel
+            )
+        }
         guard let typoCandidates else { return nil }
         return unionPostingLists(exactCandidates, typoCandidates, shouldCancel: shouldCancel)
     }
@@ -12291,7 +12476,8 @@ public final class FileIndex: @unchecked Sendable {
                     continue
                 case .retry(let error):
                     logFullScanTraversalFailure(path: root.path, error: error)
-                    return nil
+                    logSkippedRoot(root, reason: "unreadable")
+                    continue
                 }
                 guard rootCandidate.isDirectory || rootCandidate.isSymlink else {
                     logSkippedRoot(root, reason: "notDirectory")
@@ -12375,7 +12561,6 @@ public final class FileIndex: @unchecked Sendable {
                         }
 
                         var childDirectories: [URL] = []
-                        var childLookupRetryError: Int32?
                         if usesBatchedEnqueue {
                             childDirectories.reserveCapacity(32)
                         }
@@ -12423,7 +12608,7 @@ public final class FileIndex: @unchecked Sendable {
                                 case .missing:
                                     return
                                 case .retry(let error):
-                                    childLookupRetryError = error
+                                    self.logFullScanTraversalFailure(path: child.path, error: error)
                                     return
                                 }
                                 let decision = self.exclusionDecision(
@@ -12452,9 +12637,6 @@ public final class FileIndex: @unchecked Sendable {
                                 }
                             }
 
-                            if childLookupRetryError != nil {
-                                return false
-                            }
                             if batch.count >= 256 {
                                 state.append(batch)
                                 batch.removeAll(keepingCapacity: true)
@@ -12469,20 +12651,12 @@ public final class FileIndex: @unchecked Sendable {
                         case .completed:
                             break
                         case .stopped:
-                            if let childLookupRetryError {
-                                self.logFullScanTraversalFailure(
-                                    path: directory.path,
-                                    error: childLookupRetryError
-                                )
-                            }
                             state.finishDirectories(finishedDirectories)
                             state.markStopped()
                             break scanLoop
                         case .retry(let error):
                             self.logFullScanTraversalFailure(path: directory.path, error: error)
-                            state.finishDirectories(finishedDirectories)
-                            state.markStopped()
-                            break scanLoop
+                            break
                         }
 
                         if usesBatchedEnqueue {
@@ -12865,19 +13039,18 @@ public final class FileIndex: @unchecked Sendable {
                     activeIndexJobs: self.currentActiveIndexJobCount(),
                     context: memoryTelemetryContext
                 )
-                var installError: Error?
+                guard self.lock.withLock({
+                    self.generation == currentGeneration
+                        && self.searchSnapshotRevision == baseSnapshotRevision
+                }) else {
+                    try? self.fileManager.removeItem(at: packageURL)
+                    logCancellation(reason: "staleBeforeInstall")
+                    return
+                }
+                try self.replaceMappedSnapshotPackageOnDisk(packageURL)
                 let didApply = self.lock.withLock { () -> Bool in
                     guard self.generation == currentGeneration,
-                          self.searchSnapshotRevision == baseSnapshotRevision else {
-                        return false
-                    }
-
-                    do {
-                        try self.replaceMappedSnapshotPackageOnDisk(packageURL)
-                    } catch {
-                        installError = error
-                        return false
-                    }
+                          self.searchSnapshotRevision == baseSnapshotRevision else { return false }
                     self.structuralDelta = nil
                     self.clearStructuralDeltaCompactionWithoutLock()
                     self.clearSnapshotDurabilityPendingWithoutLock()
@@ -12887,12 +13060,9 @@ public final class FileIndex: @unchecked Sendable {
                     self.lastUpdated = Date()
                     return true
                 }
-                if let installError {
-                    throw installError
-                }
                 guard didApply else {
-                    try? self.fileManager.removeItem(at: packageURL)
-                    logCancellation(reason: "staleBeforeInstall")
+                    self.markReadySnapshotDurabilityPendingIfNeeded()
+                    logCancellation(reason: "staleAfterInstall")
                     return
                 }
                 self.finishMappedSnapshotInstallation()
@@ -13661,28 +13831,34 @@ public final class FileIndex: @unchecked Sendable {
             return
         }
 
+        guard lock.withLock({
+            generation == currentGeneration
+                && searchSnapshot.store === snapshot.store
+                && searchSnapshot.gramIndex == nil
+        }) else {
+            try? fileManager.removeItem(at: stagedURL)
+            return
+        }
+
         var persistError: Error?
-        let didComplete = lock.withLock { () -> Bool in
+        do {
+            try snapshotPackageLock.withLock {
+                let destinationURL = packageURL.appendingPathComponent(
+                    SnapshotLayout.FileName.pathPostings,
+                    isDirectory: false
+                )
+                try atomicallyInstallItem(at: stagedURL, to: destinationURL)
+            }
+        } catch {
+            persistError = error
+        }
+
+        let didComplete = persistError == nil && lock.withLock { () -> Bool in
             guard
                 generation == currentGeneration,
                 searchSnapshot.store === snapshot.store,
                 searchSnapshot.gramIndex == nil
             else {
-                return false
-            }
-
-            do {
-                let destinationURL = packageURL.appendingPathComponent(
-                    SnapshotLayout.FileName.pathPostings,
-                    isDirectory: false
-                )
-                if fileManager.fileExists(atPath: destinationURL.path) {
-                    _ = try fileManager.replaceItemAt(destinationURL, withItemAt: stagedURL)
-                } else {
-                    try fileManager.moveItem(at: stagedURL, to: destinationURL)
-                }
-            } catch {
-                persistError = error
                 return false
             }
 
@@ -13785,12 +13961,19 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     private func replaceMappedSnapshotPackageOnDisk(_ packageURL: URL) throws {
-        if fileManager.fileExists(atPath: snapshotURL.path) {
-            try fileManager.removeItem(at: snapshotURL)
+        try snapshotPackageLock.withLock {
+            try atomicallyInstallItem(at: packageURL, to: snapshotURL)
         }
-        try fileManager.moveItem(at: packageURL, to: snapshotURL)
         removePersistedMetadataOverlay()
         try? structuralDeltaStore.clear()
+    }
+
+    private func atomicallyInstallItem(at sourceURL: URL, to destinationURL: URL) throws {
+        if fileManager.fileExists(atPath: destinationURL.path) {
+            _ = try fileManager.replaceItemAt(destinationURL, withItemAt: sourceURL)
+        } else {
+            try fileManager.moveItem(at: sourceURL, to: destinationURL)
+        }
     }
 
     private func finishMappedSnapshotInstallation() {
@@ -14182,6 +14365,11 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     private func queuePendingRefreshWorkWithoutLock(_ work: PendingRefreshWork) {
+        if pendingRefreshPaths.count >= Self.maximumPendingRefreshPaths,
+           pendingRefreshPaths[work.path] == nil {
+            collapsePendingRefreshWorkWithoutLock(including: work)
+            return
+        }
         var queuedWork = work
         markOverlappingDirectoryProgressWithoutLock(for: &queuedWork)
         if var existing = pendingRefreshPaths[queuedWork.path] {
@@ -14195,6 +14383,50 @@ public final class FileIndex: @unchecked Sendable {
         } else {
             pendingRefreshPaths[queuedWork.path] = queuedWork
         }
+    }
+
+    private func collapsePendingRefreshWorkWithoutLock(including incoming: PendingRefreshWork) {
+        var allWork = Array(pendingRefreshPaths.values)
+        allWork.append(incoming)
+        var collapsedByRoot: [String: PendingRefreshWork] = [:]
+
+        for work in allWork {
+            let root = roots
+                .filter { Self.path(work.path, isWithinAnyRoot: [$0]) }
+                .max { $0.count < $1.count }
+                ?? work.path
+            let collapsed = PendingRefreshWork(
+                path: root,
+                priority: work.priority,
+                recursivelyScansDirectory: true,
+                followUpRecursivelyScansDirectory: false,
+                firstQueuedAt: work.firstQueuedAt,
+                completions: work.completions + work.followUpCompletions,
+                followUpCompletions: [],
+                directoryScanProgress: nil,
+                requiresDirectoryRescanAfterProgress: false,
+                eligibleAt: nil,
+                lastServiceSequence: work.lastServiceSequence,
+                retryAttempt: 0
+            )
+            if var existing = collapsedByRoot[root] {
+                existing.merge(collapsed)
+                collapsedByRoot[root] = existing
+            } else {
+                collapsedByRoot[root] = collapsed
+            }
+        }
+
+        pendingRefreshPaths = collapsedByRoot
+        DiagnosticLogger.shared.log(
+            level: .warning,
+            category: "index",
+            event: "index.pendingRefreshCollapsed",
+            fields: [
+                "previousPathCount": .publicInt(allWork.count),
+                "collapsedPathCount": .publicInt(collapsedByRoot.count)
+            ]
+        )
     }
 
     private func markOverlappingDirectoryProgressWithoutLock(for work: inout PendingRefreshWork) {
@@ -16873,17 +17105,10 @@ public final class FileIndex: @unchecked Sendable {
             })
             changes.append(contentsOf: upserts.map { StructuralDeltaChange.upsert($0) })
 
-            let delta: StructuralDelta
-            if var activeStructuralDelta {
-                try activeStructuralDelta.apply(changes)
-                try structuralDeltaStore.save(activeStructuralDelta)
-                delta = activeStructuralDelta
-            } else {
-                delta = try structuralDeltaStore.append(
-                    baseIdentity: baseIdentity,
-                    changes: changes
-                )
-            }
+            let delta = try structuralDeltaStore.append(
+                baseIdentity: baseIdentity,
+                changes: changes
+            )
             lock.withLock { structuralDelta = delta }
             removePersistedMetadataOverlay()
             invalidateStorageInsightsCache()
@@ -17202,10 +17427,9 @@ public final class FileIndex: @unchecked Sendable {
         let mappedStore = try MappedRecordStore(packageURL: temporaryURL, schemaVersion: SnapshotLayout.schemaVersion)
         try preparePackageBeforeInstall(mappedStore, temporaryURL)
 
-        if fileManager.fileExists(atPath: snapshotURL.path) {
-            try fileManager.removeItem(at: snapshotURL)
+        try snapshotPackageLock.withLock {
+            try atomicallyInstallItem(at: temporaryURL, to: snapshotURL)
         }
-        try fileManager.moveItem(at: temporaryURL, to: snapshotURL)
         removePersistedMetadataOverlay()
         try? structuralDeltaStore.clear()
         lock.withLock {
@@ -17350,10 +17574,7 @@ public final class FileIndex: @unchecked Sendable {
                     options: .atomic
                 )
 
-                if fileManager.fileExists(atPath: checkpointURL.path) {
-                    try fileManager.removeItem(at: checkpointURL)
-                }
-                try fileManager.moveItem(at: temporaryURL, to: checkpointURL)
+                try atomicallyInstallItem(at: temporaryURL, to: checkpointURL)
                 cleanupStaleTemporaryFiles()
 
                 let didUpdate = lock.withLock { () -> Bool in
@@ -17967,7 +18188,11 @@ public final class FileIndex: @unchecked Sendable {
         status: String? = nil,
         prefersDegradedSearch: Bool = false
     ) {
-        let recordsByPath = Dictionary(uniqueKeysWithValues: records.map { ($0.path, $0) })
+        var recordsByPath: [String: FileRecord] = [:]
+        recordsByPath.reserveCapacity(records.count)
+        for record in records {
+            recordsByPath[record.path] = record
+        }
         let canonicalRoots = canonicalizedRoots(rootURLs).map(\.path)
         indexQueue.sync {
             let snapshot = SearchSnapshot(

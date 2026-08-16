@@ -381,10 +381,12 @@ struct FileExclusionRulesTests {
             ("\(root)/Sources/Feature/Deep/App.swift", false, .index),
             ("\(root)/.git/hooks", true, .skipButDescend),
             ("\(root)/.git/hooks/pre-commit", false, .index),
+            ("\(root)/Nested/Repo/.git/hooks", true, .skipButDescend),
+            ("\(root)/Nested/Repo/.git/hooks/pre-commit", false, .index),
             ("\(root)/.git/objects/ab/cdef", false, .prune),
-            ("\(root)/.build/index/store", true, .index),
+            ("\(root)/.build/index/store", true, .prune),
             ("\(root)/.build/arm64/index/store", true, .prune),
-            ("\(root)/build/.tmp-cache", false, .index),
+            ("\(root)/build/.tmp-cache", false, .prune),
             ("\(root)/build/generated/.tmp-cache", false, .prune),
             ("\(root)/Objects/FOO.O", false, .prune),
             ("\(root)/Example.APP/Contents/_CodeSignature", true, .prune)
@@ -402,8 +404,8 @@ struct FileExclusionRulesTests {
                 roots: [root],
                 isDirectory: sample.isDirectory
             )
-            #expect(compiled == reference)
-            #expect(compiled == sample.expected)
+            #expect(compiled == reference, "path: \(sample.path)")
+            #expect(compiled == sample.expected, "path: \(sample.path)")
         }
 
         #expect(instrumentation.regexMatchCount == 0)

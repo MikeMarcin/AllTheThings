@@ -490,74 +490,35 @@ struct SearchToolbarTests {
         #expect(SearchRunReconciliation.canApplyResponse(generationMatches: true, tokenMatches: true))
         #expect(!SearchRunReconciliation.canApplyResponse(generationMatches: false, tokenMatches: true))
         #expect(!SearchRunReconciliation.canApplyResponse(generationMatches: true, tokenMatches: false))
-        #expect(SearchRunReconciliation.shouldRejectFinalEmptyResponse(
-            existingResultCount: 25,
-            displayedMatchesResponseSignature: true,
-            responseResultCount: 0,
-            responseTotalMatches: 0,
+        #expect(SearchRunReconciliation.shouldRejectStaleFinalResponse(
             responseSnapshotRevision: 3,
             currentSnapshotRevision: 4
         ))
-        #expect(!SearchRunReconciliation.shouldRejectFinalEmptyResponse(
-            existingResultCount: 25,
-            displayedMatchesResponseSignature: true,
-            responseResultCount: 0,
-            responseTotalMatches: 0,
+        #expect(!SearchRunReconciliation.shouldRejectStaleFinalResponse(
             responseSnapshotRevision: 4,
             currentSnapshotRevision: 4
         ))
-        #expect(!SearchRunReconciliation.shouldRejectFinalEmptyResponse(
-            existingResultCount: 0,
-            displayedMatchesResponseSignature: true,
-            responseResultCount: 0,
-            responseTotalMatches: 0,
+        #expect(SearchRunReconciliation.shouldRetryStaleFinalResponse(
             responseSnapshotRevision: 3,
-            currentSnapshotRevision: 4
-        ))
-        #expect(!SearchRunReconciliation.shouldRejectFinalEmptyResponse(
-            existingResultCount: 25,
-            displayedMatchesResponseSignature: false,
-            responseResultCount: 0,
-            responseTotalMatches: 0,
-            responseSnapshotRevision: 3,
-            currentSnapshotRevision: 4
+            currentSnapshotRevision: 4,
+            signatureStillScheduled: true
         ))
         #expect(!SearchRunReconciliation.shouldRetryStaleFinalResponse(
-            usesIndexedCandidates: true,
             responseSnapshotRevision: 3,
             currentSnapshotRevision: 4,
-            signatureStillScheduled: true,
-            responseResultCount: 25,
-            responseTotalMatches: 1_000,
-            isIndexing: true
+            signatureStillScheduled: false
         ))
-        #expect(SearchRunReconciliation.shouldRetryStaleFinalResponse(
-            usesIndexedCandidates: true,
-            responseSnapshotRevision: 3,
-            currentSnapshotRevision: 4,
-            signatureStillScheduled: true,
-            responseResultCount: 25,
-            responseTotalMatches: 1_000,
-            isIndexing: false
-        ))
-        #expect(SearchRunReconciliation.shouldRetryStaleFinalResponse(
-            usesIndexedCandidates: true,
-            responseSnapshotRevision: 3,
-            currentSnapshotRevision: 4,
-            signatureStillScheduled: true,
-            responseResultCount: 0,
-            responseTotalMatches: 0,
-            isIndexing: true
-        ))
-        #expect(!SearchRunReconciliation.shouldRetryStaleFinalResponse(
-            usesIndexedCandidates: false,
-            responseSnapshotRevision: 3,
-            currentSnapshotRevision: 4,
-            signatureStillScheduled: true,
-            responseResultCount: 25,
-            responseTotalMatches: 1_000,
-            isIndexing: false
-        ))
+    }
+
+    @Test("result identity remapping preserves selection across reorder")
+    func resultIdentityRemappingPreservesSelectionAcrossReorder() {
+        let reordered: [UInt64] = [30, 10, 40, 20]
+        #expect(ResultIdentityRemapping.rowIndexes(
+            recordIDs: [10, 20],
+            resultRecordIDs: reordered
+        ) == IndexSet([1, 3]))
+        #expect(ResultIdentityRemapping.row(recordID: 20, resultRecordIDs: reordered) == 3)
+        #expect(ResultIdentityRemapping.row(recordID: 99, resultRecordIDs: reordered) == nil)
     }
 
     @Test("foreground reconcile still presents as important reconcile")

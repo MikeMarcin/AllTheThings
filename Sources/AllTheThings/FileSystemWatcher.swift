@@ -617,8 +617,8 @@ enum FSEventIndexFilter {
     private static func containsNestedBuildIndexStore(in lowerPath: String, isDirectory: Bool) -> Bool {
         let components = lowerPath.split(separator: "/", omittingEmptySubsequences: true)
         for buildIndex in components.indices where components[buildIndex] == ".build" {
-            guard buildIndex + 3 < components.count else { continue }
-            for index in (buildIndex + 2)..<(components.count - 1)
+            guard buildIndex + 2 < components.count else { continue }
+            for index in (buildIndex + 1)..<(components.count - 1)
                 where components[index] == "index" && components[index + 1] == "store" {
                 return index + 1 < components.count - 1 || isDirectory
             }
@@ -629,7 +629,7 @@ enum FSEventIndexFilter {
     private static func containsNestedBuildTemporary(in lowerPath: String) -> Bool {
         let components = lowerPath.split(separator: "/", omittingEmptySubsequences: true)
         return components.indices.contains { index in
-            components[index] == "build" && index + 2 < components.count
+            components[index] == "build" && index + 1 < components.count
         }
     }
 
@@ -901,9 +901,25 @@ final class FileSystemWatcher {
         }
     }
 
-    private let queue = DispatchQueue(label: "att.fsevents", qos: .utility)
+    private final class EventSink: @unchecked Sendable {
+        let eventHandler: @MainActor @Sendable ([FileSystemEvent]) -> Void
+
+        init(eventHandler: @escaping @MainActor @Sendable ([FileSystemEvent]) -> Void) {
+            self.eventHandler = eventHandler
+        }
+
+        func deliver(_ events: [FileSystemEvent]) {
+            guard !events.isEmpty else { return }
+            Task { @MainActor [eventHandler] in
+                eventHandler(events)
+            }
+        }
+    }
+
+    private let stateQueue = DispatchQueue(label: "att.fsevents.state", qos: .utility)
+    private let callbackQueue = DispatchQueue(label: "att.fsevents.callback", qos: .utility)
     private var stream: FSEventStreamRef?
-    private var eventHandler: (@MainActor @Sendable ([FileSystemEvent]) -> Void)?
+    private var eventSink: EventSink?
     private var rootPaths: [String] = []
     private var streamConfiguration: StreamConfiguration?
 
@@ -914,74 +930,81 @@ final class FileSystemWatcher {
     func start(
         roots: [URL],
         configuration: StreamConfiguration = .interactive,
+        sinceWhen requestedSinceWhen: FSEventStreamEventId = FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
         eventHandler: @escaping @MainActor @Sendable ([FileSystemEvent]) -> Void
     ) {
         let paths = roots.map { $0.standardizedFileURL.path }
         guard !paths.isEmpty else { return }
 
-        if stream != nil, paths == rootPaths, configuration == streamConfiguration {
-            self.eventHandler = eventHandler
-            return
-        }
-
-        stop()
-
-        self.eventHandler = eventHandler
-        self.rootPaths = paths
-        self.streamConfiguration = configuration
-
-        var context = FSEventStreamContext(
-            version: 0,
-            info: Unmanaged.passUnretained(self).toOpaque(),
-            retain: nil,
-            release: nil,
-            copyDescription: nil
-        )
-
-        let callback: FSEventStreamCallback = { _, info, eventCount, eventPaths, eventFlags, eventIDs in
-            guard let info else { return }
-            let watcher = Unmanaged<FileSystemWatcher>.fromOpaque(info).takeUnretainedValue()
-            let paths = unsafeBitCast(eventPaths, to: NSArray.self) as? [String] ?? []
-            let flags = UnsafeBufferPointer(start: eventFlags, count: eventCount)
-            let ids = UnsafeBufferPointer(start: eventIDs, count: eventCount)
-            let events = paths.prefix(eventCount).enumerated().map { offset, path in
-                FileSystemEvent(path: path, flags: flags[offset], eventID: ids[offset])
+        stateQueue.sync {
+            if stream != nil,
+               paths == rootPaths,
+               configuration == streamConfiguration {
+                return
             }
-            watcher.handle(events: events)
+
+            stopWithoutLock()
+
+            let sink = EventSink(eventHandler: eventHandler)
+            var context = FSEventStreamContext(
+                version: 0,
+                info: Unmanaged.passUnretained(sink).toOpaque(),
+                retain: nil,
+                release: nil,
+                copyDescription: nil
+            )
+
+            let callback: FSEventStreamCallback = { _, info, eventCount, eventPaths, eventFlags, eventIDs in
+                guard let info else { return }
+                let sink = Unmanaged<EventSink>.fromOpaque(info).takeUnretainedValue()
+                let paths = unsafeBitCast(eventPaths, to: NSArray.self) as? [String] ?? []
+                let flags = UnsafeBufferPointer(start: eventFlags, count: eventCount)
+                let ids = UnsafeBufferPointer(start: eventIDs, count: eventCount)
+                let events = paths.prefix(eventCount).enumerated().map { offset, path in
+                    FileSystemEvent(path: path, flags: flags[offset], eventID: ids[offset])
+                }
+                sink.deliver(events)
+            }
+
+            let createdStream = FSEventStreamCreate(
+                kCFAllocatorDefault,
+                callback,
+                &context,
+                paths as CFArray,
+                requestedSinceWhen,
+                configuration.latency,
+                configuration.flags
+            )
+
+            guard let createdStream else { return }
+            eventSink = sink
+            stream = createdStream
+            rootPaths = paths
+            streamConfiguration = configuration
+            FSEventStreamSetDispatchQueue(createdStream, callbackQueue)
+            guard FSEventStreamStart(createdStream) else {
+                stopWithoutLock()
+                return
+            }
         }
-
-        stream = FSEventStreamCreate(
-            kCFAllocatorDefault,
-            callback,
-            &context,
-            paths as CFArray,
-            FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
-            configuration.latency,
-            configuration.flags
-        )
-
-        guard let stream else { return }
-        FSEventStreamSetDispatchQueue(stream, queue)
-        FSEventStreamStart(stream)
     }
 
     func stop() {
-        if let stream {
-            FSEventStreamStop(stream)
-            FSEventStreamInvalidate(stream)
-            FSEventStreamRelease(stream)
-            self.stream = nil
-            rootPaths = []
-            streamConfiguration = nil
+        stateQueue.sync {
+            stopWithoutLock()
         }
     }
 
-    private func handle(events: [FileSystemEvent]) {
-        guard !events.isEmpty else { return }
-        guard let eventHandler else { return }
-
-        Task { @MainActor in
-            eventHandler(events)
+    private func stopWithoutLock() {
+        if let stream {
+            FSEventStreamStop(stream)
+            FSEventStreamInvalidate(stream)
+            callbackQueue.sync {}
+            FSEventStreamRelease(stream)
+            self.stream = nil
+            eventSink = nil
+            rootPaths = []
+            streamConfiguration = nil
         }
     }
 }

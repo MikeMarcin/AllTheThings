@@ -359,7 +359,7 @@ enum SearchRunReconciliation {
         currentSnapshotRevision: UInt64
     ) -> Bool {
         guard let displayedSnapshotRevision else { return false }
-        return displayedSnapshotRevision != currentSnapshotRevision
+        return displayedSnapshotRevision < currentSnapshotRevision
     }
 
     nonisolated static func fullCancellationKeepsSearchActive(
@@ -373,47 +373,24 @@ enum SearchRunReconciliation {
         fullSearchAlreadyFinished
     }
 
-    nonisolated static func shouldRejectFinalEmptyResponse(
-        existingResultCount: Int,
-        displayedMatchesResponseSignature: Bool,
-        responseResultCount: Int,
-        responseTotalMatches: Int,
+    nonisolated static func shouldRejectStaleFinalResponse(
         responseSnapshotRevision: UInt64?,
         currentSnapshotRevision: UInt64
     ) -> Bool {
-        guard
-            existingResultCount > 0,
-            displayedMatchesResponseSignature,
-            responseResultCount == 0,
-            responseTotalMatches == 0,
-            let responseSnapshotRevision,
-            responseSnapshotRevision < currentSnapshotRevision
-        else {
-            return false
-        }
-
-        return true
+        guard let responseSnapshotRevision else { return false }
+        return responseSnapshotRevision < currentSnapshotRevision
     }
 
     nonisolated static func shouldRetryStaleFinalResponse(
-        usesIndexedCandidates: Bool,
         responseSnapshotRevision: UInt64?,
         currentSnapshotRevision: UInt64,
-        signatureStillScheduled: Bool,
-        responseResultCount: Int,
-        responseTotalMatches: Int,
-        isIndexing: Bool
+        signatureStillScheduled: Bool
     ) -> Bool {
         guard
-            usesIndexedCandidates,
             let responseSnapshotRevision,
             responseSnapshotRevision < currentSnapshotRevision,
             signatureStillScheduled
         else {
-            return false
-        }
-
-        if isIndexing, responseResultCount > 0, responseTotalMatches > 0 {
             return false
         }
 
@@ -1283,8 +1260,11 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private let mascotFlightImageView = NSImageView()
 
     private var results: [SearchResult] = []
-    private var contextMenuTargetRow: Int?
+    private var contextMenuTargetRecordID: UInt64?
     private var explanationCache: [ExplanationCacheKey: MatchExplanation] = [:]
+    private var failedExplanationKeys = Set<ExplanationCacheKey>()
+    private var pendingExplanationReloadRecordIDs = Set<UInt64>()
+    private var explanationReloadScheduled = false
     private var indexStats: IndexStats
     private var totalMatches = 0
     private var displayedSearchCompleteness = SearchCompleteness.complete
@@ -1772,6 +1752,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     func controlTextDidChange(_ obj: Notification) {
+        guard !searchFieldHasMarkedText else { return }
         markSearchInputStarted()
         scheduleSearch()
         updateSetupSuggestions()
@@ -2814,6 +2795,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         if let cached = explanationCache[key] {
             return cached
         }
+        guard !failedExplanationKeys.contains(key) else { return result.match }
 
         if schedulesAsyncExplanation {
             scheduleExplanation(for: result.record, query: query, key: key)
@@ -2842,7 +2824,11 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     private func scheduleExplanation(for record: FileRecord, query: String, key: ExplanationCacheKey) {
         guard displayedSearchSignature?.query == query else { return }
-        guard explanationCache[key] == nil, !pendingExplanationKeys.contains(key) else { return }
+        guard
+            explanationCache[key] == nil,
+            !failedExplanationKeys.contains(key),
+            !pendingExplanationKeys.contains(key)
+        else { return }
 
         pendingExplanationKeys.insert(key)
         let generation = explanationGeneration
@@ -2863,14 +2849,31 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                 }
 
                 self.pendingExplanationKeys.remove(key)
-                guard let explanation else { return }
+                guard let explanation else {
+                    self.failedExplanationKeys.insert(key)
+                    return
+                }
                 self.explanationCache[key] = explanation
-                self.reloadVisibleRows(for: record.id)
+                self.scheduleExplanationReload(for: record.id)
             }
         }
     }
 
-    private func reloadVisibleRows(for recordID: UInt64) {
+    private func scheduleExplanationReload(for recordID: UInt64) {
+        pendingExplanationReloadRecordIDs.insert(recordID)
+        guard !explanationReloadScheduled else { return }
+        explanationReloadScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            self?.reloadVisibleExplanationRows()
+        }
+    }
+
+    private func reloadVisibleExplanationRows() {
+        explanationReloadScheduled = false
+        let recordIDs = pendingExplanationReloadRecordIDs
+        pendingExplanationReloadRecordIDs.removeAll(keepingCapacity: true)
+        guard !recordIDs.isEmpty else { return }
+
         let visibleRows = tableView.rows(in: tableView.visibleRect)
         guard visibleRows.location != NSNotFound, visibleRows.length > 0 else { return }
 
@@ -2878,7 +2881,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         guard visibleRows.location < end else { return }
 
         var rowIndexes = IndexSet()
-        for row in visibleRows.location..<end where results[row].record.id == recordID {
+        for row in visibleRows.location..<end where recordIDs.contains(results[row].record.id) {
             rowIndexes.insert(row)
         }
 
@@ -2894,27 +2897,19 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         activeExplanationToken = SearchCancellationToken()
         explanationGeneration &+= 1
         explanationCache.removeAll(keepingCapacity: keepingCapacity)
+        failedExplanationKeys.removeAll(keepingCapacity: keepingCapacity)
         pendingExplanationKeys.removeAll(keepingCapacity: keepingCapacity)
+        pendingExplanationReloadRecordIDs.removeAll(keepingCapacity: keepingCapacity)
+        explanationReloadScheduled = false
     }
 
     private func scheduleSearch(force: Bool = false) {
-        guard searchRefreshGate.request(isInteractive: energyMode == .interactive) else {
-            pendingSearchInputStartedAt = nil
-            return
-        }
-
         let queryText = currentSearchText()
         let appSearchQuery = ApplicationSearchQuery.parse(queryText)
         guard appSearchQuery != nil || !indexStats.isLoadingSnapshot else { return }
 
         let trimmedQuery = queryText.trimmingCharacters(in: .whitespacesAndNewlines)
         let request = SearchRequest(query: queryText, sort: sortSpec, includeHidden: showsHiddenFiles)
-        if appSearchQuery == nil {
-            if !trimmedQuery.isEmpty {
-                index.prioritizeSearchOptimization(for: request.sort.column)
-            }
-            updateScanSnapshotPublishingPreference(for: request)
-        }
         let signature = SearchSignature(
             query: request.query,
             sort: request.sort,
@@ -2933,6 +2928,18 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         if activeSearchToken != nil, force, !signatureChanged {
             return
+        }
+
+        guard searchRefreshGate.request(isInteractive: energyMode == .interactive) else {
+            pendingSearchInputStartedAt = nil
+            return
+        }
+
+        if appSearchQuery == nil {
+            if !trimmedQuery.isEmpty {
+                index.prioritizeSearchOptimization(for: request.sort.column)
+            }
+            updateScanSnapshotPublishingPreference(for: request)
         }
 
         scheduledSearchSignature = signature
@@ -2969,16 +2976,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         startSearchStatusTimerIfNeeded()
         updateMascotPersistentAnimation()
 
-        let queryChanged = displayedSearchSignature?.query != signature.query
         if signature != displayedSearchSignature {
-            results = []
-            if queryChanged {
-                resetExplanationPipeline()
-            }
-            totalMatches = 0
-            displayedSearchCompleteness = .complete
-            queryElapsed = 0
-            tableView.reloadData()
+            displayedSearchCompleteness = .partial
+            isRefiningSearchResults = true
             updateStatus()
             updateLoadingOverlay()
             updateActionButtons()
@@ -3079,11 +3079,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                 if token.isCancelled {
                     return true
                 }
-                if
-                    appSearchQuery == nil,
-                    Self.shouldBudgetSearchDuringIndexing(request: request, stats: index.currentStats()),
-                    Date().timeIntervalSince(fullSearchStartedAt) >= SearchScheduling.unoptimizedIndexingSearchBudget
-                {
+                if appSearchQuery == nil,
+                   Date().timeIntervalSince(fullSearchStartedAt) >= SearchScheduling.unoptimizedIndexingSearchBudget,
+                   Self.shouldBudgetSearchDuringIndexing(request: request, stats: index.currentStats()) {
                     budgetTimeout.markTimedOut()
                     return true
                 }
@@ -3160,13 +3158,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                     isFinal: true
                 )
                 if SearchRunReconciliation.shouldRetryStaleFinalResponse(
-                    usesIndexedCandidates: response.usesIndexedCandidates,
                     responseSnapshotRevision: response.snapshotRevision,
                     currentSnapshotRevision: self.indexStats.snapshotRevision,
-                    signatureStillScheduled: signature == self.scheduledSearchSignature,
-                    responseResultCount: response.results.count,
-                    responseTotalMatches: response.totalMatches,
-                    isIndexing: self.indexStats.isIndexing
+                    signatureStillScheduled: signature == self.scheduledSearchSignature
                 ) {
                     self.scheduleSearch(force: true)
                 }
@@ -3434,11 +3428,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let elapsed = max(Date().timeIntervalSince(searchStartedAt), 0)
         if
             isFinal,
-            SearchRunReconciliation.shouldRejectFinalEmptyResponse(
-                existingResultCount: results.count,
-                displayedMatchesResponseSignature: displayedSearchSignature == signature,
-                responseResultCount: response.results.count,
-                responseTotalMatches: response.totalMatches,
+            SearchRunReconciliation.shouldRejectStaleFinalResponse(
                 responseSnapshotRevision: response.snapshotRevision,
                 currentSnapshotRevision: indexStats.snapshotRevision
             )
@@ -3446,7 +3436,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             logFinalSearchRejected(
                 response,
                 signature: signature,
-                reason: "staleEmptyWouldClearPreview",
+                reason: "staleSnapshotRevision",
                 elapsed: elapsed,
                 generation: queryGeneration
             )
@@ -3456,17 +3446,13 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             activeSearchToken = nil
             activeSearchNeedsRetryAfterPreview = false
             isRefiningSearchResults = false
-            hasFinalSearchTiming = true
-            queryElapsed = elapsed
+            hasFinalSearchTiming = false
             activeSearchStartedAt = nil
             stopSearchStatusTimer()
             updateStatus()
             updateLoadingOverlay()
             updateActionButtons()
             updateMascotPersistentAnimation()
-            if signature == scheduledSearchSignature {
-                scheduleSearch(force: true)
-            }
             return
         }
 
@@ -3508,13 +3494,12 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         if displayedSearchSignature?.query != signature.query {
             resetExplanationPipeline()
         }
-        results = response.results
+        replaceResultsPreservingIdentity(response.results)
         totalMatches = response.totalMatches
         displayedSearchCompleteness = response.completeness
         queryElapsed = elapsed
         displayedSearchSignature = signature
         displayedSearchSnapshotRevision = response.snapshotRevision
-        tableView.reloadData()
         scheduleVisibleExplanations()
         updateStatus(refreshesMemory: isFinal)
         updateLoadingOverlay()
@@ -3657,15 +3642,6 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     private func shouldForceSearchRefreshForSnapshotChange(previous: IndexStats, current: IndexStats) -> Bool {
         guard current.snapshotRevision != previous.snapshotRevision else {
-            return false
-        }
-
-        if
-            current.isIndexing,
-            !results.isEmpty,
-            !currentSearchText().trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-            displayedSearchSignature == scheduledSearchSignature
-        {
             return false
         }
 
@@ -4531,7 +4507,14 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             return
         }
 
-        watcher.start(roots: indexedRoots, configuration: energyMode.watcherConfiguration) { @MainActor @Sendable [weak self] events in
+        let persistedEventIDs = fseventCursorStore.eventIDs(for: rootPaths(indexedRoots))
+        let sinceWhen: FSEventStreamEventId = persistedEventIDs.values.min()
+            ?? FSEventStreamEventId(kFSEventStreamEventIdSinceNow)
+        watcher.start(
+            roots: indexedRoots,
+            configuration: energyMode.watcherConfiguration,
+            sinceWhen: sinceWhen
+        ) { @MainActor @Sendable [weak self] events in
             self?.coalesceFSEvents(events)
         }
     }
@@ -4589,7 +4572,12 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         ensureFSEventCatchUpCursorBarrier()
         startWatchingIfNeeded()
-        guard !indexStats.isIndexing, activeFSEventReplay == nil, activeFSEventReconciliationID == nil else {
+        guard
+            !indexStats.isIndexing,
+            !indexStats.isLoadingSnapshot,
+            activeFSEventReplay == nil,
+            activeFSEventReconciliationID == nil
+        else {
             pendingFSEventCatchUpRoots = roots
             DiagnosticLogger.shared.log(
                 category: "fsevents",
@@ -5025,6 +5013,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     private func flushCoalescedFSEvents() {
         eventDebounce = nil
+        guard !indexStats.isLoadingSnapshot, !index.allRoots().isEmpty else {
+            scheduleCoalescedFSEventFlush()
+            return
+        }
         let events = Array(pendingFSEventsByPath.values)
         pendingFSEventsByPath.removeAll(keepingCapacity: false)
         let cursorBatchIDs = pendingFSEventCursorBatchIDs
@@ -5309,9 +5301,52 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func setContextMenuTargetRow(_ row: Int?) {
-        contextMenuTargetRow = row
+        contextMenuTargetRecordID = row.flatMap { row in
+            guard row >= 0, row < results.count else { return nil }
+            return results[row].record.id
+        }
         if tableView.contextMenuTargetRow != row {
             tableView.contextMenuTargetRow = row
+        }
+    }
+
+    private var searchFieldHasMarkedText: Bool {
+        (searchField.currentEditor() as? NSTextView)?.hasMarkedText() == true
+    }
+
+    private func replaceResultsPreservingIdentity(_ newResults: [SearchResult]) {
+        let oldResultIDs = results.map(\.record.id)
+        var selectedRecordIDs = Set<UInt64>()
+        for row in tableView.selectedRowIndexes where row >= 0 && row < oldResultIDs.count {
+            selectedRecordIDs.insert(oldResultIDs[row])
+        }
+        let selectedRow = tableView.selectedRow
+        let primaryRecordID: UInt64? = selectedRow >= 0 && selectedRow < oldResultIDs.count
+            ? oldResultIDs[selectedRow]
+            : nil
+
+        results = newResults
+        tableView.reloadData()
+
+        let newResultIDs = newResults.map(\.record.id)
+        let selectedRows = ResultIdentityRemapping.rowIndexes(
+            recordIDs: selectedRecordIDs,
+            resultRecordIDs: newResultIDs
+        )
+        tableView.selectRowIndexes(selectedRows, byExtendingSelection: false)
+        if let primaryRow = ResultIdentityRemapping.row(
+            recordID: primaryRecordID,
+            resultRecordIDs: newResultIDs
+        ) {
+            tableView.scrollRowToVisible(primaryRow)
+        }
+
+        let contextRow = ResultIdentityRemapping.row(
+            recordID: contextMenuTargetRecordID,
+            resultRecordIDs: newResultIDs
+        )
+        if tableView.contextMenuTargetRow != contextRow {
+            tableView.contextMenuTargetRow = contextRow
         }
     }
 
@@ -5374,7 +5409,12 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func fileActionRowIndexes() -> IndexSet {
-        FileActionTargeting.rowIndexes(
+        let resultRecordIDs = results.map(\.record.id)
+        let contextMenuTargetRow = ResultIdentityRemapping.row(
+            recordID: contextMenuTargetRecordID,
+            resultRecordIDs: resultRecordIDs
+        )
+        return FileActionTargeting.rowIndexes(
             contextMenuTargetRow: contextMenuTargetRow,
             selectedRowIndexes: tableView.selectedRowIndexes,
             rowCount: results.count
@@ -5420,6 +5460,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     private func displayRange(for span: MatchSpan, in displayText: String, originalPath: String?) -> NSRange? {
         var location = span.location
+        var length = span.length
         if
             let originalPath,
             displayText.hasPrefix("~"),
@@ -5427,15 +5468,22 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         {
             let home = FileManager.default.homeDirectoryForCurrentUser.path
             let homeUTF16Count = home.utf16.count
-            if location >= homeUTF16Count {
+            let end = location + length
+            if end <= homeUTF16Count {
+                location = 0
+                length = 1
+            } else if location < homeUTF16Count {
+                location = 0
+                length = 1 + end - homeUTF16Count
+            } else {
                 location = 1 + (location - homeUTF16Count)
             }
         }
 
-        guard location >= 0, span.length > 0, location + span.length <= displayText.utf16.count else {
+        guard location >= 0, length > 0, location + length <= displayText.utf16.count else {
             return nil
         }
-        return NSRange(location: location, length: span.length)
+        return NSRange(location: location, length: length)
     }
 
     private func highlightAttributes(for style: MatchSpanStyle) -> [NSAttributedString.Key: Any] {
@@ -5652,6 +5700,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     @objc private func searchFieldDidChange(_ sender: NSSearchField) {
+        guard !searchFieldHasMarkedText else { return }
         statusPreviewSearchText = nil
         markSearchInputStarted()
         scheduleSearch()
