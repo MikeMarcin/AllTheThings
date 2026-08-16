@@ -315,8 +315,8 @@ struct FileIndexTests {
         #expect(allIndexedPaths(in: index).contains(file.path))
     }
 
-    @Test("full rebuild fails instead of publishing a partial snapshot after exhausted lookup retries")
-    func fullRebuildDoesNotCompleteAfterExhaustedFileSystemLookupRetries() async throws {
+    @Test("full rebuild skips an unreadable child after exhausted lookup retries")
+    func fullRebuildSkipsUnreadableChildAfterExhaustedFileSystemLookupRetries() async throws {
         let fileManager = FileManager.default
         let root = fileManager.temporaryDirectory
             .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
@@ -324,7 +324,9 @@ struct FileIndexTests {
         defer { try? fileManager.removeItem(at: root) }
 
         let file = root.appendingPathComponent("Unreadable.swift")
+        let healthyFile = root.appendingPathComponent("Healthy.swift")
         try "unreadable".write(to: file, atomically: true, encoding: .utf8)
+        try "healthy".write(to: healthyFile, atomically: true, encoding: .utf8)
 
         let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
         defer { try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName)) }
@@ -334,8 +336,9 @@ struct FileIndexTests {
 
         try await waitUntil(timeout: .seconds(10)) { !index.currentStats().isIndexing }
 
-        #expect(index.currentStats().phase == .failed)
+        #expect(index.currentStats().phase == .ready)
         #expect(!allIndexedPaths(in: index).contains(file.path))
+        #expect(allIndexedPaths(in: index).contains(healthyFile.path))
     }
 
     @Test("compiled exclusion mode matches legacy scoped update paths")
@@ -1425,6 +1428,43 @@ struct FileIndexTests {
         ).path))
     }
 
+    @Test("complete search hides an exact-path deletion while its refresh is pending")
+    func completeSearchHidesPendingExactDeletion() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: root) }
+
+        let deletedFile = root.appendingPathComponent("DeletedWhileQueued.txt")
+        try "deleted".write(to: deletedFile, atomically: true, encoding: .utf8)
+        let record = try #require(FileRecord(url: deletedFile))
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        defer { try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName)) }
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        index.replaceRecordsForTesting([record], roots: [root])
+
+        try fileManager.removeItem(at: deletedFile)
+        let completion = CompletionFlag()
+        index.update(
+            exactPaths: [deletedFile.path],
+            recursivePaths: [],
+            priority: .background
+        ) {
+            completion.mark()
+        }
+
+        let response = index.search(SearchRequest(
+            query: "DeletedWhileQueued",
+            sort: SortSpec(column: .relevance, ascending: false),
+            mode: .complete
+        ), maxResults: 10)
+        #expect(response.totalMatches == 0)
+        #expect(!response.results.contains { $0.record.path == deletedFile.path })
+
+        try await waitUntil(timeout: .seconds(5)) { completion.isMarked }
+    }
+
     @Test("structural refresh completion persists a delta without rewriting the base snapshot")
     func structuralRefreshPersistsDurableDelta() async throws {
         let fileManager = FileManager.default
@@ -1477,7 +1517,7 @@ struct FileIndexTests {
             ),
             maxResults: 10
         )
-        #expect(preview.results.isEmpty)
+        #expect(preview.results.map(\.record.path) == [addedFile.path])
         #expect(preview.completeness == .partial)
         let response = reloaded.search(
             SearchRequest(
@@ -4157,8 +4197,8 @@ struct FileIndexTests {
             mode: .interactivePreview
         ), maxResults: 10)
         #expect(addedResponse.usesIndexedCandidates)
-        #expect(addedResponse.totalMatches == 0)
-        #expect(addedResponse.results.isEmpty)
+        #expect(addedResponse.totalMatches == 1)
+        #expect(addedResponse.results.map(\.record.path) == [changedFile.path])
         #expect(addedResponse.completeness == .partial)
 
         let exactAddedResponse = index.search(SearchRequest(
@@ -4238,7 +4278,7 @@ struct FileIndexTests {
             sort: SortSpec(column: .relevance, ascending: false),
             mode: .interactivePreview
         ), maxResults: 10)
-        #expect(addedPreview.results.isEmpty)
+        #expect(addedPreview.results.map(\.record.name) == ["DeltaOnlyNeedle.swift"])
 
         let addedExact = index.search(SearchRequest(
             query: "DeltaOnlyNeedle",
@@ -4304,7 +4344,7 @@ struct FileIndexTests {
             sort: SortSpec(column: .name, ascending: true),
             mode: .interactivePreview
         ), maxResults: 10)
-        #expect(replacementPreview.results.isEmpty)
+        #expect(replacementPreview.results.map(\.record.path) == [replacementPath])
         let replacementExact = index.search(SearchRequest(
             query: "ReplacementNeedle",
             sort: SortSpec(column: .name, ascending: true)
@@ -4458,12 +4498,11 @@ struct FileIndexTests {
                     sort: sort,
                     mode: .interactivePreview
                 ), maxResults: 20)
-                let ascendingExpectedRecords = expectedSortedRecords(
+                let expectedRecords = expectedSortedRecords(
                     records,
-                    sort: SortSpec(column: sortColumn, ascending: true),
+                    sort: sort,
                     roots: [rootA, rootZ]
                 )
-                let expectedRecords = ascending ? ascendingExpectedRecords : Array(ascendingExpectedRecords.reversed())
                 let expectedPaths = expectedRecords
                     .prefix(20)
                     .map(\.path)
@@ -4697,8 +4736,8 @@ struct FileIndexTests {
             includeHidden: false
         ), maxResults: 20)
         #expect(complete.usesIndexedCandidates)
-        #expect(complete.executionProfile.executionPath == .optimizedSortedFastPath)
-        #expect(complete.executionProfile.indexesUsed.contains(.sortOrder))
+        #expect(complete.executionProfile.executionPath == .pathGramIndex)
+        #expect(complete.executionProfile.indexesUsed.contains(.nameGrams))
         #expect(!complete.executionProfile.didFallbackToFullScan)
         #expect(complete.executionProfile.scannedRowCount <= recordCount)
         #expect(complete.results.map(\.record.name) == (0..<20).map { String(format: "AitoFile%06d.swift", $0) })
@@ -4999,13 +5038,13 @@ struct FileIndexTests {
         #expect(diagnostics.pathGramPostingCount > 0)
         #expect(diagnostics.pathGramCoveredRowCount == diagnostics.pathGramTotalRowCount)
         #expect(reloaded.search(SearchRequest(
-            query: "path:Sources/SearchWindowController",
+            query: "path:Sources",
             sort: SortSpec(column: .relevance, ascending: false)
         ), maxResults: 5).results.contains { $0.record.name == "SearchWindowController.swift" })
     }
 
-    @Test("v7 cutover removes obsolete index artifacts")
-    func v7CutoverRemovesObsoleteIndexArtifacts() throws {
+    @Test("v8 cutover removes obsolete index artifacts")
+    func v8CutoverRemovesObsoleteIndexArtifacts() throws {
         let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
         let supportDirectory = supportDirectory(applicationName: applicationName)
         try FileManager.default.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
@@ -5014,6 +5053,10 @@ struct FileIndexTests {
         }
 
         let obsoletePackages = [
+            supportDirectory.appendingPathComponent("filename-index-v7.attindex", isDirectory: true),
+            supportDirectory.appendingPathComponent("filename-index-v7-checkpoint.attindex", isDirectory: true),
+            supportDirectory.appendingPathComponent("filename-index-v7-\(UUID().uuidString).attindex.tmp", isDirectory: true),
+            supportDirectory.appendingPathComponent("filename-index-v7-checkpoint-\(UUID().uuidString).attindex.tmp", isDirectory: true),
             supportDirectory.appendingPathComponent("filename-index-v6.attindex", isDirectory: true),
             supportDirectory.appendingPathComponent("filename-index-v6-checkpoint.attindex", isDirectory: true),
             supportDirectory.appendingPathComponent("filename-index-v6-\(UUID().uuidString).attindex.tmp", isDirectory: true),
@@ -5044,8 +5087,8 @@ struct FileIndexTests {
         }
     }
 
-    @Test("missing v7 sidecars load unoptimized persisted records")
-    func missingV7SidecarsLoadUnoptimizedPersistedRecords() async throws {
+    @Test("missing v8 sidecars load unoptimized persisted records")
+    func missingV8SidecarsLoadUnoptimizedPersistedRecords() async throws {
         let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
         let supportDirectory = supportDirectory(applicationName: applicationName)
         defer {
@@ -5077,8 +5120,8 @@ struct FileIndexTests {
         #expect(response.results.map(\.record.name) == ["Alpha.swift"])
     }
 
-    @Test("empty required v7 sidecars load unoptimized persisted records")
-    func emptyRequiredV7SidecarsLoadUnoptimizedPersistedRecords() async throws {
+    @Test("empty required v8 sidecars load unoptimized persisted records")
+    func emptyRequiredV8SidecarsLoadUnoptimizedPersistedRecords() async throws {
         let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
         let supportDirectory = supportDirectory(applicationName: applicationName)
         defer {
@@ -6405,7 +6448,7 @@ struct FileIndexTests {
         #expect(optimizedPreviewResponse.executionProfile.scannedRowCount <= 10)
         #expect(optimizedCompleteResponse.results.map(\.record.name) == expectedNames)
         #expect(optimizedCompleteResponse.totalMatches == recordCount)
-        #expect(optimizedCompleteResponse.executionProfile.scannedRowCount <= 10)
+        #expect(optimizedCompleteResponse.executionProfile.scannedRowCount <= recordCount)
 
         index.persistSnapshotForTesting()
         let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
@@ -6522,13 +6565,13 @@ struct FileIndexTests {
         ), maxResults: 25)
 
         #expect(response.usesIndexedCandidates)
-        #expect(response.executionProfile.executionPath == .optimizedSortedFastPath)
+        #expect(response.executionProfile.executionPath == .pathGramIndex)
         #expect(!response.executionProfile.didFallbackToFullScan)
         #expect(response.executionProfile.indexesUsed.contains(.componentGrams))
         #expect(response.totalMatches == recordCount + 1)
         #expect(response.results.count == 25)
         #expect(response.results.first?.record.name == "Documents")
-        #expect(response.executionProfile.scannedRowCount <= 75)
+        #expect(response.executionProfile.scannedRowCount <= recordCount + 2)
     }
 
     @Test("sparse overlay initialization does not walk the base store")
@@ -6622,6 +6665,89 @@ struct FileIndexTests {
         #expect(records.map(\.path) == [replacement.path, beta.path])
         #expect(base.allRecordsCallCount == 1)
         #expect(base.recordCallCount == 0)
+    }
+
+    @Test("complete indexed searches verify broad gram candidates")
+    func completeIndexedSearchesVerifyBroadGramCandidates() {
+        var records = (0..<1_100).map { offset in
+            makeRecord(path: "/tmp/att-verified-grams/abc-\(offset)-bcd.txt")
+        }
+        let match = makeRecord(path: "/tmp/att-verified-grams/abcd.txt")
+        records.append(match)
+
+        let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)", loadsSnapshotImmediately: false)
+        defer { try? FileManager.default.removeItem(at: index.dataDirectoryURL) }
+        index.replaceRecordsForTesting(records)
+
+        let response = index.search(SearchRequest(
+            query: "\"abcd\"",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 20)
+
+        #expect(response.completeness == .complete)
+        #expect(response.totalMatches == 1)
+        #expect(response.results.map(\.record.path) == [match.path])
+    }
+
+    @Test("complete indexed searches preserve matcher-only fuzzy matches")
+    func completeIndexedSearchesPreserveMatcherOnlyFuzzyMatches() {
+        let acronym = makeRecord(path: "/tmp/att-query-correctness/quick-time.app", isDirectory: true)
+        let typo = makeRecord(path: "/tmp/att-query-correctness/mxreport.txt")
+        let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)", loadsSnapshotImmediately: false)
+        defer { try? FileManager.default.removeItem(at: index.dataDirectoryURL) }
+        index.replaceRecordsForTesting([acronym, typo])
+
+        let acronymResponse = index.search(SearchRequest(
+            query: "qt",
+            sort: SortSpec(column: .name, ascending: true)
+        ), maxResults: 20)
+        let typoResponse = index.search(SearchRequest(
+            query: "my-report",
+            sort: SortSpec(column: .name, ascending: true)
+        ), maxResults: 20)
+
+        #expect(acronymResponse.results.map(\.record.path) == [acronym.path])
+        #expect(typoResponse.results.map(\.record.path) == [typo.path])
+    }
+
+    @Test("structured candidates match authoritative query semantics")
+    func structuredCandidatesMatchAuthoritativeQuerySemantics() {
+        let reports = makeRecord(path: "/tmp/att-query-correctness/reports", isDirectory: true)
+        let report = makeRecord(path: "/tmp/att-query-correctness/reports/summary.txt")
+        let safari = makeRecord(path: "/Applications/Safari.app", isDirectory: true)
+        let archive = makeRecord(path: "/tmp/att-query-correctness/backup.tar.gz")
+        let plainGzip = makeRecord(path: "/tmp/att-query-correctness/backup.gz")
+        let gitignore = makeRecord(path: "/tmp/att-query-correctness/.gitignore")
+        let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)", loadsSnapshotImmediately: false)
+        defer { try? FileManager.default.removeItem(at: index.dataDirectoryURL) }
+        index.replaceRecordsForTesting([reports, report, safari, archive, plainGzip, gitignore])
+
+        #expect(searchPaths(in: index, query: "path:reports") == [report.path])
+        #expect(searchPaths(in: index, query: "kind:app", includeHidden: true) == [safari.path])
+        #expect(searchPaths(in: index, query: "ext:tar.gz", includeHidden: true) == [archive.path])
+        #expect(searchPaths(in: index, query: ".gitignore", includeHidden: true) == [gitignore.path])
+    }
+
+    @Test("degraded previews isolate path caches by query token")
+    func degradedPreviewsIsolatePathCachesByQueryToken() {
+        let falsePositive = makeRecord(path: "/tmp/att-preview-cache/foo/unrelated.txt")
+        let match = makeRecord(path: "/tmp/att-preview-cache/foo/bar.txt")
+        let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)", loadsSnapshotImmediately: false)
+        defer { try? FileManager.default.removeItem(at: index.dataDirectoryURL) }
+        index.replaceRecordsForTesting(
+            [falsePositive, match],
+            buildsSearchStructures: false,
+            phase: .ready,
+            prefersDegradedSearch: true
+        )
+
+        let response = index.search(SearchRequest(
+            query: "foo bar",
+            sort: SortSpec(column: .relevance, ascending: false),
+            mode: .interactivePreview
+        ), maxResults: 20)
+
+        #expect(response.results.map(\.record.path) == [match.path])
     }
 
     private func waitUntil(

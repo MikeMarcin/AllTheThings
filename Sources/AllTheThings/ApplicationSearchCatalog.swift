@@ -5,15 +5,50 @@ struct ApplicationSearchQuery: Equatable, Sendable {
     let searchText: String
 
     static func parse(_ query: String) -> ApplicationSearchQuery? {
-        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let colon = trimmed.firstIndex(of: ":") else { return nil }
+        let parts = splitQuery(query)
+        var appValues: [String] = []
+        var remaining: [String] = []
 
-        let prefix = trimmed[..<colon].trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard ["app", "apps", "application", "applications"].contains(prefix) else { return nil }
+        for part in parts {
+            guard let colon = part.firstIndex(of: ":") else {
+                remaining.append(part)
+                continue
+            }
+            let prefix = part[..<colon].lowercased()
+            guard ["app", "apps", "application", "applications"].contains(prefix) else {
+                remaining.append(part)
+                continue
+            }
+            appValues.append(String(part[part.index(after: colon)...]))
+        }
 
-        let valueStart = trimmed.index(after: colon)
-        let value = trimmed[valueStart...].trimmingCharacters(in: .whitespacesAndNewlines)
-        return ApplicationSearchQuery(searchText: String(value))
+        guard !appValues.isEmpty else { return nil }
+        let nonemptyAppValues = appValues.filter { !$0.isEmpty }
+        return ApplicationSearchQuery(searchText: (remaining + nonemptyAppValues).joined(separator: " "))
+    }
+
+    private static func splitQuery(_ query: String) -> [String] {
+        var parts: [String] = []
+        var current = ""
+        var inQuote = false
+
+        for character in query.trimmingCharacters(in: .whitespacesAndNewlines) {
+            if character == "\"" {
+                current.append(character)
+                inQuote.toggle()
+            } else if character.isWhitespace, !inQuote {
+                if !current.isEmpty {
+                    parts.append(current)
+                    current = ""
+                }
+            } else {
+                current.append(character)
+            }
+        }
+        if !current.isEmpty {
+            parts.append(current)
+        }
+        return parts
     }
 }
 

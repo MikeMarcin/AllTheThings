@@ -86,6 +86,57 @@ struct StructuralDeltaStoreTests {
         #expect(loaded.savedAt == Date(timeIntervalSinceReferenceDate: 22_000))
     }
 
+    @Test("repeated appends extend the journal without rewriting the compact base")
+    func repeatedAppendsUseIncrementalJournal() throws {
+        let fixture = try makeFixture()
+        defer { fixture.remove() }
+
+        let base = makeBaseIdentity()
+        _ = try fixture.store.append(
+            baseIdentity: base,
+            changes: [.upsert(makeRecord(path: "/indexed/First.txt"))]
+        )
+        let compactBaseBytes = try Data(contentsOf: fixture.store.url)
+        let journalURL = URL(fileURLWithPath: fixture.store.url.path + ".journal")
+        let firstJournalSize = try #require(
+            (FileManager.default.attributesOfItem(atPath: journalURL.path)[.size] as? NSNumber)?.intValue
+        )
+
+        _ = try fixture.store.append(
+            baseIdentity: base,
+            changes: [
+                .tombstone(path: "/indexed/First.txt"),
+                .upsert(makeRecord(path: "/indexed/Second.txt"))
+            ]
+        )
+
+        #expect(try Data(contentsOf: fixture.store.url) == compactBaseBytes)
+        let secondJournalSize = try #require(
+            (FileManager.default.attributesOfItem(atPath: journalURL.path)[.size] as? NSNumber)?.intValue
+        )
+        #expect(secondJournalSize > firstJournalSize)
+        let loaded = try requireLoaded(fixture.store.load(expectedBaseIdentity: base))
+        #expect(loaded.containsTombstone(for: "/indexed/First.txt"))
+        #expect(loaded.upsert(for: "/indexed/Second.txt") != nil)
+    }
+
+    @Test("a truncated append journal is rejected")
+    func truncatedJournalIsRejected() throws {
+        let fixture = try makeFixture()
+        defer { fixture.remove() }
+
+        let base = makeBaseIdentity()
+        _ = try fixture.store.append(
+            baseIdentity: base,
+            changes: [.upsert(makeRecord(path: "/indexed/Journal.txt"))]
+        )
+        let journalURL = URL(fileURLWithPath: fixture.store.url.path + ".journal")
+        let journal = try Data(contentsOf: journalURL)
+        try Data(journal.dropLast()).write(to: journalURL)
+
+        #expect(try fixture.store.load(expectedBaseIdentity: base) == .rejected(.corrupt))
+    }
+
     @Test("missing files and repeated clears are harmless")
     func missingAndClearAreHarmless() throws {
         let fixture = try makeFixture()

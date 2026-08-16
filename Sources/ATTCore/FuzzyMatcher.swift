@@ -13,11 +13,20 @@ protocol SearchRecordReadable {
     var volumeName: String { get }
     var normalizedName: String { get }
     var normalizedPath: String { get }
+    var normalizedDirectoryPath: String { get }
     var rootPath: String? { get }
 }
 
 extension SearchRecordReadable {
     var rootPath: String? { nil }
+
+    var normalizedDirectoryPath: String {
+        let suffix = "/" + normalizedName
+        guard normalizedPath.hasSuffix(suffix) else {
+            return FuzzyMatcher.normalize(directoryPath)
+        }
+        return String(normalizedPath.dropLast(suffix.count))
+    }
 }
 
 extension FileRecord: SearchRecordReadable {}
@@ -63,6 +72,7 @@ public enum FuzzyMatcher {
         value
             .folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: Locale(identifier: "en_US_POSIX"))
             .lowercased()
+            .precomposedStringWithCanonicalMapping
     }
 
     public static func parse(_ query: String) -> ParsedQuery {
@@ -116,12 +126,6 @@ public enum FuzzyMatcher {
     private static func explainReadable<Record: SearchRecordReadable>(record: Record, parsedQuery: ParsedQuery) -> MatchExplanation? {
         guard !parsedQuery.isEmpty else { return nil }
 
-        for negative in parsedQuery.negative {
-            if explain(clause: negative, record: record) != nil {
-                return nil
-            }
-        }
-
         var total = 0
         var spans: [MatchSpan] = []
         var best: MatchExplanation?
@@ -136,9 +140,21 @@ public enum FuzzyMatcher {
             }
         }
 
+        for negative in parsedQuery.negative where literalNegativeMatches(clause: negative, record: record) {
+            return nil
+        }
+
         let depthPenalty = min(record.path.filter { $0 == "/" }.count * 4, 120)
         let hiddenPenalty = record.isHidden ? 35 : 0
         let finalScore = total - depthPenalty - hiddenPenalty
+        if parsedQuery.positive.isEmpty {
+            return MatchExplanation(
+                matchClass: .metadata,
+                score: finalScore,
+                field: .name,
+                reason: "Did not match excluded terms"
+            )
+        }
         guard let best else { return nil }
         let reason = parsedQuery.positive.count == 1
             ? best.reason
@@ -190,11 +206,42 @@ public enum FuzzyMatcher {
     private static func explain<Record: SearchRecordReadable>(part: QueryPart, record: Record) -> MatchExplanation? {
         switch part {
         case .fileExtension(let pattern, let mode):
-            return extensionExplanation(record.fileExtension, pattern: pattern, mode: mode)
+            return extensionExplanation(record: record, pattern: pattern, mode: mode)
         case .kind(let token):
             return kindExplanation(record: record, token: token)
         case .text(let field, let pattern, let mode):
             return textExplanation(record: record, field: field, pattern: pattern, mode: mode)
+        }
+    }
+
+    private static func literalNegativeMatches<Record: SearchRecordReadable>(
+        clause: QueryClause,
+        record: Record
+    ) -> Bool {
+        clause.alternatives.contains { part in
+            switch part {
+            case .text(let field, let pattern, let mode):
+                switch mode {
+                case .exact:
+                    return exactExplanation(record: record, field: field, token: pattern.token) != nil
+                case .wildcard:
+                    return wildcardExplanation(record: record, field: field, pattern: pattern.token) != nil
+                case .fuzzy:
+                    switch field {
+                    case .any:
+                        return record.normalizedName.contains(pattern.token)
+                            || record.normalizedDirectoryPath.contains(pattern.token)
+                    case .name:
+                        return record.normalizedName.contains(pattern.token)
+                    case .path:
+                        return record.normalizedDirectoryPath.contains(pattern.token)
+                    }
+                }
+            case .fileExtension(let pattern, let mode):
+                return extensionExplanation(record: record, pattern: pattern, mode: mode) != nil
+            case .kind(let token):
+                return kindExplanation(record: record, token: token) != nil
+            }
         }
     }
 
@@ -261,7 +308,8 @@ public enum FuzzyMatcher {
         case .name:
             return nil
         case .any, .path:
-            guard let match = structuredPathMatches(path: record.normalizedPath, pattern: token) else {
+            let path = field == .path ? record.normalizedDirectoryPath : record.normalizedPath
+            guard let match = structuredPathMatches(path: path, pattern: token) else {
                 return nil
             }
             let base = field == .path ? 4_500 : 4_100
@@ -294,7 +342,10 @@ public enum FuzzyMatcher {
         }
 
         var best: MatchExplanation?
-        for component in pathComponentsWithRanges(record.directoryPath, normalizedPath: FuzzyMatcher.normalize(record.directoryPath)) {
+        for component in pathComponentsWithRanges(
+            record.directoryPath,
+            normalizedPath: record.normalizedDirectoryPath
+        ) {
             if let match = stringExplanation(
                 text: component.normalized,
                 sourceText: component.source,
@@ -361,6 +412,50 @@ public enum FuzzyMatcher {
         }
     }
 
+    static func extensionExplanation<Record: SearchRecordReadable>(
+        record: Record,
+        pattern: SearchPattern,
+        mode: MatchMode
+    ) -> MatchExplanation? {
+        if mode == .exact,
+           record.fileExtension.isEmpty,
+           record.normalizedName == "." + pattern.token {
+            return MatchExplanation(
+                matchClass: .exact,
+                score: 4_900,
+                field: .name,
+                reason: "Dotfile exactly matched \".\(pattern.token)\"",
+                spans: [
+                    MatchSpan(
+                        field: .name,
+                        location: 0,
+                        length: record.name.utf16.count,
+                        style: .contiguous
+                    )
+                ]
+            )
+        }
+        if pattern.token.contains("."), mode == .exact {
+            let suffix = "." + pattern.token
+            guard record.normalizedName.hasSuffix(suffix) else { return nil }
+            return MatchExplanation(
+                matchClass: .exact,
+                score: 4_900,
+                field: .fileExtension,
+                reason: "Extension exactly matched \"\(pattern.token)\"",
+                spans: [
+                    MatchSpan(
+                        field: .fileExtension,
+                        location: max(record.name.utf16.count - suffix.utf16.count, 0),
+                        length: suffix.utf16.count,
+                        style: .contiguous
+                    )
+                ]
+            )
+        }
+        return extensionExplanation(record.fileExtension, pattern: pattern, mode: mode)
+    }
+
     private static func kindScore<Record: SearchRecordReadable>(record: Record, token: String) -> Int? {
         kindExplanation(record: record, token: token)?.score
     }
@@ -421,12 +516,12 @@ public enum FuzzyMatcher {
         switch field {
         case .any:
             let nameMatch = explanation(normalizedText: record.normalizedName, sourceText: record.name, field: .name, base: 5_200)
-            let pathMatch = explanation(normalizedText: FuzzyMatcher.normalize(record.directoryPath), sourceText: record.directoryPath, field: .path, base: 3_700)
+            let pathMatch = explanation(normalizedText: record.normalizedDirectoryPath, sourceText: record.directoryPath, field: .path, base: 3_700)
             return bestExplanation([nameMatch, pathMatch].compactMap { $0 })
         case .name:
             return explanation(normalizedText: record.normalizedName, sourceText: record.name, field: .name, base: 5_200)
         case .path:
-            return explanation(normalizedText: FuzzyMatcher.normalize(record.directoryPath), sourceText: record.directoryPath, field: .path, base: 4_000)
+            return explanation(normalizedText: record.normalizedDirectoryPath, sourceText: record.directoryPath, field: .path, base: 4_000)
         }
     }
 
@@ -462,7 +557,7 @@ public enum FuzzyMatcher {
             guard !tokenContainsPathSeparator(pattern) else { return nil }
             return explanation(text: record.normalizedName, field: .name, base: 5_100)
         case .path:
-            return pathWildcardExplanation(record.normalizedPath, pattern: pattern, base: 4_100)
+            return pathWildcardExplanation(record.normalizedDirectoryPath, pattern: pattern, base: 4_100)
         }
     }
 
@@ -514,26 +609,34 @@ public enum FuzzyMatcher {
             return values.compactMap { parsePart(field: scoped.field, rawValue: $0) }
         }
 
-        return splitAlternatives(body).compactMap { parsePart(field: .any, rawValue: $0) }
+        return splitAlternatives(body).flatMap { parseUnscopedParts(rawValue: $0) }
     }
 
-    private static func parsePart(field: QueryField, rawValue: String) -> QueryPart? {
-        let parsed = parsePattern(rawValue)
-        guard !parsed.pattern.token.isEmpty else { return nil }
+    private static func parseUnscopedParts(rawValue: String) -> [QueryPart] {
+        let parsed = parsePattern(rawValue, allowsBareCharacterClasses: false)
+        guard !parsed.pattern.token.isEmpty else { return [] }
 
-        switch field {
-        case .any where parsed.pattern.token.hasPrefix("*.") && parsed.pattern.token.count > 2:
-            return .fileExtension(makeSearchPattern(normalizedExtensionToken(parsed.pattern.token), mode: parsed.mode), mode: parsed.mode)
-        case .any where parsed.pattern.token.hasPrefix(".") && parsed.pattern.token.count > 1:
-            let extensionToken = String(parsed.pattern.token.dropFirst())
-            return .fileExtension(makeSearchPattern(extensionToken, mode: .exact), mode: .exact)
-        case .name, .path, .any:
-            return .text(field: field, pattern: parsed.pattern, mode: parsed.mode)
+        if parsed.pattern.token.hasPrefix("*.") && parsed.pattern.token.count > 2 {
+            return [.fileExtension(
+                makeSearchPattern(normalizedExtensionToken(parsed.pattern.token), mode: parsed.mode),
+                mode: parsed.mode
+            )]
         }
+
+        guard
+            parsed.mode == .fuzzy,
+            parsed.pattern.token.hasPrefix("."),
+            parsed.pattern.token.count > 1
+        else {
+            return [.text(field: .any, pattern: parsed.pattern, mode: parsed.mode)]
+        }
+
+        let extensionToken = String(parsed.pattern.token.dropFirst())
+        return [.fileExtension(makeSearchPattern(extensionToken, mode: .exact), mode: .exact)]
     }
 
     private static func parsePart(field: ScopedField, rawValue: String) -> QueryPart? {
-        let parsed = parsePattern(rawValue)
+        let parsed = parsePattern(rawValue, allowsBareCharacterClasses: field == .fileExtension)
         guard !parsed.pattern.token.isEmpty else { return nil }
 
         switch field {
@@ -602,7 +705,10 @@ public enum FuzzyMatcher {
         }
     }
 
-    private static func parsePattern(_ rawValue: String) -> (pattern: SearchPattern, mode: MatchMode) {
+    private static func parsePattern(
+        _ rawValue: String,
+        allowsBareCharacterClasses: Bool = true
+    ) -> (pattern: SearchPattern, mode: MatchMode) {
         var value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         var mode: MatchMode = .fuzzy
 
@@ -615,7 +721,7 @@ public enum FuzzyMatcher {
         } else if value.hasSuffix("\"") {
             value.removeLast()
             mode = .exact
-        } else if containsWildcardSyntax(value) {
+        } else if containsWildcardSyntax(value, allowsBareCharacterClasses: allowsBareCharacterClasses) {
             mode = .wildcard
         }
 
@@ -809,9 +915,10 @@ public enum FuzzyMatcher {
         baseUTF16Offset: Int
     ) -> MatchExplanation? {
         let textChars = Array(text)
+        let sourceChars = Array(sourceText)
         let tokenChars = Array(token)
         let boundaryOffsets = textChars.indices.filter {
-            isBoundary(in: text, sourceText: sourceText, atCharacterOffset: $0)
+            isBoundary(in: textChars, sourceChars: sourceChars, atCharacterOffset: $0)
         }
         guard !boundaryOffsets.isEmpty else { return nil }
 
@@ -849,6 +956,7 @@ public enum FuzzyMatcher {
         baseUTF16Offset: Int
     ) -> MatchExplanation? {
         let textChars = Array(text)
+        let sourceChars = Array(sourceText)
         let tokenChars = Array(token)
         var tokenIndex = 0
         var positions: [Int] = []
@@ -879,8 +987,8 @@ public enum FuzzyMatcher {
         }
 
         let spanWidth = last - first + 1
-        let startsAtBoundary = isBoundary(in: text, sourceText: sourceText, atCharacterOffset: first)
-        let endsAtBoundary = isBoundary(in: text, sourceText: sourceText, atCharacterOffset: last)
+        let startsAtBoundary = isBoundary(in: textChars, sourceChars: sourceChars, atCharacterOffset: first)
+        let endsAtBoundary = isBoundary(in: textChars, sourceChars: sourceChars, atCharacterOffset: last)
         guard spanWidth <= token.count + 1 || startsAtBoundary || endsAtBoundary else {
             return nil
         }
@@ -982,20 +1090,6 @@ public enum FuzzyMatcher {
         }
 
         return best
-    }
-
-    private static func acronymScore(text: String, token: String) -> Int? {
-        let acronym = String(text.enumerated().compactMap { index, char -> Character? in
-            if index == 0 { return char }
-            let stringIndex = text.index(text.startIndex, offsetBy: index)
-            return isBoundary(in: text, at: stringIndex) ? char : nil
-        })
-
-        guard let score = subsequenceScore(text: acronym, token: token) else {
-            return nil
-        }
-
-        return score + 1_000
     }
 
     private static func subsequenceScore(text: String, token: String) -> Int? {
@@ -1166,12 +1260,19 @@ public enum FuzzyMatcher {
     }
 
     private static func isBoundary(in text: String, sourceText: String, atCharacterOffset offset: Int) -> Bool {
+        isBoundary(in: Array(text), sourceChars: Array(sourceText), atCharacterOffset: offset)
+    }
+
+    private static func isBoundary(
+        in textChars: [Character],
+        sourceChars: [Character],
+        atCharacterOffset offset: Int
+    ) -> Bool {
         guard offset > 0 else { return true }
-        if offset < text.count, isBoundary(in: text, atCharacterOffset: offset) {
+        if offset < textChars.count, isComponentSeparator(textChars[offset - 1]) {
             return true
         }
 
-        let sourceChars = Array(sourceText)
         guard offset > 0, offset < sourceChars.count else { return false }
         let previous = sourceChars[offset - 1]
         let current = sourceChars[offset]
@@ -1211,13 +1312,16 @@ public enum FuzzyMatcher {
         }
     }
 
-    private static func containsWildcardSyntax(_ value: String) -> Bool {
-        value.contains("*") || value.contains("?") || wildcardTokens(from: value).contains {
+    private static func containsWildcardSyntax(
+        _ value: String,
+        allowsBareCharacterClasses: Bool = true
+    ) -> Bool {
+        value.contains("*") || value.contains("?") || (allowsBareCharacterClasses && wildcardTokens(from: value).contains {
             if case .characterClass = $0 {
                 return true
             }
             return false
-        }
+        })
     }
 
     static func exactWildcardLiteralAlternatives(_ pattern: String, maxAlternatives: Int = 128) -> [String]? {
@@ -1526,7 +1630,25 @@ public enum FuzzyMatcher {
             parts.append(current)
         }
 
-        return parts
+        guard parts.contains("|") else { return parts }
+
+        var combined: [String] = []
+        var index = 0
+        while index < parts.count {
+            guard parts[index] != "|" else {
+                index += 1
+                continue
+            }
+
+            var clause = parts[index]
+            while index + 2 < parts.count, parts[index + 1] == "|", parts[index + 2] != "|" {
+                clause += "|" + parts[index + 2]
+                index += 2
+            }
+            combined.append(clause)
+            index += 1
+        }
+        return combined
     }
 
     private static func boundedLevenshtein(_ lhs: String, _ rhs: String, limit: Int) -> Int? {
@@ -1569,38 +1691,34 @@ public enum FuzzyMatcher {
         guard !a.isEmpty else { return b.count <= limit ? b.count : nil }
         guard !b.isEmpty else { return a.count <= limit ? a.count : nil }
 
-        var matrix = Array(
-            repeating: Array(repeating: 0, count: b.count + 1),
-            count: a.count + 1
-        )
-        for i in 0...a.count {
-            matrix[i][0] = i
-        }
-        for j in 0...b.count {
-            matrix[0][j] = j
-        }
+        var previousPrevious = Array(repeating: 0, count: b.count + 1)
+        var previous = Array(0...b.count)
+        var current = Array(repeating: 0, count: b.count + 1)
 
         for i in 1...a.count {
-            var rowMinimum = matrix[i][0]
+            current[0] = i
+            var rowMinimum = current[0]
             for j in 1...b.count {
                 let cost = a[i - 1] == b[j - 1] ? 0 : 1
                 var value = min(
-                    matrix[i - 1][j] + 1,
-                    matrix[i][j - 1] + 1,
-                    matrix[i - 1][j - 1] + cost
+                    previous[j] + 1,
+                    current[j - 1] + 1,
+                    previous[j - 1] + cost
                 )
                 if i > 1, j > 1, a[i - 1] == b[j - 2], a[i - 2] == b[j - 1] {
-                    value = min(value, matrix[i - 2][j - 2] + 1)
+                    value = min(value, previousPrevious[j - 2] + 1)
                 }
-                matrix[i][j] = value
+                current[j] = value
                 rowMinimum = min(rowMinimum, value)
             }
             if rowMinimum > limit {
                 return nil
             }
+            swap(&previousPrevious, &previous)
+            swap(&previous, &current)
         }
 
-        let distance = matrix[a.count][b.count]
+        let distance = previous[b.count]
         return distance <= limit ? distance : nil
     }
 }

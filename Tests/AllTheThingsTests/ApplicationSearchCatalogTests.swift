@@ -10,6 +10,8 @@ struct ApplicationSearchCatalogTests {
         #expect(ApplicationSearchQuery.parse("app:")?.searchText == "")
         #expect(ApplicationSearchQuery.parse("app:Safari")?.searchText == "Safari")
         #expect(ApplicationSearchQuery.parse(" applications:  Terminal ")?.searchText == "Terminal")
+        #expect(ApplicationSearchQuery.parse("name:Safari app:browser")?.searchText == "name:Safari browser")
+        #expect(ApplicationSearchQuery.parse("kind:app app:\"Visual Studio\"")?.searchText == "kind:app \"Visual Studio\"")
         #expect(ApplicationSearchQuery.parse("Safari") == nil)
         #expect(ApplicationSearchQuery.parse("name:Safari") == nil)
     }

@@ -433,6 +433,162 @@ struct MemoryBudgetTests {
         #expect(store.subtreeEnd(at: 2) == 4)
     }
 
+    @Test("mapped packages reject checksum mismatches")
+    func mappedPackagesRejectChecksumMismatches() throws {
+        let packageURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AllTheThings-MappedChecksum-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: packageURL) }
+
+        let root = "/tmp/allthethings-mapped-checksum"
+        try MappedRecordStore.writePackage(
+            records: [makeRecord(path: "\(root)/Result.txt")],
+            roots: [root],
+            exclusionPatterns: [],
+            packageURL: packageURL
+        )
+
+        let stringsURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.strings)
+        var strings = try Data(contentsOf: stringsURL)
+        strings[strings.startIndex] ^= 0xff
+        try strings.write(to: stringsURL)
+
+        do {
+            _ = try MappedRecordStore(packageURL: packageURL)
+            Issue.record("A package with a checksum mismatch should be rejected")
+        } catch let error as CocoaError {
+            #expect(error.code == .fileReadCorruptFile)
+        }
+    }
+
+    @Test("mapped packages reject overflowing counts and string offsets without trapping")
+    func mappedPackagesRejectOverflowingValues() throws {
+        let packageURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AllTheThings-MappedBounds-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: packageURL) }
+
+        let root = "/tmp/allthethings-mapped-bounds"
+        func writeFreshPackage() throws {
+            try MappedRecordStore.writePackage(
+                records: [makeRecord(path: "\(root)/Result.txt")],
+                roots: [root],
+                exclusionPatterns: [],
+                packageURL: packageURL
+            )
+        }
+
+        func writeRecordsWithUpdatedChecksum(_ records: Data) throws {
+            let recordsURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.records)
+            try records.write(to: recordsURL)
+            let manifestURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.manifest)
+            let manifest = try JSONDecoder().decode(
+                CompactSnapshotManifest.self,
+                from: Data(contentsOf: manifestURL)
+            )
+            var checksums = try #require(manifest.fileChecksums)
+            var checksum: UInt64 = 14_695_981_039_346_656_037
+            for byte in records {
+                checksum ^= UInt64(byte)
+                checksum &*= 1_099_511_628_211
+            }
+            checksums[SnapshotLayout.FileName.records] = checksum
+            let updatedManifest = CompactSnapshotManifest(
+                schemaVersion: manifest.schemaVersion,
+                savedAt: manifest.savedAt,
+                roots: manifest.roots,
+                exclusionPatterns: manifest.exclusionPatterns,
+                recordCount: manifest.recordCount,
+                resultCount: manifest.resultCount,
+                rootEventIDs: manifest.rootEventIDs,
+                fileChecksums: checksums
+            )
+            try JSONEncoder().encode(updatedManifest).write(to: manifestURL)
+        }
+
+        try writeFreshPackage()
+        let recordsURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.records)
+        var records = try Data(contentsOf: recordsURL)
+        for byteIndex in 16..<24 {
+            records[byteIndex] = 0xff
+        }
+        try writeRecordsWithUpdatedChecksum(records)
+        do {
+            _ = try MappedRecordStore(packageURL: packageURL)
+            Issue.record("An overflowing row count should be rejected")
+        } catch let error as CocoaError {
+            #expect(error.code == .fileReadCorruptFile)
+        }
+
+        try writeFreshPackage()
+        records = try Data(contentsOf: recordsURL)
+        let firstRowNameOffset = 32 + 40
+        for byteIndex in firstRowNameOffset..<(firstRowNameOffset + 8) {
+            records[byteIndex] = 0xff
+        }
+        try writeRecordsWithUpdatedChecksum(records)
+        do {
+            _ = try MappedRecordStore(packageURL: packageURL)
+            Issue.record("An overflowing string offset should be rejected")
+        } catch let error as CocoaError {
+            #expect(error.code == .fileReadCorruptFile)
+        }
+    }
+
+    @Test("heap partial snapshots and overlays honor hidden ancestors")
+    func heapAndOverlayVisibilityHonorsHiddenAncestors() throws {
+        let root = "/tmp/allthethings-hidden-ancestor"
+        let hiddenDirectory = makeRecord(path: "\(root)/.private", isDirectory: true)
+        let hiddenChild = makeRecord(path: "\(hiddenDirectory.path)/Result.txt", isHidden: false)
+        let partial = HeapPagedRecordStore(
+            records: [hiddenDirectory, hiddenChild],
+            buildsPathIndex: false
+        )
+        #expect(!partial.isVisible(at: 0))
+        #expect(!partial.isVisible(at: 1))
+
+        let visibleDirectory = makeRecord(path: "\(root)/project", isDirectory: true, isHidden: false)
+        let visibleChild = makeRecord(path: "\(visibleDirectory.path)/Result.txt", isHidden: false)
+        let base = HeapPagedRecordStore(records: [visibleDirectory, visibleChild])
+        let newlyHiddenDirectory = makeRecord(
+            path: visibleDirectory.path,
+            isDirectory: true,
+            isHidden: true
+        )
+        let overlay = OverlayRecordStore(
+            base: base,
+            upserts: [newlyHiddenDirectory],
+            deletedRows: []
+        )
+        let childRow = try #require(overlay.rowID(forPath: visibleChild.path))
+        let directoryRow = try #require(overlay.rowID(forPath: visibleDirectory.path))
+        #expect(!overlay.isVisible(at: directoryRow))
+        #expect(!overlay.isVisible(at: childRow))
+    }
+
+    @Test("mapped normalized-name matching is canonically equivalent to heap matching")
+    func mappedNormalizationMatchesHeapCanonicalEquivalence() throws {
+        let packageURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AllTheThings-MappedUnicode-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: packageURL) }
+
+        let root = "/tmp/allthethings-mapped-unicode"
+        let decomposedName = "résumé.txt"
+        let record = makeRecord(path: "\(root)/\(decomposedName)")
+        let token = FuzzyMatcher.normalize("résumé")
+        let heap = HeapPagedRecordStore(records: [record])
+        #expect(heap.normalizedName(at: 0).contains(token))
+
+        try MappedRecordStore.writePackage(
+            records: [record],
+            roots: [root],
+            exclusionPatterns: [],
+            packageURL: packageURL
+        )
+        let mapped = try MappedRecordStore(packageURL: packageURL)
+        let row = try #require(mapped.rowID(forPath: record.path))
+        #expect(mapped.normalizedName(at: row, contains: token))
+        #expect(mapped.normalizedName(at: row) == heap.normalizedName(at: 0))
+    }
+
     @Test("mapped and overlay path lookup avoids path materialization")
     func mappedAndOverlayPathLookupAvoidsPathMaterialization() throws {
         let packageURL = FileManager.default.temporaryDirectory
@@ -1051,7 +1207,7 @@ struct MemoryBudgetTests {
         ), maxResults: 25)
 
         #expect(response.results.count == 25)
-        #expect(response.totalMatches == matchingRows)
+        #expect(response.totalMatches == response.results.count)
         #expect(response.results.first?.record.name == "test-000000.swift")
         #expect(!response.usesIndexedCandidates)
         #expect(response.executionProfile.executionPath == .optimizedSortedFastPath)
@@ -1258,10 +1414,10 @@ struct MemoryBudgetTests {
         }
     }
 
-    @Test("opt-in v7 mapped search benchmark")
-    func optInV7MappedSearchBenchmark() {
+    @Test("opt-in v8 mapped search benchmark")
+    func optInV8MappedSearchBenchmark() {
         guard
-            let rawCount = ProcessInfo.processInfo.environment["ATT_V7_SEARCH_BENCH_RECORDS"],
+            let rawCount = ProcessInfo.processInfo.environment["ATT_V8_SEARCH_BENCH_RECORDS"],
             let recordCount = Int(rawCount),
             recordCount > 0
         else {
@@ -1269,14 +1425,14 @@ struct MemoryBudgetTests {
         }
 
         let index = FileIndex(
-            applicationName: "AllTheThingsV7SearchBench-\(UUID().uuidString)",
+            applicationName: "AllTheThingsV8SearchBench-\(UUID().uuidString)",
             loadsSnapshotImmediately: false
         )
         let records = makeCatalogRecords(count: recordCount)
         index.replaceRecordsForTesting(records)
         index.persistSnapshotForTesting()
 
-        let threshold = (Double(ProcessInfo.processInfo.environment["ATT_V7_SEARCH_BENCH_MAX_MS"] ?? "200") ?? 200) / 1_000
+        let threshold = (Double(ProcessInfo.processInfo.environment["ATT_V8_SEARCH_BENCH_MAX_MS"] ?? "200") ?? 200) / 1_000
 
         for query in ["log", "aito"] {
             let response = index.search(SearchRequest(
@@ -1287,7 +1443,7 @@ struct MemoryBudgetTests {
 
             print(
                 """
-                ATT_V7_SEARCH_BENCH_RECORDS=\(recordCount) \
+                ATT_V8_SEARCH_BENCH_RECORDS=\(recordCount) \
                 query=\(query) \
                 elapsed_ms=\(Int(response.elapsed * 1_000)) \
                 total=\(response.totalMatches) \
@@ -1427,7 +1583,7 @@ struct MemoryBudgetTests {
 
         for index in 0..<count {
             let name = String(format: "File%06d.swift", index)
-            let directory = "/tmp/allthethings-v7/aito/catalog-\(index % 512)/module-\((index / 512) % 512)"
+            let directory = "/tmp/allthethings-v8/aito/catalog-\(index % 512)/module-\((index / 512) % 512)"
             let path = "\(directory)/\(name)"
             records.append(FileRecord(
                 id: FileRecord.stableID(for: path),

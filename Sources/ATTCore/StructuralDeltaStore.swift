@@ -249,11 +249,18 @@ extension StructuralDeltaStoreError: LocalizedError {
 /// explicitly by the caller before new changes can be appended.
 final class StructuralDeltaStore: @unchecked Sendable {
     static let fileName = "filename-index-structural-delta-v1.bin"
+    private static let journalSuffix = ".journal"
+    private static let maximumJournalByteCount = 16 * 1024 * 1024
 
     let url: URL
 
     private let fileManager: FileManager
     private let lock = NSLock()
+    private var cachedDelta: StructuralDelta?
+
+    private var journalURL: URL {
+        URL(fileURLWithPath: url.path + Self.journalSuffix, isDirectory: false)
+    }
 
     init(url: URL, fileManager: FileManager = .default) {
         self.url = url
@@ -269,7 +276,8 @@ final class StructuralDeltaStore: @unchecked Sendable {
 
     func load(expectedBaseIdentity: StructuralDeltaBaseIdentity) throws -> StructuralDeltaLoadResult {
         try lock.withLock {
-            try loadUnlocked(expectedBaseIdentity: expectedBaseIdentity)
+            cachedDelta = nil
+            return try loadUnlocked(expectedBaseIdentity: expectedBaseIdentity)
         }
     }
 
@@ -279,8 +287,8 @@ final class StructuralDeltaStore: @unchecked Sendable {
         }
     }
 
-    /// Loads the current delta, applies changes in order, and atomically rewrites
-    /// the compacted latest-wins state.
+    /// Loads the current delta, applies changes in order, and appends a durable
+    /// independently checksummed journal frame.
     ///
     /// A rejected existing file is not overwritten implicitly. The owner must
     /// first decide that its base snapshot is authoritative and call `clear()`.
@@ -293,29 +301,49 @@ final class StructuralDeltaStore: @unchecked Sendable {
     ) throws -> StructuralDelta {
         try lock.withLock {
             var delta: StructuralDelta
-            switch try loadUnlocked(expectedBaseIdentity: baseIdentity) {
-            case .missing:
-                delta = try StructuralDelta(baseIdentity: baseIdentity, savedAt: savedAt)
-            case let .loaded(loaded):
-                delta = loaded
-            case let .rejected(rejection):
-                throw StructuralDeltaStoreError.rejected(rejection)
+            if let cachedDelta, cachedDelta.baseIdentity.matches(baseIdentity) {
+                delta = cachedDelta
+            } else {
+                switch try loadUnlocked(expectedBaseIdentity: baseIdentity) {
+                case .missing:
+                    delta = try StructuralDelta(baseIdentity: baseIdentity, savedAt: savedAt)
+                    try saveUnlocked(delta)
+                case let .loaded(loaded):
+                    delta = loaded
+                case let .rejected(rejection):
+                    throw StructuralDeltaStoreError.rejected(rejection)
+                }
             }
 
+            let frame = try StructuralDelta(
+                baseIdentity: baseIdentity,
+                changes: changes,
+                fseventMetadata: fseventMetadata,
+                savedAt: savedAt
+            )
+            try appendJournalFrameUnlocked(frame)
             try delta.apply(
                 changes,
                 fseventMetadata: fseventMetadata,
                 savedAt: savedAt
             )
-            try saveUnlocked(delta)
+            cachedDelta = delta
+
+            let journalAttributes = try? fileManager.attributesOfItem(atPath: journalURL.path)
+            let journalByteCount = (journalAttributes?[.size] as? NSNumber)?.intValue ?? 0
+            if journalByteCount > Self.maximumJournalByteCount {
+                try saveUnlocked(delta)
+            }
             return delta
         }
     }
 
     func clear() throws {
         try lock.withLock {
-            guard fileManager.fileExists(atPath: url.path) else { return }
-            try fileManager.removeItem(at: url)
+            cachedDelta = nil
+            for candidateURL in [url, journalURL] where fileManager.fileExists(atPath: candidateURL.path) {
+                try fileManager.removeItem(at: candidateURL)
+            }
         }
     }
 
@@ -340,11 +368,17 @@ final class StructuralDeltaStore: @unchecked Sendable {
         }
 
         switch StructuralDeltaBinaryCodec.decode(data) {
-        case let .success(delta):
-            guard delta.baseIdentity.matches(expectedBaseIdentity) else {
-                return .rejected(.baseIdentityMismatch(found: delta.baseIdentity))
+        case let .success(baseDelta):
+            guard baseDelta.baseIdentity.matches(expectedBaseIdentity) else {
+                return .rejected(.baseIdentityMismatch(found: baseDelta.baseIdentity))
             }
-            return .loaded(delta)
+            do {
+                let delta = try applyingJournalUnlocked(to: baseDelta)
+                cachedDelta = delta
+                return .loaded(delta)
+            } catch {
+                return .rejected(.corrupt)
+            }
         case let .failure(rejection):
             return .rejected(rejection)
         }
@@ -357,6 +391,71 @@ final class StructuralDeltaStore: @unchecked Sendable {
             withIntermediateDirectories: true
         )
         try data.write(to: url, options: .atomic)
+        if fileManager.fileExists(atPath: journalURL.path) {
+            try fileManager.removeItem(at: journalURL)
+        }
+        cachedDelta = delta
+    }
+
+    private func appendJournalFrameUnlocked(_ frame: StructuralDelta) throws {
+        let payload = try StructuralDeltaBinaryCodec.encode(frame)
+        var framedData = Data()
+        framedData.reserveCapacity(8 + payload.count)
+        var payloadLength = UInt64(payload.count)
+        for _ in 0..<8 {
+            framedData.append(UInt8(payloadLength & 0xff))
+            payloadLength >>= 8
+        }
+        framedData.append(payload)
+
+        try fileManager.createDirectory(
+            at: journalURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        if !fileManager.fileExists(atPath: journalURL.path) {
+            guard fileManager.createFile(atPath: journalURL.path, contents: nil) else {
+                throw CocoaError(.fileWriteUnknown)
+            }
+        }
+        let handle = try FileHandle(forWritingTo: journalURL)
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: framedData)
+        try handle.synchronize()
+    }
+
+    private func applyingJournalUnlocked(to baseDelta: StructuralDelta) throws -> StructuralDelta {
+        guard fileManager.fileExists(atPath: journalURL.path) else { return baseDelta }
+        let data = try Data(contentsOf: journalURL, options: [.mappedIfSafe])
+        var offset = 0
+        var delta = baseDelta
+        while offset < data.count {
+            guard offset + 8 <= data.count else { throw CocoaError(.fileReadCorruptFile) }
+            var rawLength: UInt64 = 0
+            for byteIndex in 0..<8 {
+                rawLength |= UInt64(data[offset + byteIndex]) << UInt64(byteIndex * 8)
+            }
+            offset += 8
+            guard let length = Int(exactly: rawLength),
+                  length >= 0,
+                  length <= data.count - offset else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            let payload = Data(data[offset..<(offset + length)])
+            offset += length
+            guard case let .success(frame) = StructuralDeltaBinaryCodec.decode(payload),
+                  frame.baseIdentity.matches(delta.baseIdentity) else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            var changes = frame.tombstones.map { StructuralDeltaChange.tombstone(path: $0) }
+            changes.append(contentsOf: frame.upserts.map { StructuralDeltaChange.upsert($0) })
+            try delta.apply(
+                changes,
+                fseventMetadata: frame.fseventMetadata,
+                savedAt: frame.savedAt
+            )
+        }
+        return delta
     }
 }
 

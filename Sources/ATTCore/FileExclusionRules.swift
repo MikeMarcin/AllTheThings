@@ -254,7 +254,8 @@ public struct FileExclusionRules: @unchecked Sendable {
 
             isAnchored = anchored
             containsSlash = pattern.contains("/")
-            isTraversalOnlyDirectoryReinclude = isNegated && isDirectoryPattern && !containsSlash && pattern == "*"
+            isTraversalOnlyDirectoryReinclude = isNegated
+                && ((isDirectoryPattern && !containsSlash && pattern == "*") || pattern.hasSuffix("/**"))
             literalPrefix = Self.literalPrefix(for: pattern)
 
             do {
@@ -284,7 +285,11 @@ public struct FileExclusionRules: @unchecked Sendable {
             guard !prefix.isEmpty else { return false }
 
             return relativePaths.contains { relativePath in
-                Self.pathsMayOverlapForDescendant(rulePrefix: prefix, directoryPath: relativePath)
+                Self.pathsMayOverlapForDescendant(
+                    rulePrefix: prefix,
+                    directoryPath: relativePath,
+                    isAnchored: isAnchored
+                )
             }
         }
 
@@ -405,10 +410,28 @@ public struct FileExclusionRules: @unchecked Sendable {
                 let character = pattern[index]
                 let nextIndex = pattern.index(after: index)
 
-                if character == "*" {
+                if character == "/",
+                   nextIndex < pattern.endIndex,
+                   pattern[nextIndex] == "*" {
+                    let secondStar = pattern.index(after: nextIndex)
+                    if secondStar < pattern.endIndex, pattern[secondStar] == "*",
+                       pattern.index(after: secondStar) == pattern.endIndex {
+                        output += "(?:/.*)?"
+                        index = pattern.endIndex
+                    } else {
+                        output += "/"
+                        index = nextIndex
+                    }
+                } else if character == "*" {
                     if nextIndex < pattern.endIndex, pattern[nextIndex] == "*" {
-                        output += ".*"
-                        index = pattern.index(after: nextIndex)
+                        let afterDoubleStar = pattern.index(after: nextIndex)
+                        if afterDoubleStar < pattern.endIndex, pattern[afterDoubleStar] == "/" {
+                            output += "(?:.*/)?"
+                            index = pattern.index(after: afterDoubleStar)
+                        } else {
+                            output += ".*"
+                            index = afterDoubleStar
+                        }
                     } else {
                         output += "[^/]*"
                         index = nextIndex
@@ -488,11 +511,26 @@ public struct FileExclusionRules: @unchecked Sendable {
             }
         }
 
-        private static func pathsMayOverlapForDescendant(rulePrefix: String, directoryPath: String) -> Bool {
+        private static func pathsMayOverlapForDescendant(
+            rulePrefix: String,
+            directoryPath: String,
+            isAnchored: Bool
+        ) -> Bool {
             guard !directoryPath.isEmpty else { return true }
-            return rulePrefix == directoryPath
+            if rulePrefix == directoryPath
                 || rulePrefix.hasPrefix(directoryPath + "/")
-                || directoryPath.hasPrefix(rulePrefix + "/")
+                || directoryPath.hasPrefix(rulePrefix + "/") {
+                return true
+            }
+            guard !isAnchored else { return false }
+
+            let components = directoryPath.split(separator: "/")
+            return components.indices.contains { start in
+                let suffix = components[start...].joined(separator: "/")
+                return rulePrefix == suffix
+                    || rulePrefix.hasPrefix(suffix + "/")
+                    || suffix.hasPrefix(rulePrefix + "/")
+            }
         }
 
         private static func components(for path: String) -> [String] {

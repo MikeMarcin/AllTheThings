@@ -297,6 +297,7 @@ protocol RecordStore: AnyObject, Sendable {
     var heapPageCount: Int { get }
     var overlayCount: Int { get }
     var hasColumnarSidecars: Bool { get }
+    var hasFastPathLookup: Bool { get }
     var hasContiguousSubtreeRanges: Bool { get }
     var storedVisibleCount: Int? { get }
     var storedResultCount: Int? { get }
@@ -321,6 +322,7 @@ protocol RecordStore: AnyObject, Sendable {
     func volumeName(at index: Int) -> String
     func normalizedName(at index: Int) -> String
     func normalizedPath(at index: Int) -> String
+    func normalizedDirectoryPath(at index: Int) -> String
     func parentRowID(at index: Int) -> Int?
     func subtreeEnd(at index: Int) -> Int
     func makeSubtreeRowCursor(atPath path: String) -> RecordStoreSubtreeCursor
@@ -332,6 +334,7 @@ protocol RecordStore: AnyObject, Sendable {
     func isVirtual(at index: Int) -> Bool
     func isVisible(at index: Int) -> Bool
     func normalizedPath(at index: Int, contains token: String, cache: inout [Int: Bool]) -> Bool
+    func normalizedDirectoryPath(at index: Int, contains token: String, cache: inout [Int: Bool]) -> Bool
     func normalizedName(at index: Int, contains token: String) -> Bool
     func normalizedName(at index: Int, contains tokenBytes: [UInt8]) -> Bool
     func isHiddenInPath(at index: Int, cache: inout [Int: Bool]) -> Bool
@@ -486,6 +489,7 @@ struct RecordSearchView: Sendable {
     var volumeName: String { store.volumeName(at: rowID) }
     var normalizedName: String { store.normalizedName(at: rowID) }
     var normalizedPath: String { store.normalizedPath(at: rowID) }
+    var normalizedDirectoryPath: String { store.normalizedDirectoryPath(at: rowID) }
     var rootPath: String? { store.rootPath(at: rowID) }
 
     func materializedRecord() -> FileRecord {
@@ -523,6 +527,7 @@ extension RecordStore {
     var heapPageCount: Int { 0 }
     var overlayCount: Int { 0 }
     var hasColumnarSidecars: Bool { false }
+    var hasFastPathLookup: Bool { false }
     var hasContiguousSubtreeRanges: Bool { false }
     var storedVisibleCount: Int? { nil }
     var storedResultCount: Int? { nil }
@@ -556,6 +561,12 @@ extension RecordStore {
     func volumeName(at index: Int) -> String { record(at: index).volumeName }
     func normalizedName(at index: Int) -> String { record(at: index).normalizedName }
     func normalizedPath(at index: Int) -> String { record(at: index).normalizedPath }
+    func normalizedDirectoryPath(at index: Int) -> String {
+        if let parent = parentRowID(at: index), parent != index {
+            return normalizedPath(at: parent)
+        }
+        return FuzzyMatcher.normalize(directoryPath(at: index))
+    }
     func parentRowID(at index: Int) -> Int? {
         let record = record(at: index)
         guard record.directoryPath != record.path else { return nil }
@@ -601,6 +612,13 @@ extension RecordStore {
             cache[index] = containsToken
         }
         return containsToken
+    }
+
+    func normalizedDirectoryPath(at index: Int, contains token: String, cache: inout [Int: Bool]) -> Bool {
+        if let parent = parentRowID(at: index), parent != index {
+            return normalizedPath(at: parent, contains: token, cache: &cache)
+        }
+        return FuzzyMatcher.normalize(directoryPath(at: index)).contains(token)
     }
 
     func normalizedName(at index: Int, contains token: String) -> Bool {
@@ -650,11 +668,13 @@ final class HeapPagedRecordStore: RecordStore {
     let kind = RecordStoreKind.heapPaged
     let pages: [[FileRecord]]
     private let pathIndex: [String: Int]?
+    private let visiblePages: [[Bool]]
     private let rootIDPages: [[UInt16]]?
     let storedRootAttribution: RootAttributionTable?
     let count: Int
 
     var heapPageCount: Int { pages.count }
+    var hasFastPathLookup: Bool { pathIndex != nil }
     var storedResultCount: Int? { count }
 
     init(records: [FileRecord], buildsPathIndex: Bool = true, roots: [String] = []) {
@@ -671,10 +691,16 @@ final class HeapPagedRecordStore: RecordStore {
         self.pages = builtPages
         self.count = records.count
         if buildsPathIndex {
-            self.pathIndex = Dictionary(uniqueKeysWithValues: records.enumerated().map { ($0.element.path, $0.offset) })
+            var pathIndex: [String: Int] = [:]
+            pathIndex.reserveCapacity(records.count)
+            for (index, record) in records.enumerated() {
+                pathIndex[record.path] = index
+            }
+            self.pathIndex = pathIndex
         } else {
             self.pathIndex = nil
         }
+        self.visiblePages = Self.makeVisiblePages(from: builtPages)
         let attribution = try? RootAttributionTable.build(roots: roots, rowCount: records.count) { index in
             let record = records[index]
             return RootAttributionInput(
@@ -699,6 +725,7 @@ final class HeapPagedRecordStore: RecordStore {
         self.pages = pages
         self.count = count
         self.pathIndex = pathIndex
+        self.visiblePages = Self.makeVisiblePages(from: pages)
         self.rootIDPages = rootIDPages
         self.storedRootAttribution = rootAttribution
     }
@@ -706,6 +733,15 @@ final class HeapPagedRecordStore: RecordStore {
     func record(at index: Int) -> FileRecord {
         precondition(index >= 0 && index < count, "Record index \(index) is out of bounds")
         return pages[index / Self.pageSize][index % Self.pageSize]
+    }
+
+    func isVisible(at index: Int) -> Bool {
+        guard index >= 0, index < count else { return false }
+        return visiblePages[index / Self.pageSize][index % Self.pageSize]
+    }
+
+    func isHiddenInPath(at index: Int, cache _: inout [Int: Bool]) -> Bool {
+        !isVisible(at: index)
     }
 
     func rowID(forPath path: String) -> Int? {
@@ -746,6 +782,29 @@ final class HeapPagedRecordStore: RecordStore {
             start = end
         }
         return pages
+    }
+
+    private static func makeVisiblePages(from pages: [[FileRecord]]) -> [[Bool]] {
+        var hiddenDirectoryPaths = Set<String>()
+        for page in pages {
+            for record in page where record.isDirectory && record.isHidden {
+                hiddenDirectoryPaths.insert(record.path)
+            }
+        }
+
+        return pages.map { page in
+            page.map { record in
+                guard !record.isHidden else { return false }
+                var ancestor = record.directoryPath
+                while ancestor != record.path, !ancestor.isEmpty {
+                    if hiddenDirectoryPaths.contains(ancestor) { return false }
+                    let parent = (ancestor as NSString).deletingLastPathComponent
+                    guard parent != ancestor else { break }
+                    ancestor = parent
+                }
+                return true
+            }
+        }
     }
 }
 
@@ -971,6 +1030,7 @@ final class OverlayRecordStore: RecordStore {
     private let deletedRowsSorted: [Int]
     private let visibleBaseCount: Int
     private let pathToOverlay: [String: Int]
+    private let baseRowsByPath: [String: Int]?
     private let resultCount: Int
     private let rootAttribution: RootAttributionTable?
     private let rootAttributionMatcher: RootAttributionMatcher?
@@ -980,6 +1040,7 @@ final class OverlayRecordStore: RecordStore {
     var heapPageCount: Int { base.heapPageCount }
     var overlayCount: Int { upserts.count + deletedRows.count }
     var hasColumnarSidecars: Bool { base.hasColumnarSidecars }
+    var hasFastPathLookup: Bool { true }
     var storedResultCount: Int? { resultCount }
     var storedRootAttribution: RootAttributionTable? { rootAttribution }
     var schemaVersion: Int { base.schemaVersion }
@@ -1001,6 +1062,26 @@ final class OverlayRecordStore: RecordStore {
         var resolvedUpserts = Dictionary(
             uniqueKeysWithValues: (priorOverlay?.upserts ?? []).map { ($0.path, $0) }
         )
+        let baseRowsByPath: [String: Int]?
+        if resolvedBase.hasFastPathLookup {
+            baseRowsByPath = nil
+        } else if let priorOverlay, priorOverlay.base === resolvedBase,
+                  let priorBaseRowsByPath = priorOverlay.baseRowsByPath {
+            baseRowsByPath = priorBaseRowsByPath
+        } else if resolvedUpserts.count + incomingUpserts.count > 8 {
+            var rows: [String: Int] = [:]
+            rows.reserveCapacity(resolvedBase.count)
+            for rowID in 0..<resolvedBase.count {
+                rows[resolvedBase.path(at: rowID)] = rowID
+            }
+            baseRowsByPath = rows
+        } else {
+            baseRowsByPath = nil
+        }
+
+        func resolvedBaseRow(for path: String) -> Int? {
+            baseRowsByPath?[path] ?? resolvedBase.rowID(forPath: path)
+        }
 
         enum PriorRowOrigin {
             case base(Int)
@@ -1028,7 +1109,7 @@ final class OverlayRecordStore: RecordStore {
         }
 
         func apply(_ record: FileRecord) {
-            if let rowID = resolvedBase.rowID(forPath: record.path) {
+            if let rowID = resolvedBaseRow(for: record.path) {
                 resolvedDeletedRows.insert(rowID)
             }
             resolvedUpserts[record.path] = record
@@ -1057,6 +1138,7 @@ final class OverlayRecordStore: RecordStore {
         self.deletedRowsSorted = resolvedDeletedRows.sorted()
         let visibleBaseCount = max(resolvedBase.count - resolvedDeletedRows.count, 0)
         self.visibleBaseCount = visibleBaseCount
+        self.baseRowsByPath = baseRowsByPath
         self.pathToOverlay = Dictionary(
             uniqueKeysWithValues: upserts.enumerated().map { ($0.element.path, visibleBaseCount + $0.offset) }
         )
@@ -1245,9 +1327,15 @@ final class OverlayRecordStore: RecordStore {
 
     func isVisible(at index: Int) -> Bool {
         if index < visibleBaseCount {
-            return base.isVisible(at: baseRow(forVisibleIndex: index))
+            guard base.isVisible(at: baseRow(forVisibleIndex: index)) else { return false }
+            return !hasHiddenOverlayAncestor(of: base.directoryPath(at: baseRow(forVisibleIndex: index)))
         }
-        return !upserts[index - visibleBaseCount].isHidden
+        let record = upserts[index - visibleBaseCount]
+        guard !record.isHidden, !hasHiddenOverlayAncestor(of: record.directoryPath) else { return false }
+        if let baseAncestor = nearestBaseAncestorRow(for: record.directoryPath) {
+            return base.isVisible(at: baseAncestor)
+        }
+        return true
     }
 
     func isHiddenInPath(at index: Int, cache _: inout [Int: Bool]) -> Bool {
@@ -1262,6 +1350,33 @@ final class OverlayRecordStore: RecordStore {
             return nil
         }
         return visibleIndex(forBaseRow: row)
+    }
+
+    private func hasHiddenOverlayAncestor(of directoryPath: String) -> Bool {
+        var path = directoryPath
+        while !path.isEmpty {
+            if let rowID = pathToOverlay[path], rowID >= visibleBaseCount,
+               upserts[rowID - visibleBaseCount].isHidden {
+                return true
+            }
+            let parent = (path as NSString).deletingLastPathComponent
+            guard parent != path else { break }
+            path = parent
+        }
+        return false
+    }
+
+    private func nearestBaseAncestorRow(for directoryPath: String) -> Int? {
+        var path = directoryPath
+        while !path.isEmpty {
+            if let rowID = base.rowID(forPath: path), !deletedRows.contains(rowID) {
+                return rowID
+            }
+            let parent = (path as NSString).deletingLastPathComponent
+            guard parent != path else { break }
+            path = parent
+        }
+        return nil
     }
 
     func rootID(at index: Int) -> UInt16? {
@@ -1414,6 +1529,7 @@ final class RowMaskingRecordStore: RecordStore {
     var heapPageCount: Int { base.heapPageCount }
     var overlayCount: Int { base.overlayCount }
     var hasColumnarSidecars: Bool { base.hasColumnarSidecars }
+    var hasFastPathLookup: Bool { base.hasFastPathLookup }
     var hasContiguousSubtreeRanges: Bool { base.hasContiguousSubtreeRanges }
     // These remain physical counts so the source snapshot's row-ordered search
     // structures continue to validate. CompositeSearchState owns live counts.
@@ -1516,6 +1632,7 @@ final class ReplacingRecordStore: RecordStore {
     var heapPageCount: Int { base.heapPageCount }
     var overlayCount: Int { replacements.count }
     var hasColumnarSidecars: Bool { base.hasColumnarSidecars }
+    var hasFastPathLookup: Bool { base.hasFastPathLookup }
     var hasContiguousSubtreeRanges: Bool { base.hasContiguousSubtreeRanges }
     var storedResultCount: Int? { base.storedResultCount }
     var storedRootAttribution: RootAttributionTable? { rootAttribution }
@@ -1554,14 +1671,11 @@ final class ReplacingRecordStore: RecordStore {
     func allRecords() -> [FileRecord] {
         guard !replacements.isEmpty else { return base.allRecords() }
 
-        let replacementsByID = Dictionary(
-            uniqueKeysWithValues: replacements.map { rowID, record in
-                (base.recordID(at: rowID), record)
-            }
-        )
-        return base.allRecords().map { record in
-            replacementsByID[record.id] ?? record
+        var records = base.allRecords()
+        for (rowID, replacement) in replacements where records.indices.contains(rowID) {
+            records[rowID] = replacement
         }
+        return records
     }
 
     func recordID(at index: Int) -> UInt64 {
@@ -1747,6 +1861,19 @@ final class MappedRecordStore: RecordStore {
     private static let pathLookupEntrySize = 16
     private static let virtualFlag: UInt8 = 1 << 3
     private static let pathSeparator: UInt8 = 47
+    private static let checksummedFileNames = [
+        SnapshotLayout.FileName.records,
+        SnapshotLayout.FileName.strings,
+        SnapshotLayout.FileName.interns,
+        SnapshotLayout.FileName.pathLookup,
+        SnapshotLayout.FileName.parent,
+        SnapshotLayout.FileName.flags,
+        SnapshotLayout.FileName.visible,
+        SnapshotLayout.FileName.subtreeEnd,
+        SnapshotLayout.FileName.depth,
+        SnapshotLayout.FileName.rootID,
+        SnapshotLayout.FileName.roots
+    ]
 
     private struct Row {
         let id: UInt64
@@ -1776,6 +1903,7 @@ final class MappedRecordStore: RecordStore {
     private let recordsData: Data
     private let stringsData: Data
     private let pathLookupData: Data
+    private let pathLookupCount: Int
     private let parentData: Data
     private let flagsData: Data
     private let visibleData: Data
@@ -1798,6 +1926,7 @@ final class MappedRecordStore: RecordStore {
             + rootIDData.count + rootsByteSize
     }
     var hasColumnarSidecars: Bool { true }
+    var hasFastPathLookup: Bool { true }
     var hasContiguousSubtreeRanges: Bool { true }
     var storedVisibleCount: Int? { visibleCount }
     var storedResultCount: Int? { resultCount }
@@ -1805,6 +1934,7 @@ final class MappedRecordStore: RecordStore {
 
     init(packageURL: URL, schemaVersion: Int = SnapshotLayout.schemaVersion) throws {
         self.schemaVersion = schemaVersion
+        let manifestURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.manifest, isDirectory: false)
         let recordsURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.records, isDirectory: false)
         let stringsURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.strings, isDirectory: false)
         let internsURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.interns, isDirectory: false)
@@ -1816,6 +1946,24 @@ final class MappedRecordStore: RecordStore {
         let depthURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.depth, isDirectory: false)
         let rootIDURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.rootID, isDirectory: false)
         let rootsURL = packageURL.appendingPathComponent(SnapshotLayout.FileName.roots, isDirectory: false)
+
+        let manifest = try JSONDecoder().decode(
+            CompactSnapshotManifest.self,
+            from: Data(contentsOf: manifestURL)
+        )
+        guard manifest.schemaVersion == schemaVersion else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        guard let checksums = manifest.fileChecksums,
+              Set(checksums.keys) == Set(Self.checksummedFileNames) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        for (fileName, expectedChecksum) in checksums {
+            let url = packageURL.appendingPathComponent(fileName, isDirectory: false)
+            guard try Self.checksum(of: url) == expectedChecksum else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+        }
 
         self.recordsData = try Data(contentsOf: recordsURL, options: [.mappedIfSafe])
         self.stringsData = try Data(contentsOf: stringsURL, options: [.mappedIfSafe])
@@ -1837,13 +1985,19 @@ final class MappedRecordStore: RecordStore {
         guard
             recordsData.count >= Self.recordsHeaderSize,
             recordsData.readUInt64LE(at: 0) == Self.recordsMagic,
-            recordsData.readUInt32LE(at: 8) == Self.recordsVersion
+            recordsData.readUInt32LE(at: 8) == Self.recordsVersion,
+            recordsData.readUInt32LE(at: 12) == UInt32(Self.rowSize)
         else {
             throw CocoaError(.fileReadCorruptFile)
         }
-
-        let rowCount = Int(recordsData.readUInt64LE(at: 16))
-        guard recordsData.count == Self.recordsHeaderSize + rowCount * Self.rowSize else {
+        guard
+            let rowCount = Int(exactly: recordsData.readUInt64LE(at: 16)),
+            rowCount >= 0,
+            let rowBytes = Self.checkedProduct(rowCount, Self.rowSize),
+            let expectedRecordsSize = Self.checkedSum(Self.recordsHeaderSize, rowBytes),
+            recordsData.count == expectedRecordsSize,
+            manifest.recordCount == rowCount
+        else {
             throw CocoaError(.fileReadCorruptFile)
         }
         self.count = rowCount
@@ -1873,14 +2027,33 @@ final class MappedRecordStore: RecordStore {
         else {
             throw CocoaError(.fileReadCorruptFile)
         }
-        let lookupCount = Int(pathLookupData.readUInt64LE(at: 16))
-        guard pathLookupData.count == Self.pathLookupHeaderSize + lookupCount * Self.pathLookupEntrySize else {
+        guard
+            let lookupCount = Int(exactly: pathLookupData.readUInt64LE(at: 16)),
+            lookupCount >= 0,
+            let lookupBytes = Self.checkedProduct(lookupCount, Self.pathLookupEntrySize),
+            let expectedLookupSize = Self.checkedSum(Self.pathLookupHeaderSize, lookupBytes),
+            pathLookupData.count == expectedLookupSize
+        else {
             throw CocoaError(.fileReadCorruptFile)
         }
+        self.pathLookupCount = lookupCount
 
         let interns = try Self.loadInterns(from: internsURL)
         self.extensions = interns.extensions
         self.volumes = interns.volumes
+        guard Self.packageRowsAreValid(
+            recordsData: recordsData,
+            stringsData: stringsData,
+            pathLookupData: pathLookupData,
+            parentData: parentData,
+            subtreeEndData: subtreeEndData,
+            rowCount: rowCount,
+            lookupCount: lookupCount,
+            extensionCount: interns.extensions.count,
+            volumeCount: interns.volumes.count
+        ) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
     }
 
     func record(at index: Int) -> FileRecord {
@@ -1909,7 +2082,7 @@ final class MappedRecordStore: RecordStore {
 
     func rowID(forPath path: String) -> Int? {
         let hash = FileRecord.stableID(for: path)
-        let lookupCount = Int(pathLookupData.readUInt64LE(at: 16))
+        let lookupCount = pathLookupCount
         var low = 0
         var high = lookupCount
 
@@ -2112,7 +2285,9 @@ final class MappedRecordStore: RecordStore {
         return "\(directory)/\(name)"
     }
 
-    func recordID(at index: Int) -> UInt64 { readRow(index).id }
+    func recordID(at index: Int) -> UInt64 {
+        recordsData.readUInt64LE(at: rowOffset(for: index))
+    }
     func parentRowID(at index: Int) -> Int? {
         let parent = parentData.readInt32LE(at: columnOffset(for: index, stride: 4))
         return parent >= 0 ? Int(parent) : nil
@@ -2186,12 +2361,20 @@ final class MappedRecordStore: RecordStore {
         return value
     }
 
-    func fileExtension(at index: Int) -> String { intern(extensions, id: readRow(index).extensionID) }
-    func sizeBytes(at index: Int) -> UInt64 { readRow(index).sizeBytes }
-    func modifiedTime(at index: Int) -> TimeInterval { TimeInterval(bitPattern: readRow(index).modifiedBits) }
+    func fileExtension(at index: Int) -> String {
+        intern(extensions, id: recordsData.readUInt32LE(at: rowOffset(for: index) + 88))
+    }
+    func sizeBytes(at index: Int) -> UInt64 {
+        recordsData.readUInt64LE(at: rowOffset(for: index) + 16)
+    }
+    func modifiedTime(at index: Int) -> TimeInterval {
+        TimeInterval(bitPattern: recordsData.readUInt64LE(at: rowOffset(for: index) + 24))
+    }
     func createdTime(at index: Int) -> TimeInterval? {
-        let row = readRow(index)
-        return row.flags & 4 == 0 ? nil : TimeInterval(bitPattern: row.createdBits)
+        let offset = rowOffset(for: index)
+        return recordsData.readUInt32LE(at: offset + 12) & 4 == 0
+            ? nil
+            : TimeInterval(bitPattern: recordsData.readUInt64LE(at: offset + 32))
     }
     func isDirectory(at index: Int) -> Bool { flagsByte(at: index) & 1 != 0 }
     func isHidden(at index: Int) -> Bool { flagsByte(at: index) & 2 != 0 }
@@ -2201,7 +2384,9 @@ final class MappedRecordStore: RecordStore {
         precondition(index >= 0 && index < count, "Record index \(index) is out of bounds")
         return isResultRow(at: index) && Self.bitsetValue(in: visibleData, at: index)
     }
-    func volumeName(at index: Int) -> String { intern(volumes, id: readRow(index).volumeID) }
+    func volumeName(at index: Int) -> String {
+        intern(volumes, id: recordsData.readUInt32LE(at: rowOffset(for: index) + 92))
+    }
     func rootID(at index: Int) -> UInt16? {
         let rootID = rootIDData.readUInt16LE(at: columnOffset(for: index, stride: 2))
         return rootID == RootAttributionTable.unassignedRootID ? nil : rootID
@@ -2213,8 +2398,11 @@ final class MappedRecordStore: RecordStore {
     }
 
     func normalizedName(at index: Int) -> String {
-        let row = readRow(index)
-        return string(offset: row.normalizedNameOffset, length: row.normalizedNameLength)
+        let offset = rowOffset(for: index)
+        return string(
+            offset: recordsData.readUInt64LE(at: offset + 52),
+            length: recordsData.readUInt32LE(at: offset + 60)
+        )
     }
     func normalizedName(at index: Int, contains token: String) -> Bool {
         guard !token.isEmpty else { return false }
@@ -2367,6 +2555,92 @@ final class MappedRecordStore: RecordStore {
         let volumes = try readStringTable()
         guard offset == data.count else { throw CocoaError(.fileReadCorruptFile) }
         return (extensions, volumes)
+    }
+
+    private static func checkedProduct(_ lhs: Int, _ rhs: Int) -> Int? {
+        let (value, overflow) = lhs.multipliedReportingOverflow(by: rhs)
+        return overflow ? nil : value
+    }
+
+    private static func checkedSum(_ lhs: Int, _ rhs: Int) -> Int? {
+        let (value, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? nil : value
+    }
+
+    private static func packageRowsAreValid(
+        recordsData: Data,
+        stringsData: Data,
+        pathLookupData: Data,
+        parentData: Data,
+        subtreeEndData: Data?,
+        rowCount: Int,
+        lookupCount: Int,
+        extensionCount: Int,
+        volumeCount: Int
+    ) -> Bool {
+        func validStringRange(offset: UInt64, length: UInt32) -> Bool {
+            guard offset <= UInt64(stringsData.count) else { return false }
+            return UInt64(length) <= UInt64(stringsData.count) - offset
+        }
+
+        for rowID in 0..<rowCount {
+            let offset = recordsHeaderSize + rowID * rowSize
+            let parent = recordsData.readInt32LE(at: offset + 8)
+            guard parent == parentData.readInt32LE(at: rowID * 4),
+                  parent == -1 || (parent >= 0 && Int(parent) < rowID),
+                  validStringRange(
+                    offset: recordsData.readUInt64LE(at: offset + 40),
+                    length: recordsData.readUInt32LE(at: offset + 48)
+                  ),
+                  validStringRange(
+                    offset: recordsData.readUInt64LE(at: offset + 52),
+                    length: recordsData.readUInt32LE(at: offset + 60)
+                  ),
+                  validStringRange(
+                    offset: recordsData.readUInt64LE(at: offset + 64),
+                    length: recordsData.readUInt32LE(at: offset + 72)
+                  ),
+                  validStringRange(
+                    offset: recordsData.readUInt64LE(at: offset + 76),
+                    length: recordsData.readUInt32LE(at: offset + 84)
+                  ),
+                  Int(recordsData.readUInt32LE(at: offset + 88)) < extensionCount,
+                  Int(recordsData.readUInt32LE(at: offset + 92)) < volumeCount
+            else {
+                return false
+            }
+            if let subtreeEndData {
+                let subtreeEnd = Int(subtreeEndData.readInt32LE(at: rowID * 4))
+                guard subtreeEnd > rowID, subtreeEnd <= rowCount else { return false }
+            }
+        }
+
+        var previousHash: UInt64?
+        var previousRowID: Int32?
+        for index in 0..<lookupCount {
+            let offset = pathLookupHeaderSize + index * pathLookupEntrySize
+            let hash = pathLookupData.readUInt64LE(at: offset)
+            let rowID = pathLookupData.readInt32LE(at: offset + 8)
+            guard rowID >= 0, Int(rowID) < rowCount else { return false }
+            if let previousHash {
+                guard hash > previousHash || (hash == previousHash && rowID >= (previousRowID ?? -1)) else {
+                    return false
+                }
+            }
+            previousHash = hash
+            previousRowID = rowID
+        }
+        return true
+    }
+
+    private static func checksum(of url: URL) throws -> UInt64 {
+        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        for byte in data {
+            hash ^= UInt64(byte)
+            hash &*= 1_099_511_628_211
+        }
+        return hash
     }
 
     private struct PackageRow {
@@ -2585,16 +2859,6 @@ final class MappedRecordStore: RecordStore {
             )
         }
 
-        let manifest = CompactSnapshotManifest(
-            schemaVersion: SnapshotLayout.schemaVersion,
-            savedAt: savedAt,
-            roots: roots,
-            exclusionPatterns: exclusionPatterns,
-            recordCount: packageRows.count,
-            resultCount: resultCount
-        )
-        let manifestData = try JSONEncoder().encode(manifest)
-        try manifestData.write(to: packageURL.appendingPathComponent(SnapshotLayout.FileName.manifest, isDirectory: false), options: .atomic)
         try JSONEncoder().encode(rootAttribution.table).write(
             to: packageURL.appendingPathComponent(SnapshotLayout.FileName.roots, isDirectory: false),
             options: .atomic
@@ -2775,6 +3039,28 @@ final class MappedRecordStore: RecordStore {
         try Data().write(to: packageURL.appendingPathComponent(SnapshotLayout.FileName.componentPostings, isDirectory: false))
         try Data().write(to: packageURL.appendingPathComponent(SnapshotLayout.FileName.pathPostings, isDirectory: false))
         try Data().write(to: packageURL.appendingPathComponent(SnapshotLayout.FileName.extensionPostings, isDirectory: false))
+
+        var fileChecksums: [String: UInt64] = [:]
+        fileChecksums.reserveCapacity(Self.checksummedFileNames.count)
+        for fileName in Self.checksummedFileNames {
+            fileChecksums[fileName] = try checksum(
+                of: packageURL.appendingPathComponent(fileName, isDirectory: false)
+            )
+        }
+        let manifest = CompactSnapshotManifest(
+            schemaVersion: SnapshotLayout.schemaVersion,
+            savedAt: savedAt,
+            roots: roots,
+            exclusionPatterns: exclusionPatterns,
+            recordCount: packageRows.count,
+            resultCount: resultCount,
+            fileChecksums: fileChecksums
+        )
+        let manifestData = try JSONEncoder().encode(manifest)
+        try manifestData.write(
+            to: packageURL.appendingPathComponent(SnapshotLayout.FileName.manifest, isDirectory: false),
+            options: .atomic
+        )
     }
 
     private static func bitsetByteCount(for bitCount: Int) -> Int {
@@ -2909,11 +3195,38 @@ final class MappedIntPostingIndex: @unchecked Sendable {
             throw CocoaError(.fileReadCorruptFile)
         }
 
-        let keyCount = Int(data.readUInt64LE(at: 8))
-        let postingCount = Int(data.readUInt64LE(at: 16))
-        let expectedCount = Self.headerSize + keyCount * Self.entrySize + postingCount * 4
-        guard data.count == expectedCount else {
+        guard
+            let keyCount = Int(exactly: data.readUInt64LE(at: 8)),
+            let postingCount = Int(exactly: data.readUInt64LE(at: 16)),
+            keyCount >= 0,
+            postingCount >= 0
+        else {
             throw CocoaError(.fileReadCorruptFile)
+        }
+        let (entryBytes, entryOverflow) = keyCount.multipliedReportingOverflow(by: Self.entrySize)
+        let (postingBytes, postingOverflow) = postingCount.multipliedReportingOverflow(by: 4)
+        let (headerAndEntries, firstAddOverflow) = Self.headerSize.addingReportingOverflow(entryBytes)
+        let (expectedCount, secondAddOverflow) = headerAndEntries.addingReportingOverflow(postingBytes)
+        guard !entryOverflow,
+              !postingOverflow,
+              !firstAddOverflow,
+              !secondAddOverflow,
+              data.count == expectedCount else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+
+        var previousKey: Int32?
+        for index in 0..<keyCount {
+            let entryOffset = Self.headerSize + index * Self.entrySize
+            let key = data.readInt32LE(at: entryOffset)
+            let offset = Int(data.readUInt32LE(at: entryOffset + 4))
+            let count = Int(data.readUInt32LE(at: entryOffset + 8))
+            guard previousKey.map({ key > $0 }) ?? true,
+                  offset <= postingCount,
+                  count <= postingCount - offset else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            previousKey = key
         }
 
         self.data = data
@@ -3079,7 +3392,7 @@ enum CompactSearchStructureFiles {
             data.count == modifiedOrderHeaderSize + expectedCount * 4,
             data.readUInt64LE(at: 0) == modifiedOrderMagic,
             data.readUInt32LE(at: 8) == modifiedOrderVersion,
-            Int(data.readUInt64LE(at: 16)) == expectedCount
+            Int(exactly: data.readUInt64LE(at: 16)) == expectedCount
         else {
             return nil
         }
@@ -3124,6 +3437,7 @@ struct CompactSnapshotManifest: Codable, Sendable {
     let recordCount: Int
     let resultCount: Int?
     let rootEventIDs: [String: UInt64]?
+    let fileChecksums: [String: UInt64]?
 
     init(
         schemaVersion: Int,
@@ -3132,7 +3446,8 @@ struct CompactSnapshotManifest: Codable, Sendable {
         exclusionPatterns: [String],
         recordCount: Int,
         resultCount: Int? = nil,
-        rootEventIDs: [String: UInt64]? = nil
+        rootEventIDs: [String: UInt64]? = nil,
+        fileChecksums: [String: UInt64]? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.savedAt = savedAt
@@ -3141,6 +3456,7 @@ struct CompactSnapshotManifest: Codable, Sendable {
         self.recordCount = recordCount
         self.resultCount = resultCount
         self.rootEventIDs = rootEventIDs
+        self.fileChecksums = fileChecksums
     }
 }
 

@@ -87,7 +87,7 @@ public struct FileRecord: Codable, Hashable, Identifiable, Sendable {
         let size = UInt64(max(loadedValues.fileSize ?? 0, 0))
         let modified = loadedValues.contentModificationDate ?? .distantPast
         let created = loadedValues.creationDate
-        let ext = standardizedURL.pathExtension.lowercased()
+        let ext = FuzzyMatcher.normalize(standardizedURL.pathExtension)
         let normalizedName = FuzzyMatcher.normalize(name)
         let normalizedPath = FuzzyMatcher.normalize(path)
 

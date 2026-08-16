@@ -704,6 +704,18 @@ enum FileActionTargeting {
     }
 }
 
+enum ResultIdentityRemapping {
+    static func rowIndexes(recordIDs: Set<UInt64>, resultRecordIDs: [UInt64]) -> IndexSet {
+        guard !recordIDs.isEmpty else { return [] }
+        return IndexSet(resultRecordIDs.indices.filter { recordIDs.contains(resultRecordIDs[$0]) })
+    }
+
+    static func row(recordID: UInt64?, resultRecordIDs: [UInt64]) -> Int? {
+        guard let recordID else { return nil }
+        return resultRecordIDs.firstIndex(of: recordID)
+    }
+}
+
 final class FileTableView: NSTableView {
     var openAction: (() -> Void)?
     var copyAction: (() -> Void)?

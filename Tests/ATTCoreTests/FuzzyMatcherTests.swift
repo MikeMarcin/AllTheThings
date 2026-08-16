@@ -35,6 +35,53 @@ struct FuzzyMatcherTests {
         #expect(FuzzyMatcher.score(record: ipp, query: "ext:[h-i]pp") != nil)
     }
 
+    @Test("dotfile and compound extension queries preserve filename semantics")
+    func dotfileAndCompoundExtensionQueries() throws {
+        let gitignore = try #require(makeRecord(name: ".gitignore"))
+        let zshrc = try #require(makeRecord(name: ".zshrc"))
+        let archive = try #require(makeRecord(name: "backup.tar.gz"))
+        let plainGzip = try #require(makeRecord(name: "backup.gz"))
+
+        #expect(FuzzyMatcher.score(record: gitignore, query: ".gitignore") != nil)
+        #expect(FuzzyMatcher.score(record: gitignore, query: "\".gitignore\"") != nil)
+        #expect(FuzzyMatcher.score(record: zshrc, query: ".gitignore") == nil)
+        #expect(FuzzyMatcher.score(record: archive, query: ".tar.gz") != nil)
+        #expect(FuzzyMatcher.score(record: archive, query: "ext:tar.gz") != nil)
+        #expect(FuzzyMatcher.score(record: plainGzip, query: "ext:tar.gz") == nil)
+    }
+
+    @Test("negative terms are literal and pure-negative queries include nonmatches")
+    func literalAndPureNegativeTerms() throws {
+        let notes = try #require(makeRecord(name: "text-notes.md"))
+        let tests = try #require(makeRecord(name: "test-notes.md"))
+        let package = try #require(makeRecord(name: "Package.swift", directory: "/tmp/project/Sources"))
+        let dependency = try #require(makeRecord(name: "Package.swift", directory: "/tmp/project/node_modules"))
+
+        #expect(FuzzyMatcher.score(record: notes, query: "notes -test") != nil)
+        #expect(FuzzyMatcher.score(record: tests, query: "notes -test") == nil)
+        #expect(FuzzyMatcher.score(record: package, query: "!node_modules") != nil)
+        #expect(FuzzyMatcher.score(record: dependency, query: "!node_modules") == nil)
+    }
+
+    @Test("spaced alternatives and literal brackets remain searchable")
+    func spacedAlternativesAndLiteralBrackets() throws {
+        let foo = try #require(makeRecord(name: "foo.txt"))
+        let bar = try #require(makeRecord(name: "bar.txt"))
+        let neither = try #require(makeRecord(name: "quux.txt"))
+        let bracketed = try #require(makeRecord(name: "report[1].pdf"))
+
+        #expect(FuzzyMatcher.score(record: foo, query: "foo | bar") != nil)
+        #expect(FuzzyMatcher.score(record: bar, query: "foo | bar") != nil)
+        #expect(FuzzyMatcher.score(record: neither, query: "foo | bar") == nil)
+        #expect(FuzzyMatcher.score(record: bracketed, query: "report[1].pdf") != nil)
+    }
+
+    @Test("normalization applies to non-ASCII extensions")
+    func unicodeExtensionNormalization() throws {
+        let record = try #require(makeRecord(name: "Résumé.RÉSUMÉ"))
+        #expect(FuzzyMatcher.score(record: record, query: "ext:resume") != nil)
+    }
+
     @Test("matches small typos")
     func typoMatch() throws {
         let record = try #require(makeRecord(name: "README.md"))
@@ -181,7 +228,7 @@ struct FuzzyMatcherTests {
             path: url.path,
             name: name,
             directoryPath: directory,
-            fileExtension: url.pathExtension.lowercased(),
+            fileExtension: FuzzyMatcher.normalize(url.pathExtension),
             sizeBytes: 128,
             modifiedTime: Date().timeIntervalSinceReferenceDate,
             createdTime: nil,
