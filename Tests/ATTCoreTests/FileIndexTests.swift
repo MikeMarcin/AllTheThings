@@ -513,14 +513,14 @@ struct FileIndexTests {
 
         let diagnostics = index.currentDiagnostics()
         #expect(diagnostics.recordStoreKind == .overlay)
-        #expect(diagnostics.optimizedCount == 0)
+        #expect(diagnostics.optimizedCount == diagnostics.indexedCount)
         try await waitUntil {
             recorder.snapshot().contains {
-                $0.phase == .ready && $0.indexedCount > 0 && $0.optimizedCount == 0
+                $0.phase == .ready && $0.indexedCount > 0 && $0.optimizedCount == $0.indexedCount
             }
         }
         #expect(recorder.snapshot().contains {
-            $0.phase == .ready && $0.indexedCount > 0 && $0.optimizedCount == 0
+            $0.phase == .ready && $0.indexedCount > 0 && $0.optimizedCount == $0.indexedCount
         })
 
         let reconciledStatus = index.currentStats().status
@@ -767,7 +767,8 @@ struct FileIndexTests {
             query: "",
             sort: SortSpec(column: .created, ascending: true)
         ), maxResults: 10)
-        #expect(response.executionProfile.executionPath == .emptyQuerySortedOrder)
+        #expect(response.executionProfile.executionPath == .compositeIndexed)
+        #expect(response.executionProfile.indexesUsed.contains(.sortOrder))
         #expect(response.results.contains { $0.record.path == added.path })
     }
 
@@ -1467,6 +1468,17 @@ struct FileIndexTests {
 
         let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
         #expect(reloaded.currentDiagnostics().recordStoreKind == .overlay)
+        #expect(reloaded.currentDiagnostics().optimizedCount == reloaded.currentDiagnostics().indexedCount)
+        let preview = reloaded.search(
+            SearchRequest(
+                query: "DurableDelta",
+                sort: SortSpec(column: .relevance, ascending: false),
+                mode: .interactivePreview
+            ),
+            maxResults: 10
+        )
+        #expect(preview.results.isEmpty)
+        #expect(preview.completeness == .partial)
         let response = reloaded.search(
             SearchRequest(
                 query: "DurableDelta",
@@ -1475,6 +1487,7 @@ struct FileIndexTests {
             maxResults: 10
         )
         #expect(response.results.contains { $0.record.path == addedFile.path })
+        #expect(response.executionProfile.executionPath == .compositeIndexed)
     }
 
     @Test("foreground promotion and search prioritization preserve a tiny durable delta")
@@ -1524,7 +1537,7 @@ struct FileIndexTests {
             let diagnostics = index.currentDiagnostics()
             return completion.isMarked
                 && diagnostics.recordStoreKind == .overlay
-                && diagnostics.optimizedCount == 0
+                && diagnostics.optimizedCount == diagnostics.indexedCount
                 && fileManager.fileExists(atPath: deltaURL.path)
         }
 
@@ -1546,7 +1559,7 @@ struct FileIndexTests {
 
         let diagnostics = index.currentDiagnostics()
         #expect(diagnostics.recordStoreKind == .overlay)
-        #expect(diagnostics.optimizedCount == 0)
+        #expect(diagnostics.optimizedCount == diagnostics.indexedCount)
         #expect(try Data(contentsOf: manifestURL) == originalManifest)
         #expect(fileManager.fileExists(atPath: deltaURL.path))
         #expect(index.search(SearchRequest(
@@ -1589,7 +1602,7 @@ struct FileIndexTests {
             let diagnostics = index.currentDiagnostics()
             return diagnostics.pendingRefreshPathCount == 0
                 && diagnostics.recordStoreKind == .overlay
-                && diagnostics.optimizedCount == 0
+                && diagnostics.optimizedCount == diagnostics.indexedCount
                 && index.hasPendingDurabilityForTesting()
         }
 
@@ -1903,7 +1916,7 @@ struct FileIndexTests {
             return diagnostics.completedRefreshBatches > before.completedRefreshBatches
                 && diagnostics.recordStoreKind == .overlay
                 && diagnostics.overlayCount > 0
-                && diagnostics.optimizedCount == 0
+                && diagnostics.optimizedCount == diagnostics.indexedCount
         }
         let overlayRevision = index.currentDiagnostics().snapshotRevision
 
@@ -3383,7 +3396,7 @@ struct FileIndexTests {
             let diagnostics = index.currentDiagnostics()
             return diagnostics.completedRefreshBatches > before.completedRefreshBatches
                 && diagnostics.recordStoreKind == .overlay
-                && diagnostics.optimizedCount == 0
+                && diagnostics.optimizedCount == diagnostics.indexedCount
                 && diagnostics.pendingRefreshPathCount == 0
         }
         let overlayRevision = index.currentDiagnostics().snapshotRevision
@@ -4110,7 +4123,7 @@ struct FileIndexTests {
             let diagnostics = index.currentDiagnostics()
             return diagnostics.completedRefreshBatches > before.completedRefreshBatches
                 && diagnostics.recordStoreKind == .overlay
-                && diagnostics.optimizedCount == 0
+                && diagnostics.optimizedCount == diagnostics.indexedCount
         }
 
         for sortColumn in SortColumn.allCases {
@@ -4123,8 +4136,19 @@ struct FileIndexTests {
 
             #expect(response.usesIndexedCandidates, "\(profileSummary)")
             #expect(response.executionProfile.executionPath != SearchExecutionPath.fullFallbackScan, "\(profileSummary)")
+            #expect(response.executionProfile.executionPath == SearchExecutionPath.indexedBasePreview, "\(profileSummary)")
             #expect(response.totalMatches == 1, "\(profileSummary)")
             #expect(response.results.map { $0.record.path } == [lateNeedle], "\(profileSummary)")
+            #expect(response.completeness == .partial)
+
+            let exact = index.search(SearchRequest(
+                query: "AitoNeedle",
+                sort: SortSpec(column: sortColumn, ascending: sortColumn != .relevance)
+            ), maxResults: 10)
+            #expect(exact.executionProfile.executionPath == .compositeIndexed, "\(profileSummary)")
+            #expect(exact.totalMatches == 1, "\(profileSummary)")
+            #expect(exact.results.map(\.record.path) == [lateNeedle], "\(profileSummary)")
+            #expect(exact.completeness == .complete)
         }
 
         let addedResponse = index.search(SearchRequest(
@@ -4133,8 +4157,17 @@ struct FileIndexTests {
             mode: .interactivePreview
         ), maxResults: 10)
         #expect(addedResponse.usesIndexedCandidates)
-        #expect(addedResponse.totalMatches == 1)
-        #expect(addedResponse.results.map(\.record.path) == [changedFile.path])
+        #expect(addedResponse.totalMatches == 0)
+        #expect(addedResponse.results.isEmpty)
+        #expect(addedResponse.completeness == .partial)
+
+        let exactAddedResponse = index.search(SearchRequest(
+            query: "Changed.swift",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10)
+        #expect(exactAddedResponse.totalMatches == 1)
+        #expect(exactAddedResponse.results.map(\.record.path) == [changedFile.path])
+        #expect(exactAddedResponse.executionProfile.scannedRowCount < 100)
 
         let removedResponse = index.search(SearchRequest(
             query: "RemovedNeedle",
@@ -4144,6 +4177,248 @@ struct FileIndexTests {
         #expect(removedResponse.usesIndexedCandidates)
         #expect(removedResponse.totalMatches == 0)
         #expect(removedResponse.results.isEmpty)
+    }
+
+    @Test("indexed structural delta keeps selective search independent of overlay size")
+    func indexedStructuralDeltaKeepsSelectiveSearchIndependentOfOverlaySize() {
+        let root = "/tmp/att-indexed-structural-delta"
+        var records = (0..<2_500).map { offset in
+            makeRecord(path: String(format: "\(root)/Base/File%06d.swift", offset))
+        }
+        let needlePaths = (0..<3).map { offset in
+            "\(root)/Stable/FVS-0048-result-\(offset).md"
+        }
+        records.append(contentsOf: needlePaths.map { makeRecord(path: $0) })
+
+        let index = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        defer { try? FileManager.default.removeItem(at: index.dataDirectoryURL) }
+        index.replaceRecordsForTesting(records)
+
+        var upserts = records.prefix(1_800).map { record in
+            makeRecord(path: record.path, modifiedTime: record.modifiedTime + 1)
+        }
+        upserts.append(contentsOf: (0..<500).map { offset in
+            let name: String
+            if offset == 499 {
+                name = "DeltaOnlyNeedle.swift"
+            } else if offset == 498 {
+                name = ".HiddenDelta.swift"
+            } else {
+                name = String(format: "Added%06d.swift", offset)
+            }
+            return makeRecord(path: "\(root)/Added/\(name)")
+        })
+        index.applyStructuralOverlayForTesting(upserts: upserts, tombstonedPaths: [])
+
+        let preview = index.search(SearchRequest(
+            query: "FVS-0048",
+            sort: SortSpec(column: .name, ascending: true),
+            mode: .interactivePreview
+        ), maxResults: 10)
+        #expect(preview.results.map(\.record.path) == needlePaths)
+        #expect(preview.completeness == .partial)
+        #expect(preview.executionProfile.executionPath == .indexedBasePreview)
+        #expect(preview.executionProfile.scannedRowCount < 20)
+
+        let exact = index.search(SearchRequest(
+            query: "FVS-0048",
+            sort: SortSpec(column: .name, ascending: true)
+        ), maxResults: 10)
+        #expect(exact.results.map(\.record.path) == needlePaths)
+        #expect(exact.totalMatches == 3)
+        #expect(exact.executionProfile.executionPath == .compositeIndexed)
+        #expect(exact.executionProfile.scannedRowCount < 20)
+        #expect(exact.executionProfile.scannedRowCount < upserts.count)
+
+        let addedPreview = index.search(SearchRequest(
+            query: "DeltaOnlyNeedle",
+            sort: SortSpec(column: .relevance, ascending: false),
+            mode: .interactivePreview
+        ), maxResults: 10)
+        #expect(addedPreview.results.isEmpty)
+
+        let addedExact = index.search(SearchRequest(
+            query: "DeltaOnlyNeedle",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10)
+        #expect(addedExact.totalMatches == 1)
+        #expect(addedExact.results.map(\.record.name) == ["DeltaOnlyNeedle.swift"])
+        #expect(addedExact.executionProfile.scannedRowCount < 20)
+
+        let hiddenExcluded = index.search(SearchRequest(
+            query: "HiddenDelta",
+            sort: SortSpec(column: .name, ascending: true),
+            includeHidden: false
+        ), maxResults: 10)
+        #expect(hiddenExcluded.totalMatches == 0)
+        let hiddenIncluded = index.search(SearchRequest(
+            query: "HiddenDelta",
+            sort: SortSpec(column: .name, ascending: true),
+            includeHidden: true
+        ), maxResults: 10)
+        #expect(hiddenIncluded.totalMatches == 1)
+        #expect(hiddenIncluded.results.map(\.record.name) == [".HiddenDelta.swift"])
+
+        let empty = index.search(SearchRequest(
+            query: "",
+            sort: SortSpec(column: .name, ascending: true),
+            includeHidden: false
+        ), maxResults: 10)
+        #expect(empty.totalMatches == records.count + 499)
+        #expect(empty.results.count == 10)
+
+        let diagnostics = index.compositeSearchDiagnosticsForTesting()
+        #expect(diagnostics?.segmentCount == 2)
+        #expect((diagnostics?.maskedRowCount ?? 0) >= 1_800)
+    }
+
+    @Test("structural delta segments preserve latest-wins paths")
+    func structuralDeltaSegmentsPreserveLatestWinsPaths() {
+        let root = "/tmp/att-delta-latest-wins"
+        let removedPath = "\(root)/RemovedNeedle.swift"
+        let deltaPath = "\(root)/DeltaNeedle.swift"
+        let replacementPath = "\(root)/ReplacementNeedle.swift"
+        let index = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        defer { try? FileManager.default.removeItem(at: index.dataDirectoryURL) }
+        index.replaceRecordsForTesting([
+            makeRecord(path: removedPath),
+            makeRecord(path: replacementPath, isHidden: true),
+            makeRecord(path: "\(root)/Stable.swift")
+        ])
+
+        index.applyStructuralOverlayForTesting(
+            upserts: [
+                makeRecord(path: deltaPath, modifiedTime: 1),
+                makeRecord(path: replacementPath, isHidden: false)
+            ],
+            tombstonedPaths: [removedPath]
+        )
+        let replacementPreview = index.search(SearchRequest(
+            query: "ReplacementNeedle",
+            sort: SortSpec(column: .name, ascending: true),
+            mode: .interactivePreview
+        ), maxResults: 10)
+        #expect(replacementPreview.results.isEmpty)
+        let replacementExact = index.search(SearchRequest(
+            query: "ReplacementNeedle",
+            sort: SortSpec(column: .name, ascending: true)
+        ), maxResults: 10)
+        #expect(replacementExact.totalMatches == 1)
+        #expect(replacementExact.results.map(\.record.path) == [replacementPath])
+        index.applyStructuralOverlayForTesting(
+            upserts: [makeRecord(path: deltaPath, modifiedTime: 2)],
+            tombstonedPaths: []
+        )
+        var exact = index.search(SearchRequest(
+            query: "DeltaNeedle",
+            sort: SortSpec(column: .modified, ascending: false)
+        ), maxResults: 10)
+        #expect(exact.totalMatches == 1)
+        #expect(exact.results.map(\.record.modifiedTime) == [2])
+
+        index.applyStructuralOverlayForTesting(upserts: [], tombstonedPaths: [deltaPath])
+        exact = index.search(SearchRequest(
+            query: "DeltaNeedle",
+            sort: SortSpec(column: .modified, ascending: false)
+        ), maxResults: 10)
+        #expect(exact.totalMatches == 0)
+        #expect(exact.results.isEmpty)
+
+        index.applyStructuralOverlayForTesting(
+            upserts: [makeRecord(path: deltaPath, modifiedTime: 3)],
+            tombstonedPaths: []
+        )
+        exact = index.search(SearchRequest(
+            query: "DeltaNeedle",
+            sort: SortSpec(column: .modified, ascending: false)
+        ), maxResults: 10)
+        #expect(exact.totalMatches == 1)
+        #expect(exact.results.map(\.record.modifiedTime) == [3])
+
+        let removed = index.search(SearchRequest(
+            query: "RemovedNeedle",
+            sort: SortSpec(column: .relevance, ascending: false),
+            mode: .interactivePreview
+        ), maxResults: 10)
+        #expect(removed.results.isEmpty)
+        let removedExact = index.search(SearchRequest(
+            query: "RemovedNeedle",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10)
+        #expect(removedExact.results.isEmpty)
+        #expect(index.compositeSearchDiagnosticsForTesting()?.segmentCount == 4)
+
+        for offset in 0..<6 {
+            index.applyStructuralOverlayForTesting(
+                upserts: [makeRecord(path: "\(root)/SegmentFile\(offset).swift")],
+                tombstonedPaths: []
+            )
+        }
+        let consolidated = index.search(SearchRequest(
+            query: "SegmentFile",
+            sort: SortSpec(column: .name, ascending: true)
+        ), maxResults: 10)
+        #expect(consolidated.totalMatches == 6)
+        #expect(consolidated.results.count == 6)
+        #expect(index.compositeSearchDiagnosticsForTesting()?.segmentCount == 2)
+    }
+
+    @Test("composite search rejects a stale generation between segments")
+    func compositeSearchRejectsStaleGenerationBetweenSegments() {
+        let root = "/tmp/att-composite-stale-generation"
+        let index = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        defer { try? FileManager.default.removeItem(at: index.dataDirectoryURL) }
+        index.replaceRecordsForTesting([
+            makeRecord(path: "\(root)/FVS-0048-base.swift"),
+            makeRecord(path: "\(root)/Stable.swift")
+        ])
+        index.applyStructuralOverlayForTesting(
+            upserts: [makeRecord(path: "\(root)/FVS-0048-delta.swift")],
+            tombstonedPaths: []
+        )
+
+        let initialRevision = index.currentDiagnostics().snapshotRevision
+        let trigger = OneShotSearchTrigger(callNumber: 2)
+        let staleResponse = index.search(
+            SearchRequest(
+                query: "FVS-0048",
+                sort: SortSpec(column: .name, ascending: true)
+            ),
+            maxResults: 10,
+            shouldCancel: {
+                trigger.invoke {
+                    index.applyStructuralOverlayForTesting(
+                        upserts: [makeRecord(path: "\(root)/FVS-0048-newer.swift")],
+                        tombstonedPaths: []
+                    )
+                }
+                return false
+            }
+        )
+
+        #expect(staleResponse == nil)
+        #expect(index.currentDiagnostics().snapshotRevision > initialRevision)
+        let cancelledResponse = index.search(
+            SearchRequest(query: "FVS-0048", sort: SortSpec(column: .name, ascending: true)),
+            maxResults: 10,
+            shouldCancel: { true }
+        )
+        #expect(cancelledResponse == nil)
+        let currentResponse = index.search(SearchRequest(
+            query: "FVS-0048",
+            sort: SortSpec(column: .name, ascending: true)
+        ), maxResults: 1)
+        #expect(currentResponse.totalMatches == 3)
+        #expect(currentResponse.results.count == 1)
     }
 
     @Test("broad preview searches are bounded for every sort column")
@@ -5501,7 +5776,7 @@ struct FileIndexTests {
             let paths = allIndexedPaths(in: index)
             return !index.currentStats().isIndexing
                 && diagnostics.recordStoreKind == .overlay
-                && diagnostics.optimizedCount == 0
+                && diagnostics.optimizedCount == diagnostics.indexedCount
                 && diagnostics.virtualRowCount > 0
                 && paths.contains(addedFile.path)
                 && paths.contains(retainedFile.path)
@@ -6565,6 +6840,29 @@ private final class CompletionFlag: @unchecked Sendable {
     func mark() {
         lock.withLock {
             marked = true
+        }
+    }
+}
+
+private final class OneShotSearchTrigger: @unchecked Sendable {
+    private let lock = NSLock()
+    private let callNumber: Int
+    private var callCount = 0
+    private var didFire = false
+
+    init(callNumber: Int) {
+        self.callNumber = callNumber
+    }
+
+    func invoke(_ action: () -> Void) {
+        let shouldFire = lock.withLock { () -> Bool in
+            callCount += 1
+            guard !didFire, callCount == callNumber else { return false }
+            didFire = true
+            return true
+        }
+        if shouldFire {
+            action()
         }
     }
 }

@@ -6,6 +6,8 @@ public enum SearchExecutionPath: String, Codable, CaseIterable, Sendable {
     case pathGramIndex
     case extensionCandidateIntersection
     case optimizedSortedFastPath
+    case indexedBasePreview
+    case compositeIndexed
     case fullFallbackScan
     case indexedCandidateIntersection
     case applicationCatalog
@@ -21,6 +23,8 @@ public enum SearchIndexUse: String, Codable, CaseIterable, Hashable, Sendable {
     case modifiedOrder
     case sortOrder
     case visibleBitset
+    case rowMask
+    case structuralDelta
     case applicationCatalog
 }
 
@@ -59,7 +63,8 @@ public enum SearchRouteKind: String, Codable, CaseIterable, Hashable, Sendable {
         switch profile.executionPath {
         case .emptyQuerySortedOrder, .extensionCandidateIntersection, .optimizedSortedFastPath:
             return .sidecar
-        case .nameComponentIndex, .pathGramIndex, .indexedCandidateIntersection, .unprofiledIndexed:
+        case .nameComponentIndex, .pathGramIndex, .indexedCandidateIntersection, .indexedBasePreview,
+             .compositeIndexed, .unprofiledIndexed:
             return .mappedIndex
         case .fullFallbackScan:
             return .fullScan

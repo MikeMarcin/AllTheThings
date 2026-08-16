@@ -247,6 +247,19 @@ enum SearchWindowPresentation {
         }.joined(separator: " • ")
     }
 
+    nonisolated static func shownResultsText(
+        resultCount: Int,
+        totalMatches: Int,
+        completeness: SearchCompleteness
+    ) -> String {
+        switch completeness {
+        case .partial:
+            return "\(resultCount.formatted()) shown • refining"
+        case .complete:
+            return "\(resultCount.formatted()) shown / \(totalMatches.formatted()) matches"
+        }
+    }
+
     nonisolated static func shouldShowSearchElapsedText(
         displayedSearchSignatureIsSet: Bool,
         queryElapsed: TimeInterval,
@@ -1274,6 +1287,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var explanationCache: [ExplanationCacheKey: MatchExplanation] = [:]
     private var indexStats: IndexStats
     private var totalMatches = 0
+    private var displayedSearchCompleteness = SearchCompleteness.complete
     private var queryElapsed: TimeInterval = 0
     private var initialQueryElapsed: TimeInterval?
     private var isRefiningSearchResults = false
@@ -2962,6 +2976,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                 resetExplanationPipeline()
             }
             totalMatches = 0
+            displayedSearchCompleteness = .complete
             queryElapsed = 0
             tableView.reloadData()
             updateStatus()
@@ -3190,7 +3205,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             pendingPreviewSearchToken = nil
         }
         if activeSearchFullFinished {
-            if !keepSearchRefiningWhileAwaitingExactRetry(signature: signature) {
+            if !finishSearchWhileAwaitingExactRetry(signature: signature) {
                 clearSearchTokenIfCurrent(token)
             }
         }
@@ -3237,17 +3252,19 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
 
         activeSearchNeedsRetryAfterPreview = false
-        if !keepSearchRefiningWhileAwaitingExactRetry(signature: signature) {
+        if !finishSearchWhileAwaitingExactRetry(signature: signature) {
             clearSearchTokenIfCurrent(token)
         }
         return false
     }
 
     @discardableResult
-    private func keepSearchRefiningWhileAwaitingExactRetry(signature: SearchSignature) -> Bool {
+    private func finishSearchWhileAwaitingExactRetry(signature: SearchSignature) -> Bool {
         guard pendingExactSearchRetrySignature == signature else { return false }
         activeSearchToken = nil
-        isRefiningSearchResults = true
+        isRefiningSearchResults = false
+        activeSearchStartedAt = nil
+        stopSearchStatusTimer()
         updateStatus()
         updateLoadingOverlay()
         updateMascotPersistentAnimation()
@@ -3401,7 +3418,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             "candidateCount": .publicInt(profile.candidateCount),
             "scannedRowCount": .publicInt(profile.scannedRowCount),
             "fallbackToFullScan": .publicBool(profile.didFallbackToFullScan),
-            "staleRetry": .publicBool(profile.wasStaleRetry)
+            "staleRetry": .publicBool(profile.wasStaleRetry),
+            "completeness": .publicString(response.completeness == .complete ? "complete" : "partial")
         ]
     }
 
@@ -3472,14 +3490,11 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             )
             if completesSearch {
                 let needsRetry = activeSearchNeedsRetryAfterPreview
-                let awaitsExactRetry = pendingExactSearchRetrySignature == signature
                 activeSearchNeedsRetryAfterPreview = false
                 activeSearchToken = nil
-                isRefiningSearchResults = awaitsExactRetry
-                if !awaitsExactRetry {
-                    activeSearchStartedAt = nil
-                    stopSearchStatusTimer()
-                }
+                isRefiningSearchResults = false
+                activeSearchStartedAt = nil
+                stopSearchStatusTimer()
                 if needsRetry, signature == scheduledSearchSignature {
                     DispatchQueue.main.async { [weak self] in
                         self?.scheduleSearch(force: true)
@@ -3495,6 +3510,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
         results = response.results
         totalMatches = response.totalMatches
+        displayedSearchCompleteness = response.completeness
         queryElapsed = elapsed
         displayedSearchSignature = signature
         displayedSearchSnapshotRevision = response.snapshotRevision
@@ -3571,6 +3587,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                 resetExplanationPipeline()
             }
             totalMatches = 0
+            displayedSearchCompleteness = .complete
             queryElapsed = 0
             initialQueryElapsed = nil
             isRefiningSearchResults = false
@@ -4210,6 +4227,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         displayedSearchSnapshotRevision = nil
         results.removeAll(keepingCapacity: true)
         totalMatches = 0
+        displayedSearchCompleteness = .complete
         queryElapsed = 0
         initialQueryElapsed = nil
         isRefiningSearchResults = false
@@ -5169,7 +5187,11 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         updateActiveSearchElapsed()
 
         let appSearchActive = ApplicationSearchQuery.parse(currentSearchText()) != nil
-        let shownText = "\(results.count.formatted()) shown / \(totalMatches.formatted()) matches"
+        let shownText = SearchWindowPresentation.shownResultsText(
+            resultCount: results.count,
+            totalMatches: totalMatches,
+            completeness: displayedSearchCompleteness
+        )
         guard AppSettings.indexingSetupCompleted(defaults: defaults) || appSearchActive else {
             let footerText = SearchWindowPresentation.detailedFooterText(
                 shownText: shownText,

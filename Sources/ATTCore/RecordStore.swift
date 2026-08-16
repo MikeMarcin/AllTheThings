@@ -983,11 +983,13 @@ final class OverlayRecordStore: RecordStore {
     var storedResultCount: Int? { resultCount }
     var storedRootAttribution: RootAttributionTable? { rootAttribution }
     var schemaVersion: Int { base.schemaVersion }
-    var upsertRowRange: Range<Int> { visibleBaseCount..<count }
-    var deletedResultPaths: [String] {
-        deletedRowsSorted.compactMap { rowID in
-            base.isResultRow(at: rowID) ? base.path(at: rowID) : nil
-        }
+    var searchBaseStore: RecordStore { base }
+    var searchUpserts: [FileRecord] { upserts }
+    var deletedBaseRows: Set<Int> { deletedRows }
+
+    func searchUpsert(forPath path: String) -> FileRecord? {
+        guard let rowID = pathToOverlay[path] else { return nil }
+        return upserts[rowID - visibleBaseCount]
     }
 
     init(base requestedBase: RecordStore, upserts incomingUpserts: [FileRecord], deletedRows incomingDeletedRows: Set<Int>) {
@@ -1396,6 +1398,109 @@ final class OverlayRecordStore: RecordStore {
         }
 
         return table
+    }
+}
+
+/// A search-only view that preserves the source store's row identifiers while
+/// excluding rows superseded by a structural delta. Persisted postings and sort
+/// orders remain valid because the physical row layout never changes.
+final class RowMaskingRecordStore: RecordStore {
+    private let base: RecordStore
+    private let maskedRows: PackedRowBitSet
+
+    var count: Int { base.count }
+    var kind: RecordStoreKind { base.kind }
+    var mappedByteSize: Int { base.mappedByteSize }
+    var heapPageCount: Int { base.heapPageCount }
+    var overlayCount: Int { base.overlayCount }
+    var hasColumnarSidecars: Bool { base.hasColumnarSidecars }
+    var hasContiguousSubtreeRanges: Bool { base.hasContiguousSubtreeRanges }
+    // These remain physical counts so the source snapshot's row-ordered search
+    // structures continue to validate. CompositeSearchState owns live counts.
+    var storedVisibleCount: Int? { base.storedVisibleCount }
+    var storedResultCount: Int? { base.storedResultCount }
+    var storedRootAttribution: RootAttributionTable? { base.storedRootAttribution }
+    var schemaVersion: Int { base.schemaVersion }
+
+    init(base: RecordStore, maskedRows: PackedRowBitSet) {
+        precondition(base.count == maskedRows.bitCount, "A row mask must match its source store")
+        self.base = base
+        self.maskedRows = maskedRows
+    }
+
+    func record(at index: Int) -> FileRecord { base.record(at: index) }
+    func view(at index: Int) -> RecordSearchView { RecordSearchView(store: self, rowID: index) }
+    func recordID(at index: Int) -> UInt64 { base.recordID(at: index) }
+    func path(at index: Int) -> String { base.path(at: index) }
+    func name(at index: Int) -> String { base.name(at: index) }
+    func directoryPath(at index: Int) -> String { base.directoryPath(at: index) }
+    func fileExtension(at index: Int) -> String { base.fileExtension(at: index) }
+    func sizeBytes(at index: Int) -> UInt64 { base.sizeBytes(at: index) }
+    func modifiedTime(at index: Int) -> TimeInterval { base.modifiedTime(at: index) }
+    func createdTime(at index: Int) -> TimeInterval? { base.createdTime(at: index) }
+    func isDirectory(at index: Int) -> Bool { base.isDirectory(at: index) }
+    func isHidden(at index: Int) -> Bool { base.isHidden(at: index) }
+    func volumeName(at index: Int) -> String { base.volumeName(at: index) }
+    func normalizedName(at index: Int) -> String { base.normalizedName(at: index) }
+    func normalizedPath(at index: Int) -> String { base.normalizedPath(at: index) }
+    func parentRowID(at index: Int) -> Int? { base.parentRowID(at: index) }
+    func subtreeEnd(at index: Int) -> Int { base.subtreeEnd(at: index) }
+    func depth(at index: Int) -> Int { base.depth(at: index) }
+    func rootID(at index: Int) -> UInt16? { base.rootID(at: index) }
+    func rootPath(at index: Int) -> String? { base.rootPath(at: index) }
+    func isVirtual(at index: Int) -> Bool { base.isVirtual(at: index) }
+
+    func allRecords() -> [FileRecord] {
+        var records: [FileRecord] = []
+        records.reserveCapacity(max((base.storedResultCount ?? base.count) - maskedRows.setBitCount, 0))
+        forEachResultRecord { records.append($0) }
+        return records
+    }
+
+    func forEachResultRecord(_ body: (FileRecord) -> Void) {
+        for rowID in 0..<count where isResultRow(at: rowID) {
+            body(base.record(at: rowID))
+        }
+    }
+
+    func rowID(forPath path: String) -> Int? {
+        guard let rowID = base.rowID(forPath: path), !maskedRows.contains(rowID) else {
+            return nil
+        }
+        return rowID
+    }
+
+    func makeSubtreeRowCursor(atPath path: String) -> RecordStoreSubtreeCursor {
+        base.makeSubtreeRowCursor(atPath: path).rebound(to: self)
+    }
+
+    func rowIDs(inSubtreeAtPath path: String) -> [Int]? {
+        base.rowIDs(inSubtreeAtPath: path)?.filter { !maskedRows.contains($0) }
+    }
+
+    func isResultRow(at index: Int) -> Bool {
+        !maskedRows.contains(index) && base.isResultRow(at: index)
+    }
+
+    func isVisible(at index: Int) -> Bool {
+        !maskedRows.contains(index) && base.isVisible(at: index)
+    }
+
+    func normalizedPath(at index: Int, contains token: String, cache: inout [Int: Bool]) -> Bool {
+        guard !maskedRows.contains(index) else { return false }
+        return base.normalizedPath(at: index, contains: token, cache: &cache)
+    }
+
+    func normalizedName(at index: Int, contains token: String) -> Bool {
+        !maskedRows.contains(index) && base.normalizedName(at: index, contains: token)
+    }
+
+    func normalizedName(at index: Int, contains tokenBytes: [UInt8]) -> Bool {
+        !maskedRows.contains(index) && base.normalizedName(at: index, contains: tokenBytes)
+    }
+
+    func isHiddenInPath(at index: Int, cache: inout [Int: Bool]) -> Bool {
+        maskedRows.contains(index) || base.isHiddenInPath(at: index, cache: &cache)
     }
 }
 

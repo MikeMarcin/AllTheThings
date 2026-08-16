@@ -47,6 +47,19 @@ struct PackedRowBitSetTests {
         #expect(visited == unset.sorted())
     }
 
+    @Test("set iteration visits only populated rows in ascending order")
+    func setIteration() {
+        var bitSet = PackedRowBitSet(bitCount: 130)
+        for index in [129, 64, 0, 63] {
+            bitSet.insert(index)
+        }
+
+        var visited: [Int] = []
+        bitSet.forEachSetIndex { visited.append($0) }
+
+        #expect(visited == [0, 63, 64, 129])
+    }
+
     @Test("unset iteration crosses multiple SIMD chunks in ascending order")
     func simdChunkIteration() {
         var bitSet = PackedRowBitSet(bitCount: 1_024)

@@ -63,6 +63,11 @@ public enum SearchMode: Sendable {
     case interactivePreview
 }
 
+public enum SearchCompleteness: Equatable, Sendable {
+    case partial
+    case complete
+}
+
 extension SearchMode {
     var metricPhase: SearchMetricPhase {
         switch self {
@@ -266,6 +271,7 @@ public struct SearchResponse: Sendable {
     public let elapsed: TimeInterval
     public let snapshotRevision: UInt64?
     public let usesIndexedCandidates: Bool
+    public let completeness: SearchCompleteness
     public let executionProfile: SearchExecutionProfile
 
     public init(
@@ -274,6 +280,7 @@ public struct SearchResponse: Sendable {
         elapsed: TimeInterval,
         snapshotRevision: UInt64? = nil,
         usesIndexedCandidates: Bool = false,
+        completeness: SearchCompleteness = .complete,
         executionProfile: SearchExecutionProfile? = nil
     ) {
         self.results = results
@@ -281,6 +288,7 @@ public struct SearchResponse: Sendable {
         self.elapsed = elapsed
         self.snapshotRevision = snapshotRevision
         self.usesIndexedCandidates = usesIndexedCandidates
+        self.completeness = completeness
         self.executionProfile = executionProfile ?? SearchExecutionProfile(
             executionPath: usesIndexedCandidates ? .unprofiledIndexed : .unprofiled,
             indexesUsed: usesIndexedCandidates ? [.nameGrams] : [],
@@ -484,6 +492,8 @@ struct FileIndexDiagnostics: Sendable {
     let componentGramPostingCount: Int
     let extensionKeyCount: Int
     let extensionPostingCount: Int
+    let compositeSearchSegmentCount: Int
+    let compositeMaskedRowCount: Int
     let pendingRefreshPathCount: Int
     let pendingBackgroundRefreshPathCount: Int
     let completedRefreshBatches: UInt64
@@ -780,6 +790,7 @@ public final class FileIndex: @unchecked Sendable {
         let snapshot: SearchSnapshot
         let delta: StructuralDelta?
         let optimizedFallback: SearchSnapshot?
+        let compositeSearchState: CompositeSearchState?
         let requiresFullReconciliation: Bool
     }
 
@@ -2508,6 +2519,49 @@ public final class FileIndex: @unchecked Sendable {
                 nameGramIndex: nameGramIndex,
                 componentGramIndex: componentGramIndex,
                 extensionIndex: extensionIndex
+            )
+        }
+
+        private init(reusingCore source: SearchSnapshot, store: RecordStore) {
+            let sortState = source.sortOrderLock.withLock {
+                (
+                    orders: source.sortOrdersAscending,
+                    visibleOrders: source.visibleSortOrdersAscending,
+                    rankCache: source.sortRankCache,
+                    rankCacheOrder: source.sortRankCacheOrder
+                )
+            }
+            self.store = store
+            modifiedDescending = source.modifiedDescending
+            modifiedAscending = source.modifiedAscending
+            nameAscending = source.nameAscending
+            nameDescending = source.nameDescending
+            visibleModifiedDescending = source.visibleModifiedDescending
+            visibleModifiedAscending = source.visibleModifiedAscending
+            sortOrdersAscending = sortState.orders
+            visibleSortOrdersAscending = sortState.visibleOrders
+            sortRankCache = sortState.rankCache
+            sortRankCacheOrder = sortState.rankCacheOrder
+            gramIndex = source.gramIndex
+            pathGramShards = source.pathGramShards
+            pathGramExpectedRowCount = source.pathGramExpectedRowCount
+            nameGramIndex = source.nameGramIndex
+            componentGramIndex = source.componentGramIndex
+            resultPrefixCounts = source.resultPrefixCounts
+            visibleResultPrefixCounts = source.visibleResultPrefixCounts
+            extensionIndex = source.extensionIndex
+            childLinks = source.childLinks
+            visibleCount = source.visibleCount
+            hasSortedOrder = source.hasSortedOrder
+            prefersDegradedSearch = source.prefersDegradedSearch
+            diagnostics = source.diagnostics
+        }
+
+        func maskingRows(_ rows: PackedRowBitSet) -> SearchSnapshot {
+            guard rows.setBitCount > 0 else { return self }
+            return SearchSnapshot(
+                reusingCore: self,
+                store: RowMaskingRecordStore(base: store, maskedRows: rows)
             )
         }
 
@@ -4279,6 +4333,51 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
+    private struct SearchSegment: Sendable {
+        let sourceSnapshot: SearchSnapshot
+        let snapshot: SearchSnapshot
+        let maskedRows: PackedRowBitSet
+        let liveResultCount: Int
+        let liveVisibleCount: Int
+
+        var maskedRowCount: Int { maskedRows.setBitCount }
+    }
+
+    private struct DeltaRowOwner: Sendable {
+        let segmentIndex: Int
+        let rowID: Int
+    }
+
+    private final class CompositeSearchState: @unchecked Sendable {
+        let logicalSnapshot: SearchSnapshot
+        let base: SearchSegment
+        let deltaSegments: [SearchSegment]
+        let deltaOwnersByPath: [String: DeltaRowOwner]
+        let liveResultCount: Int
+        let liveVisibleCount: Int
+
+        init(
+            logicalSnapshot: SearchSnapshot,
+            base: SearchSegment,
+            deltaSegments: [SearchSegment],
+            deltaOwnersByPath: [String: DeltaRowOwner],
+            liveResultCount: Int,
+            liveVisibleCount: Int
+        ) {
+            self.logicalSnapshot = logicalSnapshot
+            self.base = base
+            self.deltaSegments = deltaSegments
+            self.deltaOwnersByPath = deltaOwnersByPath
+            self.liveResultCount = liveResultCount
+            self.liveVisibleCount = liveVisibleCount
+        }
+
+        var segmentCount: Int { 1 + deltaSegments.count }
+        var maskedRowCount: Int {
+            base.maskedRowCount + deltaSegments.reduce(0) { $0 + $1.maskedRowCount }
+        }
+    }
+
     private let lock = NSLock()
     private let backgroundReconciliationCondition = NSCondition()
     private let fileManager: FileManager
@@ -4320,8 +4419,12 @@ public final class FileIndex: @unchecked Sendable {
     private var searchSnapshot = SearchSnapshot.empty {
         didSet {
             rememberOptimizedSearchFallbackWithoutLock(searchSnapshot)
+            if !(searchSnapshot.store is OverlayRecordStore) {
+                compositeSearchState = nil
+            }
         }
     }
+    private var compositeSearchState: CompositeSearchState?
     private var structuralDelta: StructuralDelta?
     private var optimizedSearchFallbackSnapshot: SearchSnapshot?
     private var searchSnapshotRevision: UInt64 = 0
@@ -5338,8 +5441,178 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
+    private func makeSearchSegment(
+        source: SearchSnapshot,
+        maskedRows: PackedRowBitSet
+    ) -> SearchSegment {
+        var maskedResultCount = 0
+        var maskedVisibleCount = 0
+        maskedRows.forEachSetIndex { rowID in
+            guard source.store.isResultRow(at: rowID) else { return }
+            maskedResultCount += 1
+            if source.isVisible(at: rowID) {
+                maskedVisibleCount += 1
+            }
+        }
+
+        let physicalVisibleCount = source.visibleResultCount
+            ?? (0..<source.count).reduce(into: 0) { count, rowID in
+                if source.store.isResultRow(at: rowID), source.isVisible(at: rowID) {
+                    count += 1
+                }
+            }
+        return SearchSegment(
+            sourceSnapshot: source,
+            snapshot: source.maskingRows(maskedRows),
+            maskedRows: maskedRows,
+            liveResultCount: max(source.resultCount - maskedResultCount, 0),
+            liveVisibleCount: max(physicalVisibleCount - maskedVisibleCount, 0)
+        )
+    }
+
+    private static func deltaOwners(
+        for records: [FileRecord],
+        segmentIndex: Int
+    ) -> [String: DeltaRowOwner] {
+        Dictionary(uniqueKeysWithValues: records.enumerated().map {
+            ($0.element.path, DeltaRowOwner(segmentIndex: segmentIndex, rowID: $0.offset))
+        })
+    }
+
+    private static func sharesRowIdentity(_ snapshot: SearchSnapshot, with store: RecordStore) -> Bool {
+        guard snapshot.count == store.count, snapshot.store.schemaVersion == store.schemaVersion else {
+            return false
+        }
+        guard snapshot.count > 0 else { return true }
+        let last = snapshot.count - 1
+        return snapshot.store.recordID(at: 0) == store.recordID(at: 0)
+            && snapshot.store.recordID(at: last) == store.recordID(at: last)
+    }
+
+    private func makeDeltaSourceSnapshot(records: [FileRecord], roots: [String]) -> SearchSnapshot {
+        SearchSnapshot(
+            records: records,
+            roots: roots,
+            buildsSearchStructures: true,
+            buildsPathGramIndex: true,
+            optimizedSortColumns: currentOptimizedSortColumns(),
+            prefersDegradedSearch: false
+        )
+    }
+
+    private func makeCompositeSearchState(
+        logicalSnapshot: SearchSnapshot,
+        optimizedBase: SearchSnapshot?,
+        roots: [String],
+        previousState: CompositeSearchState?,
+        changedUpserts: [FileRecord],
+        changedTombstonedPaths: [String],
+        forceConsolidation: Bool = false
+    ) -> CompositeSearchState? {
+        guard let overlay = logicalSnapshot.store as? OverlayRecordStore else { return nil }
+
+        let previousUsesSameBase = previousState.map {
+            Self.sharesRowIdentity($0.base.sourceSnapshot, with: overlay.searchBaseStore)
+        } == true
+        let baseSource = previousUsesSameBase ? previousState?.base.sourceSnapshot : optimizedBase
+        guard
+            let baseSource,
+            baseSource.isOptimizedForSearch,
+            Self.sharesRowIdentity(baseSource, with: overlay.searchBaseStore)
+        else {
+            return nil
+        }
+
+        var baseMask = PackedRowBitSet(bitCount: baseSource.count)
+        for rowID in overlay.deletedBaseRows where rowID >= 0 && rowID < baseSource.count {
+            baseMask.insert(rowID)
+        }
+        let baseSegment = makeSearchSegment(source: baseSource, maskedRows: baseMask)
+
+        var sourceSnapshots: [SearchSnapshot] = []
+        var masks: [PackedRowBitSet] = []
+        var owners: [String: DeltaRowOwner] = [:]
+
+        if previousUsesSameBase, let previousState, !forceConsolidation {
+            sourceSnapshots = previousState.deltaSegments.map(\.sourceSnapshot)
+            masks = previousState.deltaSegments.map(\.maskedRows)
+            owners = previousState.deltaOwnersByPath
+
+            let changedPaths = Set(changedUpserts.map(\.path)).union(changedTombstonedPaths)
+            for path in changedPaths {
+                if let owner = owners.removeValue(forKey: path),
+                   owner.segmentIndex >= 0,
+                   owner.segmentIndex < masks.count,
+                   owner.rowID >= 0,
+                   owner.rowID < masks[owner.segmentIndex].bitCount {
+                    masks[owner.segmentIndex].insert(owner.rowID)
+                }
+            }
+
+            var liveBatchByPath: [String: FileRecord] = [:]
+            liveBatchByPath.reserveCapacity(changedUpserts.count)
+            for record in changedUpserts {
+                if let current = overlay.searchUpsert(forPath: record.path) {
+                    liveBatchByPath[record.path] = current
+                }
+            }
+            let liveBatch = liveBatchByPath.values.sorted { $0.path < $1.path }
+            if !liveBatch.isEmpty {
+                let segmentIndex = sourceSnapshots.count
+                sourceSnapshots.append(makeDeltaSourceSnapshot(records: liveBatch, roots: roots))
+                masks.append(PackedRowBitSet(bitCount: liveBatch.count))
+                for (rowID, record) in liveBatch.enumerated() {
+                    owners[record.path] = DeltaRowOwner(segmentIndex: segmentIndex, rowID: rowID)
+                }
+            }
+        } else if !overlay.searchUpserts.isEmpty {
+            let records = overlay.searchUpserts
+            sourceSnapshots = [makeDeltaSourceSnapshot(records: records, roots: roots)]
+            masks = [PackedRowBitSet(bitCount: records.count)]
+            owners = Self.deltaOwners(for: records, segmentIndex: 0)
+        }
+
+        let physicalDeltaCount = sourceSnapshots.reduce(0) { $0 + $1.resultCount }
+        let shadowedDeltaCount = masks.reduce(0) { $0 + $1.setBitCount }
+        let shouldConsolidate = forceConsolidation
+            || sourceSnapshots.count > 8
+            || (shadowedDeltaCount >= 4_096 && shadowedDeltaCount * 4 >= max(physicalDeltaCount, 1))
+            || owners.count != overlay.searchUpserts.count
+        if shouldConsolidate {
+            let records = overlay.searchUpserts
+            if records.isEmpty {
+                sourceSnapshots = []
+                masks = []
+                owners = [:]
+            } else {
+                sourceSnapshots = [makeDeltaSourceSnapshot(records: records, roots: roots)]
+                masks = [PackedRowBitSet(bitCount: records.count)]
+                owners = Self.deltaOwners(for: records, segmentIndex: 0)
+            }
+        }
+
+        let deltaSegments = zip(sourceSnapshots, masks).map { source, mask in
+            makeSearchSegment(source: source, maskedRows: mask)
+        }
+        let liveVisibleCount = baseSegment.liveVisibleCount
+            + deltaSegments.reduce(0) { $0 + $1.liveVisibleCount }
+        return CompositeSearchState(
+            logicalSnapshot: logicalSnapshot,
+            base: baseSegment,
+            deltaSegments: deltaSegments,
+            deltaOwnersByPath: owners,
+            liveResultCount: logicalSnapshot.resultCount,
+            liveVisibleCount: liveVisibleCount
+        )
+    }
+
     public func search(_ request: SearchRequest, maxResults: Int = 2_000) -> SearchResponse {
-        search(request, maxResults: maxResults, shouldCancel: { false }) ?? SearchResponse(results: [], totalMatches: 0, elapsed: 0)
+        for _ in 0..<3 {
+            if let response = search(request, maxResults: maxResults, shouldCancel: { false }) {
+                return response
+            }
+        }
+        return SearchResponse(results: [], totalMatches: 0, elapsed: 0)
     }
 
     private static func shouldPromoteSortedOrderForEmptyQuery(
@@ -5371,30 +5644,6 @@ public final class FileIndex: @unchecked Sendable {
         snapshot.prefersDegradedSearch || isRefreshActive
     }
 
-    private static func matchingSearchResult(
-        rowID: Int,
-        snapshot: SearchSnapshot,
-        request: SearchRequest,
-        parsedQuery: FuzzyMatcher.ParsedQuery
-    ) -> SearchResult? {
-        guard
-            snapshot.store.isResultRow(at: rowID),
-            request.includeHidden || snapshot.isVisible(at: rowID),
-            let explanation = FuzzyMatcher.explain(
-                record: snapshot.view(at: rowID),
-                parsedQuery: parsedQuery
-            )
-        else {
-            return nil
-        }
-        return SearchResult(
-            record: snapshot.record(at: rowID),
-            score: explanation.score,
-            match: explanation,
-            rootPath: snapshot.rootPath(at: rowID)
-        )
-    }
-
     private static func sortAndLimit(
         _ results: inout [SearchResult],
         request: SearchRequest,
@@ -5420,6 +5669,7 @@ public final class FileIndex: @unchecked Sendable {
             elapsed: response.elapsed,
             snapshotRevision: response.snapshotRevision,
             usesIndexedCandidates: response.usesIndexedCandidates,
+            completeness: response.completeness,
             executionProfile: SearchExecutionProfile(
                 executionPath: profile.executionPath,
                 indexesUsed: profile.indexesUsed,
@@ -5430,98 +5680,6 @@ public final class FileIndex: @unchecked Sendable {
                 wasStaleRetry: profile.wasStaleRetry,
                 elapsed: profile.elapsed
             )
-        )
-    }
-
-    private static func mergingOverlayChanges(
-        into response: SearchResponse,
-        searchedSnapshot: SearchSnapshot,
-        currentSnapshot: SearchSnapshot,
-        request: SearchRequest,
-        parsedQuery: FuzzyMatcher.ParsedQuery,
-        maxResults: Int,
-        shouldCancel: @Sendable () -> Bool
-    ) -> SearchResponse? {
-        // The optimized fallback belongs to the overlay's base snapshot. Reconcile
-        // its fast results with changed rows so previews never present stale data.
-        guard
-            searchedSnapshot.store !== currentSnapshot.store,
-            let overlay = currentSnapshot.store as? OverlayRecordStore
-        else {
-            return response
-        }
-
-        var resultsByPath: [String: SearchResult] = [:]
-        resultsByPath.reserveCapacity(response.results.count + min(overlay.upsertRowRange.count, maxResults))
-
-        for (offset, result) in response.results.enumerated() {
-            if offset.isMultiple(of: 32), shouldCancel() {
-                return nil
-            }
-            guard
-                let rowID = currentSnapshot.store.rowID(forPath: result.record.path),
-                let currentResult = matchingSearchResult(
-                    rowID: rowID,
-                    snapshot: currentSnapshot,
-                    request: request,
-                    parsedQuery: parsedQuery
-                )
-            else {
-                continue
-            }
-            resultsByPath[currentResult.record.path] = currentResult
-        }
-
-        var removedMatchCount = 0
-        let deletedResultPaths = overlay.deletedResultPaths
-        for (offset, path) in deletedResultPaths.enumerated() {
-            if offset.isMultiple(of: 64), shouldCancel() {
-                return nil
-            }
-            guard
-                let rowID = searchedSnapshot.store.rowID(forPath: path),
-                matchingSearchResult(
-                    rowID: rowID,
-                    snapshot: searchedSnapshot,
-                    request: request,
-                    parsedQuery: parsedQuery
-                ) != nil
-            else {
-                continue
-            }
-            removedMatchCount += 1
-        }
-
-        var addedMatchCount = 0
-        for (offset, rowID) in overlay.upsertRowRange.enumerated() {
-            if offset.isMultiple(of: 64), shouldCancel() {
-                return nil
-            }
-            guard let result = matchingSearchResult(
-                rowID: rowID,
-                snapshot: currentSnapshot,
-                request: request,
-                parsedQuery: parsedQuery
-            ) else {
-                continue
-            }
-
-            addedMatchCount += 1
-            guard maxResults > 0 else { continue }
-            resultsByPath[result.record.path] = result
-        }
-
-        guard !shouldCancel() else { return nil }
-        var results = Array(resultsByPath.values)
-        sortAndLimit(&results, request: request, maxResults: maxResults)
-
-        let overlayScanCount = overlay.upsertRowRange.count + deletedResultPaths.count
-        return responseByMergingRefreshResults(
-            response,
-            results: results,
-            totalMatches: max(response.totalMatches - removedMatchCount + addedMatchCount, 0),
-            additionalCandidateCount: overlay.upsertRowRange.count,
-            additionalScanCount: overlayScanCount
         )
     }
 
@@ -5636,14 +5794,259 @@ public final class FileIndex: @unchecked Sendable {
         )
     }
 
-    public func search(
+    private func searchComposite(
         _ request: SearchRequest,
-        maxResults: Int = 2_000,
+        maxResults: Int,
+        state: CompositeSearchState,
+        snapshotRevision: UInt64,
+        pendingExactPaths: [String],
+        rootPaths: [String],
         shouldCancel: @Sendable () -> Bool
     ) -> SearchResponse? {
         let started = Date()
         let metricPhase = request.mode.metricPhase
         recordSearchStarted(phase: metricPhase)
+        var didComplete = false
+        defer {
+            if !didComplete {
+                recordSearchCancelled(phase: metricPhase, elapsed: Date().timeIntervalSince(started))
+            }
+        }
+
+        let boundedMaxResults = max(maxResults, 0)
+        let parsedQuery = FuzzyMatcher.parse(
+            request.query.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+        func isCurrentCompositeGeneration() -> Bool {
+            lock.withLock {
+                compositeSearchState === state
+                    && searchSnapshotRevision == snapshotRevision
+            }
+        }
+
+        let segments: [SearchSegment]
+        let completeness: SearchCompleteness
+        let executionPath: SearchExecutionPath
+        switch request.mode {
+        case .interactivePreview:
+            segments = [state.base]
+            completeness = .partial
+            executionPath = .indexedBasePreview
+        case .complete:
+            segments = [state.base] + state.deltaSegments
+            completeness = .complete
+            executionPath = .compositeIndexed
+        }
+
+        var segmentResponses: [SearchResponse] = []
+        segmentResponses.reserveCapacity(segments.count)
+        var segmentLatencies: [TimeInterval] = []
+        segmentLatencies.reserveCapacity(segments.count)
+        var baseLatency: TimeInterval = 0
+        var deltaLatency: TimeInterval = 0
+        for (index, segment) in segments.enumerated() {
+            guard !shouldCancel(), isCurrentCompositeGeneration() else { return nil }
+            let segmentStarted = Date()
+            guard let response = searchSingleSnapshot(
+                request,
+                maxResults: boundedMaxResults,
+                snapshotOverride: segment.snapshot,
+                snapshotRevisionOverride: snapshotRevision,
+                recordsMetrics: false,
+                shouldCancel: shouldCancel
+            ) else {
+                return nil
+            }
+            let latency = Date().timeIntervalSince(segmentStarted)
+            segmentLatencies.append(latency)
+            if index == 0 {
+                baseLatency = latency
+            } else {
+                deltaLatency += latency
+            }
+            segmentResponses.append(response)
+        }
+
+        guard !shouldCancel(), isCurrentCompositeGeneration() else { return nil }
+        let mergeStarted = Date()
+        var results: [SearchResult] = []
+        results.reserveCapacity(boundedMaxResults)
+        var resultOffsets = Array(repeating: 0, count: segmentResponses.count)
+        while results.count < boundedMaxResults {
+            if results.count.isMultiple(of: 64),
+               (shouldCancel() || !isCurrentCompositeGeneration()) {
+                return nil
+            }
+
+            var bestSegment: Int?
+            for segmentIndex in segmentResponses.indices {
+                let resultIndex = resultOffsets[segmentIndex]
+                guard resultIndex < segmentResponses[segmentIndex].results.count else { continue }
+                guard let currentBest = bestSegment else {
+                    bestSegment = segmentIndex
+                    continue
+                }
+                let bestResultIndex = resultOffsets[currentBest]
+                if Self.compare(
+                    segmentResponses[segmentIndex].results[resultIndex],
+                    segmentResponses[currentBest].results[bestResultIndex],
+                    sort: request.sort,
+                    queryIsEmpty: parsedQuery.isEmpty
+                ) {
+                    bestSegment = segmentIndex
+                }
+            }
+
+            guard let bestSegment else { break }
+            results.append(segmentResponses[bestSegment].results[resultOffsets[bestSegment]])
+            resultOffsets[bestSegment] += 1
+        }
+
+        let totalMatches: Int
+        if request.mode == .interactivePreview {
+            totalMatches = results.count
+        } else if parsedQuery.isEmpty {
+            totalMatches = request.includeHidden ? state.liveResultCount : state.liveVisibleCount
+        } else {
+            totalMatches = segmentResponses.reduce(0) { $0 + $1.totalMatches }
+        }
+
+        var indexesUsed = segmentResponses.reduce(into: Set<SearchIndexUse>()) {
+            $0.formUnion($1.executionProfile.indexesUsed)
+        }
+        if state.maskedRowCount > 0 {
+            indexesUsed.insert(.rowMask)
+        }
+        if !state.deltaSegments.isEmpty {
+            indexesUsed.insert(.structuralDelta)
+        }
+        let candidateCount = segmentResponses.reduce(0) {
+            $0 + $1.executionProfile.candidateCount
+        }
+        let scannedRowCount = segmentResponses.reduce(0) {
+            $0 + $1.executionProfile.scannedRowCount
+        }
+        let didFallbackToFullScan = segmentResponses.contains {
+            $0.executionProfile.didFallbackToFullScan
+        }
+        let mergeLatency = Date().timeIntervalSince(mergeStarted)
+        let interimElapsed = Date().timeIntervalSince(started)
+        var response = SearchResponse(
+            results: results,
+            totalMatches: totalMatches,
+            elapsed: interimElapsed,
+            snapshotRevision: snapshotRevision,
+            usesIndexedCandidates: segmentResponses.allSatisfy(\.usesIndexedCandidates),
+            completeness: completeness,
+            executionProfile: SearchExecutionProfile(
+                executionPath: executionPath,
+                indexesUsed: indexesUsed,
+                candidateCount: candidateCount,
+                scannedRowCount: scannedRowCount,
+                didFallbackToFullScan: didFallbackToFullScan,
+                elapsed: interimElapsed
+            )
+        )
+
+        if request.mode == .complete {
+            guard let refreshed = mergingPendingExactRefreshes(
+                into: response,
+                pendingExactPaths: pendingExactPaths,
+                currentSnapshot: state.logicalSnapshot,
+                rootPaths: rootPaths,
+                request: request,
+                parsedQuery: parsedQuery,
+                maxResults: boundedMaxResults,
+                shouldCancel: shouldCancel
+            ) else {
+                return nil
+            }
+            response = refreshed
+        }
+
+        guard !shouldCancel(), isCurrentCompositeGeneration() else { return nil }
+        let elapsed = Date().timeIntervalSince(started)
+        let finalProfile = response.executionProfile
+        let completed = SearchResponse(
+            results: response.results,
+            totalMatches: response.totalMatches,
+            elapsed: elapsed,
+            snapshotRevision: snapshotRevision,
+            usesIndexedCandidates: response.usesIndexedCandidates,
+            completeness: completeness,
+            executionProfile: SearchExecutionProfile(
+                executionPath: executionPath,
+                indexesUsed: finalProfile.indexesUsed,
+                candidateCount: finalProfile.candidateCount,
+                scannedRowCount: finalProfile.scannedRowCount,
+                didFallbackToFullScan: finalProfile.didFallbackToFullScan,
+                elapsed: elapsed
+            )
+        )
+        var diagnosticFields: [String: DiagnosticLogFieldValue] = [
+            "segmentCount": .publicInt(segments.count),
+            "deltaSegmentCount": .publicInt(request.mode == .complete ? state.deltaSegments.count : 0),
+            "maskedRowCount": .publicInt(state.maskedRowCount),
+            "baseLatencySeconds": .publicDouble(baseLatency),
+            "deltaLatencySeconds": .publicDouble(deltaLatency),
+            "mergeLatencySeconds": .publicDouble(mergeLatency),
+            "completeness": .publicString(completeness == .complete ? "complete" : "partial")
+        ]
+        for (index, latency) in segmentLatencies.enumerated() {
+            diagnosticFields["segment\(index)LatencySeconds"] = .publicDouble(latency)
+        }
+        DiagnosticLogger.shared.log(
+            category: "search",
+            event: "search.compositeExecuted",
+            fields: diagnosticFields
+        )
+        didComplete = true
+        recordSearchCompleted(completed.executionProfile, phase: metricPhase)
+        return completed
+    }
+
+    public func search(
+        _ request: SearchRequest,
+        maxResults: Int = 2_000,
+        shouldCancel: @Sendable () -> Bool
+    ) -> SearchResponse? {
+        let compositeData = lock.withLock {
+            (
+                state: compositeSearchState,
+                revision: searchSnapshotRevision,
+                pendingExactPaths: pendingRefreshPaths.values.compactMap {
+                    $0.recursivelyScansDirectory ? nil : $0.path
+                },
+                rootPaths: roots
+            )
+        }
+        if let state = compositeData.state {
+            return searchComposite(
+                request,
+                maxResults: maxResults,
+                state: state,
+                snapshotRevision: compositeData.revision,
+                pendingExactPaths: compositeData.pendingExactPaths,
+                rootPaths: compositeData.rootPaths,
+                shouldCancel: shouldCancel
+            )
+        }
+        return searchSingleSnapshot(request, maxResults: maxResults, shouldCancel: shouldCancel)
+    }
+
+    private func searchSingleSnapshot(
+        _ request: SearchRequest,
+        maxResults: Int,
+        snapshotOverride: SearchSnapshot? = nil,
+        snapshotRevisionOverride: UInt64? = nil,
+        recordsMetrics: Bool = true,
+        shouldCancel: @Sendable () -> Bool
+    ) -> SearchResponse? {
+        let started = Date()
+        let metricPhase = request.mode.metricPhase
+        if recordsMetrics {
+            recordSearchStarted(phase: metricPhase)
+        }
         var didCompleteSearch = false
 
         let trimmedQuery = request.query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -5651,10 +6054,24 @@ public final class FileIndex: @unchecked Sendable {
         let boundedMaxResults = max(maxResults, 0)
 
         let snapshotData = lock.withLock {
+            if let snapshotOverride {
+                return (
+                    snapshot: snapshotOverride,
+                    currentSnapshot: snapshotOverride,
+                    pendingExactPaths: [String](),
+                    rootPaths: [String](),
+                    revision: snapshotRevisionOverride ?? searchSnapshotRevision,
+                    optimizedSortColumns: optimizedSortColumns,
+                    canPromoteSortedOrder: false,
+                    hasDeferredOptimization: false,
+                    isRefreshActive: false
+                )
+            }
             let currentSnapshot = searchSnapshot
             let fallbackSnapshot = optimizedSearchFallbackSnapshot
             let shouldUseOptimizedFallback = !trimmedQuery.isEmpty
                 && request.mode == .interactivePreview
+                && !(currentSnapshot.store is OverlayRecordStore)
                 && !currentSnapshot.isOptimizedForSearch
                 && fallbackSnapshot?.isOptimizedForSearch == true
                 && (fallbackSnapshot?.resultCount ?? 0) > 0
@@ -5677,19 +6094,8 @@ public final class FileIndex: @unchecked Sendable {
 
         func finish(_ response: SearchResponse) -> SearchResponse? {
             guard !shouldCancel() else { return nil }
-            guard let overlayMergedResponse = Self.mergingOverlayChanges(
-                into: response,
-                searchedSnapshot: snapshot,
-                currentSnapshot: snapshotData.currentSnapshot,
-                request: request,
-                parsedQuery: parsedQuery,
-                maxResults: boundedMaxResults,
-                shouldCancel: shouldCancel
-            ) else {
-                return nil
-            }
             guard let mergedResponse = mergingPendingExactRefreshes(
-                into: overlayMergedResponse,
+                into: response,
                 pendingExactPaths: snapshotData.pendingExactPaths,
                 currentSnapshot: snapshotData.currentSnapshot,
                 rootPaths: snapshotData.rootPaths,
@@ -5710,6 +6116,7 @@ public final class FileIndex: @unchecked Sendable {
                 elapsed: completedElapsed,
                 snapshotRevision: mergedResponse.snapshotRevision,
                 usesIndexedCandidates: mergedResponse.usesIndexedCandidates,
+                completeness: request.mode == .interactivePreview ? .partial : .complete,
                 executionProfile: SearchExecutionProfile(
                     executionPath: profile.executionPath,
                     indexesUsed: profile.indexesUsed,
@@ -5722,12 +6129,14 @@ public final class FileIndex: @unchecked Sendable {
                 )
             )
             didCompleteSearch = true
-            recordSearchCompleted(completedResponse.executionProfile, phase: metricPhase)
+            if recordsMetrics {
+                recordSearchCompleted(completedResponse.executionProfile, phase: metricPhase)
+            }
             return completedResponse
         }
 
         defer {
-            if !didCompleteSearch {
+            if recordsMetrics, !didCompleteSearch {
                 recordSearchCancelled(phase: metricPhase, elapsed: Date().timeIntervalSince(started))
             }
         }
@@ -11131,11 +11540,13 @@ public final class FileIndex: @unchecked Sendable {
                 snapshot: baseSnapshot,
                 delta: nil,
                 optimizedFallback: nil,
+                compositeSearchState: nil,
                 requiresFullReconciliation: false
             )
         }
         let snapshot = loadedStructuralSnapshot.snapshot
         let loadedOptimized = snapshot.isOptimizedForSearch
+            || loadedStructuralSnapshot.compositeSearchState != nil
         MemoryTelemetry.log(
             "snapshot.load.mapped",
             records: metrics,
@@ -11171,6 +11582,7 @@ public final class FileIndex: @unchecked Sendable {
                 rememberOptimizedSearchFallbackWithoutLock(optimizedFallback)
             }
             searchSnapshot = snapshot
+            compositeSearchState = loadedStructuralSnapshot.compositeSearchState
             structuralDelta = loadedStructuralSnapshot.delta
             searchSnapshotRevision &+= 1
             roots = persisted.manifest.roots
@@ -11627,6 +12039,22 @@ public final class FileIndex: @unchecked Sendable {
             buildsAdditionalSortOrders: false,
             prefersDegradedSearch: true
         )
+        let compositeInputs = lock.withLock {
+            (
+                previousState: compositeSearchState,
+                optimizedBase: compositeSearchState?.base.sourceSnapshot
+                    ?? optimizedSearchFallbackSnapshot,
+                roots: roots
+            )
+        }
+        let indexedCompositeState = makeCompositeSearchState(
+            logicalSnapshot: snapshot,
+            optimizedBase: compositeInputs.optimizedBase,
+            roots: compositeInputs.roots,
+            previousState: compositeInputs.previousState,
+            changedUpserts: Array(upserts.values),
+            changedTombstonedPaths: tombstonedPaths
+        )
         let persistenceResult = persistStructuralDeltaChanges(
             upserts: Array(upserts.values),
             tombstonedPaths: tombstonedPaths,
@@ -11634,12 +12062,15 @@ public final class FileIndex: @unchecked Sendable {
         )
         guard isCurrentGeneration(currentGeneration) else { return false }
         let durableSnapshot: SearchSnapshot
+        let durableCompositeState: CompositeSearchState?
         switch persistenceResult {
         case .saved:
             durableSnapshot = snapshot
+            durableCompositeState = indexedCompositeState
         case .unavailable:
             do {
                 durableSnapshot = try persistStandaloneReconciliationSnapshot(snapshot)
+                durableCompositeState = nil
             } catch {
                 failIndexing(
                     "Could not save reconciled changes: \(error.localizedDescription)",
@@ -11659,6 +12090,7 @@ public final class FileIndex: @unchecked Sendable {
         let didApply = lock.withLock { () -> Bool in
             guard generation == currentGeneration else { return false }
             searchSnapshot = durableSnapshot
+            compositeSearchState = durableCompositeState
             searchSnapshotRevision &+= 1
             indexing = false
             reconciling = false
@@ -11667,7 +12099,9 @@ public final class FileIndex: @unchecked Sendable {
             phase = .ready
             discoveredCount = durableSnapshot.resultCount
             searchableCount = durableSnapshot.resultCount
-            optimizedCount = durableSnapshot.isOptimizedForSearch ? durableSnapshot.resultCount : 0
+            optimizedCount = durableSnapshot.isOptimizedForSearch || durableCompositeState != nil
+                ? durableSnapshot.resultCount
+                : 0
             status = Self.completionStatus(
                 prefix: completionStatusPrefix,
                 recordCount: durableSnapshot.resultCount,
@@ -15039,10 +15473,27 @@ public final class FileIndex: @unchecked Sendable {
                     || finalUpdatePriority == .background
                     || previousSnapshot.count > Self.interactiveOverlayOptimizationRecordLimit)
         )
+        let compositeInputs = lock.withLock {
+            (
+                previousState: compositeSearchState,
+                optimizedBase: compositeSearchState?.base.sourceSnapshot
+                    ?? optimizedSearchFallbackSnapshot,
+                roots: roots
+            )
+        }
+        let indexedCompositeState = makeCompositeSearchState(
+            logicalSnapshot: snapshot,
+            optimizedBase: compositeInputs.optimizedBase,
+            roots: compositeInputs.roots,
+            previousState: compositeInputs.previousState,
+            changedUpserts: Array(upserts.values),
+            changedTombstonedPaths: tombstonedPaths
+        )
 
         let didApply = lock.withLock { () -> Bool in
             guard generation == currentGeneration else { return false }
             searchSnapshot = snapshot
+            compositeSearchState = indexedCompositeState
             searchSnapshotRevision &+= 1
             status = "Updated \(changedPathCount) changed path\(changedPathCount == 1 ? "" : "s")"
             phase = .ready
@@ -15051,7 +15502,9 @@ public final class FileIndex: @unchecked Sendable {
             updating = false
             discoveredCount = snapshot.resultCount
             searchableCount = snapshot.resultCount
-            optimizedCount = snapshot.isOptimizedForSearch ? snapshot.resultCount : 0
+            optimizedCount = snapshot.isOptimizedForSearch || indexedCompositeState != nil
+                ? snapshot.resultCount
+                : 0
             recordsByPath.removeAll(keepingCapacity: false)
             lastUpdated = Date()
             activeOperationStartedAt = nil
@@ -15697,7 +16150,7 @@ public final class FileIndex: @unchecked Sendable {
 
     private func structuralDeltaCompactionThreshold(for delta: StructuralDelta) -> Int {
         largeOverlayPersistRecordLimitOverride
-            ?? max(10_000, delta.baseIdentity.recordCount / 50)
+            ?? min(max(10_000, delta.baseIdentity.recordCount / 50), 50_000)
     }
 
     private func hasDurableStructuralDeltaBelowCompactionThresholdWithoutLock() -> Bool {
@@ -16541,6 +16994,7 @@ public final class FileIndex: @unchecked Sendable {
                     snapshot: baseSnapshot,
                     delta: nil,
                     optimizedFallback: nil,
+                    compositeSearchState: nil,
                     requiresFullReconciliation: false
                 )
             case let .loaded(delta):
@@ -16549,6 +17003,7 @@ public final class FileIndex: @unchecked Sendable {
                         snapshot: baseSnapshot,
                         delta: delta,
                         optimizedFallback: nil,
+                        compositeSearchState: nil,
                         requiresFullReconciliation: false
                     )
                 }
@@ -16587,10 +17042,20 @@ public final class FileIndex: @unchecked Sendable {
                         "tombstoneCount": .publicInt(delta.tombstones.count)
                     ]
                 )
+                let compositeState = makeCompositeSearchState(
+                    logicalSnapshot: snapshot,
+                    optimizedBase: baseSnapshot,
+                    roots: manifest.roots,
+                    previousState: nil,
+                    changedUpserts: delta.upserts,
+                    changedTombstonedPaths: delta.tombstones,
+                    forceConsolidation: true
+                )
                 return LoadedStructuralSnapshot(
                     snapshot: snapshot,
                     delta: delta,
                     optimizedFallback: baseSnapshot.isOptimizedForSearch ? baseSnapshot : nil,
+                    compositeSearchState: compositeState,
                     requiresFullReconciliation: false
                 )
             case let .rejected(rejection):
@@ -16614,6 +17079,7 @@ public final class FileIndex: @unchecked Sendable {
                     snapshot: baseSnapshot,
                     delta: nil,
                     optimizedFallback: nil,
+                    compositeSearchState: nil,
                     requiresFullReconciliation: requiresFullReconciliation
                 )
             }
@@ -16630,6 +17096,7 @@ public final class FileIndex: @unchecked Sendable {
                 snapshot: baseSnapshot,
                 delta: nil,
                 optimizedFallback: nil,
+                compositeSearchState: nil,
                 requiresFullReconciliation: true
             )
         }
@@ -17427,6 +17894,8 @@ public final class FileIndex: @unchecked Sendable {
             componentGramPostingCount: searchSnapshot.diagnostics.componentGramPostingCount,
             extensionKeyCount: searchSnapshot.diagnostics.extensionKeyCount,
             extensionPostingCount: searchSnapshot.diagnostics.extensionPostingCount,
+            compositeSearchSegmentCount: compositeSearchState?.segmentCount ?? 0,
+            compositeMaskedRowCount: compositeSearchState?.maskedRowCount ?? 0,
             pendingRefreshPathCount: pendingRefreshPaths.count,
             pendingBackgroundRefreshPathCount: pendingRefreshPaths.values.filter { $0.priority == .background }.count,
             completedRefreshBatches: completedRefreshBatches,
@@ -17533,6 +18002,78 @@ public final class FileIndex: @unchecked Sendable {
                 }
             }
             publishStats()
+        }
+    }
+
+    func applyStructuralOverlayForTesting(
+        upserts: [FileRecord],
+        tombstonedPaths: [String]
+    ) {
+        indexQueue.sync {
+            let prior = lock.withLock {
+                (
+                    snapshot: searchSnapshot,
+                    composite: compositeSearchState,
+                    optimizedFallback: optimizedSearchFallbackSnapshot,
+                    roots: roots
+                )
+            }
+            var deletedRows = Set<Int>()
+            for path in tombstonedPaths {
+                if let rowID = prior.snapshot.store.rowID(forPath: path) {
+                    deletedRows.insert(rowID)
+                }
+            }
+            for record in upserts {
+                if let rowID = prior.snapshot.store.rowID(forPath: record.path) {
+                    deletedRows.insert(rowID)
+                }
+            }
+
+            let store = OverlayRecordStore(
+                base: prior.snapshot.store,
+                upserts: upserts,
+                deletedRows: deletedRows
+            )
+            let snapshot = SearchSnapshot(
+                store: store,
+                buildsSearchStructures: false,
+                buildsPathGramIndex: false,
+                optimizedSortColumns: currentOptimizedSortColumns(),
+                buildsAdditionalSortOrders: false,
+                prefersDegradedSearch: true
+            )
+            let composite = makeCompositeSearchState(
+                logicalSnapshot: snapshot,
+                optimizedBase: prior.composite?.base.sourceSnapshot
+                    ?? prior.optimizedFallback
+                    ?? (prior.snapshot.isOptimizedForSearch ? prior.snapshot : nil),
+                roots: prior.roots,
+                previousState: prior.composite,
+                changedUpserts: upserts,
+                changedTombstonedPaths: tombstonedPaths
+            )
+            lock.withLock {
+                searchSnapshot = snapshot
+                compositeSearchState = composite
+                searchSnapshotRevision &+= 1
+                discoveredCount = snapshot.resultCount
+                searchableCount = snapshot.resultCount
+                optimizedCount = composite == nil ? 0 : snapshot.resultCount
+                status = "Applied \((upserts.count + tombstonedPaths.count).formatted()) test changes"
+                lastUpdated = Date()
+            }
+        }
+    }
+
+    func compositeSearchDiagnosticsForTesting() -> (
+        segmentCount: Int,
+        maskedRowCount: Int
+    )? {
+        lock.withLock {
+            compositeSearchState.map {
+                ($0.segmentCount, $0.maskedRowCount)
+            }
         }
     }
 
