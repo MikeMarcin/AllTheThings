@@ -901,8 +901,14 @@ final class FileSystemWatcher {
         }
     }
 
-    private final class EventSink: @unchecked Sendable {
-        let eventHandler: @MainActor @Sendable ([FileSystemEvent]) -> Void
+    final class EventSink: @unchecked Sendable {
+        static let maximumEventsPerDelivery = 2_048
+
+        private let lock = NSLock()
+        private let eventHandler: @MainActor @Sendable ([FileSystemEvent]) -> Void
+        private var pendingEventsByPath: [String: FileSystemEvent] = [:]
+        private var isDeliveryScheduled = false
+        private var isActive = true
 
         init(eventHandler: @escaping @MainActor @Sendable ([FileSystemEvent]) -> Void) {
             self.eventHandler = eventHandler
@@ -910,8 +916,55 @@ final class FileSystemWatcher {
 
         func deliver(_ events: [FileSystemEvent]) {
             guard !events.isEmpty else { return }
-            Task { @MainActor [eventHandler] in
-                eventHandler(events)
+
+            let shouldSchedule = lock.withLock { () -> Bool in
+                guard isActive else { return false }
+                for event in events {
+                    if let pendingEvent = pendingEventsByPath[event.path] {
+                        pendingEventsByPath[event.path] = pendingEvent.merging(event)
+                    } else {
+                        pendingEventsByPath[event.path] = event
+                    }
+                }
+                guard !isDeliveryScheduled else { return false }
+                isDeliveryScheduled = true
+                return true
+            }
+            guard shouldSchedule else { return }
+
+            Task { @MainActor [weak self] in
+                self?.flush()
+            }
+        }
+
+        func invalidate() {
+            lock.withLock {
+                isActive = false
+                pendingEventsByPath.removeAll(keepingCapacity: false)
+                isDeliveryScheduled = false
+            }
+        }
+
+        @MainActor
+        private func flush() {
+            let delivery = lock.withLock { () -> (events: [FileSystemEvent], hasMore: Bool) in
+                guard isActive else { return ([], false) }
+                let events = pendingEventsByPath.prefix(Self.maximumEventsPerDelivery).map(\.value)
+                for event in events {
+                    pendingEventsByPath.removeValue(forKey: event.path)
+                }
+                let hasMore = !pendingEventsByPath.isEmpty
+                if !hasMore {
+                    isDeliveryScheduled = false
+                }
+                return (events, hasMore)
+            }
+            guard !delivery.events.isEmpty else { return }
+            eventHandler(delivery.events)
+            guard delivery.hasMore else { return }
+            Task { @MainActor [weak self] in
+                await Task.yield()
+                self?.flush()
             }
         }
     }
@@ -922,6 +975,7 @@ final class FileSystemWatcher {
     private var eventSink: EventSink?
     private var rootPaths: [String] = []
     private var streamConfiguration: StreamConfiguration?
+    private var streamSinceWhen: FSEventStreamEventId?
 
     deinit {
         stop()
@@ -939,7 +993,8 @@ final class FileSystemWatcher {
         stateQueue.sync {
             if stream != nil,
                paths == rootPaths,
-               configuration == streamConfiguration {
+               configuration == streamConfiguration,
+               requestedSinceWhen == streamSinceWhen {
                 return
             }
 
@@ -981,6 +1036,7 @@ final class FileSystemWatcher {
             stream = createdStream
             rootPaths = paths
             streamConfiguration = configuration
+            streamSinceWhen = requestedSinceWhen
             FSEventStreamSetDispatchQueue(createdStream, callbackQueue)
             guard FSEventStreamStart(createdStream) else {
                 stopWithoutLock()
@@ -995,17 +1051,22 @@ final class FileSystemWatcher {
         }
     }
 
+    func sinceWhenForTesting() -> FSEventStreamEventId? {
+        stateQueue.sync { streamSinceWhen }
+    }
+
     private func stopWithoutLock() {
-        if let stream {
-            FSEventStreamStop(stream)
-            FSEventStreamInvalidate(stream)
-            callbackQueue.sync {}
-            FSEventStreamRelease(stream)
-            self.stream = nil
-            eventSink = nil
-            rootPaths = []
-            streamConfiguration = nil
-        }
+        guard let stream else { return }
+        eventSink?.invalidate()
+        FSEventStreamStop(stream)
+        FSEventStreamInvalidate(stream)
+        callbackQueue.sync {}
+        FSEventStreamRelease(stream)
+        self.stream = nil
+        eventSink = nil
+        rootPaths = []
+        streamConfiguration = nil
+        streamSinceWhen = nil
     }
 }
 

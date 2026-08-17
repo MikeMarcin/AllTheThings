@@ -4507,13 +4507,11 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             return
         }
 
-        let persistedEventIDs = fseventCursorStore.eventIDs(for: rootPaths(indexedRoots))
-        let sinceWhen: FSEventStreamEventId = persistedEventIDs.values.min()
-            ?? FSEventStreamEventId(kFSEventStreamEventIdSinceNow)
+        // Historical replay is handled separately by the reconciliation coordinator.
+        // The live stream must not replay the same persisted cursor on the main actor.
         watcher.start(
             roots: indexedRoots,
-            configuration: energyMode.watcherConfiguration,
-            sinceWhen: sinceWhen
+            configuration: energyMode.watcherConfiguration
         ) { @MainActor @Sendable [weak self] events in
             self?.coalesceFSEvents(events)
         }
@@ -4544,6 +4542,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func prepareFSEventsForFreshIndexBuild() {
+        // Invalidate queued callbacks from the old stream before establishing the new baseline.
+        watcher.stop()
         rawFSEventFilterDebounce?.cancel()
         rawFSEventFilterDebounce = nil
         pendingRawFSEventsByPath.removeAll(keepingCapacity: false)
@@ -5023,27 +5023,33 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         pendingFSEventCursorBatchIDs.removeAll(keepingCapacity: false)
         guard !events.isEmpty else { return }
 
-        let routedScopes = FSEventLiveRefreshScopeRouter.route(
-            events: events,
-            rootPaths: rootPaths(indexedRoots)
-        )
+        let indexedRootPaths = rootPaths(indexedRoots)
         let priority: IndexWorkPriority = energyMode == .background ? .background : .interactive
+        let index = self.index
         playMascotTransient(.fileChanged)
-        if !routedScopes.recursivePaths.isEmpty {
-            index.recordRecursiveRescan()
-        }
-        guard !routedScopes.isEmpty else {
-            commitReadyFSEventCursorBatches(cursorBatchIDs)
-            return
-        }
+        fseventFilterQueue.async { [weak self] in
+            let routedScopes = FSEventLiveRefreshScopeRouter.route(
+                events: events,
+                rootPaths: indexedRootPaths
+            )
+            if !routedScopes.recursivePaths.isEmpty {
+                index.recordRecursiveRescan()
+            }
+            guard !routedScopes.isEmpty else {
+                DispatchQueue.main.async { [weak self] in
+                    self?.commitReadyFSEventCursorBatches(cursorBatchIDs)
+                }
+                return
+            }
 
-        self.index.update(
-            exactPaths: routedScopes.exactPaths,
-            recursivePaths: routedScopes.recursivePaths,
-            priority: priority
-        ) { [weak self] in
-            Task { @MainActor [weak self] in
-                self?.commitReadyFSEventCursorBatches(cursorBatchIDs)
+            index.update(
+                exactPaths: routedScopes.exactPaths,
+                recursivePaths: routedScopes.recursivePaths,
+                priority: priority
+            ) { [weak self] in
+                Task { @MainActor [weak self] in
+                    self?.commitReadyFSEventCursorBatches(cursorBatchIDs)
+                }
             }
         }
     }
