@@ -5027,7 +5027,20 @@ public final class FileIndex: @unchecked Sendable {
             ]
         )
         let rebuildStarted = Date()
-        let currentGeneration = lock.withLock { () -> UInt64 in
+        let rebuildState = lock.withLock { () -> (generation: UInt64, supersededWorks: [PendingRefreshWork]) in
+            let supersededWorks: [PendingRefreshWork]
+            if mode == .fresh {
+                // The fresh scan supersedes earlier refreshes. Holding the lock while
+                // entering indexing preserves events queued after the rebuild starts.
+                supersededWorks = Array(pendingRefreshPaths.values)
+                pendingRefreshPaths.removeAll(keepingCapacity: false)
+                refreshDrainScheduleGeneration &+= 1
+                isRefreshDrainScheduled = false
+                scheduledRefreshDrainPriority = nil
+                scheduledRefreshDrainDeadline = nil
+            } else {
+                supersededWorks = []
+            }
             generation &+= 1
             activePathGramBuildGeneration = nil
             snapshotLoadState = .finished
@@ -5047,14 +5060,29 @@ public final class FileIndex: @unchecked Sendable {
             activeOperationStartedAt = rebuildStarted
             lastCheckpointAt = nil
             resumedFromCheckpoint = false
-            return generation
+            return (generation, supersededWorks)
+        }
+        if !rebuildState.supersededWorks.isEmpty {
+            DiagnosticLogger.shared.log(
+                category: "index",
+                event: "index.pendingRefreshSupersededByRebuild",
+                fields: [
+                    "pathCount": .publicInt(rebuildState.supersededWorks.count)
+                ]
+            )
+            Self.completeSupersededPendingRefreshWorks(rebuildState.supersededWorks)
         }
         wakeBackgroundReconciliation()
 
         publishStats()
 
         indexQueue.async { [weak self] in
-            self?.rebuild(roots: canonicalRoots, mode: mode, generation: currentGeneration, started: rebuildStarted)
+            self?.rebuild(
+                roots: canonicalRoots,
+                mode: mode,
+                generation: rebuildState.generation,
+                started: rebuildStarted
+            )
         }
     }
 
@@ -14832,6 +14860,17 @@ public final class FileIndex: @unchecked Sendable {
     private static func completePendingRefreshWorks(_ works: [PendingRefreshWork]) {
         for work in works {
             for completion in work.completions {
+                completion.completeOnePath()
+            }
+        }
+    }
+
+    private static func completeSupersededPendingRefreshWorks(_ works: [PendingRefreshWork]) {
+        for work in works {
+            for completion in work.completions {
+                completion.completeOnePath()
+            }
+            for completion in work.followUpCompletions {
                 completion.completeOnePath()
             }
         }

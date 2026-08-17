@@ -144,6 +144,94 @@ struct FileSystemWatcherTests {
         #expect(background.flags & UInt32(kFSEventStreamCreateFlagWatchRoot) != 0)
     }
 
+    @Test("stopped FSEvent sinks discard deliveries already queued for the main actor")
+    @MainActor
+    func stoppedFSEventSinksDiscardQueuedDeliveries() async {
+        var deliveredEvents: [FileSystemEvent] = []
+        let sink = FileSystemWatcher.EventSink { events in
+            deliveredEvents.append(contentsOf: events)
+        }
+
+        sink.deliver([FileSystemEvent(path: "/tmp/allthethings/stale", flags: 0, eventID: 1)])
+        sink.invalidate()
+        await Task.yield()
+
+        #expect(deliveredEvents.isEmpty)
+    }
+
+    @Test("FSEvent sinks coalesce callbacks before entering the main actor")
+    @MainActor
+    func fseventSinksCoalesceCallbacks() async {
+        var deliveredBatches: [[FileSystemEvent]] = []
+        let sink = FileSystemWatcher.EventSink { events in
+            deliveredBatches.append(events)
+        }
+        let path = "/tmp/allthethings/changed"
+
+        sink.deliver([FileSystemEvent(path: path, flags: 0, eventID: 1)])
+        sink.deliver([
+            FileSystemEvent(
+                path: path,
+                flags: FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs),
+                eventID: 2
+            )
+        ])
+        await Task.yield()
+
+        #expect(deliveredBatches.count == 1)
+        #expect(deliveredBatches.first?.count == 1)
+        #expect(deliveredBatches.first?.first?.eventID == 2)
+        #expect(deliveredBatches.first?.first?.requiresRecursiveRescan == true)
+    }
+
+    @Test("FSEvent sinks split large callback bursts into bounded main actor deliveries")
+    @MainActor
+    func fseventSinksBoundLargeDeliveries() async {
+        var deliveredBatches: [[FileSystemEvent]] = []
+        let sink = FileSystemWatcher.EventSink { events in
+            deliveredBatches.append(events)
+        }
+        let eventCount = FileSystemWatcher.EventSink.maximumEventsPerDelivery + 1
+        let events = (0..<eventCount).map { offset in
+            FileSystemEvent(
+                path: "/tmp/allthethings/changed-\(offset)",
+                flags: 0,
+                eventID: FSEventStreamEventId(offset)
+            )
+        }
+
+        sink.deliver(events)
+        for _ in 0..<4 {
+            await Task.yield()
+        }
+
+        #expect(deliveredBatches.count == 2)
+        #expect(deliveredBatches.allSatisfy {
+            $0.count <= FileSystemWatcher.EventSink.maximumEventsPerDelivery
+        })
+        #expect(deliveredBatches.reduce(0) { $0 + $1.count } == eventCount)
+    }
+
+    @Test("changing an FSEvent baseline restarts an otherwise identical stream")
+    @MainActor
+    func changingFSEventBaselineRestartsStream() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let watcher = FileSystemWatcher()
+        defer { watcher.stop() }
+        let firstBaseline = FSEventsGetCurrentEventId()
+        let secondBaseline = firstBaseline &+ 1
+
+        watcher.start(roots: [root], sinceWhen: firstBaseline) { _ in }
+        #expect(watcher.sinceWhenForTesting() == firstBaseline)
+
+        watcher.start(roots: [root], sinceWhen: secondBaseline) { _ in }
+        #expect(watcher.sinceWhenForTesting() == secondBaseline)
+    }
+
     @Test("application catalog invalidates for stream-wide control events")
     func applicationCatalogInvalidatesForStreamControlEvents() {
         let root = URL(fileURLWithPath: "/Applications", isDirectory: true)

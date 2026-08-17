@@ -3802,6 +3802,55 @@ struct FileIndexTests {
         #expect(staleResponse.totalMatches == 0)
     }
 
+    @Test("fresh rebuild supersedes refresh work queued before it starts")
+    func freshRebuildSupersedesQueuedRefreshWork() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        let deferredFolder = root.appendingPathComponent("Deferred", isDirectory: true)
+        try fileManager.createDirectory(at: deferredFolder, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: root) }
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        defer { try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName)) }
+        let index = FileIndex(
+            applicationName: applicationName,
+            loadsSnapshotImmediately: false,
+            largeOverlayPersistRecordLimit: nil,
+            largeOverlayPersistDelay: nil,
+            backgroundRefreshDrainBackoffDelay: 3_600,
+            backgroundDirectoryScanBudget: 0,
+            backgroundOptimizationPersistDelay: 60
+        )
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil(timeout: .seconds(10)) { !index.currentStats().isIndexing }
+
+        let addedFile = deferredFolder.appendingPathComponent("FoundByFreshRebuild.swift")
+        try "added".write(to: addedFile, atomically: true, encoding: .utf8)
+        let completion = CompletionFlag()
+        index.update(paths: [deferredFolder.path], priority: .background) {
+            completion.mark()
+        }
+        try await waitUntil(timeout: .seconds(5)) {
+            index.pendingDirectoryRefreshStateForTesting(path: deferredFolder.path) != nil
+        }
+        #expect(!completion.isMarked)
+        let completedRefreshBatches = index.currentDiagnostics().completedRefreshBatches
+
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil(timeout: .seconds(10)) {
+            completion.isMarked && !index.currentStats().isIndexing
+        }
+
+        let diagnostics = index.currentDiagnostics()
+        #expect(diagnostics.pendingRefreshPathCount == 0)
+        #expect(diagnostics.completedRefreshBatches == completedRefreshBatches)
+        #expect(index.search(SearchRequest(
+            query: "FoundByFreshRebuild",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10).results.contains { $0.record.path == addedFile.path })
+    }
+
     @Test("search applies name sort to small result sets")
     func searchAppliesNameSortToSmallResultSets() async throws {
         let fileManager = FileManager.default
