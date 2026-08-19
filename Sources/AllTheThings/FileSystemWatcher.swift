@@ -554,6 +554,14 @@ enum FSEventIndexFilter {
            containsDirectoryComponent(".cache", in: lowerPath, isDirectory: isDirectory) {
             return true
         }
+        if activePatterns.contains(FileExclusionRules.applicationDataDirectoryPattern),
+           containsDirectoryPathFragment(
+               "/library/application support/allthethings",
+               in: lowerPath,
+               isDirectory: isDirectory
+           ) {
+            return true
+        }
         if activePatterns.contains("Library/Caches/"),
            containsDirectoryPathFragment("/library/caches", in: lowerPath, isDirectory: isDirectory) {
             return true

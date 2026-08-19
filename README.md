@@ -18,7 +18,7 @@ On first launch, AllTheThings indexes the default folders that exist on your Mac
 
 Use **Settings > Indexed Folders** to add or remove indexed folders, manage application search folders, check Full Disk Access status, and rebuild the index. The search window toolbar opens Settings and Insights, and enables Open, Reveal, and Copy Path actions when results are selected. The footer defaults to a simple shown/matches count; **Settings > General** can switch it to detailed indexing state, match count, query time, memory, and version info. The default global search shortcut is `Command-Shift-Space`; enable it from the setup suggestion, or disable/remap it in **Settings > Hotkeys**. The default global app search shortcut is `Shift-Option-Space`; enable it from the setup suggestion or **Settings > Hotkeys** to open search with `app:` prefilled. Enable launch at login to keep shortcuts available after signing in. The optional menu bar icon can focus search, open Settings or Insights, toggle launch at login, or quit the app.
 
-High-noise folders such as `node_modules`, `DerivedData`, `.git/objects`, `Library/Caches`, and `.Trash` are skipped.
+High-noise folders such as `node_modules`, `DerivedData`, `.git/objects`, `Library/Caches`, and `.Trash` are skipped. AllTheThings also excludes its own data directory so indexing a home folder cannot create a self-update loop.
 
 ## Searching
 

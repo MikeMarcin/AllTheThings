@@ -716,6 +716,8 @@ struct FileSystemWatcherTests {
             ("\(root)/.mypy_cache/state", false),
             ("\(root)/.ruff_cache/state", false),
             ("\(root)/.cache/state", false),
+            ("\(root)/Library/Application Support/AllTheThings", true),
+            ("\(root)/Library/Application Support/AllTheThings/Logs/diagnostic-log.jsonl", false),
             ("\(root)/Library/Caches/com.example/state", false),
             ("\(root)/.Trash/deleted.txt", false),
             ("\(root)/node_modules-copy/index.js", false),
@@ -866,6 +868,7 @@ struct FileSystemWatcherTests {
             "\(root)/Sources/__pycache__/module.pyc",
             "\(root)/coverage/default.profraw",
             "\(root)/App.dSYM/Contents/Resources/DWARF/App",
+            "\(root)/Library/Application Support/AllTheThings/filename-index-v8.attindex/records.bin",
             "\(root)/Library/Caches/com.example/cache.db"
         ]
 
@@ -876,6 +879,10 @@ struct FileSystemWatcherTests {
         #expect(!FSEventIndexFilter.isKnownExcludedEventPath("\(root)/.git/hooks/pre-commit", activePatterns: patterns))
         #expect(!FSEventIndexFilter.isKnownExcludedEventPath(
             "\(root)/.build/checkouts/Dependency/Sources/Dependency.swift",
+            activePatterns: patterns
+        ))
+        #expect(!FSEventIndexFilter.isKnownExcludedEventPath(
+            "\(root)/Library/Application Support/AnotherApp/state.db",
             activePatterns: patterns
         ))
     }

@@ -377,6 +377,26 @@ struct AppSettingsTests {
         #expect(patterns.contains("!.git/description"))
         #expect(patterns.contains("!.git/hooks/**"))
         #expect(patterns.contains("!.git/info/**"))
+        #expect(patterns.contains(FileExclusionRules.applicationDataDirectoryPattern))
+    }
+
+    @Test("exclusion defaults migration prevents indexing AllTheThings data")
+    func exclusionDefaultsMigrationPreventsIndexingAllTheThingsData() throws {
+        let (defaults, suiteName) = try makeDefaults()
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        defaults.set(14, forKey: AppSettings.exclusionDefaultsVersionKey)
+        defaults.set(["custom-generated/"], forKey: AppSettings.exclusionPatternsKey)
+
+        AppSettings.registerDefaults(defaults)
+
+        let patterns = AppSettings.exclusionPatterns(defaults: defaults)
+        #expect(patterns == [
+            "custom-generated/",
+            FileExclusionRules.applicationDataDirectoryPattern
+        ])
     }
 
     @Test("match colors can be overridden and reset per appearance")
