@@ -71,7 +71,7 @@ enum AppSettings {
     static let exclusionPatternsDidChangeNotification = Notification.Name("com.allthethings.settings.exclusionPatternsDidChange")
     static let optimizedSortColumnsDidChangeNotification = Notification.Name("com.allthethings.settings.optimizedSortColumnsDidChange")
 
-    private static let currentExclusionDefaultsVersion = 14
+    private static let currentExclusionDefaultsVersion = 15
     private static let currentIndexedRootDefaultsVersion = 2
     private static let versionOneDefaultExclusionPatterns = [
         "node_modules/",
@@ -704,6 +704,9 @@ enum AppSettings {
             additions.append("buck-out/")
             additions.append("bazel-out/")
             additions.append(".buckd/")
+        }
+        if version < 15 {
+            additions.append(FileExclusionRules.applicationDataDirectoryPattern)
         }
         return additions
     }

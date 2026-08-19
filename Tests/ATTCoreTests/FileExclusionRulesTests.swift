@@ -55,6 +55,7 @@ struct FileExclusionRulesTests {
             "/tmp/project/.buckd/log/buckd.log",
             "/tmp/project/__pycache__/module.pyc",
             "/tmp/project/Sources/__pycache__/module.pyc",
+            "/tmp/project/Library/Application Support/AllTheThings/filename-index-v8.attindex/records.bin",
             "/tmp/project/Library/Caches/com.example/cache.db"
         ]
 
@@ -297,6 +298,8 @@ struct FileExclusionRulesTests {
                 ("/tmp/project/.git/objects", true),
                 ("/tmp/project/.git/objects/ab/cdef", false),
                 ("/tmp/project/Library", true),
+                ("/tmp/project/Library/Application Support/AllTheThings", true),
+                ("/tmp/project/Library/Application Support/AllTheThings/Logs/diagnostic-log.jsonl", false),
                 ("/tmp/project/Library/Caches", true),
                 ("/tmp/project/Library/Caches/com.example/cache.db", false),
                 ("/tmp/project/Example.app/Contents/_CodeSignature", true),

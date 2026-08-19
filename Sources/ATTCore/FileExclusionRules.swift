@@ -1,6 +1,8 @@
 import Foundation
 
 public struct FileExclusionRules: @unchecked Sendable {
+    public static let applicationDataDirectoryPattern = "Library/Application Support/AllTheThings/"
+
     public static let defaultPatterns = [
         ".git/*",
         "!.git/config",
@@ -59,6 +61,7 @@ public struct FileExclusionRules: @unchecked Sendable {
         ".mypy_cache/",
         ".ruff_cache/",
         ".cache/",
+        applicationDataDirectoryPattern,
         "Library/Caches/",
         ".Trash/"
     ]
