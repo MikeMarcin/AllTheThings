@@ -1385,6 +1385,164 @@ struct FileIndexTests {
         #expect(result.record.sizeBytes == UInt64(newContents.utf8.count))
     }
 
+    @Test("4,097-path refresh burst collapses linearly across roots and completes once")
+    func largeRefreshBurstCollapsesLinearlyAcrossRootsAndCompletesOnce() async throws {
+        let fileManager = FileManager.default
+        let base = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        let firstRoot = base.appendingPathComponent("First", isDirectory: true)
+        let secondRoot = base.appendingPathComponent("Second", isDirectory: true)
+        try fileManager.createDirectory(at: firstRoot, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: secondRoot, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: base) }
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        defer { try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName)) }
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        let rootRecords = try [firstRoot, secondRoot].map { url in
+            try #require(FileRecord(url: url))
+        }
+        index.replaceRecordsForTesting(rootRecords, roots: [firstRoot, secondRoot])
+
+        let paths = (0..<4_097).map { offset in
+            let root = offset.isMultiple(of: 2) ? firstRoot : secondRoot
+            return root.appendingPathComponent("queued-\(offset).txt").path
+        }
+        let completion = CompletionCounter()
+        let startedAt = Date()
+        let collapseMetrics = index.queuePendingRefreshPathsForTesting(paths) {
+            completion.increment()
+        }
+        let queueDuration = Date().timeIntervalSince(startedAt)
+
+        #expect(collapseMetrics.count == 1)
+        let collapse = try #require(collapseMetrics.first)
+        #expect(queueDuration < 2)
+        #expect(collapse.previousPathCount == paths.count)
+        #expect(collapse.collapsedPathCount == 2)
+        #expect(collapse.duration < 2)
+        #expect(index.pendingRefreshPathsForTesting() == Set([firstRoot.path, secondRoot.path]))
+
+        try await waitUntil(timeout: .seconds(5)) {
+            completion.count == 1 && index.pendingRefreshPathsForTesting().isEmpty
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(completion.count == 1)
+    }
+
+    @Test("repeated same-path refresh merges remain bounded and complete once")
+    func repeatedSamePathRefreshMergesRemainBoundedAndCompleteOnce() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: root) }
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        defer { try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName)) }
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        let rootRecord = try #require(FileRecord(url: root))
+        index.replaceRecordsForTesting([rootRecord], roots: [root])
+
+        let repeatedPath = root.appendingPathComponent("Repeated.txt").path
+        let completion = CompletionCounter()
+        let startedAt = Date()
+        let collapseMetrics = index.queuePendingRefreshPathsForTesting(
+            Array(repeating: repeatedPath, count: 4_097)
+        ) {
+            completion.increment()
+        }
+        let queueDuration = Date().timeIntervalSince(startedAt)
+
+        #expect(queueDuration < 2)
+        #expect(collapseMetrics.isEmpty)
+        #expect(index.pendingRefreshPathsForTesting() == [repeatedPath])
+
+        try await waitUntil(timeout: .seconds(5)) {
+            completion.count == 1 && index.pendingRefreshPathsForTesting().isEmpty
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(completion.count == 1)
+    }
+
+    @Test("usage metrics do not wait for the index state lock")
+    func usageMetricsDoNotWaitForIndexStateLock() {
+        let index = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        defer { try? FileManager.default.removeItem(at: index.dataDirectoryURL) }
+        let stateLockAcquired = DispatchSemaphore(value: 0)
+        let releaseStateLock = DispatchSemaphore(value: 0)
+        let metricsRecorded = DispatchSemaphore(value: 0)
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            index.withStateLockHeldForTesting {
+                stateLockAcquired.signal()
+                _ = releaseStateLock.wait(timeout: .now() + 5)
+            }
+        }
+
+        guard stateLockAcquired.wait(timeout: .now() + 1) == .success else {
+            releaseStateLock.signal()
+            Issue.record("Timed out acquiring the index state lock")
+            return
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            index.recordMemorySample(bytes: 64 * 1_024 * 1_024)
+            index.recordEnergySample(
+                duration: 1,
+                cpuTime: 0.25,
+                wakeups: 1,
+                mode: .foreground
+            )
+            metricsRecorded.signal()
+        }
+
+        let result = metricsRecorded.wait(timeout: .now() + 1)
+        releaseStateLock.signal()
+        #expect(result == .success)
+    }
+
+    @Test("maintenance requests return immediately and apply in FIFO order")
+    func maintenanceRequestsReturnImmediatelyAndApplyInFIFOOrder() {
+        let index = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        defer { try? FileManager.default.removeItem(at: index.dataDirectoryURL) }
+        let stateLockAcquired = DispatchSemaphore(value: 0)
+        let releaseStateLock = DispatchSemaphore(value: 0)
+        let initialState = index.maintenanceRequestStateForTesting()
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            index.withStateLockHeldForTesting {
+                stateLockAcquired.signal()
+                _ = releaseStateLock.wait(timeout: .now() + 5)
+            }
+        }
+
+        guard stateLockAcquired.wait(timeout: .now() + 1) == .success else {
+            releaseStateLock.signal()
+            Issue.record("Timed out acquiring the index state lock")
+            return
+        }
+
+        let startedAt = Date()
+        index.requestMaintenanceMode(background: true, promotePendingWork: false)
+        index.requestMaintenanceMode(background: false, promotePendingWork: true)
+        let requestDuration = Date().timeIntervalSince(startedAt)
+
+        #expect(requestDuration < 0.1)
+        releaseStateLock.signal()
+        index.waitForMaintenanceRequestsForTesting()
+
+        let finalState = index.maintenanceRequestStateForTesting()
+        #expect(!finalState.backgroundEnabled)
+        #expect(finalState.promotionApplicationCount == initialState.promotionApplicationCount + 1)
+    }
+
     @Test("update completion fires after exact refresh persists")
     func updateCompletionFiresAfterExactRefreshPersists() async throws {
         let fileManager = FileManager.default
@@ -7015,6 +7173,21 @@ private final class CompletionFlag: @unchecked Sendable {
     func mark() {
         lock.withLock {
             marked = true
+        }
+    }
+}
+
+private final class CompletionCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    var count: Int {
+        lock.withLock { value }
+    }
+
+    func increment() {
+        lock.withLock {
+            value += 1
         }
     }
 }

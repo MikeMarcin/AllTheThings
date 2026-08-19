@@ -762,6 +762,20 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
+    @_spi(ATTInternal)
+    public var onStateSnapshotChanged: (@MainActor @Sendable (IndexStats, [String], [String]) -> Void)? {
+        get {
+            lock.withLock {
+                stateSnapshotChangedHandler
+            }
+        }
+        set {
+            lock.withLock {
+                stateSnapshotChangedHandler = newValue
+            }
+        }
+    }
+
     public var onBackgroundReconciliationRequested: (@MainActor @Sendable ([URL]) -> Void)? {
         get {
             lock.withLock {
@@ -1502,6 +1516,12 @@ public final class FileIndex: @unchecked Sendable {
             retryAttempt = 0
             eligibleAt = nil
         }
+    }
+
+    private struct PendingRefreshCollapseMetrics: Sendable {
+        let previousPathCount: Int
+        let collapsedPathCount: Int
+        let duration: TimeInterval
     }
 
     private struct DirectoryUpdateScanResult {
@@ -4499,6 +4519,7 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     private let lock = NSLock()
+    private let metricsLock = NSLock()
     private let backgroundReconciliationCondition = NSCondition()
     private let fileManager: FileManager
     private let supportDirectory: URL
@@ -4507,6 +4528,7 @@ public final class FileIndex: @unchecked Sendable {
     private let metricsURL: URL
     private let structuralDeltaStore: StructuralDeltaStore
     private let indexQueue = DispatchQueue(label: "att.index.work", qos: .userInitiated)
+    private let maintenanceControlQueue = DispatchQueue(label: "att.index.maintenance-control", qos: .userInitiated)
     private let checkpointQueue = DispatchQueue(label: "att.index.checkpoint", qos: .utility)
     private let metricsSaveQueue = DispatchQueue(label: "att.index.metrics", qos: .utility)
     private let checkpointPersistenceLock = NSLock()
@@ -4576,6 +4598,7 @@ public final class FileIndex: @unchecked Sendable {
     private var refreshDrainScheduleGeneration: UInt64 = 0
     private var refreshServiceSequence: UInt64 = 0
     private var backgroundMaintenanceEnteredAt: Date?
+    private var maintenancePromotionApplicationCountForTesting: UInt64 = 0
     private var promotedReconciliationGeneration: UInt64?
     private var optimizesSnapshotAfterPromotedRefreshDrain = false
     private var pendingReconciliationPaths = Set<String>()
@@ -4615,6 +4638,7 @@ public final class FileIndex: @unchecked Sendable {
     private var activityPresentation: IndexActivityPresentation = .foreground
     private var publishesSearchableSnapshotsDuringScan = true
     private var statsChangedHandler: (@MainActor @Sendable (IndexStats) -> Void)?
+    private var stateSnapshotChangedHandler: (@MainActor @Sendable (IndexStats, [String], [String]) -> Void)?
     private var backgroundReconciliationHandler: (@MainActor @Sendable ([URL]) -> Void)?
 
     public init(
@@ -4918,13 +4942,15 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     public func currentInsightsSnapshot() -> IndexInsightsSnapshot {
+        let usage = metricsLock.withLock { usageMetrics }
         let state = lock.withLock {
             (
                 snapshot: searchSnapshot,
                 roots: roots,
                 stats: lockedStatsWithoutLock(),
-                usage: usageMetrics,
-                health: currentHealthDiagnosticsWithoutLock()
+                health: currentHealthDiagnosticsWithoutLock(
+                    activeIndexJobHighWaterMark: usage.health.activeJobHighWaterMark
+                )
             )
         }
 
@@ -4940,8 +4966,8 @@ public final class FileIndex: @unchecked Sendable {
             stats: state.stats,
             roots: rootInsights,
             storage: storage,
-            usage: state.usage,
-            lifetime: state.usage.lifetime,
+            usage: usage,
+            lifetime: usage.lifetime,
             health: state.health
         )
     }
@@ -5306,22 +5332,24 @@ public final class FileIndex: @unchecked Sendable {
         let completionTracker = completion.map {
             PendingRefreshCompletion(pathCount: paths.count, completion: $0)
         }
-        lock.withLock {
-            queuePendingRefreshPathsWithoutLock(
+        let collapseMetrics = lock.withLock {
+            var collapseMetrics = queuePendingRefreshPathsWithoutLock(
                 exactPaths,
                 priority: priority,
                 recursivelyScansDirectory: false,
                 queuedAt: queuedAt,
                 completion: completionTracker
             )
-            queuePendingRefreshPathsWithoutLock(
+            collapseMetrics.append(contentsOf: queuePendingRefreshPathsWithoutLock(
                 recursivePaths,
                 priority: priority,
                 recursivelyScansDirectory: true,
                 queuedAt: queuedAt,
                 completion: completionTracker
-            )
+            ))
+            return collapseMetrics
         }
+        logPendingRefreshCollapses(collapseMetrics)
         scheduleUpdateDrainIfNeeded(delay: .milliseconds(150))
     }
 
@@ -5333,6 +5361,20 @@ public final class FileIndex: @unchecked Sendable {
 
     public func refresh(paths rawPaths: [String]) {
         update(paths: rawPaths)
+    }
+
+    @_spi(ATTInternal)
+    public func requestMaintenanceMode(
+        background: Bool,
+        promotePendingWork: Bool
+    ) {
+        maintenanceControlQueue.async { [weak self] in
+            guard let self else { return }
+            self.setBackgroundMaintenanceEnabled(background)
+            if promotePendingWork, !background {
+                self.promoteBackgroundMaintenanceSynchronously()
+            }
+        }
     }
 
     @_spi(ATTInternal)
@@ -5365,6 +5407,20 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     public func promoteBackgroundMaintenance() {
+        prepareBackgroundMaintenancePromotion()
+        indexQueue.async { [weak self] in
+            self?.promoteBackgroundMaintenanceOnIndexQueue()
+        }
+    }
+
+    private func promoteBackgroundMaintenanceSynchronously() {
+        prepareBackgroundMaintenancePromotion()
+        indexQueue.sync {
+            promoteBackgroundMaintenanceOnIndexQueue()
+        }
+    }
+
+    private func prepareBackgroundMaintenancePromotion() {
         // A reconciliation owns indexQueue while its scan workers are parked.
         // Mark it as promoted and wake its workers synchronously; the queued
         // refresh promotion below cannot run until they have released the queue.
@@ -5374,9 +5430,6 @@ public final class FileIndex: @unchecked Sendable {
             }
         }
         wakeBackgroundReconciliation()
-        indexQueue.async { [weak self] in
-            self?.promoteBackgroundMaintenanceOnIndexQueue()
-        }
     }
 
     private func promoteBackgroundMaintenanceOnIndexQueue() {
@@ -5385,6 +5438,7 @@ public final class FileIndex: @unchecked Sendable {
             hasPendingRefreshes: Bool,
             shouldOptimizeSnapshot: Bool
         ) in
+            maintenancePromotionApplicationCountForTesting &+= 1
             var promotedCount = 0
             for path in pendingRefreshPaths.keys {
                 guard var work = pendingRefreshPaths[path], work.priority == .background else { continue }
@@ -14356,18 +14410,21 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     private func usageMetricsMaintenanceSaveDelay() -> TimeInterval {
-        usageMetricsMaintenanceSaveDelayOverride ?? Self.usageMetricsMaintenanceSaveDefaultDelay
+        metricsLock.withLock {
+            usageMetricsMaintenanceSaveDelayOverride ?? Self.usageMetricsMaintenanceSaveDefaultDelay
+        }
     }
 
-    private func queuePendingRefreshPathsWithoutLock(
-        _ paths: Set<String>,
+    private func queuePendingRefreshPathsWithoutLock<Paths: Sequence>(
+        _ paths: Paths,
         priority: IndexWorkPriority,
         recursivelyScansDirectory: Bool = true,
         queuedAt: Date,
         completion: PendingRefreshCompletion? = nil
-    ) {
+    ) -> [PendingRefreshCollapseMetrics] where Paths.Element == String {
+        var collapseMetrics: [PendingRefreshCollapseMetrics] = []
         for path in paths {
-            queuePendingRefreshWorkWithoutLock(
+            if let metrics = queuePendingRefreshWorkWithoutLock(
                 PendingRefreshWork(
                     path: path,
                     priority: priority,
@@ -14382,25 +14439,35 @@ public final class FileIndex: @unchecked Sendable {
                     lastServiceSequence: nil,
                     retryAttempt: 0
                 )
-            )
+            ) {
+                collapseMetrics.append(metrics)
+            }
         }
+        return collapseMetrics
     }
 
-    private func queuePendingRefreshWorksWithoutLock(_ works: [PendingRefreshWork]) {
+    private func queuePendingRefreshWorksWithoutLock(
+        _ works: [PendingRefreshWork]
+    ) -> [PendingRefreshCollapseMetrics] {
+        var collapseMetrics: [PendingRefreshCollapseMetrics] = []
         for work in works {
-            queuePendingRefreshWorkWithoutLock(work)
+            if let metrics = queuePendingRefreshWorkWithoutLock(work) {
+                collapseMetrics.append(metrics)
+            }
         }
+        return collapseMetrics
     }
 
-    private func queuePendingRefreshWorkWithoutLock(_ work: PendingRefreshWork) {
+    private func queuePendingRefreshWorkWithoutLock(
+        _ work: PendingRefreshWork
+    ) -> PendingRefreshCollapseMetrics? {
         if pendingRefreshPaths.count >= Self.maximumPendingRefreshPaths,
            pendingRefreshPaths[work.path] == nil {
-            collapsePendingRefreshWorkWithoutLock(including: work)
-            return
+            return collapsePendingRefreshWorkWithoutLock(including: work)
         }
         var queuedWork = work
         markOverlappingDirectoryProgressWithoutLock(for: &queuedWork)
-        if var existing = pendingRefreshPaths[queuedWork.path] {
+        if var existing = pendingRefreshPaths.removeValue(forKey: queuedWork.path) {
             if existing.directoryScanProgress == nil, queuedWork.directoryScanProgress != nil {
                 queuedWork.merge(existing)
                 pendingRefreshPaths[queuedWork.path] = queuedWork
@@ -14411,9 +14478,13 @@ public final class FileIndex: @unchecked Sendable {
         } else {
             pendingRefreshPaths[queuedWork.path] = queuedWork
         }
+        return nil
     }
 
-    private func collapsePendingRefreshWorkWithoutLock(including incoming: PendingRefreshWork) {
+    private func collapsePendingRefreshWorkWithoutLock(
+        including incoming: PendingRefreshWork
+    ) -> PendingRefreshCollapseMetrics {
+        let startedAt = Date()
         var allWork = Array(pendingRefreshPaths.values)
         allWork.append(incoming)
         var collapsedByRoot: [String: PendingRefreshWork] = [:]
@@ -14437,7 +14508,7 @@ public final class FileIndex: @unchecked Sendable {
                 lastServiceSequence: work.lastServiceSequence,
                 retryAttempt: 0
             )
-            if var existing = collapsedByRoot[root] {
+            if var existing = collapsedByRoot.removeValue(forKey: root) {
                 existing.merge(collapsed)
                 collapsedByRoot[root] = existing
             } else {
@@ -14446,15 +14517,26 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         pendingRefreshPaths = collapsedByRoot
-        DiagnosticLogger.shared.log(
-            level: .warning,
-            category: "index",
-            event: "index.pendingRefreshCollapsed",
-            fields: [
-                "previousPathCount": .publicInt(allWork.count),
-                "collapsedPathCount": .publicInt(collapsedByRoot.count)
-            ]
+        return PendingRefreshCollapseMetrics(
+            previousPathCount: allWork.count,
+            collapsedPathCount: collapsedByRoot.count,
+            duration: Date().timeIntervalSince(startedAt)
         )
+    }
+
+    private func logPendingRefreshCollapses(_ metrics: [PendingRefreshCollapseMetrics]) {
+        for metric in metrics {
+            DiagnosticLogger.shared.log(
+                level: .warning,
+                category: "index",
+                event: "index.pendingRefreshCollapsed",
+                fields: [
+                    "previousPathCount": .publicInt(metric.previousPathCount),
+                    "collapsedPathCount": .publicInt(metric.collapsedPathCount),
+                    "durationSeconds": .publicDouble(metric.duration)
+                ]
+            )
+        }
     }
 
     private func markOverlappingDirectoryProgressWithoutLock(for work: inout PendingRefreshWork) {
@@ -14758,9 +14840,10 @@ public final class FileIndex: @unchecked Sendable {
                     deferredRefreshes[index].deferBackgroundWork(until: backgroundResumeDate)
                 }
             }
-            lock.withLock {
+            let collapseMetrics = lock.withLock {
                 queuePendingRefreshWorksWithoutLock(deferredRefreshes)
             }
+            logPendingRefreshCollapses(collapseMetrics)
             DiagnosticLogger.shared.log(
                 category: "index",
                 event: "index.backgroundMaintenanceDeferred",
@@ -15033,9 +15116,10 @@ public final class FileIndex: @unchecked Sendable {
             return (generation, preservedReadyStatus)
         }
         guard let updateContext else {
-            lock.withLock {
+            let collapseMetrics = lock.withLock {
                 queuePendingRefreshWorksWithoutLock(requests)
             }
+            logPendingRefreshCollapses(collapseMetrics)
             scheduleUpdateDrainIfNeeded(delay: .milliseconds(0))
             return .none
         }
@@ -15189,15 +15273,16 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         func requeueRequestsAfterGenerationChange() {
-            lock.withLock {
+            let collapseMetrics = lock.withLock {
                 let carriedPaths = Set(
                     deferredRefreshes.map(\.path) + completedRefreshes.map(\.path)
                 )
                 let untouchedRequests = requests.filter { !carriedPaths.contains($0.path) }
-                queuePendingRefreshWorksWithoutLock(
+                return queuePendingRefreshWorksWithoutLock(
                     completedRefreshes + deferredRefreshes + untouchedRequests
                 )
             }
+            logPendingRefreshCollapses(collapseMetrics)
             scheduleUpdateDrainIfNeeded(delay: .milliseconds(0))
         }
 
@@ -18091,6 +18176,55 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
+    func withStateLockHeldForTesting(_ body: () -> Void) {
+        lock.withLock(body)
+    }
+
+    func waitForMaintenanceRequestsForTesting() {
+        maintenanceControlQueue.sync {}
+    }
+
+    func maintenanceRequestStateForTesting() -> (
+        backgroundEnabled: Bool,
+        promotionApplicationCount: UInt64
+    ) {
+        lock.withLock {
+            (
+                backgroundMaintenanceEnteredAt != nil,
+                maintenancePromotionApplicationCountForTesting
+            )
+        }
+    }
+
+    @discardableResult
+    func queuePendingRefreshPathsForTesting(
+        _ rawPaths: [String],
+        priority: IndexWorkPriority = .interactive,
+        recursivelyScansDirectory: Bool = false,
+        completion: (@Sendable () -> Void)? = nil
+    ) -> [(previousPathCount: Int, collapsedPathCount: Int, duration: TimeInterval)] {
+        let paths = rawPaths.map {
+            URL(fileURLWithPath: $0).standardizedFileURL.path
+        }
+        let completionTracker = completion.map {
+            PendingRefreshCompletion(pathCount: paths.count, completion: $0)
+        }
+        let collapseMetrics = lock.withLock {
+            queuePendingRefreshPathsWithoutLock(
+                paths,
+                priority: priority,
+                recursivelyScansDirectory: recursivelyScansDirectory,
+                queuedAt: Date(),
+                completion: completionTracker
+            )
+        }
+        logPendingRefreshCollapses(collapseMetrics)
+        scheduleUpdateDrainIfNeeded(delay: .milliseconds(150))
+        return collapseMetrics.map {
+            ($0.previousPathCount, $0.collapsedPathCount, $0.duration)
+        }
+    }
+
     func hasPendingDurabilityForTesting() -> Bool {
         lock.withLock {
             hasUnpersistedSnapshotChanges || !pendingDurabilityCompletions.isEmpty
@@ -18173,12 +18307,14 @@ public final class FileIndex: @unchecked Sendable {
         )
     }
 
-    private func currentHealthDiagnosticsWithoutLock() -> IndexHealthDiagnostics {
+    private func currentHealthDiagnosticsWithoutLock(
+        activeIndexJobHighWaterMark: Int
+    ) -> IndexHealthDiagnostics {
         IndexHealthDiagnostics(
             phase: phase,
             status: status,
             activeIndexJobs: activeIndexJobs,
-            activeIndexJobHighWaterMark: usageMetrics.health.activeJobHighWaterMark,
+            activeIndexJobHighWaterMark: activeIndexJobHighWaterMark,
             schemaVersion: searchSnapshot.store.schemaVersion,
             snapshotRevision: searchSnapshotRevision,
             recordStoreKind: searchSnapshot.store.kind.rawValue,
@@ -18692,14 +18828,18 @@ public final class FileIndex: @unchecked Sendable {
                     resumedFromCheckpoint: resumedFromCheckpoint,
                     activityPresentation: activityPresentation
                 ),
-                handler: statsChangedHandler
+                rootPaths: roots,
+                exclusionPatterns: exclusionRules.patterns,
+                statsHandler: statsChangedHandler,
+                stateSnapshotHandler: stateSnapshotChangedHandler
             )
         }
 
         let stats = update.stats
-        if let handler = update.handler {
+        if update.statsHandler != nil || update.stateSnapshotHandler != nil {
             Task { @MainActor in
-                handler(stats)
+                update.statsHandler?(stats)
+                update.stateSnapshotHandler?(stats, update.rootPaths, update.exclusionPatterns)
             }
         }
 
@@ -18803,20 +18943,14 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     private func recordMaintenance(_ metric: IndexMaintenanceOperationMetric) {
-        let shouldScheduleSave = lock.withLock { () -> Bool in
-            usageMetrics.recordMaintenance(metric)
-            usageMetrics.schemaVersion = IndexUsageMetrics.currentSchemaVersion
+        lock.withLock {
             lastMaintenanceOperation = metric
             if metric.priority == .background || metric.kind == .backgroundSlice {
                 lastBackgroundMaintenanceSlice = metric
             }
-            markUsageMetricsDirtyWithoutLock()
-            guard !usageMetricsSaveScheduled else { return false }
-            usageMetricsSaveScheduled = true
-            return true
         }
-        if shouldScheduleSave {
-            scheduleDeferredUsageMetricsSave()
+        updateUsageMetricsDeferred { metrics in
+            metrics.recordMaintenance(metric)
         }
     }
 
@@ -18863,10 +18997,10 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     private func updateUsageMetricsDeferred(_ body: (inout IndexUsageMetrics) -> Void) {
-        let shouldScheduleSave = lock.withLock { () -> Bool in
+        let shouldScheduleSave = metricsLock.withLock { () -> Bool in
             body(&usageMetrics)
             usageMetrics.schemaVersion = IndexUsageMetrics.currentSchemaVersion
-            markUsageMetricsDirtyWithoutLock()
+            markUsageMetricsDirtyWithoutMetricsLock()
             guard !usageMetricsSaveScheduled else { return false }
             usageMetricsSaveScheduled = true
             return true
@@ -18884,23 +19018,23 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     private func savePendingUsageMetricsIfNeeded() {
-        let metrics = lock.withLock { () -> IndexUsageMetrics? in
+        let metrics = metricsLock.withLock { () -> IndexUsageMetrics? in
             guard usageMetricsSavedGeneration != usageMetricsDirtyGeneration else {
                 usageMetricsSaveScheduled = false
                 return nil
             }
-            markUsageMetricsSavedWithoutLock()
+            markUsageMetricsSavedWithoutMetricsLock()
             return usageMetrics
         }
         guard let metrics else { return }
         Self.saveUsageMetrics(metrics, to: metricsURL, fileManager: fileManager)
     }
 
-    private func markUsageMetricsDirtyWithoutLock() {
+    private func markUsageMetricsDirtyWithoutMetricsLock() {
         usageMetricsDirtyGeneration &+= 1
     }
 
-    private func markUsageMetricsSavedWithoutLock() {
+    private func markUsageMetricsSavedWithoutMetricsLock() {
         if usageMetricsSavedGeneration == usageMetricsDirtyGeneration {
             usageMetricsDirtyGeneration &+= 1
         }

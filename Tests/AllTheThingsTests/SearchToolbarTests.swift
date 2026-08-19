@@ -6,6 +6,18 @@ import Testing
 
 @Suite("Search toolbar")
 struct SearchToolbarTests {
+    @Test("application activity maps to asynchronous index maintenance requests")
+    func applicationActivityMapsToAsynchronousIndexMaintenanceRequests() {
+        #expect(
+            IndexActivityMaintenanceRequest.applicationActivityChanged(isActive: true)
+                == IndexActivityMaintenanceRequest(background: false, promotePendingWork: true)
+        )
+        #expect(
+            IndexActivityMaintenanceRequest.applicationActivityChanged(isActive: false)
+                == IndexActivityMaintenanceRequest(background: true, promotePendingWork: false)
+        )
+    }
+
     @Test("titlebar actions use unified toolbar with centered title and open settings and insights instead of indexing actions")
     @MainActor
     func titlebarActionsUseUnifiedToolbarWithCenteredTitleAndOpenSettingsAndInsightsInsteadOfIndexingActions() throws {
