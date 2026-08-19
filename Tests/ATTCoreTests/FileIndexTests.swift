@@ -3336,6 +3336,7 @@ struct FileIndexTests {
             backgroundRefreshDrainBackoffDelay: 0.02,
             backgroundDirectoryScanBudget: 60,
             backgroundDirectoryScanVisitLimit: 1,
+            backgroundDirectoryScanEntryLimit: 1,
             backgroundOptimizationPersistDelay: 60
         )
         index.replaceRootsAndRebuild([root], mode: .fresh)
