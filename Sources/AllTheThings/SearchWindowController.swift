@@ -4,6 +4,19 @@ import CoreServices
 import QuartzCore
 import UniformTypeIdentifiers
 
+struct IndexActivityMaintenanceRequest: Equatable, Sendable {
+    static let foregroundActivation = Self(background: false, promotePendingWork: true)
+    static let foregroundInitialization = Self(background: false, promotePendingWork: false)
+    static let backgroundTransition = Self(background: true, promotePendingWork: false)
+
+    let background: Bool
+    let promotePendingWork: Bool
+
+    static func applicationActivityChanged(isActive: Bool) -> Self {
+        isActive ? foregroundActivation : backgroundTransition
+    }
+}
+
 enum AppRuntimeStatusFormatter {
     static let transientReadyStatusDisplayDuration: TimeInterval = 5
 
@@ -1292,6 +1305,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var sortSpec: SortSpec
     private var visibleColumns: Set<Column>
     private var indexedRoots: [URL]
+    private var indexedExclusionPatterns: [String]
+    private var activeIndexRootPaths: [String]
+    private var activeIndexExclusionPatterns: [String]
     private var rootDisplayNames: [String: String] = [:]
     private var pendingRawFSEventsByPath: [String: FileSystemEvent] = [:]
     private var pendingRawFSEventCount = 0
@@ -1486,6 +1502,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         self.visibleColumns = visibleColumns
         self.sortSpec = Self.initialSortSpec(defaults: defaults, visibleColumns: visibleColumns)
         self.indexedRoots = AppSettings.indexedRoots(defaults: defaults)
+        self.indexedExclusionPatterns = AppSettings.exclusionPatterns(defaults: defaults)
+        self.activeIndexRootPaths = index.allRoots().map(\.standardizedFileURL.path)
+        self.activeIndexExclusionPatterns = index.allExclusionPatterns()
         self.rootDisplayNames = Self.rootDisplayNames(for: self.indexedRoots.map { $0.standardizedFileURL.path })
         self.highlightsSearchText = defaults.bool(forKey: AppSettings.highlightSearchTextKey)
         self.showsHiddenFiles = defaults.bool(forKey: AppSettings.showHiddenFilesKey)
@@ -1525,8 +1544,12 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     override func viewDidLoad() {
         super.viewDidLoad()
 
-        index.onStatsChanged = { @MainActor @Sendable [weak self] stats in
-            self?.handleStatsChanged(stats)
+        index.onStateSnapshotChanged = { @MainActor @Sendable [weak self] stats, rootPaths, exclusionPatterns in
+            self?.handleStatsChanged(
+                stats,
+                rootPaths: rootPaths,
+                exclusionPatterns: exclusionPatterns
+            )
         }
         index.onBackgroundReconciliationRequested = { @MainActor @Sendable [weak self] roots in
             self?.runFSEventsBackedReconciliation(roots: roots)
@@ -3589,9 +3612,15 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         updateMascotPersistentAnimation()
     }
 
-    private func handleStatsChanged(_ stats: IndexStats) {
+    private func handleStatsChanged(
+        _ stats: IndexStats,
+        rootPaths: [String],
+        exclusionPatterns: [String]
+    ) {
         let previousStats = indexStats
         indexStats = stats
+        activeIndexRootPaths = rootPaths
+        activeIndexExclusionPatterns = exclusionPatterns
         markFSEventBaselineIfNeeded(previous: previousStats, current: stats)
         activateQueuedFSEventCatchUpBaselineIfNeeded(previous: previousStats, current: stats)
         markScopedFSEventCatchUpBaselineIfNeeded(previous: previousStats, current: stats)
@@ -4091,9 +4120,11 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     @objc private func exclusionPatternsDidChange(_ notification: Notification) {
         let patterns = AppSettings.exclusionPatterns(defaults: defaults)
-        guard patterns != index.allExclusionPatterns() else { return }
+        guard patterns != indexedExclusionPatterns else { return }
 
         index.updateExclusionPatterns(patterns)
+        indexedExclusionPatterns = patterns
+        activeIndexExclusionPatterns = patterns
         resetZeroRowRootRecoveryState()
         guard AppSettings.indexingSetupCompleted(defaults: defaults) else { return }
         rebuildIndexForCurrentSettings()
@@ -4106,8 +4137,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     @objc private func applicationDidBecomeActive(_ notification: Notification) {
-        if applyEnergyMode(.interactive) {
-            index.promoteBackgroundMaintenance()
+        if applyEnergyMode(
+            .interactive,
+            maintenanceRequest: .applicationActivityChanged(isActive: true)
+        ) {
             runFSEventsBackedReconciliation(roots: indexedRoots)
         }
         if searchRefreshGate.hasDeferredRefresh {
@@ -4119,7 +4152,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     @objc private func applicationDidResignActive(_ notification: Notification) {
         deferActiveSearchUntilInteractive()
-        applyEnergyMode(.background)
+        applyEnergyMode(
+            .background,
+            maintenanceRequest: .applicationActivityChanged(isActive: false)
+        )
     }
 
     private func deferActiveSearchUntilInteractive() {
@@ -4148,14 +4184,23 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     @discardableResult
-    private func applyEnergyMode(_ mode: EnergyMode, force: Bool = false) -> Bool {
+    private func applyEnergyMode(
+        _ mode: EnergyMode,
+        force: Bool = false,
+        maintenanceRequest: IndexActivityMaintenanceRequest? = nil
+    ) -> Bool {
         guard force || energyMode != mode else { return false }
 
         if !force {
             recordProcessResourceSample(mode: energyMode)
         }
         energyMode = mode
-        index.setBackgroundMaintenanceEnabled(mode == .background)
+        let maintenanceRequest = maintenanceRequest
+            ?? (mode == .background ? .backgroundTransition : .foregroundInitialization)
+        index.requestMaintenanceMode(
+            background: maintenanceRequest.background,
+            promotePendingWork: maintenanceRequest.promotePendingWork
+        )
         backgroundEnergyModeEnteredAt = mode == .background ? Date() : nil
         startWatchingIfNeeded()
         startApplicationWatchingIfNeeded()
@@ -4232,7 +4277,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     func reindexConfiguredRootsFromSettings() {
         indexedRoots = AppSettings.indexedRoots(defaults: defaults)
-        index.updateExclusionPatterns(AppSettings.exclusionPatterns(defaults: defaults))
+        let exclusionPatterns = AppSettings.exclusionPatterns(defaults: defaults)
+        index.updateExclusionPatterns(exclusionPatterns)
+        indexedExclusionPatterns = exclusionPatterns
+        activeIndexExclusionPatterns = exclusionPatterns
         refreshRootDisplayNames()
         guard AppSettings.indexingSetupCompleted(defaults: defaults), !indexedRoots.isEmpty else { return }
         didRequestInitialSnapshotLoad = true
@@ -4244,16 +4292,15 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func indexSettingsMatchConfiguredSettings() -> Bool {
-        guard index.allExclusionPatterns() == AppSettings.exclusionPatterns(defaults: defaults) else {
+        guard activeIndexExclusionPatterns == AppSettings.exclusionPatterns(defaults: defaults) else {
             return false
         }
 
-        let indexRoots = index.allRoots()
-        guard !indexRoots.isEmpty else {
+        guard !activeIndexRootPaths.isEmpty else {
             return indexStats.indexedCount == 0
         }
 
-        return rootPaths(indexRoots) == rootPaths(indexedRoots)
+        return activeIndexRootPaths == rootPaths(AppSettings.indexedRoots(defaults: defaults))
     }
 
     private func rootPaths(_ roots: [URL]) -> [String] {
@@ -4364,9 +4411,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             return
         }
 
-        let rootPaths = rootPaths(index.allRoots())
+        let rootPaths = rootPaths(indexedRoots)
         guard !rootPaths.isEmpty else { return }
-        runFSEventsBackedReconciliation(roots: index.allRoots())
+        runFSEventsBackedReconciliation(roots: indexedRoots)
     }
 
     private func activateQueuedFSEventCatchUpBaselineIfNeeded(previous: IndexStats, current: IndexStats) {
@@ -4456,7 +4503,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
         startWatchingIfNeeded()
         scheduleZeroRowRootRecoveryIfNeeded()
-        runPendingFSEventCatchUpIfNeeded(stats: index.currentStats())
+        runPendingFSEventCatchUpIfNeeded(stats: indexStats)
         resumeFSEventCursorCommitsIfCatchUpFinished()
     }
 
@@ -4565,7 +4612,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             !roots.isEmpty,
             AppSettings.indexingSetupCompleted(defaults: defaults),
             rootPaths(roots) == rootPaths(indexedRoots),
-            index.allExclusionPatterns() == AppSettings.exclusionPatterns(defaults: defaults)
+            indexedExclusionPatterns == AppSettings.exclusionPatterns(defaults: defaults)
         else {
             return
         }
@@ -4610,7 +4657,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         )
         updateStatus()
 
-        let exclusionRules = FileExclusionRules(patterns: index.allExclusionPatterns())
+        let exclusionRules = FileExclusionRules(patterns: indexedExclusionPatterns)
         activeFSEventReplay = fseventReconciler.reconcile(roots: roots, exclusions: exclusionRules) { @MainActor @Sendable [weak self] action in
             guard
                 let self,
@@ -4862,7 +4909,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         guard !events.isEmpty else { return }
 
         let rootPaths = rootPaths(indexedRoots)
-        let exclusionPatterns = index.allExclusionPatterns()
+        let exclusionPatterns = indexedExclusionPatterns
         let cursorEpoch = fseventCursorEpoch
         let wrappedBaselineEventID = events.contains(where: \.eventIDsWrapped)
             ? UInt64(FSEventsGetCurrentEventId())
@@ -5013,7 +5060,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     private func flushCoalescedFSEvents() {
         eventDebounce = nil
-        guard !indexStats.isLoadingSnapshot, !index.allRoots().isEmpty else {
+        guard !indexStats.isLoadingSnapshot, !indexedRoots.isEmpty else {
             scheduleCoalescedFSEventFlush()
             return
         }
