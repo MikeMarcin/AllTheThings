@@ -1422,6 +1422,7 @@ struct FileIndexTests {
         #expect(collapse.collapsedPathCount == 2)
         #expect(collapse.duration < 2)
         #expect(index.pendingRefreshPathsForTesting() == Set([firstRoot.path, secondRoot.path]))
+        #expect(index.pendingRefreshCompletionOwnershipCountForTesting() <= 3)
 
         try await waitUntil(timeout: .seconds(5)) {
             completion.count == 1 && index.pendingRefreshPathsForTesting().isEmpty
@@ -1457,12 +1458,86 @@ struct FileIndexTests {
         #expect(queueDuration < 2)
         #expect(collapseMetrics.isEmpty)
         #expect(index.pendingRefreshPathsForTesting() == [repeatedPath])
+        #expect(index.pendingRefreshCompletionOwnershipCountForTesting() <= 2)
 
         try await waitUntil(timeout: .seconds(5)) {
             completion.count == 1 && index.pendingRefreshPathsForTesting().isEmpty
         }
         try await Task.sleep(for: .milliseconds(100))
         #expect(completion.count == 1)
+    }
+
+    @Test("collapsed refresh receipts stay bounded when delegated to descendants")
+    func collapsedRefreshReceiptsStayBoundedWhenDelegatedToDescendants() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        for offset in 0..<8 {
+            try fileManager.createDirectory(
+                at: root.appendingPathComponent("Folder\(offset)", isDirectory: true),
+                withIntermediateDirectories: true
+            )
+        }
+        defer { try? fileManager.removeItem(at: root) }
+
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        defer { try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName)) }
+        let index = FileIndex(
+            applicationName: applicationName,
+            loadsSnapshotImmediately: false,
+            largeOverlayPersistRecordLimit: nil,
+            largeOverlayPersistDelay: nil,
+            backgroundRefreshDrainBackoffDelay: 60,
+            backgroundDirectoryScanBudget: 60,
+            backgroundDirectoryScanVisitLimit: 1,
+            backgroundDirectoryScanEntryLimit: 1,
+            backgroundOptimizationPersistDelay: 60
+        )
+        let rootRecord = try #require(FileRecord(url: root))
+        index.replaceRecordsForTesting([rootRecord], roots: [root])
+
+        let completion = CompletionFlag()
+        let initialPaths = (0..<4_097).map {
+            root.appendingPathComponent("Initial\($0)").path
+        }
+        index.queuePendingRefreshPathsForTesting(
+            initialPaths,
+            priority: .background,
+            recursivelyScansDirectory: true
+        ) {
+            completion.mark()
+        }
+
+        try await waitUntil(timeout: .seconds(5)) {
+            index.pendingDirectoryRefreshStateForTesting(path: root.path) != nil
+        }
+
+        let descendantPaths = (0..<1_024).map {
+            root.appendingPathComponent("Late\($0)").path
+        }
+        let startedAt = Date()
+        index.queuePendingRefreshPathsForTesting(
+            descendantPaths,
+            priority: .background
+        )
+        let queueDuration = Date().timeIntervalSince(startedAt)
+
+        #expect(queueDuration < 2)
+        #expect(
+            index.pendingRefreshCompletionOwnershipCountForTesting()
+                <= descendantPaths.count + 1
+        )
+
+        try await waitUntil(timeout: .seconds(5)) {
+            index.pendingRefreshPathsForTesting() == [root.path]
+        }
+        #expect(!completion.isMarked)
+
+        index.promoteBackgroundMaintenance()
+        try await waitUntil(timeout: .seconds(10)) {
+            completion.isMarked && index.currentDiagnostics().pendingRefreshPathCount == 0
+        }
     }
 
     @Test("usage metrics do not wait for the index state lock")

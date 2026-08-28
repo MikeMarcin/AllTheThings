@@ -1242,10 +1242,22 @@ public final class FileIndex: @unchecked Sendable {
         private var remainingPathCount: Int
         private var didComplete = false
         private let completion: @Sendable () -> Void
+        let aggregationRank: Int
 
         init(pathCount: Int, completion: @escaping @Sendable () -> Void) {
             remainingPathCount = max(pathCount, 0)
             self.completion = completion
+            aggregationRank = 0
+        }
+
+        init(owning completions: [PendingRefreshCompletion]) {
+            remainingPathCount = 1
+            aggregationRank = (completions.map(\.aggregationRank).max() ?? -1) + 1
+            completion = {
+                for completion in completions {
+                    completion.completeOnePath()
+                }
+            }
         }
 
         func addPathDependency() -> Bool {
@@ -1442,15 +1454,27 @@ public final class FileIndex: @unchecked Sendable {
                 followUpRecursivelyScansDirectory = followUpRecursivelyScansDirectory
                     || incoming.recursivelyScansDirectory
                     || incoming.followUpRecursivelyScansDirectory
-                followUpCompletions.append(contentsOf: incoming.completions)
-                followUpCompletions.append(contentsOf: incoming.followUpCompletions)
+                FileIndex.mergeCompletionOwnership(
+                    incoming.completions,
+                    into: &followUpCompletions
+                )
+                FileIndex.mergeCompletionOwnership(
+                    incoming.followUpCompletions,
+                    into: &followUpCompletions
+                )
             } else {
                 recursivelyScansDirectory = recursivelyScansDirectory
                     || incoming.recursivelyScansDirectory
                 followUpRecursivelyScansDirectory = followUpRecursivelyScansDirectory
                     || incoming.followUpRecursivelyScansDirectory
-                completions.append(contentsOf: incoming.completions)
-                followUpCompletions.append(contentsOf: incoming.followUpCompletions)
+                FileIndex.mergeCompletionOwnership(
+                    incoming.completions,
+                    into: &completions
+                )
+                FileIndex.mergeCompletionOwnership(
+                    incoming.followUpCompletions,
+                    into: &followUpCompletions
+                )
             }
             requiresDirectoryRescanAfterProgress = requiresDirectoryRescanAfterProgress
                 || incoming.requiresDirectoryRescanAfterProgress
@@ -14542,9 +14566,13 @@ public final class FileIndex: @unchecked Sendable {
     private func markOverlappingDirectoryProgressWithoutLock(for work: inout PendingRefreshWork) {
         var ancestorPath = Self.parentPath(of: work.path)
         while let path = ancestorPath {
-            if let ancestor = pendingRefreshPaths[path],
+            if var ancestor = pendingRefreshPaths[path],
                ancestor.directoryScanProgress?.supersedeSubtree(at: work.path) == true {
-                Self.addCompletionDependencies(from: ancestor.completions, to: &work.completions)
+                Self.addCompletionDependencies(
+                    from: &ancestor.completions,
+                    to: &work.completions
+                )
+                pendingRefreshPaths[path] = ancestor
             }
             ancestorPath = Self.parentPath(of: path)
         }
@@ -14554,23 +14582,70 @@ public final class FileIndex: @unchecked Sendable {
         where Self.isStrictDescendant(descendantPath, of: work.path) {
             guard var descendant = pendingRefreshPaths[descendantPath] else { continue }
             if work.directoryScanProgress?.supersedeSubtree(at: descendant.path) == true {
-                Self.addCompletionDependencies(from: work.completions, to: &descendant.completions)
+                Self.addCompletionDependencies(
+                    from: &work.completions,
+                    to: &descendant.completions
+                )
                 pendingRefreshPaths[descendantPath] = descendant
             }
         }
     }
 
+    private static func mergeCompletionOwnership(
+        _ incoming: [PendingRefreshCompletion],
+        into destination: inout [PendingRefreshCompletion]
+    ) {
+        guard !incoming.isEmpty else { return }
+        destination.append(contentsOf: incoming)
+        balanceCompletionOwnership(&destination)
+    }
+
+    private static func balanceCompletionOwnership(
+        _ completions: inout [PendingRefreshCompletion]
+    ) {
+        guard completions.count > 1 else { return }
+        var nodesByRank: [PendingRefreshCompletion?] = []
+
+        for completion in completions {
+            var carried = completion
+            while true {
+                let rank = carried.aggregationRank
+                while rank >= nodesByRank.count {
+                    nodesByRank.append(nil)
+                }
+                guard let existing = nodesByRank[rank] else {
+                    nodesByRank[rank] = carried
+                    break
+                }
+                nodesByRank[rank] = nil
+                carried = PendingRefreshCompletion(owning: [existing, carried])
+            }
+        }
+
+        completions = nodesByRank.compactMap { $0 }
+    }
+
+    private static func consolidateCompletionOwnership(
+        _ completions: inout [PendingRefreshCompletion]
+    ) {
+        balanceCompletionOwnership(&completions)
+        guard completions.count > 1 else { return }
+        let ownedCompletions = completions
+        completions = [PendingRefreshCompletion(owning: ownedCompletions)]
+    }
+
     private static func addCompletionDependencies(
-        from source: [PendingRefreshCompletion],
+        from source: inout [PendingRefreshCompletion],
         to destination: inout [PendingRefreshCompletion]
     ) {
-        var destinationIDs = Set(destination.map(ObjectIdentifier.init))
-        for completion in source {
-            let identifier = ObjectIdentifier(completion)
-            guard !destinationIDs.contains(identifier), completion.addPathDependency() else { continue }
-            destination.append(completion)
-            destinationIDs.insert(identifier)
+        consolidateCompletionOwnership(&source)
+        balanceCompletionOwnership(&destination)
+        guard let completion = source.first,
+              !destination.contains(where: { $0 === completion }),
+              completion.addPathDependency() else {
+            return
         }
+        mergeCompletionOwnership([completion], into: &destination)
     }
 
     private static func isStrictDescendant(_ path: String, of ancestor: String) -> Bool {
@@ -14870,7 +14945,10 @@ public final class FileIndex: @unchecked Sendable {
         } else if updateResult.applied {
             lock.withLock {
                 for work in completionWorks {
-                    pendingDurabilityCompletions.append(contentsOf: work.completions)
+                    Self.mergeCompletionOwnership(
+                        work.completions,
+                        into: &pendingDurabilityCompletions
+                    )
                 }
             }
             scheduleDurabilityRetry()
@@ -15190,7 +15268,10 @@ public final class FileIndex: @unchecked Sendable {
 
         func coverFollowUpWithCurrentObservation(_ request: inout PendingRefreshWork) {
             guard request.requiresDirectoryRescanAfterProgress else { return }
-            request.completions.append(contentsOf: request.followUpCompletions)
+            Self.mergeCompletionOwnership(
+                request.followUpCompletions,
+                into: &request.completions
+            )
             request.followUpCompletions.removeAll(keepingCapacity: false)
             request.requiresDirectoryRescanAfterProgress = false
             request.followUpRecursivelyScansDirectory = false
@@ -18707,6 +18788,14 @@ public final class FileIndex: @unchecked Sendable {
 
     func pendingRefreshPathsForTesting() -> Set<String> {
         lock.withLock { Set(pendingRefreshPaths.keys) }
+    }
+
+    func pendingRefreshCompletionOwnershipCountForTesting() -> Int {
+        lock.withLock {
+            pendingRefreshPaths.values.reduce(into: 0) { count, work in
+                count += work.completions.count + work.followUpCompletions.count
+            }
+        }
     }
 
     func promotePendingRefreshForTesting(path rawPath: String) {
