@@ -12,7 +12,7 @@ Use this workflow to regenerate AllTheThings promo media from a real app screen 
 - Do not index or capture real user folders, file names, account names, home paths, recent files, browser tabs, notifications, or other personal data.
 - Do not hardcode personal absolute paths or local usernames in instructions, scripts, generated metadata, or committed files.
 - Use repo-relative paths for AllTheThings files. Use `GAMECORETECH_SITE_ROOT` for the website checkout when available; otherwise locate or ask for the `gamecoretech.com` checkout without recording a personal folder structure in the skill or generated assets.
-- Use a temporary synthetic index root with product-like sample names, such as a Project Atlas fixture. Temporary paths like `/tmp/...` are acceptable in demo assets.
+- Use the clean, stable synthetic index root `/Users/Shared/Project Atlas Demo` with product-like sample names, such as a Project Atlas fixture. Do not point `ATTIndexedRoots` at a randomized staging path: the indexed root is visible in the recording. Create this exact folder only from known synthetic fixtures, and move it out of `/Users/Shared` after capture if it did not already exist.
 - Before recording, take a preflight screenshot and visually confirm that the capture region contains only the AllTheThings window and safe synthetic paths.
 - Restore the user's AllTheThings preferences and application support data after capture, even if asset generation fails.
 
@@ -35,7 +35,7 @@ Use this workflow to regenerate AllTheThings promo media from a real app screen 
 
    The app title in the capture should match the current release.
 
-3. Prepare a safe demo index in a temporary location. Include enough files for the query `atlas ext:swift` to produce multiple Swift results and visible Match indicators. Keep all names synthetic and non-personal. Include a release-note fixture matching the current release version so pre-query rows are not stale.
+3. Prepare the safe demo index at `/Users/Shared/Project Atlas Demo`. Before creating it, verify that the path is absent or contains only the known synthetic fixture; never merge unknown files into the capture root. Include enough files for the query `planner ext:swift` to produce multiple Swift results and visible Match indicators, including matches where `planner` appears inside a path rather than only at the beginning of a filename. Keep all names synthetic and non-personal. Include a release-note fixture matching the current release version so pre-query rows are not stale. After the movie is recorded, move the synthetic root into the capture work directory (or another recoverable staging location) rather than deleting it.
 
 4. Back up local app state before changing defaults:
 
@@ -50,8 +50,7 @@ Use this workflow to regenerate AllTheThings promo media from a real app screen 
    fi
    if [[ -d "$HOME/Library/Application Support/AllTheThings" ]]; then
      printf '1' > "$backup_root/had-app-support"
-     mkdir -p "$backup_root/Application Support"
-     ditto "$HOME/Library/Application Support/AllTheThings" "$backup_root/Application Support/AllTheThings"
+     mv "$HOME/Library/Application Support/AllTheThings" "$backup_root/original-support-live"
    else
      printf '0' > "$backup_root/had-app-support"
    fi
@@ -86,12 +85,12 @@ Use this workflow to regenerate AllTheThings promo media from a real app screen 
    screencapture -x -v -V 6.2 -R90,80,1060,622 "$work_dir/allthethings-demo.mov" &
    ```
 
-   During recording, clear the search field and type `atlas`, pause briefly, then type ` ext:swift` at a slower human cadence. The final frame should show:
+   Before starting the recorder, focus the search field, clear it, and hold the empty field on screen long enough for the opening frame to capture the placeholder. During recording, type `planner`, pause briefly, then type ` ext:swift` at a slower human cadence. The final frame should show:
 
    - title for the current AllTheThings release
-   - query `atlas ext:swift`
+   - query `planner ext:swift`
    - Match column visible with indicators
-   - only synthetic temporary paths
+   - only the clean `/Users/Shared/Project Atlas Demo` synthetic paths
    - 8 or more clean demo matches when possible
    - status text showing the safe index count
 
@@ -115,10 +114,13 @@ Use this workflow to regenerate AllTheThings promo media from a real app screen 
     else
       defaults delete com.gamecoretech.allthethings >/dev/null 2>&1 || true
     fi
-    rm -rf "$HOME/Library/Application Support/AllTheThings"
+    support_dir="$HOME/Library/Application Support/AllTheThings"
+    if [[ -d "$support_dir" ]]; then
+      mv "$support_dir" "$backup_root/capture-support-final"
+    fi
     if [[ "$(cat "$backup_root/had-app-support")" == "1" ]]; then
       mkdir -p "$HOME/Library/Application Support"
-      ditto "$backup_root/Application Support/AllTheThings" "$HOME/Library/Application Support/AllTheThings"
+      mv "$backup_root/original-support-live" "$support_dir"
     fi
     killall cfprefsd >/dev/null 2>&1 || true
     ```
