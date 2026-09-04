@@ -103,7 +103,7 @@ private extension DiagnosticLogLevel {
 }
 
 @MainActor
-private final class SettingsViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate {
+private final class SettingsViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate, NSComboBoxDelegate {
     private let defaults: UserDefaults
     private let index: FileIndex
     private let reindexHandler: @MainActor () -> Void
@@ -134,6 +134,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         action: nil
     )
     private let rememberSortBetweenLaunchesSwitch = NSSwitch()
+    private let searchHistoryRetentionComboBox = NSComboBox()
     private let highlightSearchTextSwitch = NSSwitch()
     private let showHiddenFilesSwitch = NSSwitch()
     private let allowMultipleInstancesSwitch = NSSwitch()
@@ -178,6 +179,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     private var indexedFoldersAccessWarningCollapsedHeightConstraint: NSLayoutConstraint?
 
     private static let exclusionPatternFieldIdentifier = NSUserInterfaceItemIdentifier("exclusionPatternField")
+    private static let searchHistoryRetentionIdentifier = NSUserInterfaceItemIdentifier("searchHistoryRetentionComboBox")
     private static let hotkeysCardIdentifier = NSUserInterfaceItemIdentifier("hotkeysSettingsCard")
     private static let indexedRootPasteboardType = NSPasteboard.PasteboardType("com.allthethings.settings.indexed-root-row")
     private static let appSearchRootPasteboardType = NSPasteboard.PasteboardType("com.allthethings.settings.app-search-root-row")
@@ -188,6 +190,14 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     private static let appSearchRootsMaximumVisibleRows = 5
     private static let exclusionPatternsMaximumVisibleRows = 10
     private static let diagnosticDetailLevels: [DiagnosticLogLevel] = [.info, .diagnostic]
+    private static let suggestedSearchHistoryRetentions: [AppSearchHistoryRetention] = [
+        .disabled,
+        .limited(25),
+        .limited(AppSearchHistoryRetention.defaultEntryCount),
+        .limited(100),
+        .limited(250),
+        .unlimited
+    ]
 
     init(
         defaults: UserDefaults,
@@ -475,6 +485,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         configureStatusFooterModeControl()
         configureSwitch(rememberSortBetweenLaunchesSwitch, action: #selector(toggleRememberSortBetweenLaunches(_:)))
         rememberSortBetweenLaunchesSwitch.identifier = NSUserInterfaceItemIdentifier("rememberSortBetweenLaunchesSwitch")
+        configureSearchHistoryRetentionControl()
         configureSwitch(highlightSearchTextSwitch, action: #selector(toggleHighlightSearchText(_:)))
         configureSwitch(showHiddenFilesSwitch, action: #selector(toggleShowHiddenFiles(_:)))
         configureSwitch(allowMultipleInstancesSwitch, action: #selector(toggleAllowMultipleInstances(_:)))
@@ -501,6 +512,11 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
                 title: "Remember table sort between launches",
                 detail: "Restore the last selected table sort when the app opens.",
                 control: rememberSortBetweenLaunchesSwitch
+            ),
+            makeControlRow(
+                title: "Search history retention",
+                detail: "Enter how many searches to keep, or choose Off or Unlimited.",
+                control: searchHistoryRetentionComboBox
             ),
             makeControlRow(
                 title: "Highlight search text",
@@ -1191,6 +1207,24 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         }
     }
 
+    private func configureSearchHistoryRetentionControl() {
+        searchHistoryRetentionComboBox.translatesAutoresizingMaskIntoConstraints = false
+        searchHistoryRetentionComboBox.identifier = Self.searchHistoryRetentionIdentifier
+        searchHistoryRetentionComboBox.addItems(
+            withObjectValues: Self.suggestedSearchHistoryRetentions.map(\.settingsTitle)
+        )
+        searchHistoryRetentionComboBox.numberOfVisibleItems = Self.suggestedSearchHistoryRetentions.count
+        searchHistoryRetentionComboBox.isEditable = true
+        searchHistoryRetentionComboBox.completes = true
+        searchHistoryRetentionComboBox.delegate = self
+        searchHistoryRetentionComboBox.target = self
+        searchHistoryRetentionComboBox.action = #selector(changeSearchHistoryRetention(_:))
+        searchHistoryRetentionComboBox.toolTip = "Search history retention"
+        searchHistoryRetentionComboBox.setContentHuggingPriority(.required, for: .horizontal)
+        searchHistoryRetentionComboBox.setContentCompressionResistancePriority(.required, for: .horizontal)
+        searchHistoryRetentionComboBox.widthAnchor.constraint(equalToConstant: 116).isActive = true
+    }
+
     private func configureIconButton(_ button: NSButton, symbol: String, tooltip: String, action: Selector) {
         button.translatesAutoresizingMaskIntoConstraints = false
         button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: tooltip)
@@ -1872,6 +1906,9 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
             of: AppSettings.statusFooterMode(defaults: defaults)
         ) ?? 0
         rememberSortBetweenLaunchesSwitch.state = AppSettings.rememberSortBetweenLaunches(defaults: defaults) ? .on : .off
+        searchHistoryRetentionComboBox.stringValue = AppSettings.searchHistoryRetention(
+            defaults: defaults
+        ).settingsTitle
         highlightSearchTextSwitch.state = defaults.bool(forKey: AppSettings.highlightSearchTextKey) ? .on : .off
         showHiddenFilesSwitch.state = defaults.bool(forKey: AppSettings.showHiddenFilesKey) ? .on : .off
         allowMultipleInstancesSwitch.state = defaults.bool(forKey: AppSettings.allowMultipleInstancesKey) ? .on : .off
@@ -1937,6 +1974,21 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         guard sender.selectedSegment >= 0, sender.selectedSegment < AppStatusFooterMode.allCases.count else { return }
 
         AppSettings.saveStatusFooterMode(AppStatusFooterMode.allCases[sender.selectedSegment], defaults: defaults)
+    }
+
+    @objc private func changeSearchHistoryRetention(_ sender: NSComboBox) {
+        saveSearchHistoryRetention(sender)
+    }
+
+    private func saveSearchHistoryRetention(_ sender: NSComboBox) {
+        guard let retention = AppSearchHistoryRetention.parseSettingsTitle(sender.stringValue) else {
+            NSSound.beep()
+            sender.stringValue = AppSettings.searchHistoryRetention(defaults: defaults).settingsTitle
+            return
+        }
+
+        AppSettings.saveSearchHistoryRetention(retention, defaults: defaults)
+        sender.stringValue = retention.settingsTitle
     }
 
     @objc private func changeThemePreviewPreference(_ sender: ThemePreviewSelectorControl) {
@@ -2446,6 +2498,12 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     }
 
     func controlTextDidEndEditing(_ obj: Notification) {
+        if let comboBox = obj.object as? NSComboBox,
+           comboBox.identifier == Self.searchHistoryRetentionIdentifier {
+            saveSearchHistoryRetention(comboBox)
+            return
+        }
+
         guard
             let field = obj.object as? NSTextField,
             field.identifier == Self.exclusionPatternFieldIdentifier

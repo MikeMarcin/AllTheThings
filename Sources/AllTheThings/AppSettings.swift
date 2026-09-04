@@ -27,6 +27,61 @@ enum AppStatusFooterMode: String, CaseIterable {
     }
 }
 
+enum AppSearchHistoryRetention: Equatable {
+    static let defaultEntryCount = 50
+
+    case disabled
+    case limited(Int)
+    case unlimited
+
+    init(storedValue: Int) {
+        switch storedValue {
+        case ..<0:
+            self = .unlimited
+        case 0:
+            self = .disabled
+        default:
+            self = .limited(storedValue)
+        }
+    }
+
+    var storedValue: Int {
+        switch self {
+        case .disabled: 0
+        case let .limited(count): max(count, 1)
+        case .unlimited: -1
+        }
+    }
+
+    var maximumEntryCount: Int? {
+        switch self {
+        case .disabled: 0
+        case let .limited(count): max(count, 1)
+        case .unlimited: nil
+        }
+    }
+
+    var settingsTitle: String {
+        switch self {
+        case .disabled: "Off"
+        case let .limited(count): String(count)
+        case .unlimited: "Unlimited"
+        }
+    }
+
+    static func parseSettingsTitle(_ title: String) -> AppSearchHistoryRetention? {
+        let normalized = title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if ["off", "disabled", "0"].contains(normalized) {
+            return .disabled
+        }
+        if ["unlimited", "infinite", "∞", "-1"].contains(normalized) {
+            return .unlimited
+        }
+        guard let count = Int(normalized), count > 0 else { return nil }
+        return .limited(count)
+    }
+}
+
 enum AppSettings {
     static let allowMultipleInstancesKey = "ATTAllowMultipleInstances"
     static let globalSearchHotKeyEnabledKey = "ATTGlobalSearchHotKeyEnabled"
@@ -56,6 +111,9 @@ enum AppSettings {
     static let indexingSetupCompletedKey = "ATTIndexingSetupCompleted"
     static let exclusionPatternsKey = "ATTExclusionPatterns"
     static let optimizedSortColumnsKey = "ATTOptimizedSortColumns"
+    static let searchHistoryKey = "ATTSearchHistory"
+    static let searchHistoryTimestampsKey = "ATTSearchHistoryTimestamps"
+    static let searchHistoryRetentionKey = "ATTSearchHistoryRetention"
     static let exclusionDefaultsVersionKey = "ATTExclusionDefaultsVersion"
     static let indexedRootDefaultsVersionKey = "ATTIndexedRootDefaultsVersion"
     static let globalSearchHotKeyDidChangeNotification = Notification.Name("com.allthethings.settings.globalSearchHotKeyDidChange")
@@ -70,6 +128,7 @@ enum AppSettings {
     static let appSearchRootsDidChangeNotification = Notification.Name("com.allthethings.settings.appSearchRootsDidChange")
     static let exclusionPatternsDidChangeNotification = Notification.Name("com.allthethings.settings.exclusionPatternsDidChange")
     static let optimizedSortColumnsDidChangeNotification = Notification.Name("com.allthethings.settings.optimizedSortColumnsDidChange")
+    static let searchHistoryRetentionDidChangeNotification = Notification.Name("com.allthethings.settings.searchHistoryRetentionDidChange")
 
     private static let currentExclusionDefaultsVersion = 15
     private static let currentIndexedRootDefaultsVersion = 2
@@ -150,6 +209,7 @@ enum AppSettings {
             diagnosticLogLevelKey: DiagnosticLogLevel.info.rawValue,
             lightMatchColorsKey: defaultMatchColorHexes(isDark: false),
             darkMatchColorsKey: defaultMatchColorHexes(isDark: true),
+            searchHistoryRetentionKey: AppSearchHistoryRetention.defaultEntryCount,
             exclusionPatternsKey: FileExclusionRules.defaultPatterns,
             optimizedSortColumnsKey: SortColumn.optimizedIndexColumns.map(\.rawValue)
         ])
@@ -304,6 +364,42 @@ enum AppSettings {
             ]
         )
         postSettingsDidChangeNotification(statusFooterModeDidChangeNotification, defaults: defaults)
+    }
+
+    static func searchHistoryRetention(defaults: UserDefaults = .standard) -> AppSearchHistoryRetention {
+        AppSearchHistoryRetention(storedValue: defaults.integer(forKey: searchHistoryRetentionKey))
+    }
+
+    static func saveSearchHistoryRetention(
+        _ retention: AppSearchHistoryRetention,
+        defaults: UserDefaults = .standard
+    ) {
+        guard searchHistoryRetention(defaults: defaults) != retention else { return }
+
+        defaults.set(retention.storedValue, forKey: searchHistoryRetentionKey)
+        switch retention {
+        case .disabled:
+            defaults.removeObject(forKey: searchHistoryKey)
+            defaults.removeObject(forKey: searchHistoryTimestampsKey)
+        case let .limited(count):
+            let maximumEntryCount = max(count, 1)
+            if let entries = defaults.stringArray(forKey: searchHistoryKey), entries.count > maximumEntryCount {
+                defaults.set(Array(entries.prefix(maximumEntryCount)), forKey: searchHistoryKey)
+            }
+            if let timestamps = defaults.array(forKey: searchHistoryTimestampsKey),
+               timestamps.count > maximumEntryCount {
+                defaults.set(Array(timestamps.prefix(maximumEntryCount)), forKey: searchHistoryTimestampsKey)
+            }
+        case .unlimited:
+            break
+        }
+        defaults.synchronize()
+        DiagnosticLogger.shared.log(
+            category: "settings",
+            event: "settings.searchHistoryRetentionChanged",
+            fields: ["maximumEntryCount": .publicInt(retention.storedValue)]
+        )
+        postSettingsDidChangeNotification(searchHistoryRetentionDidChangeNotification, defaults: defaults)
     }
 
     static func rememberSortBetweenLaunches(defaults: UserDefaults = .standard) -> Bool {

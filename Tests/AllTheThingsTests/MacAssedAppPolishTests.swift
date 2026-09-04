@@ -6,6 +6,33 @@ import Testing
 @Suite("Mac-assed app polish")
 struct MacAssedAppPolishTests {
     @MainActor
+    @Test("search field handles history shortcuts directly")
+    func searchFieldHandlesHistoryShortcutsDirectly() throws {
+        let searchField = SearchQueryField()
+        var invoked: [String] = []
+        searchField.recallPreviousSearch = { invoked.append("previous") }
+        searchField.recallNextSearch = { invoked.append("next") }
+        searchField.showSearchHistory = { invoked.append("search") }
+
+        #expect(searchField.performKeyEquivalent(with: try keyEvent(
+            characters: "r",
+            modifiers: [.control],
+            keyCode: UInt16(kVK_ANSI_R)
+        )))
+        #expect(searchField.performKeyEquivalent(with: try keyEvent(
+            characters: "r",
+            modifiers: [.control, .shift],
+            keyCode: UInt16(kVK_ANSI_R)
+        )))
+        #expect(searchField.performKeyEquivalent(with: try keyEvent(
+            characters: "y",
+            modifiers: [.command],
+            keyCode: UInt16(kVK_ANSI_Y)
+        )))
+        #expect(invoked == ["previous", "next", "search"])
+    }
+
+    @MainActor
     @Test("main menu exposes standard Mac structure and app commands")
     func mainMenuExposesStandardMacStructureAndAppCommands() throws {
         let delegate = AppDelegate()
@@ -37,6 +64,22 @@ struct MacAssedAppPolishTests {
         #expect(trashItem.keyEquivalentModifierMask.intersection([.command, .option, .shift, .control]) == .command)
         #expect(item(titled: "Close Window", in: fileMenu)?.keyEquivalent == "w")
 
+        let editMenu = try #require(menu(titled: "Edit", in: mainMenu))
+        let undoItem = try #require(item(titled: "Undo", in: editMenu))
+        #expect(undoItem.action == Selector(("undo:")))
+        #expect(undoItem.keyEquivalent == "z")
+        #expect(undoItem.keyEquivalentModifierMask.intersection([.command, .option, .shift, .control]) == .command)
+        let redoItem = try #require(item(titled: "Redo", in: editMenu))
+        #expect(redoItem.action == Selector(("redo:")))
+        #expect(redoItem.keyEquivalent == "z")
+        #expect(redoItem.keyEquivalentModifierMask.intersection([.command, .option, .shift, .control]) == [.command, .shift])
+        let previousSearchItem = try #require(item(titled: "Previous Search", in: editMenu))
+        #expect(previousSearchItem.keyEquivalent == "r")
+        #expect(previousSearchItem.keyEquivalentModifierMask.intersection([.command, .option, .shift, .control]) == .control)
+        let nextSearchItem = try #require(item(titled: "Next Search", in: editMenu))
+        #expect(nextSearchItem.keyEquivalent == "r")
+        #expect(nextSearchItem.keyEquivalentModifierMask.intersection([.command, .option, .shift, .control]) == [.control, .shift])
+
         let viewMenu = try #require(menu(titled: "View", in: mainMenu))
         let matchDetailsItem = try #require(item(titled: "Show Match Details", in: viewMenu))
         #expect(matchDetailsItem.keyEquivalent == "i")
@@ -56,6 +99,30 @@ struct MacAssedAppPolishTests {
         #expect(item(titled: "Minimize", in: windowMenu)?.keyEquivalent == "m")
         #expect(item(titled: "Zoom", in: windowMenu) != nil)
         #expect(item(titled: "Bring All to Front", in: windowMenu) != nil)
+        let undoAction = try #require(undoItem.action)
+        let redoAction = try #require(redoItem.action)
+
+        let editingWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 400, height: 100),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        let searchField = NSSearchField(frame: NSRect(x: 20, y: 20, width: 300, height: 28))
+        editingWindow.contentView?.addSubview(searchField)
+        #expect(editingWindow.makeFirstResponder(searchField))
+        let editor = try #require(searchField.currentEditor() as? NSTextView)
+
+        editor.insertText("atlas", replacementRange: editor.selectedRange)
+        #expect(editor.string == "atlas")
+        #expect(editingWindow.tryToPerform(undoAction, with: undoItem))
+        #expect(editor.string.isEmpty)
+        #expect(editingWindow.tryToPerform(redoAction, with: redoItem))
+        #expect(editor.string == "atlas")
+
+        let searchHistoryItem = try #require(item(titled: "Search History…", in: editMenu))
+        #expect(searchHistoryItem.keyEquivalent == "y")
+        #expect(searchHistoryItem.keyEquivalentModifierMask.intersection([.command, .option, .shift, .control]) == .command)
     }
 
     @MainActor
@@ -79,6 +146,26 @@ struct MacAssedAppPolishTests {
         tableView.keyDown(with: try keyEvent(characters: "c", modifiers: [.command, .option], keyCode: UInt16(kVK_ANSI_C)))
 
         #expect(actions == ["open", "quickLook", "open", "getInfo", "trash", "copy", "copyPath"])
+    }
+
+    @MainActor
+    @Test("history table restores copies and prunes with standard keys")
+    func historyTableRestoresCopiesAndPrunesWithStandardKeys() throws {
+        let tableView = SearchHistoryTableView()
+        var actions: [String] = []
+        tableView.restoreAction = { actions.append("restore") }
+        tableView.deleteAction = { actions.append("delete") }
+        tableView.copyAction = { actions.append("copy") }
+
+        tableView.keyDown(with: try keyEvent(characters: "\r", keyCode: UInt16(kVK_Return)))
+        tableView.keyDown(with: try keyEvent(
+            characters: "c",
+            modifiers: .command,
+            keyCode: UInt16(kVK_ANSI_C)
+        ))
+        tableView.keyDown(with: try keyEvent(characters: "\u{8}", keyCode: UInt16(kVK_Delete)))
+
+        #expect(actions == ["restore", "copy", "delete"])
     }
 
     @Test("context menu target row only replaces selection when unselected")

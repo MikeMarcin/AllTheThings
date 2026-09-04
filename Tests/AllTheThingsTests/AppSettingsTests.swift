@@ -156,6 +156,33 @@ struct AppSettingsTests {
         #expect(!defaults.bool(forKey: AppSettings.rememberSortBetweenLaunchesKey))
     }
 
+    @Test("search history retention defaults to fifty and supports bounded off and unlimited modes")
+    func searchHistoryRetentionModes() throws {
+        let (defaults, suiteName) = try makeDefaults()
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        AppSettings.registerDefaults(defaults)
+        #expect(AppSettings.searchHistoryRetention(defaults: defaults) == .limited(50))
+        #expect(AppSearchHistoryRetention.parseSettingsTitle("75") == .limited(75))
+        #expect(AppSearchHistoryRetention.parseSettingsTitle("infinite") == .unlimited)
+
+        defaults.set((0..<80).map { "query-\($0)" }, forKey: AppSettings.searchHistoryKey)
+        defaults.set((0..<80).map(Double.init), forKey: AppSettings.searchHistoryTimestampsKey)
+        AppSettings.saveSearchHistoryRetention(.limited(25), defaults: defaults)
+        #expect(defaults.stringArray(forKey: AppSettings.searchHistoryKey)?.count == 25)
+        #expect(defaults.array(forKey: AppSettings.searchHistoryTimestampsKey)?.count == 25)
+
+        AppSettings.saveSearchHistoryRetention(.unlimited, defaults: defaults)
+        #expect(AppSettings.searchHistoryRetention(defaults: defaults) == .unlimited)
+
+        AppSettings.saveSearchHistoryRetention(.disabled, defaults: defaults)
+        #expect(AppSettings.searchHistoryRetention(defaults: defaults) == .disabled)
+        #expect(defaults.object(forKey: AppSettings.searchHistoryKey) == nil)
+        #expect(defaults.object(forKey: AppSettings.searchHistoryTimestampsKey) == nil)
+    }
+
     @Test("legacy default indexed roots move Applications to app search defaults")
     func legacyDefaultIndexedRootsMoveApplicationsToAppSearchDefaults() throws {
         let (defaults, suiteName) = try makeDefaults()

@@ -1,6 +1,7 @@
 @testable import AllTheThings
 import AppKit
 import ATTCore
+import Carbon.HIToolbox
 import Foundation
 import Testing
 
@@ -36,6 +37,10 @@ struct SearchToolbarTests {
         let contentTooltips = Set(buttons(in: view).compactMap(\.toolTip))
         let titlebarTooltips = Set(toolbar.items.compactMap(\.toolTip))
         let centeredTitleLabels = textFields(in: view).filter { $0.stringValue == window.title }
+        let searchField = try #require(textFields(in: view).compactMap { $0 as? SearchQueryField }.first)
+        let historyButton = try #require(buttons(in: view).compactMap { $0 as? SearchHistoryPopUpButton }.first)
+        let resultsTable = try #require(tableViews(in: view).first { !($0 is SearchHistoryTableView) })
+        let historyTable = try #require(tableViews(in: view).compactMap { $0 as? SearchHistoryTableView }.first)
 
         #expect(window.toolbarStyle == .unified)
         #expect(window.titleVisibility == .hidden)
@@ -51,8 +56,409 @@ struct SearchToolbarTests {
         #expect(titlebarTooltips.contains("Copy selected path"))
         #expect(!contentTooltips.contains("Open Settings"))
         #expect(!contentTooltips.contains("Open Insights"))
+        #expect(contentTooltips.contains("Search History (Command-Y); recall with Control-R"))
+        #expect(searchField.nextKeyView === historyButton)
+        #expect(historyButton.nextKeyView === resultsTable)
+        #expect(resultsTable.nextKeyView === searchField)
+        #expect(historyTable.nextKeyView === searchField)
+        #expect(historyButton.canBecomeKeyView)
         #expect(!titlebarTooltips.contains("Add indexed folder"))
         #expect(!titlebarTooltips.contains("Reindex scopes"))
+    }
+
+    @Test("search history stores one clean, deduplicated entry per committed query")
+    func searchHistoryStoresOneCleanDeduplicatedEntryPerCommittedQuery() {
+        var history = SearchHistory(entries: ["  README  ", "readme", "", "kind:folder", "history:ignored"])
+
+        #expect(history.entries == ["README", "kind:folder"])
+        let recordedEmptyQuery = history.record("   ")
+        let recordedCaseVariant = history.record("readme", timestamp: Date(timeIntervalSince1970: 1))
+        #expect(!recordedEmptyQuery)
+        #expect(recordedCaseVariant)
+        #expect(history.entries == ["readme", "kind:folder"])
+        let recordedImmediateDuplicate = history.record("readme", timestamp: Date(timeIntervalSince1970: 2))
+        let recordedHistoryModeQuery = history.record("history:new query")
+        #expect(recordedImmediateDuplicate)
+        #expect(history.entries == ["readme", "kind:folder"])
+        #expect(!recordedHistoryModeQuery)
+    }
+
+    @Test("history mode parses a filter and fuzzy matches recent queries")
+    func historyModeParsesAndFuzzyMatchesRecentQueries() {
+        #expect(SearchHistoryQuery.parse("history:") == SearchHistoryQuery(searchText: ""))
+        #expect(SearchHistoryQuery.parse(" HIST:  rdme ") == SearchHistoryQuery(searchText: "rdme"))
+        #expect(SearchHistoryQuery.parse("name:history:") == nil)
+
+        let history = SearchHistory(entries: [
+            "release notes ext:md",
+            "README ext:md",
+            "kind:folder project"
+        ])
+        #expect(history.matching("") == history.entries)
+        #expect(history.matching("rdme") == ["README ext:md"])
+        #expect(history.matching("project") == ["kind:folder project"])
+    }
+
+    @Test("search history sorts by query and timestamp")
+    func searchHistorySortsByQueryAndTimestamp() {
+        let history = SearchHistory(
+            entries: ["bravo", "Alpha", "charlie"],
+            timestamps: [200, 100, 300]
+        )
+
+        #expect(history.matchingEntries("", sort: SearchHistorySort()).map(\.query)
+            == ["charlie", "bravo", "Alpha"])
+        #expect(history.matchingEntries(
+            "",
+            sort: SearchHistorySort(column: .timestamp, ascending: true)
+        ).map(\.query) == ["Alpha", "bravo", "charlie"])
+        #expect(history.matchingEntries(
+            "",
+            sort: SearchHistorySort(column: .query, ascending: true)
+        ).map(\.query) == ["Alpha", "bravo", "charlie"])
+    }
+
+    @Test("one search history entry can be removed")
+    func oneSearchHistoryEntryCanBeRemoved() {
+        var history = SearchHistory(entries: ["README", "atlas", "kind:folder"])
+
+        let removedAtlas = history.remove("ATLAS")
+        #expect(removedAtlas)
+        #expect(history.entries == ["README", "kind:folder"])
+        let removedMissing = history.remove("missing")
+        #expect(!removedMissing)
+    }
+
+    @Test("history popup participates in the key view loop")
+    @MainActor
+    func historyPopUpParticipatesInTheKeyViewLoop() {
+        let button = SearchHistoryPopUpButton(frame: .zero, pullsDown: true)
+        #expect(button.canBecomeKeyView)
+    }
+
+    @Test("Tab cycles from the results table back to the search field")
+    @MainActor
+    func tabCyclesFromResultsTableBackToSearchField() throws {
+        let index = FileIndex(
+            applicationName: "AllTheThingsResultsTableTabTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        defer {
+            try? FileManager.default.removeItem(at: index.dataDirectoryURL)
+        }
+
+        let controller = SearchWindowController(index: index)
+        let window = try #require(controller.window)
+        let view = try #require(window.contentViewController?.view)
+        let searchField = try #require(textFields(in: view).compactMap { $0 as? SearchQueryField }.first)
+        let resultsTable = try #require(tableViews(in: view).first { !($0 is SearchHistoryTableView) })
+
+        #expect(window.makeFirstResponder(resultsTable))
+        resultsTable.keyDown(with: try keyEvent(
+            characters: "\t",
+            modifiers: [],
+            keyCode: UInt16(kVK_Tab)
+        ))
+
+        #expect(window.firstResponder === searchField.currentEditor())
+    }
+
+    @Test("history dropdown exposes native Tab traversal")
+    @MainActor
+    func historyDropdownExposesNativeTabTraversal() async throws {
+        let (defaults, suiteName) = try makeDefaults()
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        defaults.set(["README"], forKey: AppSettings.searchHistoryKey)
+
+        let index = FileIndex(
+            applicationName: "AllTheThingsSearchHistoryMenuTabTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        defer {
+            try? FileManager.default.removeItem(at: index.dataDirectoryURL)
+        }
+
+        let controller = SearchWindowController(index: index, defaults: defaults)
+        let window = try #require(controller.window)
+        let view = try #require(window.contentViewController?.view)
+        let historyButton = try #require(buttons(in: view).compactMap { $0 as? SearchHistoryPopUpButton }.first)
+        let resultsTable = try #require(tableViews(in: view).first { !($0 is SearchHistoryTableView) })
+        let menu = try #require(historyButton.menu)
+        let hiddenCommandTitles = Set([
+            "Traverse Search Controls",
+            "Delete Highlighted Search"
+        ])
+        let hiddenCommands = menu.items.filter { hiddenCommandTitles.contains($0.title) }
+        #expect(hiddenCommands.allSatisfy { $0.allowsKeyEquivalentWhenHidden })
+        #expect(hiddenCommands.contains {
+            $0.keyEquivalent == "\t" && $0.keyEquivalentModifierMask.isEmpty
+        })
+        #expect(SearchHistoryMenuFocusDirection.resolve(modifiers: []) == .forward)
+        #expect(SearchHistoryMenuFocusDirection.resolve(modifiers: [.shift]) == .backward)
+
+        #expect(window.makeFirstResponder(historyButton))
+        #expect(menu.performKeyEquivalent(with: try keyEvent(
+            characters: "\t",
+            modifiers: [],
+            keyCode: UInt16(kVK_Tab)
+        )))
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(window.firstResponder === resultsTable)
+    }
+
+    @Test("Delete removes the highlighted query from the history dropdown")
+    @MainActor
+    func deleteRemovesHighlightedQueryFromHistoryDropdown() async throws {
+        let (defaults, suiteName) = try makeDefaults()
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        defaults.set(["README", "kind:folder"], forKey: AppSettings.searchHistoryKey)
+
+        let index = FileIndex(
+            applicationName: "AllTheThingsSearchHistoryMenuDeleteTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        defer {
+            try? FileManager.default.removeItem(at: index.dataDirectoryURL)
+        }
+
+        let controller = SearchWindowController(index: index, defaults: defaults)
+        let view = try #require(controller.window?.contentViewController?.view)
+        let historyButton = try #require(buttons(in: view).compactMap { $0 as? NSPopUpButton }.first {
+            $0.toolTip == "Search History (Command-Y); recall with Control-R"
+        })
+        let menu = try #require(historyButton.menu)
+        let readmeItem = try #require(menu.items.first { $0.representedObject as? String == "README" })
+        menu.delegate?.menuWillOpen?(menu)
+        defer { menu.delegate?.menuDidClose?(menu) }
+        menu.delegate?.menu?(menu, willHighlight: readmeItem)
+
+        #expect(menu.performKeyEquivalent(with: try keyEvent(
+            characters: "\u{8}",
+            modifiers: [],
+            keyCode: UInt16(kVK_Delete)
+        )))
+        try await Task.sleep(for: .milliseconds(20))
+
+        #expect(defaults.stringArray(forKey: AppSettings.searchHistoryKey) == ["kind:folder"])
+        #expect(!menu.items.contains { $0.representedObject as? String == "README" })
+    }
+
+    @Test("search history retains only the most recent fifty committed queries")
+    func searchHistoryRetainsOnlyTheMostRecentFiftyCommittedQueries() {
+        var history = SearchHistory()
+        for index in 0..<75 {
+            history.record("query-\(index)")
+        }
+
+        #expect(history.entries.count == SearchHistory.maximumEntryCount)
+        #expect(history.entries.first == "query-74")
+        #expect(history.entries.last == "query-25")
+    }
+
+    @Test("search history supports custom and unlimited retention")
+    func searchHistorySupportsCustomAndUnlimitedRetention() {
+        var bounded = SearchHistory()
+        for index in 0..<12 {
+            bounded.record("query-\(index)", maximumEntryCount: 5)
+        }
+        #expect(bounded.entries == (7..<12).reversed().map { "query-\($0)" })
+
+        var unlimited = SearchHistory()
+        for index in 0..<75 {
+            unlimited.record("query-\(index)", maximumEntryCount: nil)
+        }
+        #expect(unlimited.entries.count == 75)
+        #expect(SearchHistory(entries: unlimited.entries, maximumEntryCount: nil).entries.count == 75)
+    }
+
+    @Test("search history commits one entry after typing settles without waiting for refinement")
+    @MainActor
+    func searchHistoryCommitsOneEntryAfterTypingSettlesWithoutWaitingForRefinement() async throws {
+        let (defaults, suiteName) = try makeDefaults()
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        let index = FileIndex(
+            applicationName: "AllTheThingsSearchHistoryTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        defer {
+            try? FileManager.default.removeItem(at: index.dataDirectoryURL)
+        }
+
+        let controller = SearchWindowController(index: index, defaults: defaults)
+        let view = try #require(controller.window?.contentViewController?.view)
+        let searchField = try #require(textFields(in: view).compactMap { $0 as? SearchQueryField }.first)
+        let historyButton = try #require(buttons(in: view).compactMap { $0 as? NSPopUpButton }.first {
+            $0.toolTip == "Search History (Command-Y); recall with Control-R"
+        })
+        #expect(controller.window?.makeFirstResponder(searchField) == true)
+        let editor = try #require(searchField.currentEditor() as? NSTextView)
+
+        editor.insertText("a", replacementRange: editor.selectedRange)
+        editor.insertText("tlas", replacementRange: editor.selectedRange)
+        #expect(defaults.object(forKey: AppSettings.searchHistoryKey) == nil)
+        try await Task.sleep(for: .milliseconds(3_250))
+
+        #expect(defaults.stringArray(forKey: AppSettings.searchHistoryKey) == ["atlas"])
+        let timestamps = defaults.array(forKey: AppSettings.searchHistoryTimestampsKey) as? [NSNumber]
+        #expect((timestamps?.first?.doubleValue ?? 0) > 0)
+        #expect(historyButton.itemTitles.contains("atlas"))
+    }
+
+    @Test("command Y enters searchable history mode and Return restores a match")
+    @MainActor
+    func commandYEntersSearchableHistoryModeAndReturnRestoresMatch() throws {
+        let (defaults, suiteName) = try makeDefaults()
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        defaults.set([
+            "release notes ext:md",
+            "README ext:md",
+            "kind:folder project"
+        ], forKey: AppSettings.searchHistoryKey)
+
+        let index = FileIndex(
+            applicationName: "AllTheThingsSearchHistoryModeTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        defer {
+            try? FileManager.default.removeItem(at: index.dataDirectoryURL)
+        }
+
+        let controller = SearchWindowController(index: index, defaults: defaults)
+        let contentController = try #require(controller.window?.contentViewController)
+        let view = contentController.view
+        let searchField = try #require(textFields(in: view).compactMap { $0 as? NSSearchField }.first)
+        #expect(controller.window?.makeFirstResponder(searchField) == true)
+        let editor = try #require(searchField.currentEditor() as? NSTextView)
+
+        #expect(contentController.tryToPerform(NSSelectorFromString("showSearchHistory:"), with: nil))
+        #expect(editor.string == "history:")
+        let historyTable = try #require(tableViews(in: view).compactMap { $0 as? SearchHistoryTableView }.first)
+        #expect(historyTable.numberOfRows == 3)
+        #expect(historyTable.headerView != nil)
+        #expect(historyTable.usesAlternatingRowBackgroundColors)
+        #expect(historyTable.allowsMultipleSelection)
+        #expect(historyTable.tableColumns.map(\.title) == ["Search", "Searched"])
+
+        historyTable.sortDescriptors = [NSSortDescriptor(key: "query", ascending: true)]
+        let firstQueryCell = try #require(
+            historyTable.view(atColumn: 0, row: 0, makeIfNecessary: true) as? NSTableCellView
+        )
+        #expect(firstQueryCell.textField?.stringValue == "kind:folder project")
+
+        editor.insertText("rdme", replacementRange: editor.selectedRange)
+        #expect(editor.string == "history:rdme")
+        #expect(historyTable.numberOfRows == 1)
+        #expect(searchField.performKeyEquivalent(with: try keyEvent(
+            characters: "y",
+            modifiers: [.command],
+            keyCode: UInt16(kVK_ANSI_Y)
+        )))
+        #expect(editor.string == "history:")
+        #expect(historyTable.numberOfRows == 3)
+
+        editor.insertText("rdme", replacementRange: editor.selectedRange)
+        #expect(editor.string == "history:rdme")
+        #expect(historyTable.numberOfRows == 1)
+        #expect(contentController.tryToPerform(
+            NSSelectorFromString("restoreSelectedSearchHistoryEntry:"),
+            with: nil
+        ))
+        #expect(editor.string == "README ext:md")
+        #expect(defaults.stringArray(forKey: AppSettings.searchHistoryKey)?.first == "README ext:md")
+    }
+
+    @Test("Control Shift R returns from a recalled search to the draft")
+    @MainActor
+    func controlShiftRReturnsFromRecalledSearchToDraft() throws {
+        let (defaults, suiteName) = try makeDefaults()
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        defaults.set(["README", "kind:folder"], forKey: AppSettings.searchHistoryKey)
+
+        let index = FileIndex(
+            applicationName: "AllTheThingsSearchHistoryNavigationTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        defer {
+            try? FileManager.default.removeItem(at: index.dataDirectoryURL)
+        }
+
+        let controller = SearchWindowController(index: index, defaults: defaults)
+        let view = try #require(controller.window?.contentViewController?.view)
+        let searchField = try #require(textFields(in: view).compactMap { $0 as? SearchQueryField }.first)
+        #expect(controller.window?.makeFirstResponder(searchField) == true)
+        let editor = try #require(searchField.currentEditor() as? NSTextView)
+        editor.insertText("draft", replacementRange: editor.selectedRange)
+
+        #expect(searchField.performKeyEquivalent(with: try keyEvent(
+            characters: "r",
+            modifiers: [.control],
+            keyCode: UInt16(kVK_ANSI_R)
+        )))
+        #expect(editor.string == "README")
+        #expect(searchField.performKeyEquivalent(with: try keyEvent(
+            characters: "r",
+            modifiers: [.control, .shift],
+            keyCode: UInt16(kVK_ANSI_R)
+        )))
+        #expect(editor.string == "draft")
+    }
+
+    @Test("history mode copies and deletes multiple selected searches")
+    @MainActor
+    func historyModeCopiesAndDeletesMultipleSelectedSearches() throws {
+        let (defaults, suiteName) = try makeDefaults()
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        defaults.set(["README", "kind:folder"], forKey: AppSettings.searchHistoryKey)
+
+        let index = FileIndex(
+            applicationName: "AllTheThingsSearchHistoryDeleteTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        defer {
+            try? FileManager.default.removeItem(at: index.dataDirectoryURL)
+        }
+
+        let controller = SearchWindowController(index: index, defaults: defaults)
+        let contentController = try #require(controller.window?.contentViewController)
+        let view = contentController.view
+        #expect(contentController.tryToPerform(NSSelectorFromString("showSearchHistory:"), with: nil))
+        let historyTable = try #require(tableViews(in: view).compactMap { $0 as? SearchHistoryTableView }.first)
+        #expect(historyTable.numberOfRows == 2)
+        historyTable.selectRowIndexes(IndexSet(integersIn: 0..<2), byExtendingSelection: false)
+
+        let contextMenu = try #require(historyTable.menu)
+        contextMenu.delegate?.menuNeedsUpdate?(contextMenu)
+        #expect(contextMenu.items.map(\.title) == ["Copy", "", "Delete Searches from History"])
+
+        historyTable.keyDown(with: try keyEvent(
+            characters: "c",
+            modifiers: [.command],
+            keyCode: UInt16(kVK_ANSI_C)
+        ))
+        #expect(NSPasteboard.general.string(forType: .string) == "README\nkind:folder")
+
+        historyTable.keyDown(with: try keyEvent(
+            characters: "\u{8}",
+            modifiers: [],
+            keyCode: UInt16(kVK_Delete)
+        ))
+
+        #expect(historyTable.numberOfRows == 0)
+        #expect(defaults.object(forKey: AppSettings.searchHistoryKey) == nil)
+        #expect(defaults.object(forKey: AppSettings.searchHistoryTimestampsKey) == nil)
     }
 
     @Test("expanded mascot layout keeps visible pixels onscreen")
@@ -582,6 +988,34 @@ struct SearchToolbarTests {
         return view.subviews.reduce(current) { partial, subview in
             partial + textFields(in: subview)
         }
+    }
+
+    @MainActor
+    private func tableViews(in view: NSView?) -> [NSTableView] {
+        guard let view else { return [] }
+        let current = (view as? NSTableView).map { [$0] } ?? []
+        return view.subviews.reduce(current) { partial, subview in
+            partial + tableViews(in: subview)
+        }
+    }
+
+    private func keyEvent(
+        characters: String,
+        modifiers: NSEvent.ModifierFlags,
+        keyCode: UInt16
+    ) throws -> NSEvent {
+        try #require(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: modifiers,
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: characters,
+            charactersIgnoringModifiers: characters,
+            isARepeat: false,
+            keyCode: keyCode
+        ))
     }
 
     @MainActor

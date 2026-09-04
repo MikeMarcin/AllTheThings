@@ -30,6 +30,7 @@ struct SettingsWindowTests {
         #expect(generalStrings.contains("Diagnostic detail"))
         #expect(generalStrings.contains("Status footer"))
         #expect(generalStrings.contains("Remember table sort between launches"))
+        #expect(generalStrings.contains("Search history retention"))
         #expect(!generalStrings.contains("Global search hotkey"))
         #expect(!generalStrings.contains("Global app search hotkey"))
         #expect(!generalStrings.contains { $0.contains("Full Disk Access") })
@@ -118,6 +119,15 @@ struct SettingsWindowTests {
         )
         #expect(rememberSwitch.state == .off)
         #expect(!AppSettings.rememberSortBetweenLaunches(defaults: defaults))
+
+        let historyRetention = try #require(
+            firstView(withIdentifier: "searchHistoryRetentionComboBox", in: controller.window?.contentView)
+                as? NSComboBox
+        )
+        #expect(historyRetention.stringValue == "50")
+        historyRetention.stringValue = "75"
+        _ = historyRetention.sendAction(historyRetention.action, to: historyRetention.target)
+        #expect(AppSettings.searchHistoryRetention(defaults: defaults) == .limited(75))
 
         rememberSwitch.state = .on
         _ = rememberSwitch.sendAction(rememberSwitch.action, to: rememberSwitch.target)

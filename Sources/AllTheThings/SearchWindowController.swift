@@ -1,5 +1,6 @@
 import AppKit
 @_spi(ATTInternal) import ATTCore
+import Carbon.HIToolbox
 import CoreServices
 import QuartzCore
 import UniformTypeIdentifiers
@@ -347,6 +348,251 @@ enum SearchWindowPresentation {
     }
 }
 
+struct SearchHistoryQuery: Equatable, Sendable {
+    let searchText: String
+
+    static func parse(_ query: String) -> SearchHistoryQuery? {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let colon = trimmed.firstIndex(of: ":") else { return nil }
+        let prefix = trimmed[..<colon].lowercased()
+        guard ["history", "hist"].contains(prefix) else { return nil }
+
+        let searchText = trimmed[trimmed.index(after: colon)...]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return SearchHistoryQuery(searchText: searchText)
+    }
+}
+
+enum SearchHistoryColumn: String, Sendable {
+    case query
+    case timestamp
+
+    var title: String {
+        switch self {
+        case .query: "Search"
+        case .timestamp: "Searched"
+        }
+    }
+}
+
+enum SearchHistoryMenuFocusDirection: Equatable {
+    case forward
+    case backward
+
+    static func resolve(modifiers: NSEvent.ModifierFlags) -> Self {
+        modifiers.contains(.shift) ? .backward : .forward
+    }
+}
+
+struct SearchHistorySort: Equatable, Sendable {
+    var column: SearchHistoryColumn = .timestamp
+    var ascending = false
+}
+
+struct SearchHistory: Equatable, Sendable {
+    struct Entry: Equatable, Sendable {
+        let query: String
+        let timestamp: Date?
+    }
+
+    static let maximumEntryCount = AppSearchHistoryRetention.defaultEntryCount
+
+    private(set) var records: [Entry]
+    private var textIndex: InMemoryTextSearchIndex
+    private var queryAscendingIndices: [Int]
+    private var queryDescendingIndices: [Int]
+    private var timestampAscendingIndices: [Int]
+    private var timestampDescendingIndices: [Int]
+
+    var entries: [String] {
+        records.map(\.query)
+    }
+
+    var persistedTimestamps: [TimeInterval] {
+        records.map { $0.timestamp?.timeIntervalSince1970 ?? 0 }
+    }
+
+    init(
+        entries: [String] = [],
+        timestamps: [TimeInterval] = [],
+        maximumEntryCount: Int? = SearchHistory.maximumEntryCount
+    ) {
+        self.records = []
+        self.textIndex = InMemoryTextSearchIndex(texts: [])
+        self.queryAscendingIndices = []
+        self.queryDescendingIndices = []
+        self.timestampAscendingIndices = []
+        self.timestampDescendingIndices = []
+        for (index, entry) in entries.enumerated() {
+            if let maximumEntryCount, records.count >= max(maximumEntryCount, 0) {
+                break
+            }
+            let timestampValue = timestamps.indices.contains(index) ? timestamps[index] : 0
+            let timestamp = timestampValue.isFinite && timestampValue > 0
+                ? Date(timeIntervalSince1970: timestampValue)
+                : nil
+            appendSanitized(entry, timestamp: timestamp)
+        }
+        rebuildIndexes()
+    }
+
+    @discardableResult
+    mutating func record(
+        _ query: String,
+        timestamp: Date = Date(),
+        maximumEntryCount: Int? = SearchHistory.maximumEntryCount
+    ) -> Bool {
+        let previousRecords = records
+        if let maximumEntryCount, maximumEntryCount <= 0 {
+            records.removeAll()
+            rebuildIndexes()
+            return records != previousRecords
+        }
+        guard let query = Self.sanitized(query) else { return false }
+        guard SearchHistoryQuery.parse(query) == nil else { return false }
+
+        let key = Self.canonicalKey(query)
+        records.removeAll { Self.canonicalKey($0.query) == key }
+        records.insert(Entry(query: query, timestamp: timestamp), at: 0)
+        if let maximumEntryCount {
+            records = Array(records.prefix(maximumEntryCount))
+        }
+        rebuildIndexes()
+        return records != previousRecords
+    }
+
+    mutating func removeAll() {
+        records.removeAll()
+        rebuildIndexes()
+    }
+
+    @discardableResult
+    mutating func trim(maximumEntryCount: Int?) -> Bool {
+        guard let maximumEntryCount else { return false }
+        let previousRecords = records
+        records = Array(records.prefix(max(maximumEntryCount, 0)))
+        if records != previousRecords {
+            rebuildIndexes()
+        }
+        return records != previousRecords
+    }
+
+    @discardableResult
+    mutating func remove(_ query: String) -> Bool {
+        remove([query])
+    }
+
+    @discardableResult
+    mutating func remove(_ queries: [String]) -> Bool {
+        let keys = Set(queries.compactMap(Self.sanitized).map(Self.canonicalKey))
+        guard !keys.isEmpty else { return false }
+        let previousCount = records.count
+        records.removeAll { keys.contains(Self.canonicalKey($0.query)) }
+        if records.count != previousCount {
+            rebuildIndexes()
+        }
+        return records.count != previousCount
+    }
+
+    func matching(_ searchText: String) -> [String] {
+        matchingEntries(searchText).map(\.query)
+    }
+
+    func matchingEntries(_ searchText: String, sort: SearchHistorySort = SearchHistorySort()) -> [Entry] {
+        guard let searchText = Self.sanitized(searchText) else {
+            return sortedEntries(using: sort)
+        }
+
+        return textIndex.matchingIndices(for: searchText).map { index in
+            (records[index], index)
+        }
+        .sorted { lhs, rhs in
+            let comparison = Self.compare(lhs.0, rhs.0, column: sort.column)
+            if comparison == .orderedSame {
+                return lhs.1 < rhs.1
+            }
+            return sort.ascending ? comparison == .orderedAscending : comparison == .orderedDescending
+        }
+        .map(\.0)
+    }
+
+    private func sortedEntries(using sort: SearchHistorySort) -> [Entry] {
+        let indices: [Int]
+        switch (sort.column, sort.ascending) {
+        case (.query, true):
+            indices = queryAscendingIndices
+        case (.query, false):
+            indices = queryDescendingIndices
+        case (.timestamp, true):
+            indices = timestampAscendingIndices
+        case (.timestamp, false):
+            indices = timestampDescendingIndices
+        }
+        return indices.map { records[$0] }
+    }
+
+    func index(matching query: String) -> Int? {
+        guard let query = Self.sanitized(query) else { return nil }
+        let key = Self.canonicalKey(query)
+        return records.firstIndex { Self.canonicalKey($0.query) == key }
+    }
+
+    private mutating func appendSanitized(_ rawEntry: String, timestamp: Date?) {
+        guard let entry = Self.sanitized(rawEntry) else { return }
+        guard SearchHistoryQuery.parse(entry) == nil else { return }
+        let key = Self.canonicalKey(entry)
+        guard !records.contains(where: { Self.canonicalKey($0.query) == key }) else { return }
+        records.append(Entry(query: entry, timestamp: timestamp))
+    }
+
+    private static func compare(
+        _ lhs: Entry,
+        _ rhs: Entry,
+        column: SearchHistoryColumn
+    ) -> ComparisonResult {
+        switch column {
+        case .query:
+            return lhs.query.localizedStandardCompare(rhs.query)
+        case .timestamp:
+            switch (lhs.timestamp, rhs.timestamp) {
+            case let (lhs?, rhs?):
+                return lhs.compare(rhs)
+            case (_?, nil):
+                return .orderedDescending
+            case (nil, _?):
+                return .orderedAscending
+            case (nil, nil):
+                return .orderedSame
+            }
+        }
+    }
+
+    private static func sanitized(_ query: String) -> String? {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func canonicalKey(_ query: String) -> String {
+        FuzzyMatcher.normalize(query)
+    }
+
+    private mutating func rebuildIndexes() {
+        textIndex = InMemoryTextSearchIndex(texts: entries)
+        queryAscendingIndices = sortedIndices(for: .query, ascending: true)
+        queryDescendingIndices = sortedIndices(for: .query, ascending: false)
+        timestampAscendingIndices = sortedIndices(for: .timestamp, ascending: true)
+        timestampDescendingIndices = sortedIndices(for: .timestamp, ascending: false)
+    }
+
+    private func sortedIndices(for column: SearchHistoryColumn, ascending: Bool) -> [Int] {
+        records.indices.sorted { lhs, rhs in
+            let comparison = Self.compare(records[lhs], records[rhs], column: column)
+            if comparison == .orderedSame { return lhs < rhs }
+            return ascending ? comparison == .orderedAscending : comparison == .orderedDescending
+        }
+    }
+}
+
 enum SearchRunReconciliation {
     nonisolated static func canApplyResponse(generationMatches: Bool, tokenMatches: Bool) -> Bool {
         generationMatches && tokenMatches
@@ -687,8 +933,8 @@ final class SearchWindowController: NSWindowController {
         static let visibleFrameInset: CGFloat = 64
     }
 
-    init(index: FileIndex) {
-        let viewController = SearchViewController(index: index)
+    init(index: FileIndex, defaults: UserDefaults = .standard) {
+        let viewController = SearchViewController(index: index, defaults: defaults)
         let window = NSWindow(
             contentRect: NSRect(origin: .zero, size: Self.startupContentSize()),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
@@ -967,6 +1213,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     private enum SearchScheduling {
         static let unoptimizedIndexingSearchBudget: TimeInterval = 0.75
+    }
+
+    private enum SearchHistoryTiming {
+        static let stableQueryCommitDelay: TimeInterval = 3
     }
 
     private final class SearchBudgetTimeout: @unchecked Sendable {
@@ -1249,11 +1499,16 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private let explanationQueue = DispatchQueue(label: "att.search.explain", qos: .utility)
     private let fseventFilterQueue = DispatchQueue(label: "att.fsevents.filter", qos: .utility)
     private let applicationSearchCatalog = ApplicationSearchCatalog()
-    private let defaults = UserDefaults.standard
+    private let defaults: UserDefaults
 
-    private let searchField = NSSearchField()
+    private let searchField = SearchQueryField()
+    private let searchHistoryButton = SearchHistoryPopUpButton(frame: .zero, pullsDown: true)
     private let setupSuggestionPanel = SetupSuggestionPanelView()
     private let tableView = FileTableView()
+    private let searchHistoryContainer = NSView()
+    private let searchHistoryScrollView = NSScrollView()
+    private let searchHistoryTableView = SearchHistoryTableView()
+    private let searchHistoryEmptyLabel = NSTextField(labelWithString: "")
     private let headerMenu = NSMenu()
     private let scrollView = NSScrollView()
     private let mascotSlotView = ClickableMascotView()
@@ -1302,6 +1557,16 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var displayedSearchSignature: SearchSignature?
     private var displayedSearchSnapshotRevision: UInt64?
     private var statusPreviewSearchText: String?
+    private var searchHistory: SearchHistory
+    private var searchHistoryRetention: AppSearchHistoryRetention
+    private var searchHistoryNavigationIndex: Int?
+    private var searchHistoryNavigationDraft: String?
+    private var searchHistoryModeDraft: String?
+    private var searchHistoryMatches: [SearchHistory.Entry] = []
+    private var searchHistorySort = SearchHistorySort()
+    private var isApplyingSearchHistory = false
+    private nonisolated(unsafe) var pendingSearchHistoryCommit: DispatchWorkItem?
+    private var highlightedSearchHistoryMenuQuery: String?
     private var sortSpec: SortSpec
     private var visibleColumns: Set<Column>
     private var indexedRoots: [URL]
@@ -1492,11 +1757,12 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         return formatter
     }()
 
-    init(index: FileIndex) {
-        let defaults = UserDefaults.standard
+    init(index: FileIndex, defaults: UserDefaults) {
         AppSettings.registerDefaults(defaults)
         let visibleColumns = Self.loadVisibleColumns(defaults: defaults)
+        let searchHistoryRetention = AppSettings.searchHistoryRetention(defaults: defaults)
         self.index = index
+        self.defaults = defaults
         index.updateOptimizedSortColumns(AppSettings.optimizedSortColumns(defaults: defaults))
         self.indexStats = index.currentStats()
         self.visibleColumns = visibleColumns
@@ -1506,6 +1772,14 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         self.activeIndexRootPaths = index.allRoots().map(\.standardizedFileURL.path)
         self.activeIndexExclusionPatterns = index.allExclusionPatterns()
         self.rootDisplayNames = Self.rootDisplayNames(for: self.indexedRoots.map { $0.standardizedFileURL.path })
+        self.searchHistoryRetention = searchHistoryRetention
+        self.searchHistory = SearchHistory(
+            entries: defaults.stringArray(forKey: AppSettings.searchHistoryKey) ?? [],
+            timestamps: (defaults.array(forKey: AppSettings.searchHistoryTimestampsKey) ?? []).map {
+                ($0 as? NSNumber)?.doubleValue ?? 0
+            },
+            maximumEntryCount: searchHistoryRetention.maximumEntryCount
+        )
         self.highlightsSearchText = defaults.bool(forKey: AppSettings.highlightSearchTextKey)
         self.showsHiddenFiles = defaults.bool(forKey: AppSettings.showHiddenFilesKey)
         self.statusFooterMode = AppSettings.statusFooterMode(defaults: defaults)
@@ -1522,6 +1796,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         memoryStatusTask?.cancel()
         processResourceTask?.cancel()
         activeExplanationToken.cancel()
+        pendingSearchHistoryCommit?.cancel()
         pendingMascotExpansion?.cancel()
         pendingZeroRowRootRecoveryWorkItem?.cancel()
         NotificationCenter.default.removeObserver(self)
@@ -1536,6 +1811,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let rootView = ThemedBackgroundView()
         rootView.appearanceDidChange = { [weak self] in
             self?.tableView.reloadData()
+            self?.searchHistoryTableView.reloadData()
         }
         view = rootView
         buildInterface()
@@ -1651,6 +1927,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     func focusSearchField(prefill text: String) {
+        cancelPendingSearchHistoryCommit()
+        searchHistoryModeDraft = nil
+        hideSearchHistoryResults()
         statusPreviewSearchText = nil
         view.window?.makeFirstResponder(searchField)
         searchField.stringValue = text
@@ -1665,9 +1944,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     func updateSearchQuery(_ text: String) {
         guard statusPreviewSearchText != text else { return }
         statusPreviewSearchText = text
-        markSearchInputStarted()
-        scheduleSearch()
-        updateSetupSuggestions()
+        handleSearchTextChange()
     }
 
     func suppressNextSearchFieldFocusOnAppear() {
@@ -1675,10 +1952,40 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int {
-        results.count
+        if tableView === searchHistoryTableView {
+            return searchHistoryMatches.count
+        }
+        return results.count
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        if tableView === searchHistoryTableView {
+            guard
+                row >= 0,
+                row < searchHistoryMatches.count,
+                let tableColumn,
+                let column = SearchHistoryColumn(rawValue: tableColumn.identifier.rawValue)
+            else {
+                return nil
+            }
+
+            let entry = searchHistoryMatches[row]
+            let cell = makeCell(in: searchHistoryTableView, for: tableColumn.identifier)
+            let textField = cell.textField
+            switch column {
+            case .query:
+                textField?.stringValue = entry.query
+                textField?.font = AppSettings.appFont(defaults: defaults, weight: .semibold)
+                textField?.textColor = .labelColor
+                textField?.toolTip = entry.query
+            case .timestamp:
+                textField?.stringValue = entry.timestamp.map(dateFormatter.string(from:)) ?? "—"
+                textField?.font = AppSettings.appFont(defaults: defaults)
+                textField?.textColor = entry.timestamp == nil ? .secondaryLabelColor : .labelColor
+            }
+            return cell
+        }
+
         guard
             row >= 0,
             row < results.count,
@@ -1697,7 +2004,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             return cell
         }
 
-        let cell = makeCell(for: tableColumn.identifier)
+        let cell = makeCell(in: tableView, for: tableColumn.identifier)
         let textField = cell.textField
         textField?.font = AppSettings.appFont(defaults: defaults)
 
@@ -1763,11 +2070,18 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
+        guard tableView === self.tableView else { return nil }
         guard row >= 0, row < results.count else { return nil }
         return results[row].record.url as NSURL
     }
 
     func tableView(_ tableView: NSTableView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
+        if tableView === searchHistoryTableView {
+            updateSearchHistorySortFromTable()
+            return
+        }
+
+        guard tableView === self.tableView else { return }
         guard let descriptor = tableView.sortDescriptors.first else { return }
         sortSpec = sortSpec(for: descriptor)
         saveSortSpec()
@@ -1776,9 +2090,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     func controlTextDidChange(_ obj: Notification) {
         guard !searchFieldHasMarkedText else { return }
-        markSearchInputStarted()
-        scheduleSearch()
-        updateSetupSuggestions()
+        handleSearchTextChange()
     }
 
     func control(
@@ -1790,13 +2102,35 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
         switch commandSelector {
         case #selector(NSResponder.moveDown(_:)):
-            moveResultSelection(delta: 1)
+            if isSearchHistoryModeActive {
+                moveSearchHistorySelection(delta: 1)
+            } else {
+                moveResultSelection(delta: 1)
+            }
             return true
         case #selector(NSResponder.moveUp(_:)):
-            moveResultSelection(delta: -1)
+            if isSearchHistoryModeActive {
+                moveSearchHistorySelection(delta: -1)
+            } else {
+                moveResultSelection(delta: -1)
+            }
             return true
         case #selector(NSResponder.insertNewline(_:)), NSSelectorFromString("insertNewlineIgnoringFieldEditor:"):
-            openSelectedOrFirstResult()
+            if isSearchHistoryModeActive {
+                restoreSelectedSearchHistoryEntry(nil)
+            } else {
+                openSelectedOrFirstResult()
+            }
+            return true
+        case #selector(NSResponder.cancelOperation(_:)):
+            guard isSearchHistoryModeActive else { return false }
+            cancelSearchHistoryMode()
+            return true
+        case #selector(NSResponder.deleteBackward(_:)), #selector(NSResponder.deleteForward(_:)):
+            let modifiers = NSApp.currentEvent?.modifierFlags
+                .intersection([.command, .option, .control, .shift]) ?? []
+            guard isSearchHistoryModeActive, modifiers == [.shift] else { return false }
+            removeSelectedSearchHistoryEntries(nil)
             return true
         default:
             return false
@@ -1806,6 +2140,13 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     func menuNeedsUpdate(_ menu: NSMenu) {
         if menu === headerMenu {
             populateHeaderMenu(menu)
+            return
+        }
+        if menu === searchHistoryButton.menu {
+            return
+        }
+        if menu === searchHistoryTableView.menu {
+            populateSearchHistoryContextMenu(menu)
             return
         }
 
@@ -1835,11 +2176,27 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
     }
 
-    func menuDidClose(_ menu: NSMenu) {
-        guard menu === tableView.menu else { return }
+    func menuWillOpen(_ menu: NSMenu) {
+        guard menu === searchHistoryButton.menu else { return }
+        highlightedSearchHistoryMenuQuery = nil
+    }
 
-        DispatchQueue.main.async { [weak self] in
-            self?.setContextMenuTargetRow(nil)
+    func menu(_ menu: NSMenu, willHighlight item: NSMenuItem?) {
+        guard menu === searchHistoryButton.menu else { return }
+        highlightedSearchHistoryMenuQuery = item?.representedObject as? String
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        if menu === searchHistoryButton.menu {
+            highlightedSearchHistoryMenuQuery = nil
+        } else if menu === tableView.menu {
+            DispatchQueue.main.async { [weak self] in
+                self?.setContextMenuTargetRow(nil)
+            }
+        } else if menu === searchHistoryTableView.menu {
+            DispatchQueue.main.async { [weak self] in
+                self?.searchHistoryTableView.clearContextMenuTargetRow()
+            }
         }
     }
 
@@ -1887,9 +2244,14 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         switch action {
         case #selector(openSelected(_:)),
              #selector(revealSelected(_:)),
-             #selector(copy(_:)),
              #selector(copySelectedPath(_:)):
             return !records.isEmpty
+        case #selector(copy(_:)):
+            return isSearchHistoryModeActive
+                ? !searchHistoryActionRowIndexes().isEmpty
+                : !records.isEmpty
+        case #selector(removeSelectedSearchHistoryEntries(_:)):
+            return !searchHistoryActionRowIndexes().isEmpty
         case #selector(quickLookSelected(_:)):
             return !records.isEmpty && !isSearchFieldEditing
         case #selector(moveSelectedToTrash(_:)):
@@ -1909,6 +2271,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             return true
         case #selector(resetMascotPosition(_:)):
             return mascotIsExpanded || userExpandedMascot || userCollapsedExpandedMascotDuringOperation
+        case #selector(recallPreviousSearch(_:)),
+             #selector(recallNextSearch(_:)):
+            return !searchHistory.entries.isEmpty
         default:
             return true
         }
@@ -2012,7 +2377,22 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         searchField.sendsSearchStringImmediately = true
         searchField.sendsWholeSearchString = false
         searchField.translatesAutoresizingMaskIntoConstraints = false
+        searchField.recallPreviousSearch = { [weak self] in
+            self?.recallPreviousSearch(nil)
+        }
+        searchField.recallNextSearch = { [weak self] in
+            self?.recallNextSearch(nil)
+        }
+        searchField.showSearchHistory = { [weak self] in
+            self?.showSearchHistory(nil)
+        }
         topBar.addArrangedSubview(searchField)
+
+        configureSearchHistoryButton()
+        topBar.addArrangedSubview(searchHistoryButton)
+        searchField.nextKeyView = searchHistoryButton
+        searchHistoryButton.nextKeyView = tableView
+        tableView.nextKeyView = searchField
 
         configureSetupSuggestionPanel()
 
@@ -2067,6 +2447,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
         tableView.sortDescriptors = [sortDescriptor(for: sortSpec)]
 
+        configureSearchHistoryResults()
+
         let footer = NSView()
         footer.translatesAutoresizingMaskIntoConstraints = false
 
@@ -2111,6 +2493,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         rootStack.addArrangedSubview(titlebarSeparator)
         rootStack.addArrangedSubview(searchBand)
         rootStack.addArrangedSubview(setupSuggestionPanel)
+        rootStack.addArrangedSubview(searchHistoryContainer)
         rootStack.addArrangedSubview(scrollView)
         rootStack.addArrangedSubview(footer)
         view.addSubview(rootStack)
@@ -2135,14 +2518,19 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             titlebarSeparator.heightAnchor.constraint(equalToConstant: 1),
             setupSuggestionPanel.leadingAnchor.constraint(equalTo: rootStack.leadingAnchor),
             setupSuggestionPanel.trailingAnchor.constraint(equalTo: rootStack.trailingAnchor),
+            searchHistoryContainer.leadingAnchor.constraint(equalTo: rootStack.leadingAnchor),
+            searchHistoryContainer.trailingAnchor.constraint(equalTo: rootStack.trailingAnchor),
             scrollView.leadingAnchor.constraint(equalTo: rootStack.leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: rootStack.trailingAnchor),
             footer.leadingAnchor.constraint(equalTo: rootStack.leadingAnchor),
             footer.trailingAnchor.constraint(equalTo: rootStack.trailingAnchor),
             footer.heightAnchor.constraint(greaterThanOrEqualToConstant: OperationMascotCoordinator.footerSlotHeight + 4),
             searchField.widthAnchor.constraint(greaterThanOrEqualToConstant: 360),
+            searchHistoryButton.widthAnchor.constraint(equalToConstant: 38),
+            searchHistoryButton.heightAnchor.constraint(equalTo: searchField.heightAnchor),
 
             scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 400),
+            searchHistoryContainer.heightAnchor.constraint(greaterThanOrEqualToConstant: 400),
 
             mascotSlotView.leadingAnchor.constraint(equalTo: footer.leadingAnchor, constant: 14),
             mascotSlotView.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
@@ -2176,6 +2564,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let baseSize = AppSettings.appFontSize(defaults: defaults)
         searchField.font = AppSettings.appFont(defaults: defaults, sizeDelta: 4)
         tableView.rowHeight = max(20, baseSize + 8)
+        searchHistoryTableView.rowHeight = tableView.rowHeight
+        searchHistoryTableView.reloadData()
         countLabel.font = AppSettings.appFont(defaults: defaults)
         statusLabel.font = AppSettings.appFont(defaults: defaults)
         operationStatusLabel.font = AppSettings.appFont(defaults: defaults)
@@ -2206,6 +2596,220 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             mascotImageView.centerXAnchor.constraint(equalTo: mascotSlotView.centerXAnchor),
             mascotImageView.bottomAnchor.constraint(equalTo: mascotSlotView.bottomAnchor)
         ])
+    }
+
+    private func configureSearchHistoryButton() {
+        searchHistoryButton.translatesAutoresizingMaskIntoConstraints = false
+        searchHistoryButton.controlSize = .large
+        searchHistoryButton.bezelStyle = .texturedRounded
+        searchHistoryButton.imagePosition = .imageOnly
+        searchHistoryButton.toolTip = "Search History (Command-Y); recall with Control-R"
+        searchHistoryButton.setAccessibilityLabel("Search History")
+        searchHistoryButton.isEnabled = searchHistoryRetention != .disabled
+        rebuildSearchHistoryMenu()
+    }
+
+    private func configureSearchHistoryResults() {
+        searchHistoryContainer.translatesAutoresizingMaskIntoConstraints = false
+        searchHistoryContainer.isHidden = true
+
+        searchHistoryScrollView.translatesAutoresizingMaskIntoConstraints = false
+        searchHistoryScrollView.hasVerticalScroller = true
+        searchHistoryScrollView.hasHorizontalScroller = true
+        searchHistoryScrollView.borderType = .noBorder
+        searchHistoryScrollView.documentView = searchHistoryTableView
+
+        searchHistoryTableView.delegate = self
+        searchHistoryTableView.dataSource = self
+        searchHistoryTableView.usesAlternatingRowBackgroundColors = true
+        searchHistoryTableView.style = .fullWidth
+        searchHistoryTableView.rowSizeStyle = .small
+        searchHistoryTableView.intercellSpacing = NSSize(width: 3, height: 1)
+        searchHistoryTableView.allowsMultipleSelection = true
+        searchHistoryTableView.allowsColumnReordering = true
+        searchHistoryTableView.allowsColumnResizing = true
+        searchHistoryTableView.nextKeyView = searchField
+        searchHistoryTableView.target = self
+        searchHistoryTableView.doubleAction = #selector(restoreSelectedSearchHistoryEntry(_:))
+        searchHistoryTableView.restoreAction = { [weak self] in
+            self?.restoreSelectedSearchHistoryEntry(nil)
+        }
+        searchHistoryTableView.deleteAction = { [weak self] in
+            self?.removeSelectedSearchHistoryEntries(nil)
+        }
+        searchHistoryTableView.copyAction = { [weak self] in
+            self?.copySelectedSearchHistoryEntries()
+        }
+        searchHistoryTableView.contextMenuTargetRowDidChange = { [weak self] _ in
+            self?.updateActionButtons()
+        }
+
+        let menu = NSMenu()
+        menu.delegate = self
+        searchHistoryTableView.menu = menu
+
+        let queryColumn = makeSearchHistoryColumn(.query, width: 700)
+        queryColumn.resizingMask = .autoresizingMask
+        searchHistoryTableView.addTableColumn(queryColumn)
+        searchHistoryTableView.addTableColumn(makeSearchHistoryColumn(.timestamp, width: 170))
+        searchHistoryTableView.sortDescriptors = [searchHistorySortDescriptor()]
+
+        searchHistoryEmptyLabel.translatesAutoresizingMaskIntoConstraints = false
+        searchHistoryEmptyLabel.font = AppSettings.appFont(defaults: defaults, sizeDelta: 1)
+        searchHistoryEmptyLabel.textColor = .secondaryLabelColor
+        searchHistoryEmptyLabel.alignment = .center
+
+        searchHistoryContainer.addSubview(searchHistoryScrollView)
+        searchHistoryContainer.addSubview(searchHistoryEmptyLabel)
+        NSLayoutConstraint.activate([
+            searchHistoryScrollView.topAnchor.constraint(equalTo: searchHistoryContainer.topAnchor),
+            searchHistoryScrollView.leadingAnchor.constraint(equalTo: searchHistoryContainer.leadingAnchor),
+            searchHistoryScrollView.trailingAnchor.constraint(equalTo: searchHistoryContainer.trailingAnchor),
+            searchHistoryScrollView.bottomAnchor.constraint(equalTo: searchHistoryContainer.bottomAnchor),
+            searchHistoryEmptyLabel.centerXAnchor.constraint(equalTo: searchHistoryContainer.centerXAnchor),
+            searchHistoryEmptyLabel.centerYAnchor.constraint(equalTo: searchHistoryContainer.centerYAnchor),
+            searchHistoryEmptyLabel.leadingAnchor.constraint(greaterThanOrEqualTo: searchHistoryContainer.leadingAnchor, constant: 24),
+            searchHistoryEmptyLabel.trailingAnchor.constraint(lessThanOrEqualTo: searchHistoryContainer.trailingAnchor, constant: -24)
+        ])
+    }
+
+    private func makeSearchHistoryColumn(_ column: SearchHistoryColumn, width: CGFloat) -> NSTableColumn {
+        let tableColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(column.rawValue))
+        tableColumn.title = column.title
+        tableColumn.width = width
+        tableColumn.minWidth = column == .query ? 120 : 130
+        tableColumn.sortDescriptorPrototype = NSSortDescriptor(
+            key: column.rawValue,
+            ascending: column == .query
+        )
+        return tableColumn
+    }
+
+    private func searchHistorySortDescriptor() -> NSSortDescriptor {
+        NSSortDescriptor(key: searchHistorySort.column.rawValue, ascending: searchHistorySort.ascending)
+    }
+
+    private func rebuildSearchHistoryMenu() {
+        searchHistoryButton.removeAllItems()
+        guard let menu = searchHistoryButton.menu else { return }
+        menu.delegate = self
+
+        let titleItem = NSMenuItem(
+            title: "Search History…",
+            action: #selector(showSearchHistory(_:)),
+            keyEquivalent: "y"
+        )
+        titleItem.target = self
+        titleItem.keyEquivalentModifierMask = [.command]
+        titleItem.image = NSImage(
+            systemSymbolName: "clock.arrow.circlepath",
+            accessibilityDescription: "Search History"
+        )
+        menu.addItem(titleItem)
+
+        addHiddenSearchHistoryMenuCommand(
+            to: menu,
+            title: "Traverse Search Controls",
+            keyEquivalent: "\t",
+            modifiers: [],
+            action: #selector(traverseFocusFromHistoryMenu(_:))
+        )
+        for keyEquivalent in ["\u{8}", "\u{7f}"] {
+            addHiddenSearchHistoryMenuCommand(
+                to: menu,
+                title: "Delete Highlighted Search",
+                keyEquivalent: keyEquivalent,
+                modifiers: [],
+                action: #selector(deleteHighlightedSearchHistoryMenuEntry(_:))
+            )
+        }
+        menu.addItem(.separator())
+
+        if searchHistory.entries.isEmpty {
+            let emptyItem = NSMenuItem(title: "No Recent Searches", action: nil, keyEquivalent: "")
+            emptyItem.isEnabled = false
+            menu.addItem(emptyItem)
+        } else {
+            for query in searchHistory.entries {
+                let item = NSMenuItem(
+                    title: searchHistoryMenuTitle(query),
+                    action: #selector(selectSearchHistoryEntry(_:)),
+                    keyEquivalent: ""
+                )
+                item.target = self
+                item.representedObject = query
+                item.toolTip = query
+                menu.addItem(item)
+            }
+
+            menu.addItem(.separator())
+            let clearItem = NSMenuItem(
+                title: "Clear Search History",
+                action: #selector(clearSearchHistory(_:)),
+                keyEquivalent: ""
+            )
+            clearItem.target = self
+            menu.addItem(clearItem)
+        }
+
+        menu.autoenablesItems = false
+        searchHistoryButton.setAccessibilityValue("\(searchHistory.entries.count) recent searches")
+    }
+
+    private func addHiddenSearchHistoryMenuCommand(
+        to menu: NSMenu,
+        title: String,
+        keyEquivalent: String,
+        modifiers: NSEvent.ModifierFlags,
+        action: Selector
+    ) {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: keyEquivalent)
+        item.target = self
+        item.keyEquivalentModifierMask = modifiers
+        item.isHidden = true
+        item.allowsKeyEquivalentWhenHidden = true
+        menu.addItem(item)
+    }
+
+    @objc private func traverseFocusFromHistoryMenu(_ sender: Any?) {
+        let modifiers = NSApp.currentEvent?.modifierFlags ?? NSEvent.modifierFlags
+        let direction = SearchHistoryMenuFocusDirection.resolve(modifiers: modifiers)
+        searchHistoryButton.menu?.cancelTracking()
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            switch direction {
+            case .forward:
+                self.view.window?.selectKeyView(following: self.searchHistoryButton)
+            case .backward:
+                self.view.window?.selectKeyView(preceding: self.searchHistoryButton)
+            }
+        }
+    }
+
+    @objc private func deleteHighlightedSearchHistoryMenuEntry(_ sender: Any?) {
+        guard let query = searchHistoryButton.menu?.highlightedItem?.representedObject as? String
+            ?? highlightedSearchHistoryMenuQuery else {
+            return
+        }
+        searchHistoryButton.menu?.cancelTracking()
+        DispatchQueue.main.async { [weak self] in
+            self?.removeSearchHistoryMenuEntry(query)
+        }
+    }
+
+    private func removeSearchHistoryMenuEntry(_ query: String) {
+        guard searchHistory.remove(query) else { return }
+        highlightedSearchHistoryMenuQuery = nil
+        persistSearchHistory()
+        resetSearchHistoryNavigation()
+        rebuildSearchHistoryMenu()
+        refreshSearchHistoryResultsIfNeeded()
+    }
+
+    private func searchHistoryMenuTitle(_ query: String) -> String {
+        let singleLine = query.components(separatedBy: .newlines).joined(separator: " ")
+        guard singleLine.count > 80 else { return singleLine }
+        return "\(singleLine.prefix(79))…"
     }
 
     private func configureExpandedMascotOverlay() {
@@ -2313,12 +2917,14 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private func updateSetupSuggestions() {
         let needsIndexingSetup = !AppSettings.indexingSetupCompleted(defaults: defaults)
         let appSearchActive = ApplicationSearchQuery.parse(currentSearchText()) != nil
+        let historySearchActive = isSearchHistoryModeActive
         let needsGlobalHotKey = AppSettings.globalSearchHotKeyNeedsConfirmation(defaults: defaults)
         let needsGlobalAppSearchHotKey = AppSettings.globalAppSearchHotKeyNeedsConfirmation(defaults: defaults)
         let needsFullDiskAccess = !defaults.bool(forKey: AppSettings.fullDiskAccessOnboardingShownKey)
             && (needsIndexingSetup || !FullDiskAccessController.protectedDefaultFoldersCovered(by: indexedRoots).isEmpty)
 
-        let setupOverlayVisible = (needsIndexingSetup && !appSearchActive) || isSetupMascotTuckInProgress
+        let setupOverlayVisible = (needsIndexingSetup && !appSearchActive && !historySearchActive)
+            || isSetupMascotTuckInProgress
         indexingSetupOverlay.isHidden = !setupOverlayVisible
         indexingSetupOverlay.setMascotVisible(setupOverlayVisible && !isSetupMascotTuckInProgress)
         setupMascotCoordinator?.setActive(setupOverlayVisible && !isSetupMascotTuckInProgress)
@@ -2684,6 +3290,20 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
     }
 
+    private func populateSearchHistoryContextMenu(_ menu: NSMenu) {
+        menu.removeAllItems()
+        let selectionCount = searchHistoryActionRowIndexes().count
+        let hasSelection = selectionCount > 0
+        menu.addItem(actionItem("Copy", #selector(copy(_:)), enabled: hasSelection))
+        menu.addItem(.separator())
+        let deleteTitle = selectionCount == 1 ? "Delete from History" : "Delete Searches from History"
+        menu.addItem(actionItem(
+            deleteTitle,
+            #selector(removeSelectedSearchHistoryEntries(_:)),
+            enabled: hasSelection
+        ))
+    }
+
     private func actionItem(_ title: String, _ selector: Selector, enabled: Bool = true) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
         item.target = self
@@ -2741,7 +3361,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
     }
 
-    private func makeCell(for identifier: NSUserInterfaceItemIdentifier) -> NSTableCellView {
+    private func makeCell(
+        in tableView: NSTableView,
+        for identifier: NSUserInterfaceItemIdentifier
+    ) -> NSTableCellView {
         if let reusable = tableView.makeView(withIdentifier: identifier, owner: self) as? NSTableCellView {
             return reusable
         }
@@ -2928,6 +3551,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
 
     private func scheduleSearch(force: Bool = false) {
         let queryText = currentSearchText()
+        guard SearchHistoryQuery.parse(queryText) == nil else { return }
         let appSearchQuery = ApplicationSearchQuery.parse(queryText)
         guard appSearchQuery != nil || !indexStats.isLoadingSnapshot else { return }
 
@@ -3761,6 +4385,13 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func updateLoadingOverlay() {
+        guard !isSearchHistoryModeActive else {
+            loadingOverlaySawActiveLoad = false
+            loadingOverlay.isHidden = true
+            updateMascotPlacementVisibility()
+            return
+        }
+
         guard AppSettings.indexingSetupCompleted(defaults: defaults), !indexedRoots.isEmpty else {
             loadingOverlaySawActiveLoad = false
             loadingOverlay.isHidden = true
@@ -4016,8 +4647,96 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func currentSearchText() -> String {
-        (statusPreviewSearchText ?? searchField.currentEditor()?.string ?? searchField.stringValue)
+        untrimmedSearchText()
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func untrimmedSearchText() -> String {
+        statusPreviewSearchText ?? searchField.currentEditor()?.string ?? searchField.stringValue
+    }
+
+    private func recordCurrentSearchInHistory() {
+        recordSearchInHistory(currentSearchText())
+    }
+
+    private func recordSearchInHistory(_ query: String) {
+        cancelPendingSearchHistoryCommit()
+        guard searchHistory.record(
+            query,
+            maximumEntryCount: searchHistoryRetention.maximumEntryCount
+        ) else { return }
+
+        persistSearchHistory()
+        resetSearchHistoryNavigation()
+        rebuildSearchHistoryMenu()
+        refreshSearchHistoryResultsIfNeeded()
+    }
+
+    private func persistSearchHistory() {
+        if searchHistory.entries.isEmpty {
+            defaults.removeObject(forKey: AppSettings.searchHistoryKey)
+            defaults.removeObject(forKey: AppSettings.searchHistoryTimestampsKey)
+        } else {
+            defaults.set(searchHistory.entries, forKey: AppSettings.searchHistoryKey)
+            defaults.set(searchHistory.persistedTimestamps, forKey: AppSettings.searchHistoryTimestampsKey)
+        }
+    }
+
+    private func scheduleSearchHistoryCommit() {
+        cancelPendingSearchHistoryCommit()
+        let query = currentSearchText()
+        guard !query.isEmpty else { return }
+        guard searchHistoryRetention != .disabled else { return }
+        guard SearchHistoryQuery.parse(query) == nil else { return }
+
+        // A stable query or a result action signals intent; search completion does not.
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.pendingSearchHistoryCommit = nil
+            guard self.currentSearchText() == query else { return }
+            self.recordSearchInHistory(query)
+        }
+        pendingSearchHistoryCommit = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + SearchHistoryTiming.stableQueryCommitDelay,
+            execute: workItem
+        )
+    }
+
+    private func cancelPendingSearchHistoryCommit() {
+        pendingSearchHistoryCommit?.cancel()
+        pendingSearchHistoryCommit = nil
+    }
+
+    private func resetSearchHistoryNavigation() {
+        searchHistoryNavigationIndex = nil
+        searchHistoryNavigationDraft = nil
+    }
+
+    private func applySearchHistoryEntry(_ query: String) {
+        replaceSearchFieldText(query, preservesHistoryNavigation: true)
+    }
+
+    private func replaceSearchFieldText(_ text: String, preservesHistoryNavigation: Bool) {
+        cancelPendingSearchHistoryCommit()
+        statusPreviewSearchText = nil
+        isApplyingSearchHistory = true
+        view.window?.makeFirstResponder(searchField)
+
+        if let editor = searchField.currentEditor() as? NSTextView {
+            let replacementRange = NSRange(location: 0, length: (editor.string as NSString).length)
+            editor.insertText(text, replacementRange: replacementRange)
+            editor.selectedRange = NSRange(location: (text as NSString).length, length: 0)
+        } else {
+            searchField.stringValue = text
+        }
+
+        isApplyingSearchHistory = false
+        handleSearchTextChange(preservesHistoryNavigation: preservesHistoryNavigation)
+    }
+
+    private var isSearchHistoryModeActive: Bool {
+        SearchHistoryQuery.parse(untrimmedSearchText()) != nil
     }
 
     private var isSearchFieldEditing: Bool {
@@ -4040,6 +4759,18 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         let updatedStatusFooterMode = AppSettings.statusFooterMode(defaults: defaults)
         let updatedAppFontFamilyName = AppSettings.appFontFamilyName(defaults: defaults)
         let updatedAppFontSize = AppSettings.appFontSize(defaults: defaults)
+        let updatedSearchHistoryRetention = AppSettings.searchHistoryRetention(defaults: defaults)
+
+        if updatedSearchHistoryRetention != searchHistoryRetention {
+            searchHistoryRetention = updatedSearchHistoryRetention
+            cancelPendingSearchHistoryCommit()
+            searchHistory.trim(maximumEntryCount: updatedSearchHistoryRetention.maximumEntryCount)
+            persistSearchHistory()
+            resetSearchHistoryNavigation()
+            searchHistoryButton.isEnabled = updatedSearchHistoryRetention != .disabled
+            rebuildSearchHistoryMenu()
+            refreshSearchHistoryResultsIfNeeded()
+        }
 
         if updatedHighlightsSearchText != highlightsSearchText {
             highlightsSearchText = updatedHighlightsSearchText
@@ -5231,6 +5962,18 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         }
         updateActiveSearchElapsed()
 
+        if isSearchHistoryModeActive {
+            let count = searchHistoryMatches.count
+            let shownText = "\(count.formatted()) history \(count == 1 ? "match" : "matches")"
+            applyFooterStatus(
+                shownText: shownText,
+                detailedCenterText: "Return restores • Delete removes • Command-C copies • Esc cancels",
+                detailedRightText: memoryStatusText,
+                detailedOperationText: "Search history"
+            )
+            return
+        }
+
         let appSearchActive = ApplicationSearchQuery.parse(currentSearchText()) != nil
         let shownText = SearchWindowPresentation.shownResultsText(
             resultCount: results.count,
@@ -5419,7 +6162,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func openSelectedOrFirstResult() {
-        guard !results.isEmpty else { return }
+        guard !results.isEmpty else {
+            recordCurrentSearchInHistory()
+            return
+        }
 
         if tableView.selectedRow < 0 {
             selectResultRow(0)
@@ -5440,7 +6186,8 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func selectedRecords() -> [FileRecord] {
-        tableView.selectedRowIndexes.compactMap { row in
+        guard !isSearchHistoryModeActive else { return [] }
+        return tableView.selectedRowIndexes.compactMap { row in
             guard row >= 0, row < results.count else { return nil }
             return results[row].record
         }
@@ -5462,6 +6209,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private func fileActionRowIndexes() -> IndexSet {
+        guard !isSearchHistoryModeActive else { return [] }
         let resultRecordIDs = results.map(\.record.id)
         let contextMenuTargetRow = ResultIdentityRemapping.row(
             recordID: contextMenuTargetRecordID,
@@ -5755,9 +6503,268 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     @objc private func searchFieldDidChange(_ sender: NSSearchField) {
         guard !searchFieldHasMarkedText else { return }
         statusPreviewSearchText = nil
+        handleSearchTextChange()
+    }
+
+    private func handleSearchTextChange(preservesHistoryNavigation: Bool = false) {
+        guard !isApplyingSearchHistory else { return }
+
+        if !preservesHistoryNavigation {
+            resetSearchHistoryNavigation()
+        }
+
+        if let historyQuery = SearchHistoryQuery.parse(untrimmedSearchText()) {
+            cancelPendingSearchHistoryCommit()
+            showSearchHistoryResults(matching: historyQuery.searchText)
+            updateSetupSuggestions()
+            updateLoadingOverlay()
+            updateStatus()
+            updateActionButtons()
+            return
+        }
+
+        if !searchHistoryContainer.isHidden, !preservesHistoryNavigation {
+            searchHistoryModeDraft = nil
+        }
+        hideSearchHistoryResults()
+        if !preservesHistoryNavigation {
+            scheduleSearchHistoryCommit()
+        }
         markSearchInputStarted()
         scheduleSearch()
         updateSetupSuggestions()
+        updateLoadingOverlay()
+        updateStatus()
+        updateActionButtons()
+    }
+
+    @objc private func showSearchHistory(_ sender: Any?) {
+        guard searchHistoryRetention != .disabled else {
+            NSSound.beep()
+            return
+        }
+        if isSearchHistoryModeActive {
+            resetSearchHistoryNavigation()
+            replaceSearchFieldText("history:", preservesHistoryNavigation: true)
+            return
+        }
+
+        searchHistoryModeDraft = untrimmedSearchText()
+        resetSearchHistoryNavigation()
+        replaceSearchFieldText("history:", preservesHistoryNavigation: true)
+    }
+
+    private func showSearchHistoryResults(
+        matching searchText: String,
+        selectedQueries: Set<String> = [],
+        selectedRow: Int = 0
+    ) {
+        searchHistoryMatches = searchHistory.matchingEntries(searchText, sort: searchHistorySort)
+        scrollView.isHidden = true
+        searchHistoryContainer.isHidden = false
+        searchHistoryEmptyLabel.stringValue = searchHistory.entries.isEmpty
+            ? "No search history yet"
+            : "No matching searches"
+        searchHistoryEmptyLabel.isHidden = !searchHistoryMatches.isEmpty
+        searchHistoryTableView.reloadData()
+        searchHistoryButton.nextKeyView = searchHistoryTableView
+
+        if searchHistoryMatches.isEmpty {
+            searchHistoryTableView.deselectAll(nil)
+        } else {
+            let matchingSelection = IndexSet(searchHistoryMatches.indices.filter {
+                selectedQueries.contains(searchHistoryMatches[$0].query)
+            })
+            let row = min(max(selectedRow, 0), searchHistoryMatches.count - 1)
+            let selection = matchingSelection.isEmpty ? IndexSet(integer: row) : matchingSelection
+            searchHistoryTableView.selectRowIndexes(selection, byExtendingSelection: false)
+            searchHistoryTableView.scrollRowToVisible(selection.first ?? row)
+        }
+    }
+
+    private func updateSearchHistorySortFromTable() {
+        guard
+            let descriptor = searchHistoryTableView.sortDescriptors.first,
+            let key = descriptor.key,
+            let column = SearchHistoryColumn(rawValue: key),
+            let historyQuery = SearchHistoryQuery.parse(untrimmedSearchText())
+        else {
+            return
+        }
+
+        let selectedQueries = Set<String>(searchHistoryTableView.selectedRowIndexes.compactMap { row -> String? in
+            guard row >= 0, row < searchHistoryMatches.count else { return nil }
+            return searchHistoryMatches[row].query
+        })
+        searchHistorySort = SearchHistorySort(column: column, ascending: descriptor.ascending)
+        showSearchHistoryResults(matching: historyQuery.searchText, selectedQueries: selectedQueries)
+    }
+
+    private func hideSearchHistoryResults() {
+        guard !searchHistoryContainer.isHidden else { return }
+        searchHistoryContainer.isHidden = true
+        scrollView.isHidden = false
+        searchHistoryButton.nextKeyView = tableView
+        searchHistoryMatches.removeAll(keepingCapacity: true)
+        searchHistoryTableView.reloadData()
+    }
+
+    private func refreshSearchHistoryResultsIfNeeded() {
+        guard let query = SearchHistoryQuery.parse(untrimmedSearchText()) else { return }
+        showSearchHistoryResults(matching: query.searchText)
+        updateStatus()
+    }
+
+    private func moveSearchHistorySelection(delta: Int) {
+        guard !searchHistoryMatches.isEmpty else { return }
+
+        let row: Int
+        if searchHistoryTableView.selectedRow >= 0 {
+            row = min(max(searchHistoryTableView.selectedRow + delta, 0), searchHistoryMatches.count - 1)
+        } else {
+            row = delta < 0 ? searchHistoryMatches.count - 1 : 0
+        }
+
+        searchHistoryTableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        searchHistoryTableView.scrollRowToVisible(row)
+    }
+
+    @objc private func restoreSelectedSearchHistoryEntry(_ sender: Any?) {
+        let row = searchHistoryTableView.selectedRow
+        guard row >= 0, row < searchHistoryMatches.count else {
+            NSSound.beep()
+            return
+        }
+
+        let query = searchHistoryMatches[row].query
+        searchHistoryModeDraft = nil
+        resetSearchHistoryNavigation()
+        applySearchHistoryEntry(query)
+        recordSearchInHistory(query)
+    }
+
+    private func cancelSearchHistoryMode() {
+        let draft = searchHistoryModeDraft ?? ""
+        searchHistoryModeDraft = nil
+        resetSearchHistoryNavigation()
+        applySearchHistoryEntry(draft)
+    }
+
+    @objc private func removeSelectedSearchHistoryEntries(_ sender: Any?) {
+        let rows = searchHistoryActionRowIndexes()
+        guard !rows.isEmpty else {
+            NSSound.beep()
+            return
+        }
+
+        let queries = rows.compactMap { row -> String? in
+            guard row >= 0, row < searchHistoryMatches.count else { return nil }
+            return searchHistoryMatches[row].query
+        }
+        guard searchHistory.remove(queries) else { return }
+        let nextRow = rows.first ?? 0
+        searchHistoryTableView.clearContextMenuTargetRow()
+        persistSearchHistory()
+        resetSearchHistoryNavigation()
+        rebuildSearchHistoryMenu()
+        if let historyQuery = SearchHistoryQuery.parse(untrimmedSearchText()) {
+            showSearchHistoryResults(matching: historyQuery.searchText, selectedRow: nextRow)
+            updateStatus()
+        }
+    }
+
+    private func copySelectedSearchHistoryEntries() {
+        let entries = searchHistoryActionRowIndexes().compactMap { row -> String? in
+            guard row >= 0, row < searchHistoryMatches.count else { return nil }
+            return searchHistoryMatches[row].query
+        }
+        guard !entries.isEmpty else { return }
+
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(entries.joined(separator: "\n"), forType: .string)
+    }
+
+    private func searchHistoryActionRowIndexes() -> IndexSet {
+        guard isSearchHistoryModeActive else { return [] }
+        return FileActionTargeting.rowIndexes(
+            contextMenuTargetRow: searchHistoryTableView.contextMenuTargetRow,
+            selectedRowIndexes: searchHistoryTableView.selectedRowIndexes,
+            rowCount: searchHistoryMatches.count
+        )
+    }
+
+    @objc private func recallPreviousSearch(_ sender: Any?) {
+        searchHistoryModeDraft = nil
+        let entries = searchHistory.entries
+        guard !entries.isEmpty else {
+            NSSound.beep()
+            return
+        }
+
+        let currentText = untrimmedSearchText()
+        let nextIndex: Int
+        if let searchHistoryNavigationIndex {
+            guard searchHistoryNavigationIndex + 1 < entries.count else {
+                NSSound.beep()
+                return
+            }
+            nextIndex = searchHistoryNavigationIndex + 1
+        } else if let matchingIndex = searchHistory.index(matching: currentText) {
+            guard matchingIndex + 1 < entries.count else {
+                NSSound.beep()
+                return
+            }
+            searchHistoryNavigationDraft = currentText
+            nextIndex = matchingIndex + 1
+        } else {
+            searchHistoryNavigationDraft = currentText
+            nextIndex = 0
+        }
+
+        searchHistoryNavigationIndex = nextIndex
+        applySearchHistoryEntry(entries[nextIndex])
+    }
+
+    @objc private func recallNextSearch(_ sender: Any?) {
+        guard let currentIndex = searchHistoryNavigationIndex else {
+            NSSound.beep()
+            return
+        }
+
+        if currentIndex > 0 {
+            let nextIndex = currentIndex - 1
+            searchHistoryNavigationIndex = nextIndex
+            applySearchHistoryEntry(searchHistory.entries[nextIndex])
+            return
+        }
+
+        let draft = searchHistoryNavigationDraft ?? ""
+        searchHistoryNavigationIndex = nil
+        searchHistoryNavigationDraft = nil
+        applySearchHistoryEntry(draft)
+    }
+
+    @objc private func selectSearchHistoryEntry(_ sender: NSMenuItem) {
+        guard
+            let query = sender.representedObject as? String,
+            let index = searchHistory.index(matching: query)
+        else {
+            return
+        }
+
+        searchHistoryModeDraft = nil
+        searchHistoryNavigationDraft = untrimmedSearchText()
+        searchHistoryNavigationIndex = index
+        applySearchHistoryEntry(query)
+    }
+
+    @objc private func clearSearchHistory(_ sender: Any?) {
+        cancelPendingSearchHistoryCommit()
+        searchHistory.removeAll()
+        persistSearchHistory()
+        resetSearchHistoryNavigation()
+        rebuildSearchHistoryMenu()
+        refreshSearchHistoryResultsIfNeeded()
     }
 
     @objc private func toggleColumnVisibility(_ sender: NSMenuItem) {
@@ -5787,6 +6794,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         level: DiagnosticLogLevel = .info,
         extraFields: [String: DiagnosticLogFieldValue] = [:]
     ) {
+        recordCurrentSearchInHistory()
         var fields = extraFields.filter { _, value in
             level == .warning || level == .error || !isDiagnosticOnlyField(value)
         }
@@ -6166,6 +7174,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     @objc private func copy(_ sender: Any?) {
+        if isSearchHistoryModeActive {
+            copySelectedSearchHistoryEntries()
+            return
+        }
         copySelectedFiles()
     }
 

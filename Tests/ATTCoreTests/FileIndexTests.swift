@@ -52,6 +52,26 @@ struct FileIndexTests {
         #expect(response.results.map(\.record.path) == [fuzzyHeader.path])
     }
 
+    @Test("tilde wildcard path search ranks the exact literal folder before fuzzy sibling prefixes")
+    func tildeWildcardPathSearchRanksExactLiteralFolderFirst() {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let exact = makeRecord(path: "\(home)/Projects/atlas-engine/Sources/manifest.json")
+        let fuzzyPrefix = makeRecord(path: "\(home)/Projects/atlas-engine-cache/Sources/manifest.json")
+        let index = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        defer { try? FileManager.default.removeItem(at: index.dataDirectoryURL) }
+        index.replaceRecordsForTesting([fuzzyPrefix, exact])
+
+        let response = index.search(SearchRequest(
+            query: "~/Projects/atlas-engine/**/manifest.json",
+            sort: SortSpec(column: .name, ascending: true)
+        ), maxResults: 10)
+
+        #expect(response.results.map(\.record.path) == [exact.path, fuzzyPrefix.path])
+    }
+
     @Test("update moves an updated file to the top of modified sort")
     func updateResortsModifiedResults() async throws {
         let fileManager = FileManager.default

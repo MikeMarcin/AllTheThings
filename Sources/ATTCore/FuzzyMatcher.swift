@@ -75,6 +75,16 @@ public enum FuzzyMatcher {
             .precomposedStringWithCanonicalMapping
     }
 
+    static func scoreNormalizedText(_ text: String, matching token: String) -> Int? {
+        guard !token.isEmpty, !text.isEmpty else { return nil }
+        if text == token { return 10_000 }
+        if text.hasPrefix(token) { return 8_000 - (text.count - token.count) }
+        if let range = text.range(of: token) {
+            return 6_000 - text.distance(from: text.startIndex, to: range.lowerBound)
+        }
+        return subsequenceScore(text: text, token: token)
+    }
+
     public static func parse(_ query: String) -> ParsedQuery {
         let rawParts = splitQuery(query)
         var positives: [QueryClause] = []
@@ -572,9 +582,21 @@ public enum FuzzyMatcher {
             }
             let anchorBonus = match.startsAtRoot ? 450 : 0
             let consumedBonus = min(match.matchedSegments * 80, 640)
-            let score = base + anchorBonus + consumedBonus - min(match.startSegment * 70, 700)
+            let exactLiteralBonus = min(match.exactLiteralSegments * 120, 960)
+            let fuzzyPrefixPenalty = min(match.fuzzyPrefixSegments * 500, 1_500)
+            let score = base
+                + anchorBonus
+                + consumedBonus
+                + exactLiteralBonus
+                - fuzzyPrefixPenalty
+                - min(match.startSegment * 70, 700)
+            // Literal path components accept prefixes for abbreviated queries. Keep that
+            // fallback below a wildcard path whose literal components all match exactly.
+            let matchClass: MatchClass = match.exactLiteralSegments > 0 && match.fuzzyPrefixSegments == 0
+                ? .substring
+                : .weakPath
             return MatchExplanation(
-                matchClass: .weakPath,
+                matchClass: matchClass,
                 score: score,
                 field: .path,
                 reason: "Path matched \"\(pattern)\""
@@ -725,8 +747,17 @@ public enum FuzzyMatcher {
             mode = .wildcard
         }
 
-        let token = normalize(value)
+        let token = normalize(expandingCurrentUserHome(in: value))
         return (makeSearchPattern(token, mode: mode), mode)
+    }
+
+    private static func expandingCurrentUserHome(in value: String) -> String {
+        guard value == "~" || value.hasPrefix("~/") else {
+            return value
+        }
+
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return value == "~" ? home : home + value.dropFirst()
     }
 
     private static func makeSearchPattern(_ token: String, mode: MatchMode) -> SearchPattern {
@@ -1489,6 +1520,20 @@ public enum FuzzyMatcher {
         let startSegment: Int
         let matchedSegments: Int
         let startsAtRoot: Bool
+        let exactLiteralSegments: Int
+        let fuzzyPrefixSegments: Int
+    }
+
+    private struct StructuredPathResolution {
+        let endSegment: Int
+        let exactLiteralSegments: Int
+        let fuzzyPrefixSegments: Int
+    }
+
+    private enum StructuredSegmentMatch {
+        case exactLiteral
+        case fuzzyPrefix
+        case wildcard
     }
 
     private static func structuredPathMatches(path: String, pattern rawPattern: String) -> StructuredPathMatch? {
@@ -1537,9 +1582,13 @@ public enum FuzzyMatcher {
             (patternIndex << 16) | pathIndex
         }
 
-        func match(patternIndex: Int, pathIndex: Int) -> Int? {
+        func match(patternIndex: Int, pathIndex: Int) -> StructuredPathResolution? {
             if patternIndex == patternSegments.count {
-                return pathIndex
+                return StructuredPathResolution(
+                    endSegment: pathIndex,
+                    exactLiteralSegments: 0,
+                    fuzzyPrefixSegments: 0
+                )
             }
 
             let key = memoKey(patternIndex: patternIndex, pathIndex: pathIndex)
@@ -1550,12 +1599,16 @@ public enum FuzzyMatcher {
             let patternSegment = patternSegments[patternIndex]
             if patternSegment == "**" {
                 if patternIndex == patternSegments.count - 1 {
-                    return pathSegments.count
+                    return StructuredPathResolution(
+                        endSegment: pathSegments.count,
+                        exactLiteralSegments: 0,
+                        fuzzyPrefixSegments: 0
+                    )
                 }
 
                 for nextPathIndex in pathIndex...pathSegments.count {
-                    if let end = match(patternIndex: patternIndex + 1, pathIndex: nextPathIndex) {
-                        return end
+                    if let resolution = match(patternIndex: patternIndex + 1, pathIndex: nextPathIndex) {
+                        return resolution
                     }
                 }
 
@@ -1568,35 +1621,57 @@ public enum FuzzyMatcher {
                 return nil
             }
 
-            guard structuredSegmentMatches(pathSegments[pathIndex], pattern: patternSegment) else {
+            guard let segmentMatch = structuredSegmentMatch(
+                pathSegments[pathIndex],
+                pattern: patternSegment
+            ) else {
                 memo.insert(key)
                 return nil
             }
 
-            if let end = match(patternIndex: patternIndex + 1, pathIndex: pathIndex + 1) {
-                return end
+            if let resolution = match(patternIndex: patternIndex + 1, pathIndex: pathIndex + 1) {
+                var exactLiteralSegments = resolution.exactLiteralSegments
+                var fuzzyPrefixSegments = resolution.fuzzyPrefixSegments
+                switch segmentMatch {
+                case .exactLiteral:
+                    exactLiteralSegments += 1
+                case .fuzzyPrefix:
+                    fuzzyPrefixSegments += 1
+                case .wildcard:
+                    break
+                }
+                return StructuredPathResolution(
+                    endSegment: resolution.endSegment,
+                    exactLiteralSegments: exactLiteralSegments,
+                    fuzzyPrefixSegments: fuzzyPrefixSegments
+                )
             }
 
             memo.insert(key)
             return nil
         }
 
-        guard let endSegment = match(patternIndex: 0, pathIndex: startSegment) else {
+        guard let resolution = match(patternIndex: 0, pathIndex: startSegment) else {
             return nil
         }
 
         return StructuredPathMatch(
             startSegment: startSegment,
-            matchedSegments: max(endSegment - startSegment, 0),
-            startsAtRoot: startsAtRoot
+            matchedSegments: max(resolution.endSegment - startSegment, 0),
+            startsAtRoot: startsAtRoot,
+            exactLiteralSegments: resolution.exactLiteralSegments,
+            fuzzyPrefixSegments: resolution.fuzzyPrefixSegments
         )
     }
 
-    private static func structuredSegmentMatches(_ segment: String, pattern: String) -> Bool {
+    private static func structuredSegmentMatch(_ segment: String, pattern: String) -> StructuredSegmentMatch? {
         if containsWildcardSyntax(pattern) {
-            return wildcardMatches(segment, pattern: pattern)
+            return wildcardMatches(segment, pattern: pattern) ? .wildcard : nil
         }
-        return segment.hasPrefix(pattern)
+        if segment == pattern {
+            return .exactLiteral
+        }
+        return segment.hasPrefix(pattern) ? .fuzzyPrefix : nil
     }
 
     private static func splitPathSegments(from value: String) -> [String] {
