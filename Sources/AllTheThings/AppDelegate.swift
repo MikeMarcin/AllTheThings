@@ -804,6 +804,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSear
 
         let editItem = NSMenuItem()
         let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        let redoItem = editMenu.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "z")
+        redoItem.keyEquivalentModifierMask = [.command, .shift]
+        editMenu.addItem(.separator())
         editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
         editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
         let copyPathItem = NSMenuItem(
@@ -815,6 +819,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSear
         editMenu.addItem(copyPathItem)
         editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editMenu.addItem(.separator())
+        let searchHistoryItem = editMenu.addItem(
+            withTitle: "Search History…",
+            action: Selector(("showSearchHistory:")),
+            keyEquivalent: "y"
+        )
+        searchHistoryItem.keyEquivalentModifierMask = [.command]
+        let previousSearchItem = editMenu.addItem(
+            withTitle: "Previous Search",
+            action: Selector(("recallPreviousSearch:")),
+            keyEquivalent: "r"
+        )
+        previousSearchItem.keyEquivalentModifierMask = [.control]
+        let nextSearchItem = editMenu.addItem(
+            withTitle: "Next Search",
+            action: Selector(("recallNextSearch:")),
+            keyEquivalent: "r"
+        )
+        nextSearchItem.keyEquivalentModifierMask = [.control, .shift]
         editItem.submenu = editMenu
         mainMenu.addItem(editItem)
 

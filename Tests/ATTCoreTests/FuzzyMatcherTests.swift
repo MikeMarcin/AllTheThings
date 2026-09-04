@@ -183,6 +183,43 @@ struct FuzzyMatcherTests {
         #expect(FuzzyMatcher.score(record: record, query: "**/gct/*.hpp") == nil)
     }
 
+    @Test("expands the current user home shorthand in path queries")
+    func homeDirectoryShorthand() throws {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let record = try #require(makeRecord(
+            name: "manifest.json",
+            directory: "\(home)/Projects/atlas-engine/Sources"
+        ))
+        let outsideHome = try #require(makeRecord(
+            name: "manifest.json",
+            directory: "/Library/Projects/atlas-engine/Sources"
+        ))
+
+        #expect(FuzzyMatcher.score(record: record, query: "~") != nil)
+        #expect(FuzzyMatcher.score(record: record, query: "~/Projects") != nil)
+        #expect(FuzzyMatcher.score(record: record, query: "~/Projects/**/manifest.json") != nil)
+        #expect(FuzzyMatcher.score(record: outsideHome, query: "~/Projects/**/manifest.json") == nil)
+    }
+
+    @Test("exact literal path components outrank fuzzy prefixes around wildcards")
+    func exactWildcardPathComponentsOutrankFuzzyPrefixes() throws {
+        let exact = try #require(makeRecord(
+            name: "manifest.json",
+            directory: "/Users/example/Projects/atlas-engine/Sources"
+        ))
+        let fuzzyPrefix = try #require(makeRecord(
+            name: "manifest.json",
+            directory: "/Users/example/Projects/atlas-engine-cache/Sources"
+        ))
+        let query = "/Users/example/Projects/atlas-engine/**/manifest.json"
+
+        let exactMatch = try #require(FuzzyMatcher.explain(record: exact, query: query))
+        let fuzzyPrefixMatch = try #require(FuzzyMatcher.explain(record: fuzzyPrefix, query: query))
+
+        #expect(exactMatch.quality > fuzzyPrefixMatch.quality)
+        #expect(exactMatch.score > fuzzyPrefixMatch.score)
+    }
+
     @Test("supports slash-structured path prefixes")
     func slashStructuredPathPrefixes() throws {
         let record = try #require(makeRecord(

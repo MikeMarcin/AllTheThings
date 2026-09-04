@@ -716,13 +716,7 @@ enum ResultIdentityRemapping {
     }
 }
 
-final class FileTableView: NSTableView {
-    var openAction: (() -> Void)?
-    var copyAction: (() -> Void)?
-    var copyPathAction: (() -> Void)?
-    var quickLookAction: (() -> Void)?
-    var getInfoAction: (() -> Void)?
-    var moveToTrashAction: (() -> Void)?
+class ContextTargetingTableView: NSTableView {
     var contextMenuTargetRowDidChange: ((Int?) -> Void)?
     var contextMenuTargetRow: Int? {
         didSet {
@@ -731,16 +725,72 @@ final class FileTableView: NSTableView {
         }
     }
 
-    @objc func copy(_ sender: Any?) {
-        copyAction?()
-    }
-
     override func rightMouseDown(with event: NSEvent) {
         let location = convert(event.locationInWindow, from: nil)
         let clickedRow = row(at: location)
         setContextMenuTargetRow(clickedRow >= 0 ? clickedRow : nil)
 
         super.rightMouseDown(with: event)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        let modifiers = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        let isTab = event.keyCode == UInt16(kVK_Tab)
+            || event.charactersIgnoringModifiers == "\t"
+            || event.charactersIgnoringModifiers == "\u{19}"
+        if isTab, modifiers.isEmpty || modifiers == .shift {
+            if modifiers == .shift {
+                window?.selectPreviousKeyView(nil)
+            } else {
+                window?.selectNextKeyView(nil)
+            }
+            return
+        }
+
+        super.keyDown(with: event)
+    }
+
+    override func drawRow(_ row: Int, clipRect: NSRect) {
+        super.drawRow(row, clipRect: clipRect)
+
+        guard row == contextMenuTargetRow else { return }
+
+        let rowRect = rect(ofRow: row).insetBy(dx: 2, dy: 1.5)
+        guard rowRect.intersects(clipRect) else { return }
+
+        let path = NSBezierPath(roundedRect: rowRect, xRadius: 4, yRadius: 4)
+        path.lineWidth = 2
+        NSColor.keyboardFocusIndicatorColor
+            .withAlphaComponent(window?.isKeyWindow == true ? 0.95 : 0.45)
+            .setStroke()
+        path.stroke()
+    }
+
+    func setContextMenuTargetRow(_ row: Int?) {
+        contextMenuTargetRow = row
+        contextMenuTargetRowDidChange?(row)
+    }
+
+    func clearContextMenuTargetRow() {
+        setContextMenuTargetRow(nil)
+    }
+
+    private func invalidateContextMenuTargetRow(_ row: Int?) {
+        guard let row, row >= 0, row < numberOfRows else { return }
+        setNeedsDisplay(rect(ofRow: row))
+    }
+}
+
+final class FileTableView: ContextTargetingTableView {
+    var openAction: (() -> Void)?
+    var copyAction: (() -> Void)?
+    var copyPathAction: (() -> Void)?
+    var quickLookAction: (() -> Void)?
+    var getInfoAction: (() -> Void)?
+    var moveToTrashAction: (() -> Void)?
+
+    @objc func copy(_ sender: Any?) {
+        copyAction?()
     }
 
     override func keyDown(with event: NSEvent) {
@@ -782,36 +832,6 @@ final class FileTableView: NSTableView {
         super.keyDown(with: event)
     }
 
-    override func drawRow(_ row: Int, clipRect: NSRect) {
-        super.drawRow(row, clipRect: clipRect)
-
-        guard row == contextMenuTargetRow else { return }
-
-        let rowRect = rect(ofRow: row).insetBy(dx: 2, dy: 1.5)
-        guard rowRect.intersects(clipRect) else { return }
-
-        let path = NSBezierPath(roundedRect: rowRect, xRadius: 4, yRadius: 4)
-        path.lineWidth = 2
-        NSColor.keyboardFocusIndicatorColor
-            .withAlphaComponent(window?.isKeyWindow == true ? 0.95 : 0.45)
-            .setStroke()
-        path.stroke()
-    }
-
-    func setContextMenuTargetRow(_ row: Int?) {
-        contextMenuTargetRow = row
-        contextMenuTargetRowDidChange?(row)
-    }
-
-    func clearContextMenuTargetRow() {
-        setContextMenuTargetRow(nil)
-    }
-
-    private func invalidateContextMenuTargetRow(_ row: Int?) {
-        guard let row, row >= 0, row < numberOfRows else { return }
-        setNeedsDisplay(rect(ofRow: row))
-    }
-
     private static func actionModifiers(_ event: NSEvent) -> NSEvent.ModifierFlags {
         event.modifierFlags.intersection([.command, .option, .control, .shift])
     }
@@ -845,6 +865,91 @@ final class FileTableView: NSTableView {
         return event.keyCode == UInt16(kVK_Return)
             || event.charactersIgnoringModifiers == "\r"
             || event.charactersIgnoringModifiers == "\u{3}"
+    }
+}
+
+final class SearchHistoryPopUpButton: NSPopUpButton {
+    override var canBecomeKeyView: Bool { true }
+}
+
+final class SearchQueryField: NSSearchField {
+    var recallPreviousSearch: (() -> Void)?
+    var recallNextSearch: (() -> Void)?
+    var showSearchHistory: (() -> Void)?
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        guard event.type == .keyDown else {
+            return super.performKeyEquivalent(with: event)
+        }
+
+        let modifiers = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        let character = event.charactersIgnoringModifiers?.lowercased()
+        if character == "r", modifiers == [.control] {
+            recallPreviousSearch?()
+            return true
+        }
+        if character == "r", modifiers == [.control, .shift] {
+            recallNextSearch?()
+            return true
+        }
+        if character == "y", modifiers == [.command] {
+            showSearchHistory?()
+            return true
+        }
+
+        return super.performKeyEquivalent(with: event)
+    }
+}
+
+final class SearchHistoryTableView: ContextTargetingTableView {
+    var restoreAction: (() -> Void)?
+    var deleteAction: (() -> Void)?
+    var copyAction: (() -> Void)?
+
+    @objc func copy(_ sender: Any?) {
+        copyAction?()
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if isPlainReturn(event) {
+            restoreAction?()
+            return
+        }
+
+        if isPlainDelete(event) {
+            deleteAction?()
+            return
+        }
+
+        if isCommandOnly(event, character: "c") {
+            copyAction?()
+            return
+        }
+
+        super.keyDown(with: event)
+    }
+
+    private func isPlainReturn(_ event: NSEvent) -> Bool {
+        actionModifiers(event).isEmpty
+            && (event.keyCode == UInt16(kVK_Return)
+                || event.charactersIgnoringModifiers == "\r"
+                || event.charactersIgnoringModifiers == "\u{3}")
+    }
+
+    private func isPlainDelete(_ event: NSEvent) -> Bool {
+        actionModifiers(event).isEmpty
+            && (event.keyCode == UInt16(kVK_Delete)
+                || event.charactersIgnoringModifiers == "\u{8}"
+                || event.charactersIgnoringModifiers == "\u{7f}")
+    }
+
+    private func actionModifiers(_ event: NSEvent) -> NSEvent.ModifierFlags {
+        event.modifierFlags.intersection([.command, .option, .control, .shift])
+    }
+
+    private func isCommandOnly(_ event: NSEvent, character: String) -> Bool {
+        actionModifiers(event) == .command
+            && event.charactersIgnoringModifiers?.lowercased() == character
     }
 }
 

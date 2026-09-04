@@ -3156,7 +3156,7 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         func candidatePathIndices(containing tokenBytes: [UInt8]) -> [Int32]? {
-            let keys = FileIndex.searchGramKeys(for: tokenBytes)
+            let keys = SearchTextGrams.queryKeys(for: tokenBytes)
             guard !keys.isEmpty else { return nil }
             if let gramIndex {
                 return Self.candidates(in: gramIndex, keys: keys)
@@ -3181,7 +3181,7 @@ public final class FileIndex: @unchecked Sendable {
             var keys: [Int] = []
             keys.reserveCapacity(tokenBytes.count)
             for byte in tokenBytes {
-                keys.append(FileIndex.searchGramKey(bytes: [byte], start: 0, length: 1))
+                keys.append(SearchTextGrams.key(bytes: [byte], start: 0, length: 1))
             }
 
             return partialPathGramCandidates(
@@ -3292,7 +3292,7 @@ public final class FileIndex: @unchecked Sendable {
                 return postings[0]
             }
 
-            return FileIndex.intersectPostingLists(postings, shouldCancel: shouldCancel)
+            return SortedPostingLists.intersection(postings, shouldCancel: shouldCancel)
         }
 
         private static func candidates(
@@ -3314,7 +3314,7 @@ public final class FileIndex: @unchecked Sendable {
         ) -> [Int32]? {
             guard let nameGramIndex else { return nil }
 
-            let keys = FileIndex.searchGramKeys(for: tokenBytes)
+            let keys = SearchTextGrams.queryKeys(for: tokenBytes)
             guard !keys.isEmpty else { return nil }
 
             var postings: [[Int32]] = []
@@ -3332,7 +3332,7 @@ public final class FileIndex: @unchecked Sendable {
                 return postings[0]
             }
 
-            return FileIndex.intersectPostingLists(postings, shouldCancel: shouldCancel)
+            return SortedPostingLists.intersection(postings, shouldCancel: shouldCancel)
         }
 
         func candidateNameIndices(
@@ -3379,7 +3379,7 @@ public final class FileIndex: @unchecked Sendable {
         ) -> [Int32]? {
             guard let componentGramIndex else { return nil }
 
-            let keys = FileIndex.searchGramKeys(for: tokenBytes)
+            let keys = SearchTextGrams.queryKeys(for: tokenBytes)
             return Self.candidates(
                 in: componentGramIndex,
                 keys: keys,
@@ -3393,7 +3393,7 @@ public final class FileIndex: @unchecked Sendable {
         ) -> [Int32]? {
             guard let componentGramIndex, !tokenBytes.isEmpty else { return nil }
             let keys = tokenBytes.map { byte in
-                FileIndex.searchGramKey(bytes: [byte], start: 0, length: 1)
+                SearchTextGrams.key(bytes: [byte], start: 0, length: 1)
             }
             return Self.candidates(in: componentGramIndex, keys: keys, shouldCancel: shouldCancel)
         }
@@ -3799,7 +3799,7 @@ public final class FileIndex: @unchecked Sendable {
             postings.reserveCapacity(tokenBytes.count)
 
             for byte in tokenBytes {
-                let key = FileIndex.searchGramKey(bytes: [byte], start: 0, length: 1)
+                let key = SearchTextGrams.key(bytes: [byte], start: 0, length: 1)
                 guard let values = postingIndex.values(for: key) else {
                     return []
                 }
@@ -3811,7 +3811,7 @@ public final class FileIndex: @unchecked Sendable {
                 return postings[0]
             }
 
-            return FileIndex.intersectPostingLists(postings, shouldCancel: shouldCancel)
+            return SortedPostingLists.intersection(postings, shouldCancel: shouldCancel)
         }
 
         func candidateIndices(
@@ -4357,7 +4357,7 @@ public final class FileIndex: @unchecked Sendable {
 
             for recordIndex in lowerBound..<upperBound {
                 keys.removeAll(keepingCapacity: true)
-                FileIndex.collectSearchGramKeys(from: store.normalizedPath(at: recordIndex), into: &keys)
+                SearchTextGrams.collectKeys(from: store.normalizedPath(at: recordIndex), into: &keys)
 
                 let storedIndex = Int32(recordIndex)
                 for key in keys {
@@ -4403,7 +4403,7 @@ public final class FileIndex: @unchecked Sendable {
 
             for recordIndex in 0..<store.count {
                 keys.removeAll(keepingCapacity: true)
-                FileIndex.collectSearchGramKeys(from: store.normalizedName(at: recordIndex), into: &keys)
+                SearchTextGrams.collectKeys(from: store.normalizedName(at: recordIndex), into: &keys)
 
                 let storedIndex = Int32(recordIndex)
                 for key in keys {
@@ -10774,7 +10774,7 @@ public final class FileIndex: @unchecked Sendable {
             }
 
             if let current = candidates {
-                candidates = intersectPostingLists(current, clauseCandidates, shouldCancel: shouldCancel)
+                candidates = SortedPostingLists.intersection(current, clauseCandidates, shouldCancel: shouldCancel)
             } else {
                 candidates = clauseCandidates
             }
@@ -10987,7 +10987,7 @@ public final class FileIndex: @unchecked Sendable {
             }
 
             if let current = candidates {
-                candidates = intersectPostingLists(
+                candidates = SortedPostingLists.intersection(
                     current,
                     fragmentCandidates,
                     shouldCancel: shouldCancel
@@ -11500,99 +11500,6 @@ public final class FileIndex: @unchecked Sendable {
 
     private static func tokenContainsPathSeparator(_ token: String) -> Bool {
         token.contains("/") || token.contains("\\")
-    }
-
-    private static func collectSearchGramKeys(from text: String, into keys: inout Set<Int>) {
-        guard !text.isEmpty else { return }
-        let bytes = Array(text.utf8)
-        guard !bytes.isEmpty else { return }
-
-        let maximumLength = min(3, bytes.count)
-        for length in 1...maximumLength {
-            let lastStart = bytes.count - length
-            for start in 0...lastStart {
-                keys.insert(searchGramKey(bytes: bytes, start: start, length: length))
-            }
-        }
-    }
-
-    private static func searchGramKeys(for tokenBytes: [UInt8]) -> [Int] {
-        guard !tokenBytes.isEmpty else { return [] }
-
-        if tokenBytes.count <= 3 {
-            return [searchGramKey(bytes: tokenBytes, start: 0, length: tokenBytes.count)]
-        }
-
-        var keys = Set<Int>()
-        let lastStart = tokenBytes.count - 3
-        for start in 0...lastStart {
-            keys.insert(searchGramKey(bytes: tokenBytes, start: start, length: 3))
-        }
-        return Array(keys)
-    }
-
-    private static func searchGramKey(bytes: [UInt8], start: Int, length: Int) -> Int {
-        var key = length << 24
-        for offset in 0..<length {
-            key |= Int(bytes[start + offset]) << ((2 - offset) * 8)
-        }
-        return key
-    }
-
-    private static func intersectPostingLists(
-        _ postings: [[Int32]],
-        shouldCancel: @Sendable () -> Bool = { false }
-    ) -> [Int32]? {
-        guard var result = postings.first else {
-            return []
-        }
-
-        for posting in postings.dropFirst() {
-            guard !shouldCancel() else { return nil }
-            if result.isEmpty {
-                break
-            }
-            guard let intersection = intersectPostingLists(result, posting, shouldCancel: shouldCancel) else {
-                return nil
-            }
-            result = intersection
-        }
-
-        return result
-    }
-
-    private static func intersectPostingLists(
-        _ lhs: [Int32],
-        _ rhs: [Int32],
-        shouldCancel: @Sendable () -> Bool = { false }
-    ) -> [Int32]? {
-        var result: [Int32] = []
-        result.reserveCapacity(min(lhs.count, rhs.count))
-
-        var leftIndex = 0
-        var rightIndex = 0
-        var comparisonCount = 0
-
-        while leftIndex < lhs.count, rightIndex < rhs.count {
-            if comparisonCount & 255 == 0, shouldCancel() {
-                return nil
-            }
-            comparisonCount += 1
-            let left = lhs[leftIndex]
-            let right = rhs[rightIndex]
-
-            if left == right {
-                result.append(left)
-                leftIndex += 1
-                rightIndex += 1
-            } else if left < right {
-                leftIndex += 1
-            } else {
-                rightIndex += 1
-            }
-        }
-
-        return result
     }
 
     private static func unionPostingLists(
