@@ -447,6 +447,17 @@ struct InsightsTreemapLayoutTests {
             #expect(contentRoot.fittingSize.height <= contentRoot.bounds.height + 1)
             #expect(contentRoot.fittingSize.width <= contentRoot.bounds.width + 1)
             #expect(page.frame.maxY <= contentRoot.bounds.maxY - 17)
+
+            // The header keeps its natural size on every tab: the title is never
+            // compressed by a tall page and the status line sits directly below it.
+            let titleLabel = try #require(findView(accessibilityIdentifier: "Insights.TitleLabel", in: contentRoot))
+            let statusLabel = try #require(findView(accessibilityIdentifier: "Insights.StatusLabel", in: contentRoot))
+            let titleFrame = titleLabel.convert(titleLabel.bounds, to: contentRoot)
+            let statusFrame = statusLabel.convert(statusLabel.bounds, to: contentRoot)
+            #expect(titleFrame.height >= titleLabel.fittingSize.height - 0.5, "\(identifier) compressed the title")
+            // contentRoot is flipped: y grows downward, so the status line sits at a larger y.
+            #expect(abs(statusFrame.minY - (titleFrame.maxY + 2)) <= 1, "\(identifier) moved the status line away from the title")
+            #expect(statusFrame.minY >= titleFrame.maxY - 0.5, "\(identifier) overlapped the title with the status line")
             if let tableIdentifier = expectedTables[identifier] {
                 #expect(findView(accessibilityIdentifier: tableIdentifier, in: page) != nil)
             }

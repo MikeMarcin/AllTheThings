@@ -5,7 +5,7 @@ import Darwin
 
 @MainActor
 final class InsightsWindowController: NSWindowController {
-    static let defaultContentSize = NSSize(width: 900, height: 600)
+    static let defaultContentSize = NSSize(width: 900, height: 640)
     private static let screenMargin: CGFloat = 18
 
     init(
@@ -498,10 +498,18 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
         titleLabel.font = .systemFont(ofSize: 24, weight: .semibold)
         titleLabel.textColor = .labelColor
+        titleLabel.setAccessibilityIdentifier("Insights.TitleLabel")
+        // The header must never absorb page slack: pages that are too tall
+        // otherwise squeeze the title, and pages that are too short stretch it.
+        titleLabel.setContentCompressionResistancePriority(.required, for: .vertical)
+        titleLabel.setContentHuggingPriority(.required, for: .vertical)
 
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
         statusLabel.font = .systemFont(ofSize: 13, weight: .regular)
         statusLabel.textColor = .secondaryLabelColor
+        statusLabel.setAccessibilityIdentifier("Insights.StatusLabel")
+        statusLabel.setContentCompressionResistancePriority(.required, for: .vertical)
+        statusLabel.setContentHuggingPriority(.required, for: .vertical)
         allowHorizontalCompression(statusLabel)
 
         configureIconButton(revealDataFolderButton, title: "Reveal Data Folder", symbol: "folder", action: #selector(revealDataFolder(_:)))
@@ -734,7 +742,7 @@ private final class InsightsViewController: NSViewController, NSTableViewDataSou
             energyFactsTable.trailingAnchor.constraint(equalTo: energyBody.trailingAnchor),
             energyFactsTable.bottomAnchor.constraint(lessThanOrEqualTo: energyChartView.bottomAnchor),
             energyFactsTable.widthAnchor.constraint(equalToConstant: 292),
-            energyChartView.heightAnchor.constraint(equalToConstant: 216)
+            energyChartView.heightAnchor.constraint(greaterThanOrEqualToConstant: 216)
         ])
         let energyCard = makeCard(containing: energyBody)
         energyCard.setAccessibilityIdentifier("Insights.EnergyCard")
