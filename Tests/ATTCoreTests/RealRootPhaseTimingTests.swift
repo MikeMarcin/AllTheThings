@@ -72,7 +72,7 @@ struct RealRootPhaseTimingTests {
         }
 
         let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
-        var events: [(elapsed: TimeInterval, phase: IndexPhase, status: String, indexed: Int, discovered: Int)] = []
+        nonisolated(unsafe) var events: [(elapsed: TimeInterval, phase: IndexPhase, status: String, indexed: Int, discovered: Int)] = []
         let lock = NSLock()
         let started = Date()
         let memoryTimeline = MemoryTimelineRecorder(started: started)
@@ -156,7 +156,7 @@ struct RealRootPhaseTimingTests {
         try await waitUntilCoreOptimized(index)
         try await waitUntilPathGramCompleteOrInactive(index)
 
-        var events: [(elapsed: TimeInterval, phase: IndexPhase, status: String, indexed: Int, discovered: Int)] = []
+        nonisolated(unsafe) var events: [(elapsed: TimeInterval, phase: IndexPhase, status: String, indexed: Int, discovered: Int)] = []
         let lock = NSLock()
         let started = Date()
         let memoryTimeline = MemoryTimelineRecorder(started: started)
@@ -241,7 +241,7 @@ struct RealRootPhaseTimingTests {
             try await waitUntilPathGramCompleteOrInactive(index)
         }
 
-        var events: [(elapsed: TimeInterval, phase: IndexPhase, status: String, indexed: Int, discovered: Int)] = []
+        nonisolated(unsafe) var events: [(elapsed: TimeInterval, phase: IndexPhase, status: String, indexed: Int, discovered: Int)] = []
         let lock = NSLock()
         let started = Date()
         let memoryTimeline = MemoryTimelineRecorder(started: started)
@@ -325,7 +325,7 @@ struct RealRootPhaseTimingTests {
         )
         index.onBackgroundReconciliationRequested = { _ in }
 
-        var events: [(elapsed: TimeInterval, phase: IndexPhase, status: String, indexed: Int, discovered: Int)] = []
+        nonisolated(unsafe) var events: [(elapsed: TimeInterval, phase: IndexPhase, status: String, indexed: Int, discovered: Int)] = []
         let lock = NSLock()
         let started = Date()
         let memoryTimeline = MemoryTimelineRecorder(started: started)
@@ -405,7 +405,7 @@ struct RealRootPhaseTimingTests {
         sourceAppName: String,
         sourceRecordCount: Int
     ) async throws {
-        var events: [(elapsed: TimeInterval, phase: IndexPhase, status: String, indexed: Int, discovered: Int)] = []
+        nonisolated(unsafe) var events: [(elapsed: TimeInterval, phase: IndexPhase, status: String, indexed: Int, discovered: Int)] = []
         let lock = NSLock()
         let started = Date()
         let memoryTimeline = MemoryTimelineRecorder(started: started)
