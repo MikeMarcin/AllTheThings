@@ -33,15 +33,17 @@ Queries are case-insensitive and diacritic-insensitive. Separate terms with spac
 
 | Query | Meaning |
 | --- | --- |
-| `psr` | Fuzzy/acronym match, such as `PhotoSyncReport.final.pdf`. |
+| `psr` | Fuzzy and acronym match, such as `PhotoSyncReport.final.pdf`. |
 | `redme` | Small typo match for a filename like `README.md`. |
-| `.swift` or `*.swift` | Match files by extension. |
-| `name:Search*.swift` | Match a wildcard pattern against the filename. |
-| `path:Sources ext:swift` | Match a path token and require Swift files. |
-| `package !path:node_modules` | Match `package` but exclude `node_modules` paths. |
-| `~/Projects/**/*.json` | Search below your home directory using `~` and path wildcards. |
-| `app:terminal` | Search launchable `.app` bundles from configured application search folders. |
-| `history:swift package` | Fuzzy-search saved queries for `swift package`. |
+| `*.swift` | `*` matches any run of characters and `?` matches one. |
+| `ext:swift\|md` | `\|` separates alternatives. |
+| `name:Search*.swift` | Match a pattern against the file name only. |
+| `path:Sources ext:swift` | Combine constraints. Path tokens and extensions stack. |
+| `package !path:node_modules` | Exclude with `!` or `-`. |
+| `~/Projects/**/*.json` | Search below a folder. `**` spans nested folders. |
+| `"query planner"` | Quotes match the exact substring, spaces included. |
+| `app:terminal` | Search installed applications instead of files. |
+| `history:swift package` | Search your own past queries. |
 
 The main prefixes are `name:`, `path:`, `ext:`, `kind:`, `app:`, and `history:`. The `app:` and `history:` prefixes switch search modes; the others constrain file metadata. Use `!` or `-` to exclude a term, `|` for alternatives, and double quotes for an exact substring. Wildcards use `*` for any run of characters, `?` for one character, `[abc]` for one character from a set (so `*.[hic]pp` matches `.hpp`, `.ipp`, and `.cpp`), and `**` to span folders.
 
