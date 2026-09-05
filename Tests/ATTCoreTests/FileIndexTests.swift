@@ -6672,8 +6672,8 @@ struct FileIndexTests {
     @Test("interactive preview refines to complete short fuzzy path matches")
     func interactivePreviewRefinesToCompleteShortFuzzyPathMatches() throws {
         let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
-        let root = "/tmp/allthethings-preview-refinement/"
-            + String(repeating: "wide-directory-segment/", count: 200)
+        let root = "/tmp/allthethings-preview-refinement"
+            + String(repeating: "/wide-directory-segment", count: 200)
         var records = [
             makeRecord(path: "\(root)/Arcology.md"),
             makeRecord(path: "\(root)/MALoopManagement.framework", isDirectory: true),

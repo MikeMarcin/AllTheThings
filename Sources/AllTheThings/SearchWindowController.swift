@@ -1565,6 +1565,10 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var searchHistoryMatches: [SearchHistory.Entry] = []
     private var searchHistorySort = SearchHistorySort()
     private var isApplyingSearchHistory = false
+    /// Text of the last change `handleSearchTextChange` processed. NSSearchField
+    /// delivers its action on a later run-loop pass, so a recalled history entry
+    /// would otherwise be treated as fresh typing and lose its navigation state.
+    private var lastHandledSearchText: String?
     private nonisolated(unsafe) var pendingSearchHistoryCommit: DispatchWorkItem?
     private var highlightedSearchHistoryMenuQuery: String?
     private var sortSpec: SortSpec
@@ -6503,11 +6507,16 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     @objc private func searchFieldDidChange(_ sender: NSSearchField) {
         guard !searchFieldHasMarkedText else { return }
         statusPreviewSearchText = nil
-        handleSearchTextChange()
+        // The field's action can arrive after a change that was already handled
+        // (for example a recalled history entry). Re-handling identical text must
+        // not discard history navigation.
+        let alreadyHandled = lastHandledSearchText == untrimmedSearchText()
+        handleSearchTextChange(preservesHistoryNavigation: alreadyHandled)
     }
 
     private func handleSearchTextChange(preservesHistoryNavigation: Bool = false) {
         guard !isApplyingSearchHistory else { return }
+        lastHandledSearchText = untrimmedSearchText()
 
         if !preservesHistoryNavigation {
             resetSearchHistoryNavigation()

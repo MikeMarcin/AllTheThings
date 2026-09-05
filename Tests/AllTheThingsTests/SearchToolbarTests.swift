@@ -414,6 +414,50 @@ struct SearchToolbarTests {
         #expect(editor.string == "draft")
     }
 
+    @Test("Control-Shift-R survives the search field's deferred action after a recall")
+    @MainActor
+    func controlShiftRSurvivesDeferredSearchFieldAction() throws {
+        let (defaults, suiteName) = try makeDefaults()
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        defaults.set(["README", "kind:folder"], forKey: AppSettings.searchHistoryKey)
+
+        let index = FileIndex(
+            applicationName: "AllTheThingsSearchHistoryDeferredActionTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        defer {
+            try? FileManager.default.removeItem(at: index.dataDirectoryURL)
+        }
+
+        let controller = SearchWindowController(index: index, defaults: defaults)
+        let view = try #require(controller.window?.contentViewController?.view)
+        let searchField = try #require(textFields(in: view).compactMap { $0 as? SearchQueryField }.first)
+        #expect(controller.window?.makeFirstResponder(searchField) == true)
+        let editor = try #require(searchField.currentEditor() as? NSTextView)
+        editor.insertText("draft", replacementRange: editor.selectedRange)
+
+        #expect(searchField.performKeyEquivalent(with: try keyEvent(
+            characters: "r",
+            modifiers: [.control],
+            keyCode: UInt16(kVK_ANSI_R)
+        )))
+        #expect(editor.string == "README")
+
+        // NSSearchField sends its action on a later run-loop pass, after the
+        // recall has finished. That delivery must not reset history navigation.
+        #expect(searchField.sendAction(searchField.action, to: searchField.target))
+        #expect(editor.string == "README")
+
+        #expect(searchField.performKeyEquivalent(with: try keyEvent(
+            characters: "R",
+            modifiers: [.control, .shift],
+            keyCode: UInt16(kVK_ANSI_R)
+        )))
+        #expect(editor.string == "draft")
+    }
+
     @Test("history mode copies and deletes multiple selected searches")
     @MainActor
     func historyModeCopiesAndDeletesMultipleSelectedSearches() throws {
@@ -1068,7 +1112,8 @@ private final class ManualSearchPreviewExecutor: @unchecked Sendable {
             guard !queuedWork.isEmpty else { return nil }
             return queuedWork.removeFirst()
         }
-        try #require(work)()
+        let next = try #require(work)
+        next()
     }
 }
 
