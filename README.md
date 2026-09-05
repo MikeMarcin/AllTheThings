@@ -9,23 +9,18 @@ AllTheThings is a native macOS file-search app. It indexes file metadata locally
   <img src="docs/images/allthethings-demo.png" alt="AllTheThings filtering a safe demo folder for planner Swift files with middle-word match indicators">
 </picture>
 
-## Requirements
+## Getting started
 
-- macOS 15 Sequoia or newer
-- Apple Silicon Mac
+1. Download the DMG from the [latest release](https://github.com/MikeMarcin/AllTheThings/releases/latest).
+2. Move AllTheThings to Applications and open it.
+3. Start typing. Search works while the initial index is still being built.
 
-## Getting Started
+By default the index covers `~/Desktop`, `~/Documents`, `~/Downloads`, and `~/Developer` when they exist. Change the list, add application search folders, or rebuild the index in **Settings > Indexed Folders**.
 
-Download the DMG from the [latest release](https://github.com/MikeMarcin/AllTheThings/releases/latest), move AllTheThings to Applications, and open it. Search remains available while the initial index is being built.
-
-By default, AllTheThings indexes `~/Desktop`, `~/Documents`, `~/Downloads`, and `~/Developer` when those folders exist. Use **Settings > Indexed Folders** to change that list, configure application search folders, check Full Disk Access, or rebuild the index. Application bundles are searched separately with `app:` so their internal files do not fill normal search results.
-
-Two optional global shortcuts are available from **Settings > Hotkeys**:
+Two optional global shortcuts live in **Settings > Hotkeys**. Enable launch at login if you want them available right after signing in.
 
 - `Command-Shift-Space` opens file search.
 - `Shift-Option-Space` opens application search.
-
-Enable launch at login if you want the shortcuts available after signing in.
 
 ## Searching
 
@@ -45,21 +40,33 @@ Queries are case-insensitive and diacritic-insensitive. Separate terms with spac
 | `app:terminal` | Search installed applications instead of files. |
 | `history:swift package` | Search your own past queries. |
 
-The main prefixes are `name:`, `path:`, `ext:`, `kind:`, `app:`, and `history:`. The `app:` and `history:` prefixes switch search modes; the others constrain file metadata. Use `!` or `-` to exclude a term, `|` for alternatives, and double quotes for an exact substring. Wildcards use `*` for any run of characters, `?` for one character, `[abc]` for one character from a set (so `*.[hic]pp` matches `.hpp`, `.ipp`, and `.cpp`), and `**` to span folders.
+Syntax reference:
 
-### Search History
+- Prefixes: `name:`, `path:`, `ext:`, and `kind:` constrain file metadata. `app:` and `history:` switch search modes.
+- Modifiers: `!` or `-` excludes a term, `|` separates alternatives, and double quotes match an exact substring.
+- Wildcards: `*` matches any run of characters, `?` matches one, `[abc]` matches one from a set (`*.[hic]pp` matches `.hpp`, `.ipp`, and `.cpp`), and `**` spans folders.
+- Application bundles are indexed separately and searched with `app:`, so their internal files stay out of normal results.
 
-Press `Command-Y`, click the history button, or type `history:` to browse earlier searches. Add text after the prefix to fuzzy-filter the list, and press Return to restore the selected query. `Control-R` and `Control-Shift-R` step backward and forward through history without opening the browser.
+### Search history
 
-A query is recorded after it remains unchanged for three seconds or when you act on its results; individual keystrokes and `history:` lookups are never recorded. **Settings > General > Search history retention** keeps 50 searches by default. Keyboard navigation and management details are in [docs/SEARCH_HISTORY.md](docs/SEARCH_HISTORY.md).
+- Press `Command-Y`, click the history button, or type `history:` to browse earlier searches. Add text after the prefix to filter, then press Return to restore a query.
+- `Control-R` and `Control-Shift-R` step backward and forward through history without opening the browser.
+- A query is recorded once it sits unchanged for three seconds or you act on its results. Keystrokes and `history:` lookups are never recorded.
+- **Settings > General > Search history retention** keeps 50 searches by default.
+
+Keyboard navigation and management details are in [docs/SEARCH_HISTORY.md](docs/SEARCH_HISTORY.md).
 
 ## Actions
 
-Select one or more results to open, reveal, copy, rename, preview, inspect, or move them to Trash. `Command-C` copies files; `Command-Option-C` copies their paths. AllTheThings can also use the macOS Services provided by Ghostty or iTerm2 to open a terminal in the selected folder.
+Select one or more results to open, reveal in Finder, rename, preview, inspect, or move to Trash.
+
+- `Command-C` copies the files.
+- `Command-Option-C` copies their paths.
+- With Ghostty or iTerm2 installed, their macOS Services open a terminal in the selected folder.
 
 ## Insights
 
-**AllTheThings > Insights...** (`Command-Option-Shift-I`) shows what the index is doing: how many files it tracks, how much disk the index package uses, how each search was routed and how long it took, and the app's CPU time and wakeups for the last hour, day, or three months. An indexer runs all day, so its cost should be easy to check.
+**AllTheThings > Insights...** (`Command-Option-Shift-I`) shows what the index costs: files tracked, disk used by the index package, how each search was routed and how long it took, and CPU time and wakeups over the last hour, day, or three months.
 
 <picture>
   <source srcset="docs/images/allthethings-insights.webp" type="image/webp">
@@ -68,23 +75,24 @@ Select one or more results to open, reveal, copy, rename, preview, inspect, or m
 
 ## Updates
 
-AllTheThings checks GitHub Releases once per day. Use **AllTheThings > Check for Updates...** to check manually or **AllTheThings > Automatically Check for Updates** to disable automatic checks.
+AllTheThings checks GitHub Releases once a day. **AllTheThings > Check for Updates...** checks now; **AllTheThings > Automatically Check for Updates** turns the daily check off.
 
 ## Privacy
 
-AllTheThings indexes file metadata, not file contents. The index, search history, and diagnostic logs stay on your Mac and are never attached to update checks. Raw logs can contain search queries and file paths; use **AllTheThings > Export Anonymized Diagnostic Log...** before sharing them unless you intend to disclose that information.
-
-macOS may request access when AllTheThings indexes Desktop, Documents, Downloads, or other protected locations. You can grant Full Disk Access from **System Settings > Privacy & Security > Full Disk Access** or limit the index to folders the app can already read.
-
-AllTheThings skips common high-noise directories, including `node_modules`, `DerivedData`, `.git/objects`, `Library/Caches`, and `.Trash`. Screenshots can still expose filenames and paths, so check them before sharing.
+- The index holds file metadata, not file contents.
+- The index, search history, and diagnostic logs stay on your Mac and are never attached to update checks.
+- Raw logs can contain queries and paths. Use **AllTheThings > Export Anonymized Diagnostic Log...** before sharing one.
+- High-noise directories such as `node_modules`, `DerivedData`, `.git/objects`, `Library/Caches`, and `.Trash` are skipped.
+- macOS may ask for access when the index reaches Desktop, Documents, Downloads, or other protected locations. Grant Full Disk Access in **System Settings > Privacy & Security**, or limit the index to folders the app can already read.
 
 ## Troubleshooting
 
-If a file is missing, confirm that its parent folder is indexed, check whether it is inside a skipped directory, and use **Reindex** if necessary. For missing applications, check the **Application Search** folders in **Settings > Indexed Folders**.
+- A file is missing: confirm its parent folder is indexed and not inside a skipped directory, then use **Reindex** if needed.
+- An application is missing: check the **Application Search** folders in **Settings > Indexed Folders**.
 
 ## Contributing
 
-Build instructions, VSCode tasks, architecture notes, and implementation limits are in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md). Bug reports with reproducible cases, documentation fixes, and code contributions are welcome through GitHub issues and pull requests. Development is supported through [GitHub Sponsors](https://github.com/sponsors/MikeMarcin).
+Build instructions, architecture notes, and implementation limits are in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md). Bug reports with reproducible cases, documentation fixes, and pull requests are welcome. Development is supported through [GitHub Sponsors](https://github.com/sponsors/MikeMarcin).
 
 ## License
 
