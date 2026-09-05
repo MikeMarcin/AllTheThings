@@ -2,6 +2,11 @@
 
 AllTheThings is a native macOS file-search app. It indexes file metadata locally and returns results as you type.
 
+[![Latest release](https://img.shields.io/github/v/release/MikeMarcin/AllTheThings?label=release&color=3f8fe4)](https://github.com/MikeMarcin/AllTheThings/releases/latest)
+![macOS 15+](https://img.shields.io/badge/macOS-15%2B-f4c542)
+![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-arm64-7a6ff0)
+[![MIT license](https://img.shields.io/badge/license-MIT-39d98a)](LICENSE)
+
 **[Download the latest release](https://github.com/MikeMarcin/AllTheThings/releases/latest)** for macOS 15 or newer on Apple Silicon. Website: [gamecoretech.com](https://gamecoretech.com/).
 
 <picture>
@@ -17,10 +22,10 @@ AllTheThings is a native macOS file-search app. It indexes file metadata locally
 
 By default the index covers `~/Desktop`, `~/Documents`, `~/Downloads`, and `~/Developer` when they exist. Change the list, add application search folders, or rebuild the index in **Settings > Indexed Folders**.
 
-Two optional global shortcuts live in **Settings > Hotkeys**. Enable launch at login if you want them available right after signing in.
-
-- `Command-Shift-Space` opens file search.
-- `Shift-Option-Space` opens application search.
+> [!TIP]
+> Two optional global shortcuts live in **Settings > Hotkeys**. Enable launch at login if you want them available right after signing in.
+> - <kbd>Command</kbd> <kbd>Shift</kbd> <kbd>Space</kbd> opens file search.
+> - <kbd>Shift</kbd> <kbd>Option</kbd> <kbd>Space</kbd> opens application search.
 
 ## Searching
 
@@ -79,8 +84,9 @@ AllTheThings checks GitHub Releases once a day. **AllTheThings > Check for Updat
 
 ## Privacy
 
-- The index holds file metadata, not file contents.
-- The index, search history, and diagnostic logs stay on your Mac and are never attached to update checks.
+> [!NOTE]
+> The index holds file metadata, not file contents. The index, search history, and diagnostic logs stay on your Mac and are never attached to update checks.
+
 - Raw logs can contain queries and paths. Use **AllTheThings > Export Anonymized Diagnostic Log...** before sharing one.
 - High-noise directories such as `node_modules`, `DerivedData`, `.git/objects`, `Library/Caches`, and `.Trash` are skipped.
 - macOS may ask for access when the index reaches Desktop, Documents, Downloads, or other protected locations. Grant Full Disk Access in **System Settings > Privacy & Security**, or limit the index to folders the app can already read.
@@ -91,6 +97,8 @@ AllTheThings checks GitHub Releases once a day. **AllTheThings > Check for Updat
 - An application is missing: check the **Application Search** folders in **Settings > Indexed Folders**.
 
 ## Contributing
+
+<img src="docs/images/nib.png" alt="Nib, the AllTheThings mascot" width="64" align="right">
 
 Build instructions, architecture notes, and implementation limits are in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md). Bug reports with reproducible cases, documentation fixes, and pull requests are welcome. Development is supported through [GitHub Sponsors](https://github.com/sponsors/MikeMarcin).
 
