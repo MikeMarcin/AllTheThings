@@ -74,3 +74,4 @@ Testing/
 
 # Generated captures, contact sheets, and animation review output
 artifacts/
+/.agents/skills/sprite-sheet-animation-updater

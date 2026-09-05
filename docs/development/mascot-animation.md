@@ -1,8 +1,3 @@
----
-name: sprite-sheet-animation-updater
-description: Generate, update, integrate, and validate fixed-cell sprite-sheet animations for app/game mascots. Use when Codex is asked to create new sprite animation rows, replace or repair existing sprite-sheet animations, preserve a character's model/identity across frames, assemble a master sprite sheet, add standalone animation strips, or add regression tests for sprite dimensions, transparent gutters, body scale, width, baseline, or horizontal registration.
----
-
 # Sprite Sheet Animation Updater
 
 Use this workflow for fixed-cell mascot sprite sheets where visual consistency matters as much as frame count. Preserve the approved character model first; effects and props are secondary.
@@ -14,7 +9,7 @@ Use this workflow for fixed-cell mascot sprite sheets where visual consistency m
 3. **Generate or edit one row at a time.** If using image generation, prompt for the exact frame count, a single horizontal row, fixed cell size, consistent baseline/scale, and no text/borders/background scene.
 4. **Post-process deterministically.** Remove background, crop/pad into fixed cells, and keep transparent gutters. Never let confetti, papers, gears, or other props determine mascot body scale.
 5. **Check theme contrast.** Composite transparent frames over the app's expected light and dark backgrounds before approving pale props, gray strokes, shadows, glows, or sparkles. A prop that reads on checkerboard or dark gray can disappear on a light table row.
-6. **Check model metrics before integrating.** Validate active frames for nonempty alpha, gutters, body height, body width, and body center registration. For Nib-style blue mascot sheets, use `scripts/validate_sprite_sheet.py`.
+6. **Check model metrics before integrating.** Validate active frames for nonempty alpha, gutters, body height, body width, and body center registration. For Nib-style blue mascot sheets, use `tools/validate_allthethings_nib.sh`.
 7. **Integrate the asset.** Update app resource references, bundle scripts, animation metadata, and tests together. Remove obsolete sheet assets only after references are gone.
 8. **Run regression tests and build.** Run the validator, the project tests, and the app/resource build path that copies the sheet into the bundle.
 
@@ -85,10 +80,10 @@ Avoid prop colors that match the mascot body detector. Gray papers, gears, shado
 For AllTheThings, run the strip-aware wrapper from the repo skill directory:
 
 ```bash
-.codex/skills/sprite-sheet-animation-updater/scripts/validate_allthethings_nib.sh .
+tools/validate_allthethings_nib.sh .
 ```
 
-Use `scripts/validate_sprite_sheet.py` directly for legacy master sheets, non-AllTheThings projects, or one-off generated rows. Add `--no-body-check` for non-blue characters or when a sheet does not have a detectable mascot-color component. In that case, add a project-specific test or script for the character model before shipping.
+The optional shared skill supplies a generic `validate_sprite_sheet.py` for other layouts. ATT’s local wrapper below is self-contained and does not require AgentSkills access.
 
 The AllTheThings wrapper checks every runtime strip, then runs Swift tests and the CMake app bundle build. The image checks include:
 
@@ -127,13 +122,17 @@ The app should load only the individual runtime strips. The audit contact sheet 
 To regenerate the smoother first-impression operation strips, standalone strips, and the audit contact sheet, keep the approved idle body locked and redraw only the props:
 
 ```bash
-python3 .codex/skills/sprite-sheet-animation-updater/scripts/generate_allthethings_operation_rows.py --repo-root . --frames 16
+python3 tools/generate_allthethings_operation_rows.py --repo-root . --frames 16
 ```
 
 After changing the sheet in AllTheThings, run:
 
 ```bash
-.codex/skills/sprite-sheet-animation-updater/scripts/validate_allthethings_nib.sh .
+tools/validate_allthethings_nib.sh .
 ```
 
 Also keep or update Swift regression tests that check sprite metadata, strip slicing, transparent gutters, body height, body width, horizontal body registration, standalone strip dimensions, and standalone loop seams.
+
+## Local contributor workflow
+
+`tools/generate_allthethings_operation_rows.py`, `tools/validate_allthethings_nib.sh`, this document, the Swift tests, and the CMake app build remain maintained in this repository. The optional MASK-managed skill is an agent convenience; it is not a build or contributor dependency.

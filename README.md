@@ -105,3 +105,7 @@ Build instructions, architecture notes, and implementation limits are in [docs/D
 ## License
 
 AllTheThings is released under the [MIT License](LICENSE).
+
+## Mascot asset development
+
+The [mascot animation workflow](docs/development/mascot-animation.md) documents Nib’s asset contract and local generation/validation commands. Its tools and checks are maintained here and do not require access to the optional shared AgentSkills library.
