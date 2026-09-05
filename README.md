@@ -2,6 +2,8 @@
 
 AllTheThings is a native macOS file-search app. It indexes file metadata locally and returns results as you type.
 
+**[Download the latest release](https://github.com/MikeMarcin/AllTheThings/releases/latest)** for macOS 15 or newer on Apple Silicon. Website: [gamecoretech.com](https://gamecoretech.com/).
+
 <picture>
   <source srcset="docs/images/allthethings-demo.webp" type="image/webp">
   <img src="docs/images/allthethings-demo.png" alt="AllTheThings filtering a safe demo folder for planner Swift files with middle-word match indicators">
@@ -41,17 +43,26 @@ Queries are case-insensitive and diacritic-insensitive. Separate terms with spac
 | `app:terminal` | Search launchable `.app` bundles from configured application search folders. |
 | `history:swift package` | Fuzzy-search saved queries for `swift package`. |
 
-The main prefixes are `name:`, `path:`, `ext:`, `kind:`, `app:`, and `history:`. The `app:` and `history:` prefixes switch search modes; the others constrain file metadata. Use `!` or `-` to exclude a term, `|` for alternatives, and double quotes for an exact substring. Wildcards use `*` for any run of characters, `?` for one character, and `**` to span folders.
+The main prefixes are `name:`, `path:`, `ext:`, `kind:`, `app:`, and `history:`. The `app:` and `history:` prefixes switch search modes; the others constrain file metadata. Use `!` or `-` to exclude a term, `|` for alternatives, and double quotes for an exact substring. Wildcards use `*` for any run of characters, `?` for one character, `[abc]` for one character from a set (so `*.[hic]pp` matches `.hpp`, `.ipp`, and `.cpp`), and `**` to span folders.
 
 ### Search History
 
-Press `Command-Y`, click the history button, or type `history:` to browse earlier searches. Add text after the prefix to fuzzy-filter the list, sort by the **Search** or **Searched** column, and press Return to restore the selected query. For keyboard access to the compact menu, press Tab from the search field to focus its button, then press Space. In the open menu, use the arrow keys to move among queries or Tab to continue to the results; Tab from the results cycles back to the search field. `Control-R` and `Control-Shift-R` step backward and forward through history without opening the browser; Escape leaves history and restores the query you were editing.
+Press `Command-Y`, click the history button, or type `history:` to browse earlier searches. Add text after the prefix to fuzzy-filter the list, and press Return to restore the selected query. `Control-R` and `Control-Shift-R` step backward and forward through history without opening the browser.
 
-AllTheThings records a query after it remains unchanged for three seconds or when you take an action on its results. It does not wait for a long-running search to finish, does not record each character you type, and never records the `history:` lookup itself. History rows support multiple selection, `Command-C` copies selected queries as separate lines, and Delete or the context menu removes them. In the compact history menu, highlight a query with the pointer or arrow keys and press Delete or Backspace to remove it. **Settings > General > Search history retention** keeps 50 searches by default and can be set to another limit, Off, or Unlimited.
+A query is recorded after it remains unchanged for three seconds or when you act on its results; individual keystrokes and `history:` lookups are never recorded. **Settings > General > Search history retention** keeps 50 searches by default. Keyboard navigation and management details are in [docs/SEARCH_HISTORY.md](docs/SEARCH_HISTORY.md).
 
 ## Actions
 
 Select one or more results to open, reveal, copy, rename, preview, inspect, or move them to Trash. `Command-C` copies files; `Command-Option-C` copies their paths. AllTheThings can also use the macOS Services provided by Ghostty or iTerm2 to open a terminal in the selected folder.
+
+## Insights
+
+**AllTheThings > Insights...** (`Command-Option-Shift-I`) shows what the index is doing: how many files it tracks, how much disk the index package uses, how each search was routed and how long it took, and the app's CPU time and wakeups for the last hour, day, or three months. An indexer runs all day, so its cost should be easy to check.
+
+<picture>
+  <source srcset="docs/images/allthethings-insights.webp" type="image/webp">
+  <img src="docs/images/allthethings-insights.png" alt="The Insights window on the Energy tab, showing CPU share of the system, wakeups per minute, and an hour of CPU history">
+</picture>
 
 ## Updates
 
@@ -69,6 +80,10 @@ AllTheThings skips common high-noise directories, including `node_modules`, `Der
 
 If a file is missing, confirm that its parent folder is indexed, check whether it is inside a skipped directory, and use **Reindex** if necessary. For missing applications, check the **Application Search** folders in **Settings > Indexed Folders**.
 
-## Development
+## Contributing
 
-Build instructions, VSCode tasks, architecture notes, and implementation limits are in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md). Development is supported through [GitHub Sponsors](https://github.com/sponsors/MikeMarcin).
+Build instructions, VSCode tasks, architecture notes, and implementation limits are in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md). Bug reports with reproducible cases, documentation fixes, and code contributions are welcome through GitHub issues and pull requests. Development is supported through [GitHub Sponsors](https://github.com/sponsors/MikeMarcin).
+
+## License
+
+AllTheThings is released under the [MIT License](LICENSE).
