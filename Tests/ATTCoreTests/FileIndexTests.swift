@@ -5534,6 +5534,49 @@ struct FileIndexTests {
         #expect(response.results.map(\.record.name) == ["LogViewer.swift"])
     }
 
+    @Test("slow snapshot construction leaves time for scan progress")
+    func slowSnapshotConstructionLeavesTimeForScanProgress() {
+        var schedule = ScanSnapshotSchedule()
+        let started = Date(timeIntervalSince1970: 1_000)
+        let count = 5_335_317
+        #expect(schedule.shouldCreateSnapshot(recordCount: count, at: started))
+
+        let completed = started.addingTimeInterval(120)
+        schedule.didCreateSnapshot(recordCount: count, completedAt: completed)
+        // All waiting workers reach this point after the expensive copy returns.
+        for worker in 1...8 {
+            #expect(!schedule.shouldCreateSnapshot(recordCount: count + worker, at: completed))
+        }
+        #expect(schedule.shouldCreateSnapshot(recordCount: count + 8, at: completed.addingTimeInterval(1)))
+        #expect(!schedule.shouldCreateSnapshot(recordCount: count, at: completed.addingTimeInterval(300)))
+        #expect(schedule.shouldCreateSnapshot(recordCount: count + 25_000, at: completed))
+        #expect(schedule.shouldCreateSnapshot(recordCount: count, at: completed, force: true))
+    }
+
+    @Test("scan workers skip checkpoints while persistence is busy")
+    func scanWorkersSkipCheckpointsWhilePersistenceIsBusy() {
+        let index = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        defer { try? FileManager.default.removeItem(at: index.dataDirectoryURL) }
+        let workers = DispatchGroup()
+        index.withCheckpointPersistenceLockHeldForTesting {
+            for _ in 0..<8 {
+                workers.enter()
+                DispatchQueue.global().async {
+                    defer { workers.leave() }
+                    #expect(!index.requestEmptyCheckpointForTesting())
+                }
+            }
+            #expect(workers.wait(timeout: .now() + 2) == .success)
+        }
+        #expect(workers.wait(timeout: .now() + 2) == .success)
+        // A skipped attempt must neither construct a snapshot nor retain the gate.
+        #expect(index.requestEmptyCheckpointForTesting())
+        #expect(index.requestEmptyCheckpointForTesting())
+    }
+
     @Test("fast scans do not package full-prefix checkpoints")
     func fastScansDoNotPackageFullPrefixCheckpoints() {
         let startedAt = Date(timeIntervalSinceReferenceDate: 10_000)
@@ -5665,6 +5708,8 @@ struct FileIndexTests {
             .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
         let pendingDirectory = root.appendingPathComponent("pending", isDirectory: true)
         try fileManager.createDirectory(at: pendingDirectory, withIntermediateDirectories: true)
+        let activeDirectory = root.appendingPathComponent("worktree", isDirectory: true)
+        try fileManager.createDirectory(at: activeDirectory, withIntermediateDirectories: true)
         defer {
             try? fileManager.removeItem(at: root)
             try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName))
@@ -5672,8 +5717,13 @@ struct FileIndexTests {
 
         let existingFile = root.appendingPathComponent("Existing.log")
         let pendingFile = pendingDirectory.appendingPathComponent("Pending.log")
+        let activeFile = activeDirectory.appendingPathComponent("Active.log")
         try "existing".write(to: existingFile, atomically: true, encoding: .utf8)
         try "pending".write(to: pendingFile, atomically: true, encoding: .utf8)
+        try "active".write(to: activeFile, atomically: true, encoding: .utf8)
+        try "gitdir: ../main/.git/worktrees/example\n".write(
+            to: activeDirectory.appendingPathComponent(".git"), atomically: true, encoding: .utf8
+        )
 
         let checkpointRecords = [root, existingFile].compactMap { FileRecord(url: $0) }
         let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
@@ -5681,6 +5731,7 @@ struct FileIndexTests {
             records: checkpointRecords,
             roots: [root],
             pendingDirectories: [pendingDirectory],
+            activeDirectories: [activeDirectory],
             completedDirectories: [root]
         )
         #expect(index.checkpointExistsForTesting())
@@ -5703,7 +5754,21 @@ struct FileIndexTests {
             sort: SortSpec(column: .relevance, ascending: false)
         ), maxResults: 10)
         #expect(response.results.contains { $0.record.path == pendingFile.path })
+        let activeResponse = resumed.search(SearchRequest(
+            query: "Active.log", sort: SortSpec(column: .name, ascending: true)
+        ), maxResults: 10)
+        #expect(activeResponse.results.contains { $0.record.path == activeFile.path })
         #expect(!resumed.checkpointExistsForTesting())
+
+        let addedFile = activeDirectory.appendingPathComponent("AfterRebuild.log")
+        try "new".write(to: addedFile, atomically: true, encoding: .utf8)
+        resumed.refresh(paths: [addedFile.path])
+        try await waitUntil(timeout: .seconds(10)) {
+            resumed.search(SearchRequest(
+                query: "AfterRebuild.log", sort: SortSpec(column: .name, ascending: true)
+            ), maxResults: 10)
+                .results.contains { $0.record.path == addedFile.path }
+        }
     }
 
     @Test("resumed checkpoints optimize when external reconciliation is already up to date")

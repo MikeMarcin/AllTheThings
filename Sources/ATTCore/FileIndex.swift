@@ -576,6 +576,23 @@ struct ScanFrontierMetrics: Sendable, Equatable {
     var retainedRecordDictionaryCount: Int = 0
 }
 
+struct ScanSnapshotSchedule: Sendable {
+    private var lastRecordCount = 0
+    private var lastCompletedAt = Date.distantPast
+
+    func shouldCreateSnapshot(recordCount: Int, at now: Date, force: Bool = false) -> Bool {
+        if force { return true }
+        guard recordCount > lastRecordCount else { return false }
+        return recordCount - lastRecordCount >= 25_000
+            || now.timeIntervalSince(lastCompletedAt) >= 1
+    }
+
+    mutating func didCreateSnapshot(recordCount: Int, completedAt: Date) {
+        lastRecordCount = recordCount
+        lastCompletedAt = completedAt
+    }
+}
+
 struct ScanCheckpointSchedule: Sendable {
     private let operationStartedAt: Date
     private let minimumElapsedInterval: TimeInterval
@@ -638,7 +655,6 @@ public final class FileIndex: @unchecked Sendable {
     private static let maximumRefreshBatchPaths = 512
     private static let maximumPendingRefreshPaths = 4_096
     private static let primaryPublishRecordInterval = 25_000
-    private static let primaryPublishTimeInterval: TimeInterval = 1
     private static let scanStatusPublishRecordInterval = 1_000
     private static let scanStatusPublishTimeInterval: TimeInterval = 0.25
     private static let pathGramRecordLimit = 200_000
@@ -1821,8 +1837,7 @@ public final class FileIndex: @unchecked Sendable {
         private var yieldedSlices = 0
         private var lastStatusPublishedCount = 0
         private var lastStatusPublishedAt = Date.distantPast
-        private var lastPublishedCount = 0
-        private var lastPublishedAt = Date.distantPast
+        private var snapshotSchedule = ScanSnapshotSchedule()
         private var checkpointSchedule: ScanCheckpointSchedule
         private let operationStartedAt: Date
         private var frontierMetrics = ScanFrontierMetrics()
@@ -2060,14 +2075,13 @@ public final class FileIndex: @unchecked Sendable {
 
             let now = Date()
             let recordCount = builder.count
-            let shouldPublish = force
-                || recordCount - lastPublishedCount >= FileIndex.primaryPublishRecordInterval
-                || now.timeIntervalSince(lastPublishedAt) >= FileIndex.primaryPublishTimeInterval
-            guard shouldPublish else { return nil }
-
-            lastPublishedCount = recordCount
-            lastPublishedAt = now
+            guard snapshotSchedule.shouldCreateSnapshot(recordCount: recordCount, at: now, force: force) else {
+                return nil
+            }
             let store = builder.snapshot(includesPathIndex: false)
+            // Snapshot construction can exceed the publish interval for large trees.
+            // Start the interval after that work so waiting workers can scan first.
+            snapshotSchedule.didCreateSnapshot(recordCount: recordCount, completedAt: Date())
             frontierMetrics.searchableSnapshotCount += 1
             frontierMetrics.searchableSnapshotRowCount += UInt64(store.count)
             return ScanProgress(store: store, visited: visited)
@@ -12440,23 +12454,14 @@ public final class FileIndex: @unchecked Sendable {
             self.publishScanStatus(visited: visited, generation: currentGeneration)
         }
 
-        let checkpointProgress: @Sendable (_ result: ScanCheckpointProgress?, _ force: Bool) -> Void = { [weak self] result, force in
-            guard writesCheckpoints, let self, let result else { return }
-            if force {
-                self.persistScanCheckpoint(
-                    result,
-                    roots: rootPaths,
-                    exclusionPatterns: exclusions.patterns,
-                    generation: currentGeneration
-                )
-            } else {
-                self.persistScanCheckpointAsync(
-                    result,
-                    roots: rootPaths,
-                    exclusionPatterns: exclusions.patterns,
-                    generation: currentGeneration
-                )
-            }
+        let checkpointProgress: @Sendable () -> Void = { [weak self] in
+            guard writesCheckpoints, let self else { return }
+            self.persistScanCheckpointAsync(
+                makeProgress: { state.checkpointIfNeeded(force: false) },
+                roots: rootPaths,
+                exclusionPatterns: exclusions.patterns,
+                generation: currentGeneration
+            )
         }
         let recordBackgroundYield: @Sendable (TimeInterval) -> Void = { [weak self] delay in
             state.recordYieldedSlice()
@@ -12655,7 +12660,7 @@ public final class FileIndex: @unchecked Sendable {
                                 batch.removeAll(keepingCapacity: true)
                                 publishStatus(state.statusIfNeeded(force: false))
                                 publishSearchableSnapshot(false)
-                                checkpointProgress(state.checkpointIfNeeded(force: false), false)
+                                checkpointProgress()
                             }
                             return true
                         }
@@ -12681,7 +12686,7 @@ public final class FileIndex: @unchecked Sendable {
                             batch.removeAll(keepingCapacity: true)
                             publishStatus(state.statusIfNeeded(force: false))
                             publishSearchableSnapshot(false)
-                            checkpointProgress(state.checkpointIfNeeded(force: false), false)
+                            checkpointProgress()
                         }
 
                         finishedDirectories.append(directory)
@@ -17737,20 +17742,26 @@ public final class FileIndex: @unchecked Sendable {
     }
 
     private func persistScanCheckpointAsync(
-        _ progress: ScanCheckpointProgress,
+        makeProgress: () -> ScanCheckpointProgress?,
         roots: [String],
         exclusionPatterns: [String],
         generation currentGeneration: UInt64
     ) {
-        var shouldEnqueue = false
-        checkpointPersistenceLock.withLock {
-            if !checkpointWriteInFlight {
-                checkpointWriteInFlight = true
-                shouldEnqueue = true
-            }
+        // Persistence holds this lock throughout package construction and I/O.
+        // A scan worker must never wait for it, or build a full snapshot only to
+        // discard it while another checkpoint is still being written.
+        guard checkpointPersistenceLock.try() else { return }
+        guard !checkpointWriteInFlight else {
+            checkpointPersistenceLock.unlock()
+            return
         }
+        checkpointWriteInFlight = true
+        checkpointPersistenceLock.unlock()
 
-        guard shouldEnqueue else { return }
+        guard let progress = makeProgress() else {
+            checkpointPersistenceLock.withLock { checkpointWriteInFlight = false }
+            return
+        }
 
         checkpointQueue.async { [weak self] in
             guard let self else { return }
@@ -18801,6 +18812,24 @@ public final class FileIndex: @unchecked Sendable {
 
     func checkpointExistsForTesting() -> Bool {
         fileManager.fileExists(atPath: checkpointURL.path)
+    }
+
+    func withCheckpointPersistenceLockHeldForTesting(_ body: () -> Void) {
+        checkpointPersistenceLock.withLock(body)
+    }
+
+    func requestEmptyCheckpointForTesting() -> Bool {
+        var requestedSnapshot = false
+        persistScanCheckpointAsync(
+            makeProgress: {
+                requestedSnapshot = true
+                return nil
+            },
+            roots: [],
+            exclusionPatterns: [],
+            generation: currentGeneration()
+        )
+        return requestedSnapshot
     }
 
     private func publishStats() {
