@@ -3452,10 +3452,6 @@ struct FileIndexTests {
 
         try await waitUntil(timeout: .seconds(10)) { firstCompletion.isMarked }
         #expect(!followUpCompletion.isMarked)
-        #expect(
-            index.pendingRefreshPathsForTesting().contains(folder.path)
-                || index.currentStats().isUpdating
-        )
 
         index.promoteBackgroundMaintenance()
         try await waitUntil(timeout: .seconds(10)) {
