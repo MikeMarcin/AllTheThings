@@ -1108,6 +1108,7 @@ struct FileIndexTests {
         index.replaceRootsAndRebuild([replacementRoot], mode: .fresh)
         try await waitUntil(timeout: .seconds(5)) {
             !index.currentStats().isIndexing
+                && index.currentDiagnostics().activeIndexJobs == 0
                 && index.search(SearchRequest(
                     query: "Replacement",
                     sort: SortSpec(column: .relevance, ascending: false)
