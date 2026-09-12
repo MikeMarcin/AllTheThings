@@ -5281,6 +5281,66 @@ struct FileIndexTests {
         #expect(response.results.contains { $0.record.path == finderHiddenFile.path })
     }
 
+    @Test("long filename searches retain indexed candidates with and without a trailing quote")
+    func longFilenameFuzzyAndLiteralSearches() throws {
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        defer { try? FileManager.default.removeItem(at: index.dataDirectoryURL) }
+        let filename = "ReplicationSynchronizationPrimitive-comparison.md"
+        let target = "/tmp/att-long-filename/\(filename)"
+        var records = (0..<20_000).map {
+            makeRecord(path: "/tmp/att-long-filename/\($0)/SynchronizationReplicationModelHistory.swift")
+        }
+        records.append(makeRecord(path: target))
+        index.replaceRecordsForTesting(records)
+        index.persistSnapshotForTesting()
+        let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
+        for query in [filename, filename + "\""] {
+            for sortColumn in [SortColumn.relevance, .name, .modified, .path, .size] {
+                for mode in [SearchMode.interactivePreview, .complete] {
+                    let response = reloaded.search(SearchRequest(
+                        query: query,
+                        sort: SortSpec(column: sortColumn, ascending: true),
+                        mode: mode
+                    ), maxResults: 20)
+                    #expect(response.results.map(\.record.path) == [target])
+                    #expect(!response.executionProfile.didFallbackToFullScan)
+                    #expect(response.executionProfile.candidateCount < 100)
+                }
+            }
+        }
+    }
+
+    @Test("long fuzzy candidates preserve typo limits and queries beyond the old subset cap")
+    func longFuzzyCandidatesMatchBruteForce() {
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        defer { try? FileManager.default.removeItem(at: index.dataDirectoryURL) }
+        let queries = [
+            "replicationsynchronizationprimitive",
+            "abcdefghijklmnopqrstuvwx",
+            "replication-comparison.md"
+        ]
+        var records: [FileRecord] = []
+        for query in queries {
+            for deletionCount in 0...3 {
+                records.append(makeRecord(path: "/tmp/att-typo/\(query.dropFirst(deletionCount))"))
+            }
+            records.append(makeRecord(path: "/tmp/att-typo/prefix-\(query)-suffix"))
+            records.append(makeRecord(path: "/tmp/att-typo/\(query.replacingOccurrences(of: "e", with: "é"))"))
+        }
+        index.replaceRecordsForTesting(records)
+        for query in queries {
+            let expected = Set(records.filter { FuzzyMatcher.score(record: $0, query: query) != nil }.map(\.path))
+            let response = index.search(SearchRequest(
+                query: query,
+                sort: SortSpec(column: .relevance, ascending: false)
+            ), maxResults: records.count)
+            #expect(Set(response.results.map(\.record.path)) == expected)
+            #expect(!response.executionProfile.didFallbackToFullScan)
+        }
+    }
+
     @Test("optimized search keeps fuzzy and acronym filename matches")
     func optimizedSearchKeepsFuzzyAndAcronymFilenameMatches() throws {
         let acronymPath = "/tmp/allthethings-tests/reports/PhotoSyncReport.final.pdf"

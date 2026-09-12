@@ -89,6 +89,40 @@ enum SearchTextGrams {
 }
 
 enum SortedPostingLists {
+    /// Posting lists contain unique, sorted row IDs. Counting each list once is
+    /// equivalent to unioning every intersection of `requiredCount` lists, without
+    /// the combinatorial rereads and intermediate allocations.
+    static func matchingAtLeast(
+        _ requiredCount: Int,
+        in postings: [[Int32]],
+        rowCount: Int,
+        shouldCancel: @Sendable () -> Bool = { false }
+    ) -> [Int32]? {
+        guard !shouldCancel() else { return nil }
+        guard requiredCount > 0, requiredCount <= postings.count else { return [] }
+        precondition(requiredCount <= Int(UInt8.max))
+        let threshold = UInt8(requiredCount)
+        var counts = [UInt8](repeating: 0, count: rowCount)
+        for posting in postings {
+            guard !shouldCancel() else { return nil }
+            for (offset, rowID) in posting.enumerated() {
+                if offset & 511 == 0, shouldCancel() { return nil }
+                let row = Int(rowID)
+                if counts[row] < threshold {
+                    counts[row] += 1
+                }
+            }
+        }
+        var matches: [Int32] = []
+        for row in counts.indices {
+            if row & 511 == 0, shouldCancel() { return nil }
+            if counts[row] == threshold {
+                matches.append(Int32(row))
+            }
+        }
+        return matches
+    }
+
     static func intersection(
         _ postings: [[Int32]],
         shouldCancel: @Sendable () -> Bool = { false }

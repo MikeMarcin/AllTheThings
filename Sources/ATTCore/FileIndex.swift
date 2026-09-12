@@ -3350,30 +3350,26 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         func candidateNameIndices(
-            containingAny tokenByteSets: [[UInt8]],
+            containingAtLeast requiredCount: Int,
+            ofDistinctBytes tokenBytes: [UInt8],
             shouldCancel: @Sendable () -> Bool = { false }
         ) -> [Int32]? {
-            guard !tokenByteSets.isEmpty else { return nil }
-
-            var candidates: [Int32] = []
-            for tokenBytes in tokenByteSets {
-                guard let values = candidateNameIndices(
-                    containingAllBytes: tokenBytes,
-                    shouldCancel: shouldCancel
-                ) else {
-                    return nil
+            guard let nameGramIndex, !tokenBytes.isEmpty else { return nil }
+            var postings: [[Int32]] = []
+            postings.reserveCapacity(tokenBytes.count)
+            for byte in tokenBytes {
+                guard !shouldCancel() else { return nil }
+                let key = SearchTextGrams.key(bytes: [byte], start: 0, length: 1)
+                if let values = nameGramIndex.values(for: key) {
+                    postings.append(values)
                 }
-                guard let merged = FileIndex.unionPostingLists(
-                    candidates,
-                    values,
-                    shouldCancel: shouldCancel
-                ) else {
-                    return nil
-                }
-                candidates = merged
             }
-
-            return candidates
+            return SortedPostingLists.matchingAtLeast(
+                requiredCount,
+                in: postings,
+                rowCount: count,
+                shouldCancel: shouldCancel
+            )
         }
 
         func candidateNameIndices(
@@ -11194,7 +11190,20 @@ public final class FileIndex: @unchecked Sendable {
             snapshot: snapshot,
             tokenBytes: tokenBytes,
             shouldCancel: shouldCancel
-        )
+        ).flatMap { candidates -> [Int32]? in
+            // ASCII literals and acronyms cannot match a shorter name, and typo
+            // matching permits at most one or two deletions. Reject impossible
+            // lengths before building full match explanations for broad byte hits.
+            let minimumLength = max(0, tokenBytes.count - (tokenBytes.count <= 5 ? 1 : 2))
+            var viable: [Int32] = []
+            for (offset, rowID) in candidates.enumerated() {
+                if offset & 511 == 0, shouldCancel() { return nil }
+                if snapshot.store.normalizedName(at: Int(rowID)).utf8.count >= minimumLength {
+                    viable.append(rowID)
+                }
+            }
+            return viable
+        }
 
         switch field {
         case .name:
@@ -11256,13 +11265,9 @@ public final class FileIndex: @unchecked Sendable {
             )
         }
 
-        let requiredSubsets = byteSubsets(distinctBytes, count: requiredCount)
-        guard !requiredSubsets.isEmpty, requiredSubsets.count <= 256 else {
-            return nil
-        }
-
         return snapshot.candidateNameIndices(
-            containingAny: requiredSubsets,
+            containingAtLeast: requiredCount,
+            ofDistinctBytes: distinctBytes,
             shouldCancel: shouldCancel
         )
     }
@@ -11294,10 +11299,9 @@ public final class FileIndex: @unchecked Sendable {
         let requiredCount = max(1, distinctNonSeparatorBytes.count - allowedMissing)
         let typoCandidates: [Int32]?
         if requiredCount < distinctNonSeparatorBytes.count {
-            let requiredSubsets = byteSubsets(distinctNonSeparatorBytes, count: requiredCount)
-            guard !requiredSubsets.isEmpty, requiredSubsets.count <= 256 else { return nil }
             typoCandidates = snapshot.candidateNameIndices(
-                containingAny: requiredSubsets,
+                containingAtLeast: requiredCount,
+                ofDistinctBytes: distinctNonSeparatorBytes,
                 shouldCancel: shouldCancel
             )
         } else {
@@ -11478,38 +11482,6 @@ public final class FileIndex: @unchecked Sendable {
 
         let distance = previous[rhs.count]
         return distance <= limit ? distance : nil
-    }
-
-    private static func byteSubsets(_ bytes: [UInt8], count: Int) -> [[UInt8]] {
-        guard count > 0, count <= bytes.count else {
-            return []
-        }
-
-        var subsets: [[UInt8]] = []
-        var current: [UInt8] = []
-        current.reserveCapacity(count)
-
-        func appendSubsets(start: Int) {
-            if current.count == count {
-                subsets.append(current)
-                return
-            }
-
-            let remainingSlots = count - current.count
-            guard bytes.count - start >= remainingSlots else {
-                return
-            }
-
-            let lastStart = bytes.count - remainingSlots
-            for index in start...lastStart {
-                current.append(bytes[index])
-                appendSubsets(start: index + 1)
-                current.removeLast()
-            }
-        }
-
-        appendSubsets(start: 0)
-        return subsets
     }
 
     private static func tokenContainsPathSeparator(_ token: String) -> Bool {

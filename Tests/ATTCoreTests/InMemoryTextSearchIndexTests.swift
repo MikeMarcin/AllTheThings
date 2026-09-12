@@ -3,6 +3,25 @@ import Testing
 
 @Suite("In-memory text search index")
 struct InMemoryTextSearchIndexTests {
+    @Test("threshold postings equal exhaustive membership for every row and threshold")
+    func thresholdPostingsPreserveCandidateMembership() {
+        // Each row is one of all 64 possible combinations of six postings.
+        let postings: [[Int32]] = (0..<6).map { bit in
+            (0..<64).filter { $0 & (1 << bit) != 0 }.map(Int32.init)
+        }
+        for threshold in 1...6 {
+            let expected = (0..<64).filter { $0.nonzeroBitCount >= threshold }.map(Int32.init)
+            #expect(SortedPostingLists.matchingAtLeast(
+                threshold, in: postings, rowCount: 64
+            ) == expected)
+        }
+        #expect(SortedPostingLists.matchingAtLeast(7, in: postings, rowCount: 64) == [])
+        #expect(SortedPostingLists.matchingAtLeast(1, in: [], rowCount: 64) == [])
+        #expect(SortedPostingLists.matchingAtLeast(
+            2, in: postings, rowCount: 64, shouldCancel: { true }
+        ) == nil)
+    }
+
     @Test("indexed candidates preserve normalized fuzzy subsequence matches")
     func indexedCandidatesPreserveNormalizedFuzzySubsequenceMatches() {
         let index = InMemoryTextSearchIndex(texts: [
