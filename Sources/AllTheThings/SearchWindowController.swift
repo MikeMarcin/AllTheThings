@@ -1610,7 +1610,6 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     private var processResourceTask: Task<Void, Never>?
     private var processResourceBaseline: ProcessResourceUsage?
     private var energyMode: EnergyMode = .interactive
-    private var backgroundEnergyModeEnteredAt: Date?
     private var mascotCoordinator: OperationMascotCoordinator?
     private var expandedMascotPresenter: ExpandedMascotPresentationController?
     private var loadingMascotCoordinator: OperationMascotCoordinator?
@@ -1696,19 +1695,14 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             }
         }
 
-        func eventDebounceDelay(inactiveDuration: TimeInterval?) -> TimeInterval {
+        var eventDebounceDelay: TimeInterval {
             switch self {
             case .interactive:
                 return 0.05
             case .background:
-                let duration = inactiveDuration ?? 0
-                if duration < 3 * 60 {
-                    return 3.0
-                }
-                if duration < 15 * 60 {
-                    return 15.0
-                }
-                return 60.0
+                // Events already arrive in batches from FSEvents. Holding them for
+                // minutes makes files created in another app stale when ATT opens.
+                return 0.25
             }
         }
 
@@ -4936,7 +4930,6 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             background: maintenanceRequest.background,
             promotePendingWork: maintenanceRequest.promotePendingWork
         )
-        backgroundEnergyModeEnteredAt = mode == .background ? Date() : nil
         startWatchingIfNeeded()
         startApplicationWatchingIfNeeded()
         reschedulePendingFSEventFlushIfNeeded()
@@ -4948,13 +4941,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
     }
 
     private var currentEventDebounceDelay: TimeInterval {
-        let inactiveDuration: TimeInterval?
-        if let backgroundEnergyModeEnteredAt {
-            inactiveDuration = Date().timeIntervalSince(backgroundEnergyModeEnteredAt)
-        } else {
-            inactiveDuration = nil
-        }
-        return energyMode.eventDebounceDelay(inactiveDuration: inactiveDuration)
+        energyMode.eventDebounceDelay
     }
 
     private func applyMascotPlaybackSuspension() {

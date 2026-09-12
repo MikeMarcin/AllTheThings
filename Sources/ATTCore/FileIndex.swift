@@ -14590,7 +14590,20 @@ public final class FileIndex: @unchecked Sendable {
     ) -> [PendingRefreshWork] {
         guard maximumCount > 0, !works.isEmpty else { return [] }
 
-        let allWorks = works.sorted { $0.path < $1.path }
+        // An exact update is finite work. Do it before an enclosing traversal,
+        // even when that traversal has not started yet. Resumed scans already
+        // supersede newer descendants at queue ingress to protect their results.
+        var ancestorsOfExactWork = Set<String>()
+        for work in works where !work.recursivelyScansDirectory && work.isEligible(at: date) {
+            var ancestor = Self.parentPath(of: work.path)
+            while let path = ancestor {
+                guard ancestorsOfExactWork.insert(path).inserted else { break }
+                ancestor = Self.parentPath(of: path)
+            }
+        }
+        let allWorks = works.filter {
+            !$0.recursivelyScansDirectory || !ancestorsOfExactWork.contains($0.path)
+        }.sorted { $0.path < $1.path }
         var promotedAncestorPaths = Set<String>()
         var unblockedWorks: [PendingRefreshWork] = []
         unblockedWorks.reserveCapacity(min(allWorks.count, maximumCount))

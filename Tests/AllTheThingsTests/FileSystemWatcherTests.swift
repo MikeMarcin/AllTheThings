@@ -987,7 +987,7 @@ struct FileSystemWatcherTests {
             rootPaths: [root]
         )
 
-        #expect(routed.exactPaths.isEmpty)
+        #expect(routed.exactPaths == [createdChild])
         #expect(Set(routed.recursivePaths) == [createdDirectory, renamedDirectory, replacedDirectory])
     }
 

@@ -817,9 +817,9 @@ enum FSEventLiveRefreshScopeRouter {
         for scope in recursivePaths {
             recursiveScopeIndex.insert(scope)
         }
-        if !recursivePaths.isEmpty {
-            exactPaths = exactPaths.filter { !recursiveScopeIndex.containsScope(covering: $0) }
-        }
+        // Keep individual changes beneath recursive scopes so the index can publish
+        // them before traversing the containing directory.
+        exactPaths.subtract(recursivePaths)
 
         return FSEventLiveRefreshScopeRouting(
             exactPaths: exactPaths.sorted(),

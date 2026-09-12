@@ -2666,6 +2666,36 @@ struct FileIndexTests {
         #expect(completedSnapshot.usage.maintenance.counters(for: .directoryRefresh).yieldedSlices > 1)
     }
 
+    @Test("exact file updates publish before an unstarted enclosing directory scan",
+          arguments: [IndexWorkPriority.background, .interactive])
+    func exactFileUpdatePrecedesQueuedAncestor(priority: IndexWorkPriority) async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: root) }
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        defer { try? fileManager.removeItem(at: supportDirectory(applicationName: applicationName)) }
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        index.replaceRootsAndRebuild([root], mode: .fresh)
+        try await waitUntil { !index.currentStats().isIndexing }
+
+        let newFile = root.appendingPathComponent("JustCreated.txt")
+        try "new".write(to: newFile, atomically: true, encoding: .utf8)
+        let order = CompletionOrderRecorder()
+        index.update(paths: [root.path], priority: priority) { order.append("directory") }
+        index.update(exactPaths: [newFile.path], recursivePaths: [], priority: priority) {
+            order.append("file")
+        }
+
+        try await waitUntil { order.snapshot().count == 2 }
+        #expect(order.snapshot() == ["file", "directory"])
+        #expect(index.search(SearchRequest(
+            query: "JustCreated",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10).results.map(\.record.path) == [newFile.path])
+    }
+
     @Test("background refresh service rotates past a yielded ancestor")
     func backgroundRefreshServiceIsFairAcrossPendingPaths() async throws {
         let fileManager = FileManager.default
