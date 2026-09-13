@@ -24,8 +24,8 @@ By default the index covers `~/Desktop`, `~/Documents`, `~/Downloads`, and `~/De
 
 > [!TIP]
 > Two optional global shortcuts live in **Settings > Hotkeys**. Enable launch at login if you want them available right after signing in.
-> - <kbd>Command</kbd> <kbd>Shift</kbd> <kbd>Space</kbd> opens file search.
-> - <kbd>Shift</kbd> <kbd>Option</kbd> <kbd>Space</kbd> opens application search.
+> - <kbd>⌘</kbd> <kbd>⇧</kbd> <kbd>Space</kbd> opens file search.
+> - <kbd>⇧</kbd> <kbd>⌥</kbd> <kbd>Space</kbd> opens application search.
 
 ## Searching
 
@@ -54,8 +54,8 @@ Syntax reference:
 
 ### Search history
 
-- Press <kbd>Command</kbd> <kbd>Y</kbd>, click the history button, or type `history:` to browse earlier searches. Add text after the prefix to filter, then press <kbd>Return</kbd> to restore a query.
-- <kbd>Control</kbd> <kbd>R</kbd> and <kbd>Control</kbd> <kbd>Shift</kbd> <kbd>R</kbd> step backward and forward through history without opening the browser.
+- Press <kbd>⌘</kbd> <kbd>Y</kbd>, click the history button, or type `history:` to browse earlier searches. Add text after the prefix to filter, then press <kbd>Return</kbd> to restore a query.
+- <kbd>⌃</kbd> <kbd>R</kbd> and <kbd>⌃</kbd> <kbd>⇧</kbd> <kbd>R</kbd> step backward and forward through history without opening the browser.
 - A query is recorded once it sits unchanged for three seconds or you act on its results. Keystrokes and `history:` lookups are never recorded.
 - **Settings > General > Search history retention** keeps 50 searches by default.
 
@@ -65,13 +65,13 @@ Keyboard navigation and management details are in [docs/SEARCH_HISTORY.md](docs/
 
 Select one or more results to open, reveal in Finder, rename, preview, inspect, or move to Trash.
 
-- <kbd>Command</kbd> <kbd>C</kbd> copies the files.
-- <kbd>Command</kbd> <kbd>Option</kbd> <kbd>C</kbd> copies their paths.
+- <kbd>⌘</kbd> <kbd>C</kbd> copies the files.
+- <kbd>⌘</kbd> <kbd>⌥</kbd> <kbd>C</kbd> copies their paths.
 - With Ghostty or iTerm2 installed, their macOS Services open a terminal in the selected folder.
 
 ## Insights
 
-**AllTheThings > Insights...** (<kbd>Command</kbd> <kbd>Option</kbd> <kbd>Shift</kbd> <kbd>I</kbd>) shows what the index costs: files tracked, disk used by the index package, how each search was routed and how long it took, and CPU time and wakeups over the last hour, day, or three months.
+**AllTheThings > Insights...** (<kbd>⌘</kbd> <kbd>⌥</kbd> <kbd>⇧</kbd> <kbd>I</kbd>) shows what the index costs: files tracked, disk used by the index package, how each search was routed and how long it took, and CPU time and wakeups over the last hour, day, or three months.
 
 <picture>
   <source srcset="docs/images/allthethings-insights.webp" type="image/webp">
