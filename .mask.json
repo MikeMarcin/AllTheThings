@@ -1,9 +1,19 @@
 {
-  "schema_version": 1,
-  "skills": [
-    "sprite-sheet-animation-updater"
-  ],
-  "targets": [
+  "default_agents": [
     "codex"
-  ]
+  ],
+  "schema_version": 2,
+  "skills": [
+    {
+      "id": "sprite-sheet-animation-updater",
+      "source": "agentskills"
+    }
+  ],
+  "sources": {
+    "agentskills": {
+      "packages": "skills",
+      "ref": "refs/heads/main",
+      "repository": "https://github.com/MikeMarcin/AgentSkills.git"
+    }
+  }
 }

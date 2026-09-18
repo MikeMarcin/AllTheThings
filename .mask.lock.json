@@ -1,0 +1,20 @@
+{
+  "packages": [
+    {
+      "commit": "0f287c5d142f7e49179c7192d0af7a3bbb7632b0",
+      "git_object_format": "sha1",
+      "id": "sprite-sheet-animation-updater",
+      "metadata_digest": "sha256:74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b",
+      "path": "skills/sprite-sheet-animation-updater",
+      "payload_digest": "sha256:7454a4e56661fc623a8f07307c3351dac8bdd73230107770bc6fe589c985d0a7",
+      "repository": "https://github.com/MikeMarcin/AgentSkills.git",
+      "selector": {
+        "ref": "refs/heads/main"
+      },
+      "source": "agentskills"
+    }
+  ],
+  "resolver": "mask-lock-v1",
+  "schema_version": 1,
+  "selection_digest": "sha256:93b5311ba1626cb19e0b5bb9c33594635524edb51db58cc5845cce39fe72f8d3"
+}
