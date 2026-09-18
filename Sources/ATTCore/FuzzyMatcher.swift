@@ -287,10 +287,12 @@ public enum FuzzyMatcher {
                     token: token,
                     basenameBias: true
                 )
-                let pathMatch = fuzzyPathExplanation(record: record, pattern: pattern).map {
+                // Every filename class outranks weakPath. In particular, a
+                // literal prefix must not pay for typo matching every ancestor.
+                if let nameMatch { return nameMatch }
+                return fuzzyPathExplanation(record: record, pattern: pattern).map {
                     adjustedExplanation($0, scoreDelta: -400, preferredClass: .weakPath)
                 }
-                return bestExplanation([nameMatch, pathMatch].compactMap { $0 })
             case .name:
                 return stringExplanation(
                     text: record.normalizedName,

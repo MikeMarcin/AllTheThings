@@ -3326,7 +3326,26 @@ final class MappedIntPostingIndex: @unchecked Sendable {
         try data.write(to: url, options: .atomic)
     }
 
+    /// A mapped view: opening a frequent gram must not copy all of its rows.
+    struct PostingValues: RandomAccessCollection {
+        let data: Data
+        let offset: Int
+        let count: Int
+
+        var startIndex: Int { 0 }
+        var endIndex: Int { count }
+
+        subscript(index: Int) -> Int32 {
+            precondition(index >= 0 && index < count)
+            return data.readInt32LE(at: offset + index * 4)
+        }
+    }
+
     func values(for key: Int) -> [Int32]? {
+        posting(for: key).map(Array.init)
+    }
+
+    func posting(for key: Int) -> PostingValues? {
         var low = 0
         var high = keyCount
 
@@ -3348,12 +3367,7 @@ final class MappedIntPostingIndex: @unchecked Sendable {
         let count = entryCount(at: low)
         let postingsStart = Self.headerSize + keyCount * Self.entrySize + offset * 4
 
-        var result: [Int32] = []
-        result.reserveCapacity(count)
-        for index in 0..<count {
-            result.append(data.readInt32LE(at: postingsStart + index * 4))
-        }
-        return result
+        return PostingValues(data: data, offset: postingsStart, count: count)
     }
 
     private func entryKey(at index: Int) -> Int {

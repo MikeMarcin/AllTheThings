@@ -138,6 +138,35 @@ struct SettingsWindowTests {
         #expect(!AppSettings.rememberSortBetweenLaunches(defaults: defaults))
     }
 
+    @Test("indexed folders exposes the refinement limit and saves zero as unlimited")
+    @MainActor
+    func refinementTimeLimitControl() throws {
+        let suiteName = "AllTheThingsSettingsTests-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        AppSettings.registerDefaults(defaults)
+        let index = FileIndex(applicationName: suiteName, loadsSnapshotImmediately: false)
+        defer { try? FileManager.default.removeItem(at: index.dataDirectoryURL) }
+        let controller = SettingsWindowController(defaults: defaults, index: index, reindexHandler: {})
+        controller.loadWindow()
+        defer { controller.close() }
+        controller.selectSection(.indexedFolders)
+        controller.window?.contentView?.layoutSubtreeIfNeeded()
+        let field = try #require(firstView(
+            withIdentifier: "searchRefinementTimeLimitField", in: controller.window?.contentView
+        ) as? NSTextField)
+        #expect(field.stringValue == "60")
+        #expect(field.frame.width >= 80)
+        for value in ["120", "0"] {
+            field.stringValue = value
+            _ = field.sendAction(field.action, to: field.target)
+            #expect(AppSettings.searchRefinementTimeLimit(defaults: defaults) == Double(value))
+        }
+        field.stringValue = "-1"
+        _ = field.sendAction(field.action, to: field.target)
+        #expect(field.stringValue == "0")
+    }
+
     @MainActor
     private func visibleStrings(in view: NSView?) -> [String] {
         guard let view, !view.isHidden else { return [] }

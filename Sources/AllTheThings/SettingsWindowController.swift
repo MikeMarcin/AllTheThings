@@ -135,6 +135,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     )
     private let rememberSortBetweenLaunchesSwitch = NSSwitch()
     private let searchHistoryRetentionComboBox = NSComboBox()
+    private let searchRefinementTimeLimitField = NSTextField()
     private let highlightSearchTextSwitch = NSSwitch()
     private let showHiddenFilesSwitch = NSSwitch()
     private let allowMultipleInstancesSwitch = NSSwitch()
@@ -180,6 +181,7 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
 
     private static let exclusionPatternFieldIdentifier = NSUserInterfaceItemIdentifier("exclusionPatternField")
     private static let searchHistoryRetentionIdentifier = NSUserInterfaceItemIdentifier("searchHistoryRetentionComboBox")
+    private static let searchRefinementTimeLimitIdentifier = NSUserInterfaceItemIdentifier("searchRefinementTimeLimitField")
     private static let hotkeysCardIdentifier = NSUserInterfaceItemIdentifier("hotkeysSettingsCard")
     private static let indexedRootPasteboardType = NSPasteboard.PasteboardType("com.allthethings.settings.indexed-root-row")
     private static let appSearchRootPasteboardType = NSPasteboard.PasteboardType("com.allthethings.settings.app-search-root-row")
@@ -921,6 +923,19 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
 
     private func makeOptimizedSortColumnsCard() -> NSView {
         let card = makeCard()
+        searchRefinementTimeLimitField.translatesAutoresizingMaskIntoConstraints = false
+        searchRefinementTimeLimitField.identifier = Self.searchRefinementTimeLimitIdentifier
+        searchRefinementTimeLimitField.delegate = self
+        searchRefinementTimeLimitField.target = self
+        searchRefinementTimeLimitField.action = #selector(changeSearchRefinementTimeLimit(_:))
+        searchRefinementTimeLimitField.setAccessibilityLabel("Refinement time limit in seconds")
+        searchRefinementTimeLimitField.widthAnchor.constraint(equalToConstant: 90).isActive = true
+        let limitRow = makeControlRow(
+            title: "Refinement time limit (seconds)",
+            detail: "Keep the best results when time runs out. 0 means unlimited.",
+            control: searchRefinementTimeLimitField
+        )
+        let separator = makeSeparator()
 
         let detailLabel = NSTextField(labelWithString: "Prebuild row-order indexes for sorted searches. Disable columns to reduce index sidecars and optimization work.")
         detailLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -948,6 +963,8 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         card.addSubview(detailLabel)
         card.addSubview(grid)
         card.addSubview(resetOptimizedSortColumnsButton)
+        card.addSubview(separator)
+        card.addSubview(limitRow)
 
         NSLayoutConstraint.activate([
             detailLabel.topAnchor.constraint(equalTo: card.topAnchor, constant: 16),
@@ -957,7 +974,13 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
             grid.topAnchor.constraint(equalTo: detailLabel.bottomAnchor, constant: 14),
             grid.leadingAnchor.constraint(equalTo: detailLabel.leadingAnchor),
             grid.trailingAnchor.constraint(lessThanOrEqualTo: resetOptimizedSortColumnsButton.leadingAnchor, constant: -16),
-            grid.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -16),
+            separator.topAnchor.constraint(equalTo: grid.bottomAnchor, constant: 16),
+            separator.leadingAnchor.constraint(equalTo: card.leadingAnchor),
+            separator.trailingAnchor.constraint(equalTo: card.trailingAnchor),
+            limitRow.topAnchor.constraint(equalTo: separator.bottomAnchor),
+            limitRow.leadingAnchor.constraint(equalTo: card.leadingAnchor),
+            limitRow.trailingAnchor.constraint(equalTo: card.trailingAnchor),
+            limitRow.bottomAnchor.constraint(equalTo: card.bottomAnchor),
 
             resetOptimizedSortColumnsButton.topAnchor.constraint(equalTo: grid.topAnchor),
             resetOptimizedSortColumnsButton.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -20),
@@ -1909,6 +1932,8 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         searchHistoryRetentionComboBox.stringValue = AppSettings.searchHistoryRetention(
             defaults: defaults
         ).settingsTitle
+        searchRefinementTimeLimitField.stringValue = AppSettings.searchRefinementTimeLimit(defaults: defaults)
+            .formatted(.number.grouping(.never))
         highlightSearchTextSwitch.state = defaults.bool(forKey: AppSettings.highlightSearchTextKey) ? .on : .off
         showHiddenFilesSwitch.state = defaults.bool(forKey: AppSettings.showHiddenFilesKey) ? .on : .off
         allowMultipleInstancesSwitch.state = defaults.bool(forKey: AppSettings.allowMultipleInstancesKey) ? .on : .off
@@ -2498,6 +2523,10 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
     }
 
     func controlTextDidEndEditing(_ obj: Notification) {
+        if let field = obj.object as? NSTextField, field.identifier == Self.searchRefinementTimeLimitIdentifier {
+            changeSearchRefinementTimeLimit(field)
+            return
+        }
         if let comboBox = obj.object as? NSComboBox,
            comboBox.identifier == Self.searchHistoryRetentionIdentifier {
             saveSearchHistoryRetention(comboBox)
@@ -2512,6 +2541,15 @@ private final class SettingsViewController: NSViewController, NSTableViewDataSou
         }
 
         saveExclusionPattern(field)
+    }
+
+    @objc private func changeSearchRefinementTimeLimit(_ sender: NSTextField) {
+        if let seconds = Double(sender.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)),
+           seconds.isFinite, seconds >= 0 {
+            AppSettings.saveSearchRefinementTimeLimit(seconds, defaults: defaults)
+        }
+        sender.stringValue = AppSettings.searchRefinementTimeLimit(defaults: defaults)
+            .formatted(.number.grouping(.never))
     }
 
     private func saveExclusionPatternsFromRows() {

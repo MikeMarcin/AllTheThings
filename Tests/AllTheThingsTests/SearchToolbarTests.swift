@@ -1,6 +1,6 @@
 @testable import AllTheThings
 import AppKit
-import ATTCore
+@testable import ATTCore
 import Carbon.HIToolbox
 import Foundation
 import Testing
@@ -630,8 +630,59 @@ struct SearchToolbarTests {
         ) == .searchRefining)
     }
 
+    @Test("refinement budget expires monotonically and supports unlimited searches")
+    func refinementBudget() {
+        let budget = SearchRefinementBudget(seconds: 60, startedAt: 100)
+        #expect(!budget.shouldStop(at: 159.999))
+        #expect(!budget.didTimeOut)
+        #expect(budget.shouldStop(at: 160))
+        #expect(budget.didTimeOut)
+        #expect(budget.shouldStop(at: 159))
+        let unlimited = SearchRefinementBudget(seconds: 0, startedAt: 100)
+        #expect(!unlimited.shouldStop(at: 1_000_000))
+        #expect(!unlimited.didTimeOut)
+    }
+
+    @Test("refinement timeout preserves the displayed literal preview")
+    @MainActor
+    func refinementTimeoutPreservesPreview() async throws {
+        let (defaults, suiteName) = try makeDefaults()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        AppSettings.saveSearchRefinementTimeLimit(.leastNonzeroMagnitude, defaults: defaults)
+        let index = FileIndex(applicationName: suiteName, loadsSnapshotImmediately: false)
+        defer { try? FileManager.default.removeItem(at: index.dataDirectoryURL) }
+        let path = "/tmp/att-preview-timeout/Replication.swift"
+        index.replaceRecordsForTesting([FileRecord(
+            id: FileRecord.stableID(for: path), path: path, name: "Replication.swift",
+            directoryPath: "/tmp/att-preview-timeout", fileExtension: "swift", sizeBytes: 1,
+            modifiedTime: 0, createdTime: nil, isDirectory: false, isHidden: false,
+            volumeName: "Test", normalizedName: "replication.swift", normalizedPath: path.lowercased()
+        )])
+        let controller = SearchWindowController(index: index, defaults: defaults)
+        defer { controller.close() }
+        let view = try #require(controller.window?.contentViewController?.view)
+        let table = try #require(tableViews(in: view).first { !($0 is SearchHistoryTableView) })
+        // Test runners start inactive; foreground searches must pass the app's
+        // background-refresh gate just as real keyboard input does.
+        NotificationCenter.default.post(name: NSApplication.didBecomeActiveNotification, object: NSApp)
+        controller.updateSearchQuery("replicati")
+        let deadline = ContinuousClock.now + .seconds(5)
+        while ContinuousClock.now < deadline,
+              table.numberOfRows != 1 || !textFields(in: view).contains(where: { $0.stringValue.contains("refinement limit reached") }) {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(textFields(in: view).contains { $0.stringValue.contains("refinement limit reached") })
+        #expect(table.numberOfRows == 1)
+    }
+
     @Test("search timing presentation stays available independent of query text")
     func searchTimingPresentationStaysAvailableIndependentOfQueryText() {
+        #expect(SearchWindowPresentation.shownResultsText(
+            resultCount: 3, totalMatches: 8, completeness: .topResultsComplete
+        ) == "3 shown / 8+ matches")
+        #expect(SearchWindowPresentation.shownResultsText(
+            resultCount: 3, totalMatches: 8, completeness: .timeLimited
+        ) == "3 shown • refinement limit reached")
         #expect(SearchWindowPresentation.shownResultsText(
             resultCount: 3,
             totalMatches: 3,

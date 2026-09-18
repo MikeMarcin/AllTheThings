@@ -7,6 +7,25 @@ import Testing
 
 @Suite("App settings")
 struct AppSettingsTests {
+    @Test("refinement defaults to sixty seconds and zero means unlimited")
+    func refinementTimeLimit() throws {
+        let (defaults, suiteName) = try makeDefaults()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        #expect(AppSettings.searchRefinementTimeLimit(defaults: defaults) == 60)
+        AppSettings.registerDefaults(defaults)
+        #expect(AppSettings.searchRefinementTimeLimit(defaults: defaults) == 60)
+        for limit: TimeInterval in [0, 0.5, 120] {
+            AppSettings.saveSearchRefinementTimeLimit(limit, defaults: defaults)
+            #expect(AppSettings.searchRefinementTimeLimit(defaults: defaults) == limit)
+        }
+        for invalid: TimeInterval in [-1, .infinity, .nan] {
+            AppSettings.saveSearchRefinementTimeLimit(invalid, defaults: defaults)
+            #expect(AppSettings.searchRefinementTimeLimit(defaults: defaults) == 120)
+        }
+        defaults.set(-1, forKey: AppSettings.searchRefinementTimeLimitKey)
+        #expect(AppSettings.searchRefinementTimeLimit(defaults: defaults) == 60)
+    }
+
     @Test("reading unconfigured indexed roots does not persist defaults")
     func readingUnconfiguredIndexedRootsDoesNotPersistDefaults() throws {
         let (defaults, suiteName) = try makeDefaults()

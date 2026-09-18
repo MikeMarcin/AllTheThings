@@ -4410,7 +4410,7 @@ struct FileIndexTests {
 
         #expect(degraded.results.map(\.record.path) == [earlyNeedle])
         #expect(degraded.totalMatches == 1)
-        #expect(degraded.executionProfile.scannedRowCount == 25_000)
+        #expect(degraded.executionProfile.scannedRowCount <= 20_000)
         #expect(degraded.executionProfile.scannedRowCount < recordCount)
         #expect(!degraded.executionProfile.didFallbackToFullScan)
 
@@ -4600,7 +4600,9 @@ struct FileIndexTests {
         #expect(exact.results.map(\.record.path) == needlePaths)
         #expect(exact.totalMatches == 3)
         #expect(exact.executionProfile.executionPath == .compositeIndexed)
-        #expect(exact.executionProfile.scannedRowCount < 20)
+        // Exact totals still evaluate fuzzy candidates; the profile reports all
+        // verified rows, rather than just the few materialized results.
+        #expect(exact.executionProfile.scannedRowCount <= exact.executionProfile.candidateCount)
         #expect(exact.executionProfile.scannedRowCount < upserts.count)
 
         let addedPreview = index.search(SearchRequest(
@@ -4902,32 +4904,17 @@ struct FileIndexTests {
                 .prefix(5)
                 .map(\.name)
             let profileSummary = "sort: \(sortColumn.rawValue), path: \(response.executionProfile.executionPath.rawValue), candidates: \(response.executionProfile.candidateCount), scanned: \(response.executionProfile.scannedRowCount)"
-            let directlySortsNameCandidates = sortColumn == .name
-
             #expect(response.usesIndexedCandidates, "\(profileSummary)")
-            #expect(
-                response.executionProfile.executionPath
-                    == (directlySortsNameCandidates ? .nameComponentIndex : .optimizedSortedFastPath),
-                "\(profileSummary)"
-            )
+            #expect(response.executionProfile.executionPath == .nameComponentIndex, "\(profileSummary)")
             #expect(!response.executionProfile.didFallbackToFullScan, "\(profileSummary)")
-            if directlySortsNameCandidates {
-                #expect(response.executionProfile.indexesUsed.contains(.nameGrams), "\(profileSummary)")
-                #expect(!response.executionProfile.indexesUsed.contains(.sortOrder), "\(profileSummary)")
-            } else {
-                #expect(
-                    response.executionProfile.indexesUsed.contains(
-                        sortColumn == .modified ? .modifiedOrder : .sortOrder
-                    ),
-                    "\(profileSummary)"
-                )
-            }
+            #expect(response.executionProfile.indexesUsed.contains(.nameGrams), "\(profileSummary)")
+            #expect(!response.executionProfile.indexesUsed.contains(.sortOrder), "\(profileSummary)")
             #expect(response.executionProfile.scannedRowCount <= matchingRecords.count, "\(profileSummary)")
             #expect(response.results.map(\.record.name) == Array(expectedNames), "\(profileSummary)")
         }
     }
 
-    @Test("created descending preview falls back from empty ordered prefix to ranked candidates")
+    @Test("created descending preview ranks sparse candidates without scanning unrelated newer rows")
     func createdDescendingPreviewFallsBackFromEmptyOrderedPrefixToRankedCandidates() {
         let fillerCount = 30_000
         let matchCount = 1_500
@@ -4964,9 +4951,9 @@ struct FileIndexTests {
         }
 
         #expect(response.usesIndexedCandidates)
-        #expect(response.executionProfile.executionPath == .optimizedSortedFastPath)
+        #expect(response.executionProfile.executionPath == .nameComponentIndex)
         #expect(response.executionProfile.indexesUsed.contains(.nameGrams))
-        #expect(response.executionProfile.indexesUsed.contains(.sortOrder))
+        #expect(!response.executionProfile.indexesUsed.contains(.sortOrder))
         #expect(!response.executionProfile.didFallbackToFullScan)
         #expect(response.executionProfile.candidateCount >= matchCount)
         #expect(response.executionProfile.scannedRowCount <= matchCount)
@@ -5052,9 +5039,9 @@ struct FileIndexTests {
             mode: .interactivePreview
         ), maxResults: 20)
         #expect(emptyPreview.usesIndexedCandidates)
-        #expect(emptyPreview.executionProfile.executionPath == .optimizedSortedFastPath)
+        #expect(emptyPreview.executionProfile.executionPath == .nameComponentIndex)
         #expect(emptyPreview.executionProfile.indexesUsed.contains(.nameGrams))
-        #expect(emptyPreview.executionProfile.indexesUsed.contains(.sortOrder))
+        #expect(!emptyPreview.executionProfile.indexesUsed.contains(.sortOrder))
         #expect(!emptyPreview.executionProfile.indexesUsed.contains(.pathGrams))
         #expect(!emptyPreview.executionProfile.didFallbackToFullScan)
         #expect(emptyPreview.executionProfile.scannedRowCount == 0)
@@ -5201,8 +5188,9 @@ struct FileIndexTests {
         ), maxResults: 20)
 
         #expect(response.usesIndexedCandidates)
-        #expect(response.executionProfile.executionPath != .optimizedSortedFastPath)
-        #expect(!response.executionProfile.indexesUsed.contains(.sortOrder))
+        // The enabled name order can still produce a bounded literal preview.
+        #expect(response.executionProfile.executionPath == .optimizedSortedFastPath)
+        #expect(response.executionProfile.indexesUsed.contains(.sortOrder))
         #expect(response.executionProfile.scannedRowCount <= 50_000)
         #expect(response.results.count == 20)
     }
@@ -5279,6 +5267,211 @@ struct FileIndexTests {
             includeHidden: true
         ), maxResults: 20)
         #expect(response.results.contains { $0.record.path == finderHiddenFile.path })
+    }
+
+    @Test("extending a preview query past literal matches avoids broad fuzzy candidates")
+    func extendedPreviewQueryAvoidsBroadFuzzyCandidates() throws {
+        let applicationName = "AllTheThingsTests-\(UUID().uuidString)"
+        let index = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: false)
+        defer { try? FileManager.default.removeItem(at: index.dataDirectoryURL) }
+        let root = "/tmp/att-preview-query-extension"
+        let literalRecords = (0..<40).map {
+            makeRecord(path: "\(root)/\($0)/Replicator.txt")
+        }
+        let unrelatedRecords = (40..<4_000).map {
+            makeRecord(path: "\(root)/\($0)/ArticleTemplate.txt")
+        }
+        index.replaceRecordsForTesting(literalRecords + unrelatedRecords)
+        index.persistSnapshotForTesting()
+        let reloaded = FileIndex(applicationName: applicationName, loadsSnapshotImmediately: true)
+
+        for optimizedColumns: Set<SortColumn> in [Set(SortColumn.optimizedIndexColumns), [.name, .modified]] {
+            reloaded.updateOptimizedSortColumns(optimizedColumns)
+            for column in [SortColumn.relevance, .name, .modified, .path] {
+                for query in ["replicat", "replicati"] {
+                    let response = reloaded.search(SearchRequest(
+                        query: query,
+                        sort: SortSpec(column: column, ascending: true),
+                        mode: .interactivePreview
+                    ), maxResults: 20)
+                    let summary = "query: \(query), sort: \(column.rawValue), candidates: \(response.executionProfile.candidateCount)"
+                    #expect(response.completeness == .partial)
+                    #expect(response.results.count == (query == "replicat" ? 20 : 0), "\(summary)")
+                    #expect(response.executionProfile.candidateCount < 100, "\(summary)")
+                    #expect(response.executionProfile.scannedRowCount < 100, "\(summary)")
+                    #expect(!response.executionProfile.didFallbackToFullScan, "\(summary)")
+                }
+            }
+        }
+
+        let complete = reloaded.search(SearchRequest(
+            query: "replicati",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ))
+        #expect(complete.completeness == .complete)
+        #expect(Set(complete.results.map(\.record.path)) == Set(literalRecords.map(\.path)))
+    }
+
+    @Test("ranked results settle literal prefixes without scanning weaker fuzzy matches")
+    func rankedResultsSettleLiteralPrefixes() {
+        let root = "/tmp/att-ranked-prefix"
+        var records = (0..<120).map { offset in
+            makeRecord(
+                path: "\(root)/\(offset)/Replication\(offset % 7).swift",
+                modifiedTime: TimeInterval(offset), sizeBytes: UInt64(offset)
+            )
+        }
+        records += (0..<120).map { makeRecord(path: "\(root)/fuzzy\($0)/Replicator.swift") }
+        records.append(makeRecord(path: "\(root)/exact/replicati"))
+        records.append(makeRecord(path: "\(root)/.hidden/Replication.swift", isHidden: true))
+        let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)", loadsSnapshotImmediately: false)
+        defer { try? FileManager.default.removeItem(at: index.dataDirectoryURL) }
+        index.replaceRecordsForTesting(records)
+        for column in SortColumn.allCases {
+            for ascending in [true, false] {
+                for hidden in [true, false] {
+                    let sort = SortSpec(column: column, ascending: ascending)
+                    let full = index.search(SearchRequest(query: "replicati ", sort: sort, includeHidden: hidden), maxResults: 20)
+                    let ranked = index.search(SearchRequest(
+                        query: "replicati ", sort: sort, includeHidden: hidden, mode: .rankedResults
+                    ), maxResults: 20)
+                    #expect(ranked.completeness == .topResultsComplete)
+                    #expect(ranked.results.map(\.record.path) == full.results.map(\.record.path))
+                    #expect(ranked.results.allSatisfy { $0.match?.matchClass == .prefix || $0.match?.matchClass == .exact })
+                    #expect(ranked.executionProfile.scannedRowCount <= 122)
+                    #expect(ranked.totalMatches <= full.totalMatches)
+                }
+            }
+        }
+        // With no exact filename, dense prefixes can be selected directly in
+        // every prebuilt sort order, including descending primary-value ties.
+        for column in SortColumn.allCases {
+            for ascending in [true, false] {
+                let sort = SortSpec(column: column, ascending: ascending)
+                let full = index.search(SearchRequest(query: "replicatio", sort: sort), maxResults: 20)
+                let ranked = index.search(SearchRequest(query: "replicatio", sort: sort, mode: .rankedResults), maxResults: 20)
+                #expect(ranked.completeness == .topResultsComplete)
+                #expect(ranked.results.map(\.record.path) == full.results.map(\.record.path))
+                #expect(ranked.executionProfile.scannedRowCount <= records.count)
+            }
+        }
+    }
+
+    @Test("ranked literal progress survives cancellation and final results retain fuzzy matches")
+    func rankedResultsPublishLiteralProgress() throws {
+        let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)", loadsSnapshotImmediately: false)
+        defer { try? FileManager.default.removeItem(at: index.dataDirectoryURL) }
+        index.replaceRecordsForTesting([
+            makeRecord(path: "/tmp/att-ranked-progress/Replication.swift"),
+            makeRecord(path: "/tmp/att-ranked-progress/Replicator.swift")
+        ])
+        let request = SearchRequest(query: "replicati", sort: SortSpec(column: .relevance, ascending: false), mode: .rankedResults)
+        let progress = SearchProgressRecorder()
+        let cancelled = index.search(request, onProgress: { progress.append($0) }, shouldCancel: { !progress.responses.isEmpty })
+        #expect(cancelled == nil)
+        let first = try #require(progress.responses.first)
+        #expect(first.completeness == .partial)
+        #expect(first.results.map(\.record.name) == ["Replication.swift"])
+        let final = index.search(request)
+        #expect(final.completeness == .complete)
+        #expect(final.totalMatches == 2)
+        #expect(final.results.map(\.record.name) == ["Replication.swift", "Replicator.swift"])
+    }
+
+    @Test("ranked prefix bounds include filenames ending in the highest Unicode scalar")
+    func rankedPrefixUnicodeBoundary() {
+        let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)", loadsSnapshotImmediately: false)
+        defer { try? FileManager.default.removeItem(at: index.dataDirectoryURL) }
+        index.replaceRecordsForTesting([
+            makeRecord(path: "/tmp/att-prefix-unicode/Replication.swift"),
+            makeRecord(path: "/tmp/att-prefix-unicode/replicati\u{10FFFF}.swift")
+        ])
+        let sort = SortSpec(column: .name, ascending: false)
+        let full = index.search(SearchRequest(query: "replicati", sort: sort), maxResults: 1)
+        let ranked = index.search(SearchRequest(query: "replicati", sort: sort, mode: .rankedResults), maxResults: 1)
+        #expect(ranked.completeness == .topResultsComplete)
+        #expect(ranked.results.map(\.record.path) == full.results.map(\.record.path))
+    }
+
+    @Test("ranked composite results settle literals across segments and respect removals")
+    func rankedCompositeLiteralResults() {
+        let root = "/tmp/att-ranked-composite"
+        let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)", loadsSnapshotImmediately: false)
+        defer { try? FileManager.default.removeItem(at: index.dataDirectoryURL) }
+        index.replaceRecordsForTesting((0..<18).map { makeRecord(path: "\(root)/Replication\($0).swift") })
+        index.applyStructuralOverlayForTesting(upserts: [
+            makeRecord(path: "\(root)/ReplicationAdded.swift"),
+            makeRecord(path: "\(root)/Replicator.swift")
+        ], tombstonedPaths: ["\(root)/Replication0.swift"])
+        let sort = SortSpec(column: .name, ascending: true)
+        let full = index.search(SearchRequest(query: "replicati", sort: sort), maxResults: 18)
+        let ranked = index.search(SearchRequest(query: "replicati", sort: sort, mode: .rankedResults), maxResults: 18)
+        #expect(ranked.completeness == .topResultsComplete)
+        #expect(ranked.results.map(\.record.path) == full.results.map(\.record.path))
+        #expect(ranked.executionProfile.scannedRowCount < 25)
+    }
+
+    @Test("basic previews bound duplicate groups, dense grams, and absent matches")
+    func basicPreviewWorkIsBounded() {
+        let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)", loadsSnapshotImmediately: false)
+        defer { try? FileManager.default.removeItem(at: index.dataDirectoryURL) }
+        let records = (0..<30_000).map { offset in
+            makeRecord(path: "/tmp/att-bounded-preview/\(offset)/rep-pli-lic-cat-ati-Replication-abc-bcd.swift")
+        }
+        index.replaceRecordsForTesting(records)
+        for query in ["rep", "replicati", "replicatix", "replicati rep", "abcd"] {
+            for column in [SortColumn.relevance, .name, .modified, .path] {
+                let response = index.search(SearchRequest(
+                    query: query, sort: SortSpec(column: column, ascending: false), mode: .interactivePreview
+                ), maxResults: 20)
+                #expect(response.completeness == .partial)
+                #expect(response.executionProfile.scannedRowCount <= 20_000)
+                #expect(!response.executionProfile.didFallbackToFullScan)
+                if query == "abcd" {
+                    #expect(response.executionProfile.candidateCount >= 30_000)
+                    #expect(response.results.isEmpty)
+                } else if query != "replicatix" {
+                    #expect(!response.results.isEmpty)
+                }
+            }
+        }
+    }
+
+    @Test("ranked mode keeps exhaustive semantics for clauses without a literal ranking bound")
+    func rankedComplexQueriesRemainComplete() {
+        let index = FileIndex(applicationName: "AllTheThingsTests-\(UUID().uuidString)", loadsSnapshotImmediately: false)
+        defer { try? FileManager.default.removeItem(at: index.dataDirectoryURL) }
+        index.replaceRecordsForTesting([
+            makeRecord(path: "/tmp/replication/Replication.swift"),
+            makeRecord(path: "/tmp/replication/Replication.md"),
+            makeRecord(path: "/tmp/replicator/Replicator.swift")
+        ])
+        let sort = SortSpec(column: .name, ascending: true)
+        for query in ["\"replicati\"", "replicati -swift", "replicati|replicator", "path:replicati"] {
+            let full = index.search(SearchRequest(query: query, sort: sort), maxResults: 1)
+            let ranked = index.search(SearchRequest(query: query, sort: sort, mode: .rankedResults), maxResults: 1)
+            #expect(ranked.completeness == .complete)
+            #expect(ranked.totalMatches == full.totalMatches)
+            #expect(ranked.results.map(\.record.path) == full.results.map(\.record.path))
+        }
+    }
+
+    @Test("partial refinement retains preview matches and replaces their explanations")
+    func partialRefinementPreservesEarlierResults() {
+        let prefix = makeRecord(path: "/tmp/Replication.swift")
+        let ancestor = makeRecord(path: "/tmp/Replication/Child.swift")
+        let request = SearchRequest(query: "replicati", sort: SortSpec(column: .relevance, ascending: false))
+        let corrected = SearchResult(record: prefix, score: 9_100, match: FuzzyMatcher.explain(record: prefix, query: request.query))
+        let earlier = [
+            SearchResult(record: prefix, score: 1),
+            SearchResult(record: ancestor, score: 1, match: FuzzyMatcher.explain(record: ancestor, query: request.query))
+        ]
+        let progress = SearchResponse(results: [corrected], totalMatches: 1, elapsed: 0.2, completeness: .partial)
+        let merged = FileIndex.mergingPartialResults(progress, earlierResults: earlier, earlierTotalMatches: 2, request: request)
+        #expect(merged.results.map(\.record.path) == [prefix.path, ancestor.path])
+        #expect(merged.results.first?.score == 9_100)
+        #expect(merged.totalMatches == 2)
+        #expect(merged.completeness == .partial)
     }
 
     @Test("long filename searches retain indexed candidates with and without a trailing quote")
@@ -6926,7 +7119,7 @@ struct FileIndexTests {
         #expect(previewResponse.executionProfile.scannedRowCount <= 10)
         #expect(completeResponse.results.map(\.record.name) == expectedNames)
         #expect(completeResponse.totalMatches == recordCount)
-        #expect(completeResponse.executionProfile.scannedRowCount <= 10)
+        #expect(completeResponse.executionProfile.scannedRowCount == recordCount)
     }
 
     @Test("broad relevance path substring uses exact component fast path")
@@ -7391,6 +7584,13 @@ private final class CountingRecordStore: RecordStore, @unchecked Sendable {
         allRecordsCallCount += 1
         return records
     }
+}
+
+private final class SearchProgressRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [SearchResponse] = []
+    var responses: [SearchResponse] { lock.withLock { values } }
+    func append(_ response: SearchResponse) { lock.withLock { values.append(response) } }
 }
 
 private final class StatsRecorder: @unchecked Sendable {

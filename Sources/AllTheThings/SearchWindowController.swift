@@ -269,6 +269,10 @@ enum SearchWindowPresentation {
         switch completeness {
         case .partial:
             return "\(resultCount.formatted()) shown • refining"
+        case .topResultsComplete:
+            return "\(resultCount.formatted()) shown / \(totalMatches.formatted())+ matches"
+        case .timeLimited:
+            return "\(resultCount.formatted()) shown • refinement limit reached"
         case .complete:
             return "\(resultCount.formatted()) shown / \(totalMatches.formatted()) matches"
         }
@@ -3554,7 +3558,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         guard appSearchQuery != nil || !indexStats.isLoadingSnapshot else { return }
 
         let trimmedQuery = queryText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let request = SearchRequest(query: queryText, sort: sortSpec, includeHidden: showsHiddenFiles)
+        let request = SearchRequest(
+            query: queryText, sort: sortSpec, includeHidden: showsHiddenFiles, mode: .rankedResults
+        )
         let signature = SearchSignature(
             query: request.query,
             sort: request.sort,
@@ -3652,66 +3658,9 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         )
         let appSearchRoots = appSearchQuery == nil ? [] : AppSettings.appSearchRoots(defaults: defaults)
         let applicationSearchCatalog = self.applicationSearchCatalog
+        let refinementTimeLimit = AppSettings.searchRefinementTimeLimit(defaults: defaults)
 
-        if shouldRunPreviewSearch {
-            pendingPreviewSearchToken = token
-            logSearchPreviewScheduled(signature: signature, generation: generation)
-            searchPreviewScheduler.schedule { [weak self] in
-                guard !token.isCancelled else {
-                    DispatchQueue.main.async { [weak self] in
-                        self?.logSearchPreviewRejected(
-                            signature: signature,
-                            reason: "tokenCancelledBeforeStart",
-                            generation: generation,
-                            token: token
-                        )
-                    }
-                    return
-                }
-                guard let previewResponse = index.search(previewRequest, shouldCancel: { token.isCancelled }) else {
-                    DispatchQueue.main.async { [weak self] in
-                        self?.handlePreviewSearchCancelled(
-                            signature: signature,
-                            token: token,
-                            generation: generation,
-                            reason: token.isCancelled ? "tokenCancelled" : "nilResponse"
-                        )
-                    }
-                    return
-                }
-
-                DispatchQueue.main.async { [weak self] in
-                    guard let self else { return }
-                    let generationMatches = self.queryGeneration == generation
-                    let tokenMatches = self.activeSearchToken === token
-                    guard SearchRunReconciliation.canApplyResponse(
-                        generationMatches: generationMatches,
-                        tokenMatches: tokenMatches
-                    ) else {
-                        self.logSearchPreviewRejected(
-                            signature: signature,
-                            reason: "staleResponse",
-                            generation: generation,
-                            token: token,
-                            generationMatches: generationMatches,
-                            tokenMatches: tokenMatches
-                        )
-                        return
-                    }
-                    self.applySearchResponse(
-                        previewResponse,
-                        signature: signature,
-                        token: token,
-                        searchStartedAt: searchStartedAt,
-                        isFinal: false
-                    )
-                }
-            }
-        } else if let previewSkipReason {
-            logSearchPreviewSkipped(signature: signature, reason: previewSkipReason, generation: generation)
-        }
-
-        searchQueue.async {
+        let runRefinement: @Sendable () -> Void = {
             guard !token.isCancelled else {
                 DispatchQueue.main.async { [weak self] in
                     self?.clearSearchTokenIfCurrent(token)
@@ -3720,10 +3669,12 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             }
 
             let fullSearchStartedAt = Date()
+            let refinementBudget = SearchRefinementBudget(seconds: refinementTimeLimit)
             let shouldCancelSearch: @Sendable () -> Bool = {
                 if token.isCancelled {
                     return true
                 }
+                if appSearchQuery == nil, refinementBudget.shouldStop() { return true }
                 if appSearchQuery == nil,
                    Date().timeIntervalSince(fullSearchStartedAt) >= SearchScheduling.unoptimizedIndexingSearchBudget,
                    Self.shouldBudgetSearchDuringIndexing(request: request, stats: index.currentStats()) {
@@ -3752,12 +3703,38 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                     )
                 }
             } else {
-                response = index.search(request, shouldCancel: shouldCancelSearch)
+                response = index.search(request, onProgress: { [weak self] progress in
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self, self.queryGeneration == generation,
+                              self.activeSearchToken === token, !token.isCancelled else { return }
+                        self.applySearchResponse(
+                            progress, signature: signature, token: token,
+                            searchStartedAt: searchStartedAt, isFinal: false
+                        )
+                    }
+                }, shouldCancel: shouldCancelSearch)
             }
 
             guard let response else {
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
+                    if refinementBudget.didTimeOut, !token.isCancelled,
+                       self.queryGeneration == generation, self.activeSearchToken === token {
+                        let hasCurrentResults = self.displayedSearchSignature == signature
+                        let timedOut = SearchResponse(
+                            results: hasCurrentResults ? self.results : [],
+                            totalMatches: hasCurrentResults ? self.totalMatches : 0,
+                            elapsed: Date().timeIntervalSince(fullSearchStartedAt),
+                            snapshotRevision: hasCurrentResults
+                                ? self.displayedSearchSnapshotRevision : self.indexStats.snapshotRevision,
+                            usesIndexedCandidates: true, completeness: .timeLimited
+                        )
+                        self.applySearchResponse(
+                            timedOut, signature: signature, token: token,
+                            searchStartedAt: searchStartedAt, isFinal: true
+                        )
+                        return
+                    }
                     let shouldRetry = budgetTimeout.didTimeOut && !self.shouldBudgetSearchDuringIndexing(request: request)
                     let keptPendingPreview = self.handleFullSearchCancelled(
                         signature: signature,
@@ -3811,13 +3788,75 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
                 }
             }
         }
+        if shouldRunPreviewSearch {
+            pendingPreviewSearchToken = token
+            logSearchPreviewScheduled(signature: signature, generation: generation)
+            searchPreviewScheduler.schedule { [weak self] in
+                guard !token.isCancelled else {
+                    DispatchQueue.main.async { [weak self] in
+                        self?.logSearchPreviewRejected(
+                            signature: signature,
+                            reason: "tokenCancelledBeforeStart",
+                            generation: generation,
+                            token: token
+                        )
+                    }
+                    return
+                }
+                guard let previewResponse = index.search(previewRequest, shouldCancel: { token.isCancelled }) else {
+                    DispatchQueue.main.async { [weak self] in
+                        self?.handlePreviewSearchCancelled(
+                            signature: signature,
+                            token: token,
+                            generation: generation,
+                            reason: token.isCancelled ? "tokenCancelled" : "nilResponse"
+                        )
+                        self?.searchQueue.async(execute: runRefinement)
+                    }
+                    return
+                }
+
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    let generationMatches = self.queryGeneration == generation
+                    let tokenMatches = self.activeSearchToken === token
+                    guard SearchRunReconciliation.canApplyResponse(
+                        generationMatches: generationMatches,
+                        tokenMatches: tokenMatches
+                    ), self.pendingPreviewSearchToken === token else {
+                        self.logSearchPreviewRejected(
+                            signature: signature,
+                            reason: "staleResponse",
+                            generation: generation,
+                            token: token,
+                            generationMatches: generationMatches,
+                            tokenMatches: tokenMatches
+                        )
+                        return
+                    }
+                    self.applySearchResponse(
+                        previewResponse,
+                        signature: signature,
+                        token: token,
+                        searchStartedAt: searchStartedAt,
+                        isFinal: false
+                    )
+                    self.searchQueue.async(execute: runRefinement)
+                }
+            }
+        } else {
+            if let previewSkipReason {
+                logSearchPreviewSkipped(signature: signature, reason: previewSkipReason, generation: generation)
+            }
+            searchQueue.async(execute: runRefinement)
+        }
     }
 
     nonisolated private static func metricPhase(for mode: SearchMode) -> SearchMetricPhase {
         switch mode {
         case .interactivePreview:
             return .initialResults
-        case .complete:
+        case .complete, .rankedResults:
             return .refinedResults
         }
     }
@@ -4058,7 +4097,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             "scannedRowCount": .publicInt(profile.scannedRowCount),
             "fallbackToFullScan": .publicBool(profile.didFallbackToFullScan),
             "staleRetry": .publicBool(profile.wasStaleRetry),
-            "completeness": .publicString(response.completeness == .complete ? "complete" : "partial")
+            "completeness": .publicString(response.completeness.rawValue)
         ]
     }
 
@@ -4070,6 +4109,14 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
         isFinal: Bool
     ) {
         guard activeSearchToken === token else { return }
+        var response = response
+        if !isFinal, displayedSearchSignature == signature,
+           displayedSearchSnapshotRevision == response.snapshotRevision {
+            response = FileIndex.mergingPartialResults(
+                response, earlierResults: results, earlierTotalMatches: totalMatches,
+                request: SearchRequest(query: signature.query, sort: signature.sort, includeHidden: signature.includeHidden)
+            )
+        }
         let elapsed = max(Date().timeIntervalSince(searchStartedAt), 0)
         if
             isFinal,
@@ -4115,7 +4162,7 @@ private final class SearchViewController: NSViewController, NSTableViewDataSourc
             if pendingPreviewSearchToken === token {
                 pendingPreviewSearchToken = nil
             }
-            initialQueryElapsed = elapsed
+            if initialQueryElapsed == nil { initialQueryElapsed = elapsed }
             let completesSearch = SearchRunReconciliation.previewApplicationCompletesSearch(
                 fullSearchAlreadyFinished: activeSearchFullFinished
             )

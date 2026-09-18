@@ -61,10 +61,15 @@ public struct SearchRequest: Sendable {
 public enum SearchMode: Sendable {
     case complete
     case interactivePreview
+    /// Settle the best results without counting matches that cannot enter the list.
+    case rankedResults
 }
 
-public enum SearchCompleteness: Equatable, Sendable {
+public enum SearchCompleteness: String, Equatable, Sendable {
     case partial
+    /// The best results are final; totalMatches is a lower bound.
+    case topResultsComplete
+    case timeLimited
     case complete
 }
 
@@ -73,7 +78,7 @@ extension SearchMode {
         switch self {
         case .interactivePreview:
             return .initialResults
-        case .complete:
+        case .complete, .rankedResults:
             return .refinedResults
         }
     }
@@ -3496,11 +3501,13 @@ public final class FileIndex: @unchecked Sendable {
                 if visited & 511 == 0, shouldCancel() { return nil }
                 if !body(rowID) { return false }
 
-                var child = childLinks.firstChild[rowID]
-                while child >= 0 {
-                    let childRow = Int(child)
-                    stack.append(childRow)
-                    child = childLinks.nextSibling[childRow]
+                // Visit one sibling at a time. A wide directory must not enqueue
+                // all its children before a bounded preview can stop traversal.
+                if rowID != start, childLinks.nextSibling[rowID] >= 0 {
+                    stack.append(Int(childLinks.nextSibling[rowID]))
+                }
+                if childLinks.firstChild[rowID] >= 0 {
+                    stack.append(Int(childLinks.firstChild[rowID]))
                 }
             }
             return true
@@ -6099,7 +6106,9 @@ public final class FileIndex: @unchecked Sendable {
         snapshotRevision: UInt64,
         pendingExactPaths: [String],
         rootPaths: [String],
-        shouldCancel: @Sendable () -> Bool
+        onProgress: ((SearchResponse) -> Void)?,
+        previewBudget: PreviewBudget?,
+        shouldCancel: @escaping @Sendable () -> Bool
     ) -> SearchResponse? {
         let started = Date()
         let metricPhase = request.mode.metricPhase
@@ -6123,14 +6132,14 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         let segments: [SearchSegment]
-        let completeness: SearchCompleteness
+        var completeness: SearchCompleteness
         let executionPath: SearchExecutionPath
         switch request.mode {
         case .interactivePreview:
             segments = [state.base] + state.deltaSegments
             completeness = .partial
             executionPath = .indexedBasePreview
-        case .complete:
+        case .complete, .rankedResults:
             segments = [state.base] + state.deltaSegments
             completeness = .complete
             executionPath = .compositeIndexed
@@ -6138,6 +6147,46 @@ public final class FileIndex: @unchecked Sendable {
 
         var segmentResponses: [SearchResponse] = []
         segmentResponses.reserveCapacity(segments.count)
+        var literalSeeds: [RankedLiteralMatches?] = []
+        for segment in segments {
+            guard !shouldCancel(), isCurrentCompositeGeneration() else { return nil }
+            literalSeeds.append(Self.rankedLiteralMatches(
+                snapshot: segment.snapshot,
+                request: request,
+                parsedQuery: parsedQuery,
+                maxResults: boundedMaxResults,
+                shouldCancel: shouldCancel
+            ))
+        }
+        let literalsSettleResults = request.mode == .rankedResults && boundedMaxResults > 0
+            && pendingExactPaths.isEmpty && literalSeeds.allSatisfy { $0 != nil }
+            && literalSeeds.reduce(0) { $0 + ($1?.totalMatches ?? 0) } >= boundedMaxResults
+
+        func publishSegmentProgress(_ progress: SearchResponse, segmentIndex: Int) {
+            guard let onProgress, !shouldCancel(), isCurrentCompositeGeneration() else { return }
+            var responses = segmentResponses + [progress]
+            for remaining in (segmentIndex + 1)..<segments.count {
+                if let seed = literalSeeds[remaining] {
+                    responses.append(seed.response(
+                        snapshot: segments[remaining].snapshot, started: started,
+                        snapshotRevision: snapshotRevision, completeness: .partial, shouldCancel: shouldCancel
+                    ))
+                }
+            }
+            var results = responses.flatMap(\.results)
+            Self.sortAndLimit(&results, request: request, maxResults: boundedMaxResults)
+            let response = SearchResponse(
+                results: results, totalMatches: responses.reduce(0) { $0 + $1.totalMatches },
+                elapsed: Date().timeIntervalSince(started), snapshotRevision: snapshotRevision,
+                usesIndexedCandidates: responses.allSatisfy(\.usesIndexedCandidates), completeness: .partial
+            )
+            guard let refreshed = mergingPendingExactRefreshes(
+                into: response, pendingExactPaths: pendingExactPaths, currentSnapshot: state.logicalSnapshot,
+                rootPaths: rootPaths, request: request, parsedQuery: parsedQuery,
+                maxResults: boundedMaxResults, shouldCancel: shouldCancel
+            ), !shouldCancel(), isCurrentCompositeGeneration() else { return }
+            onProgress(refreshed)
+        }
         var segmentLatencies: [TimeInterval] = []
         segmentLatencies.reserveCapacity(segments.count)
         var baseLatency: TimeInterval = 0
@@ -6145,7 +6194,7 @@ public final class FileIndex: @unchecked Sendable {
         for (index, segment) in segments.enumerated() {
             guard !shouldCancel(), isCurrentCompositeGeneration() else { return nil }
             let segmentStarted = Date()
-            let emptyPreviewIndexes = request.mode == .interactivePreview && index > 0
+            let emptyPreviewIndexes = request.mode == .interactivePreview && index > 0 && previewBudget == nil
                 ? Self.emptyCompositePreviewIndexes(
                     snapshot: segment.snapshot,
                     parsedQuery: parsedQuery,
@@ -6153,7 +6202,13 @@ public final class FileIndex: @unchecked Sendable {
                 )
                 : nil
             let response: SearchResponse
-            if let emptyPreviewIndexes {
+            if literalsSettleResults, let seed = literalSeeds[index] {
+                response = seed.response(
+                    snapshot: segment.snapshot, started: segmentStarted,
+                    snapshotRevision: snapshotRevision, completeness: .topResultsComplete,
+                    shouldCancel: shouldCancel
+                )
+            } else if let emptyPreviewIndexes {
                 let elapsed = Date().timeIntervalSince(segmentStarted)
                 response = SearchResponse(
                     results: [],
@@ -6176,6 +6231,10 @@ public final class FileIndex: @unchecked Sendable {
                     snapshotOverride: segment.snapshot,
                     snapshotRevisionOverride: snapshotRevision,
                     recordsMetrics: false,
+                    literalSeed: literalSeeds[index],
+                    allowsRankedCompletion: pendingExactPaths.isEmpty,
+                    onProgress: onProgress == nil ? nil : { publishSegmentProgress($0, segmentIndex: index) },
+                    previewBudget: previewBudget,
                     shouldCancel: shouldCancel
                 ) else {
                     return nil
@@ -6190,6 +6249,10 @@ public final class FileIndex: @unchecked Sendable {
                 deltaLatency += latency
             }
             segmentResponses.append(response)
+        }
+
+        if segmentResponses.contains(where: { $0.completeness == .topResultsComplete }) {
+            completeness = .topResultsComplete
         }
 
         guard !shouldCancel(), isCurrentCompositeGeneration() else { return nil }
@@ -6313,7 +6376,7 @@ public final class FileIndex: @unchecked Sendable {
             "baseLatencySeconds": .publicDouble(baseLatency),
             "deltaLatencySeconds": .publicDouble(deltaLatency),
             "mergeLatencySeconds": .publicDouble(mergeLatency),
-            "completeness": .publicString(completeness == .complete ? "complete" : "partial")
+            "completeness": .publicString(completeness.rawValue)
         ]
         for (index, latency) in segmentLatencies.enumerated() {
             diagnosticFields["segment\(index)LatencySeconds"] = .publicDouble(latency)
@@ -6328,11 +6391,34 @@ public final class FileIndex: @unchecked Sendable {
         return completed
     }
 
+    /// Retain useful preview rows while refinement visits other candidates.
+    /// Callers must only merge results for the same request and snapshot revision.
+    public static func mergingPartialResults(
+        _ response: SearchResponse, earlierResults: [SearchResult], earlierTotalMatches: Int,
+        request: SearchRequest, maxResults: Int = 2_000
+    ) -> SearchResponse {
+        guard response.completeness == .partial else { return response }
+        var byPath: [String: SearchResult] = [:]
+        for result in earlierResults { byPath[result.record.path] = result }
+        for result in response.results { byPath[result.record.path] = result }
+        let total = max(response.totalMatches, earlierTotalMatches, byPath.count)
+        var results = Array(byPath.values)
+        sortAndLimit(&results, request: request, maxResults: max(maxResults, 0))
+        return SearchResponse(
+            results: results, totalMatches: total, elapsed: response.elapsed,
+            snapshotRevision: response.snapshotRevision, usesIndexedCandidates: response.usesIndexedCandidates,
+            completeness: .partial, executionProfile: response.executionProfile
+        )
+    }
+
     public func search(
         _ request: SearchRequest,
         maxResults: Int = 2_000,
-        shouldCancel: @Sendable () -> Bool
+        onProgress: (@Sendable (SearchResponse) -> Void)? = nil,
+        shouldCancel: @escaping @Sendable () -> Bool
     ) -> SearchResponse? {
+        let previewBudget = request.mode == .interactivePreview
+            && Self.basicLiteralTerm(FuzzyMatcher.parse(request.query)) != nil ? PreviewBudget() : nil
         let compositeData = lock.withLock {
             (
                 state: compositeSearchState,
@@ -6351,10 +6437,15 @@ public final class FileIndex: @unchecked Sendable {
                 snapshotRevision: compositeData.revision,
                 pendingExactPaths: compositeData.pendingExactPaths,
                 rootPaths: compositeData.rootPaths,
+                onProgress: onProgress,
+                previewBudget: previewBudget,
                 shouldCancel: shouldCancel
             )
         }
-        return searchSingleSnapshot(request, maxResults: maxResults, shouldCancel: shouldCancel)
+        return searchSingleSnapshot(
+            request, maxResults: maxResults, onProgress: onProgress,
+            previewBudget: previewBudget, shouldCancel: shouldCancel
+        )
     }
 
     private func searchSingleSnapshot(
@@ -6363,7 +6454,11 @@ public final class FileIndex: @unchecked Sendable {
         snapshotOverride: SearchSnapshot? = nil,
         snapshotRevisionOverride: UInt64? = nil,
         recordsMetrics: Bool = true,
-        shouldCancel: @Sendable () -> Bool
+        literalSeed: RankedLiteralMatches? = nil,
+        allowsRankedCompletion: Bool = true,
+        onProgress: ((SearchResponse) -> Void)? = nil,
+        previewBudget: PreviewBudget? = nil,
+        shouldCancel: @escaping @Sendable () -> Bool
     ) -> SearchResponse? {
         let started = Date()
         let metricPhase = request.mode.metricPhase
@@ -6447,7 +6542,7 @@ public final class FileIndex: @unchecked Sendable {
                 elapsed: completedElapsed,
                 snapshotRevision: mergedResponse.snapshotRevision,
                 usesIndexedCandidates: mergedResponse.usesIndexedCandidates,
-                completeness: request.mode == .interactivePreview ? .partial : .complete,
+                completeness: request.mode == .interactivePreview ? .partial : mergedResponse.completeness,
                 executionProfile: SearchExecutionProfile(
                     executionPath: profile.executionPath,
                     indexesUsed: profile.indexesUsed,
@@ -6533,13 +6628,63 @@ public final class FileIndex: @unchecked Sendable {
 
         guard !shouldCancel() else { return nil }
 
-        var matches: [SearchMatch] = []
+        if let previewBudget, snapshot.nameGramIndex != nil,
+           let term = Self.basicLiteralTerm(parsedQuery) {
+            return finish(Self.boundedLiteralPreview(
+                snapshot: snapshot, request: request, term: term,
+                maxResults: boundedMaxResults, started: started,
+                snapshotRevision: snapshotRevision, budget: previewBudget,
+                shouldCancel: shouldCancel
+            ))
+        }
+
+        let rankedLiterals = literalSeed ?? Self.rankedLiteralMatches(
+            snapshot: snapshot,
+            request: request,
+            parsedQuery: parsedQuery,
+            maxResults: boundedMaxResults,
+            shouldCancel: shouldCancel
+        )
+        guard !shouldCancel() else { return nil }
+
+        func publishProgress(_ response: SearchResponse) {
+            guard let onProgress, !shouldCancel(),
+                  let refreshed = mergingPendingExactRefreshes(
+                    into: response,
+                    pendingExactPaths: snapshotData.pendingExactPaths,
+                    currentSnapshot: snapshotData.currentSnapshot,
+                    rootPaths: snapshotData.rootPaths,
+                    request: request,
+                    parsedQuery: parsedQuery,
+                    maxResults: boundedMaxResults,
+                    shouldCancel: shouldCancel
+                  ), !shouldCancel() else { return }
+            onProgress(refreshed)
+        }
+
+        if let rankedLiterals {
+            let settlesResults = rankedLiterals.totalMatches >= boundedMaxResults
+                && snapshotData.pendingExactPaths.isEmpty && allowsRankedCompletion
+            let response = rankedLiterals.response(
+                snapshot: snapshot,
+                started: started,
+                snapshotRevision: snapshotRevision,
+                completeness: settlesResults ? .topResultsComplete : .partial,
+                shouldCancel: shouldCancel
+            )
+            if settlesResults { return finish(response) }
+            if rankedLiterals.totalMatches > 0 { publishProgress(response) }
+        }
+
+        var matches: [SearchMatch] = rankedLiterals?.matches ?? []
         matches.reserveCapacity(min(snapshot.count, boundedMaxResults))
         let trimThreshold = boundedMaxResults > 0 ? boundedMaxResults * 5 : 0
-        var total = 0
+        var total = rankedLiterals?.totalMatches ?? 0
         var shouldSortMatches = true
         var emptyQueryScannedRowCount: Int?
         var fallbackScannedRowCount: Int?
+        var lastPublishedTotal = total
+        var lastPublishedAt = Date()
 
         func sortAndLimitMatches() {
             guard boundedMaxResults > 0 else { return }
@@ -6670,6 +6815,7 @@ public final class FileIndex: @unchecked Sendable {
                     maxResults: boundedMaxResults,
                     started: started,
                     snapshotRevision: snapshotRevision,
+                    previewBudget: previewBudget,
                     shouldCancel: shouldCancel
                 ) {
                     return finish(degradedResponse)
@@ -6856,6 +7002,8 @@ public final class FileIndex: @unchecked Sendable {
                 maxResults: boundedMaxResults,
                 started: started,
                 snapshotRevision: snapshotRevision,
+                literalSeed: rankedLiterals,
+                onProgress: onProgress == nil ? nil : publishProgress,
                 shouldCancel: shouldCancel
             ) {
                 return finish(indexedResponse)
@@ -6868,6 +7016,7 @@ public final class FileIndex: @unchecked Sendable {
                 maxResults: boundedMaxResults,
                 started: started,
                 snapshotRevision: snapshotRevision,
+                previewBudget: previewBudget,
                 shouldCancel: shouldCancel
             ) {
                 return finish(degradedResponse)
@@ -6889,9 +7038,22 @@ public final class FileIndex: @unchecked Sendable {
                     return nil
                 }
                 guard snapshot.store.isResultRow(at: index) else { continue }
+                guard rankedLiterals?.rowIDs.contains(index) != true else { continue }
                 let record = snapshot.view(at: index)
                 if let explanation = FuzzyMatcher.explain(record: record, parsedQuery: parsedQuery) {
                     appendMatch(rowID: index, score: explanation.score, match: explanation)
+                }
+                if request.mode == .rankedResults, onProgress != nil,
+                   index.isMultiple(of: 64), total != lastPublishedTotal,
+                   Date().timeIntervalSince(lastPublishedAt) >= 0.2 {
+                    sortAndLimitMatches()
+                    publishProgress(SearchResponse(
+                        results: Self.materialize(matches, from: snapshot, shouldCancel: shouldCancel),
+                        totalMatches: total, elapsed: Date().timeIntervalSince(started),
+                        snapshotRevision: snapshotRevision, usesIndexedCandidates: false, completeness: .partial
+                    ))
+                    lastPublishedTotal = total
+                    lastPublishedAt = Date()
                 }
             }
         }
@@ -6948,6 +7110,249 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
+    private struct BasicLiteralTerm {
+        let field: FuzzyMatcher.QueryField
+        let token: String
+        let mode: FuzzyMatcher.MatchMode
+        let query: FuzzyMatcher.ParsedQuery
+    }
+
+    private static func basicLiteralTerm(_ query: FuzzyMatcher.ParsedQuery) -> BasicLiteralTerm? {
+        guard query.negative.isEmpty, !query.positive.isEmpty else { return nil }
+        var selected: BasicLiteralTerm?
+        for clause in query.positive {
+            guard clause.alternatives.count == 1,
+                  case .text(let field, let pattern, let mode) = clause.alternatives[0],
+                  field != .path, mode == .fuzzy || mode == .exact,
+                  !pattern.token.isEmpty, !tokenContainsPathSeparator(pattern.token) else { return nil }
+            if let selected, selected.token.utf8.count >= pattern.token.utf8.count { continue }
+            selected = BasicLiteralTerm(field: field, token: pattern.token, mode: mode, query: query)
+        }
+        return selected
+    }
+
+    /// Shared across base and delta segments. Expiry returns the rows found so far,
+    /// never a nil response that can fall through into an exhaustive search.
+    private final class PreviewBudget {
+        static let searchDuration: TimeInterval = 0.1
+        static let maximumRows = 20_000
+        static let maximumSortedCandidates = 4_096
+        private let deadline = ProcessInfo.processInfo.systemUptime + searchDuration
+        private var remainingRows = maximumRows
+
+        var isExhausted: Bool {
+            remainingRows <= 0 || ProcessInfo.processInfo.systemUptime >= deadline
+        }
+
+        func consumeRow() -> Bool {
+            guard !isExhausted else { return false }
+            remainingRows -= 1
+            return true
+        }
+    }
+
+    private static func rarestLiteralPosting(
+        in index: MappedIntPostingIndex?, token: String
+    ) -> MappedIntPostingIndex.PostingValues? {
+        guard let index else { return nil }
+        var rarest: MappedIntPostingIndex.PostingValues?
+        for key in SearchTextGrams.queryKeys(for: Array(token.utf8)) {
+            guard let posting = index.posting(for: key) else { return nil }
+            if let rarest, rarest.count <= posting.count { continue }
+            rarest = posting
+        }
+        return rarest
+    }
+
+    private static func samePrimarySortValue(
+        _ lhs: Int, _ rhs: Int, column: SortColumn, store: RecordStore
+    ) -> Bool {
+        switch column {
+        case .name, .relevance: return store.normalizedName(at: lhs) == store.normalizedName(at: rhs)
+        case .path: return store.normalizedPath(at: lhs) == store.normalizedPath(at: rhs)
+        case .modified: return store.modifiedTime(at: lhs) == store.modifiedTime(at: rhs)
+        case .created: return (store.createdTime(at: lhs) ?? 0) == (store.createdTime(at: rhs) ?? 0)
+        case .size: return store.sizeBytes(at: lhs) == store.sizeBytes(at: rhs)
+        case .fileExtension: return store.fileExtension(at: lhs) == store.fileExtension(at: rhs)
+        case .kind: return kindName(for: store.view(at: lhs)) == kindName(for: store.view(at: rhs))
+        case .volume: return store.volumeName(at: lhs) == store.volumeName(at: rhs)
+        case .root: return store.rootPath(at: lhs) == store.rootPath(at: rhs)
+        }
+    }
+
+    /// Reverse primary groups lazily, retaining ascending name/path tie breaks.
+    /// Binary search skips a large group without walking every duplicate first.
+    private static func visitOrderedRows(
+        _ order: ArraySlice<Int>, ascending: Bool, column: SortColumn, store: RecordStore,
+        visit: (Int) -> Bool
+    ) {
+        if ascending {
+            for row in order { if !visit(row) { return } }
+            return
+        }
+        var end = order.endIndex
+        while end > order.startIndex {
+            if end == order.startIndex + 1 || !samePrimarySortValue(
+                order[end - 2], order[end - 1], column: column, store: store
+            ) {
+                if !visit(order[end - 1]) { return }
+                end -= 1
+                continue
+            }
+            var low = order.startIndex
+            var high = end - 1
+            while low < high {
+                let middle = low + (high - low) / 2
+                if samePrimarySortValue(order[middle], order[end - 1], column: column, store: store) {
+                    high = middle
+                } else {
+                    low = middle + 1
+                }
+            }
+            for position in low..<end { if !visit(order[position]) { return } }
+            end = low
+        }
+    }
+
+    private static func boundedLiteralPreview(
+        snapshot: SearchSnapshot, request: SearchRequest, term: BasicLiteralTerm,
+        maxResults: Int, started: Date, snapshotRevision: UInt64, budget: PreviewBudget,
+        shouldCancel: @Sendable () -> Bool
+    ) -> SearchResponse {
+        var matches: [SearchMatch] = []
+        var selected = Set<Int>()
+        var scanned = 0
+        var indexes: Set<SearchIndexUse> = []
+        var usedOrder = false
+        var pathContainsCache: [String: [Int: Bool]] = [:]
+        let posting = rarestLiteralPosting(in: snapshot.nameGramIndex, token: term.token)
+        if snapshot.nameGramIndex != nil { indexes.insert(.nameGrams) }
+
+        func visitName(_ row: Int) -> Bool {
+            guard maxResults > 0, !shouldCancel(), budget.consumeRow() else { return false }
+            scanned += 1
+            guard !selected.contains(row), snapshot.store.isResultRow(at: row),
+                  request.includeHidden || snapshot.isVisible(at: row) else { return true }
+            let explanation: MatchExplanation?
+            if snapshot.nameGramIndex == nil {
+                // During indexing, there may be no component index to find
+                // ancestors separately. Verify both fields in this bounded scan.
+                explanation = cheapDegradedExplanation(
+                    snapshot: snapshot, rowID: row, parsedQuery: term.query, pathContainsCache: &pathContainsCache
+                )
+            } else if let literal = cheapLiteralNameExplanation(
+                snapshot: snapshot, rowID: row, token: term.token, mode: term.mode
+            ) {
+                explanation = term.query.positive.count == 1 ? literal : cheapDegradedExplanation(
+                    snapshot: snapshot, rowID: row, parsedQuery: term.query, pathContainsCache: &pathContainsCache
+                )
+            } else {
+                explanation = nil
+            }
+            guard let match = explanation else { return true }
+            selected.insert(row)
+            matches.append(SearchMatch(rowID: row, score: match.score, match: match))
+            return true
+        }
+
+        let broadPosting = (posting?.count ?? 0) > maxResults * 4
+            && (posting?.count ?? 0) > snapshot.count / 8
+        if snapshot.hasSortedOrder, maxResults > 0 {
+            var cursor = lowerBoundName(in: snapshot.nameAscending, snapshot: snapshot, key: term.token)
+            while cursor < snapshot.nameAscending.count, matches.count < maxResults {
+                let row = snapshot.nameAscending[cursor]
+                guard snapshot.store.normalizedName(at: row) == term.token, visitName(row) else { break }
+                cursor += 1
+            }
+        }
+        if broadPosting, request.sort.column != .relevance,
+           let order = snapshot.persistedSortOrderAscending(for: request.sort.column) {
+            usedOrder = true
+            indexes.insert(request.sort.column == .modified ? .modifiedOrder : .sortOrder)
+            // Leave budget for a selective prefix/posting lookup if this sort's
+            // first rows don't match. Never build a rank map or reversed array.
+            let scanLimit = min(2_048, maxResults * 4)
+            visitOrderedRows(order[...], ascending: request.sort.ascending,
+                             column: request.sort.column, store: snapshot.store) { row in
+                scanned < scanLimit && matches.count < maxResults && visitName(row)
+            }
+        }
+
+        if matches.count < maxResults, snapshot.hasSortedOrder,
+           request.sort.column == .relevance || broadPosting {
+            indexes.insert(.sortOrder)
+            usedOrder = true
+            let lower = lowerBoundName(in: snapshot.nameAscending, snapshot: snapshot, key: term.token)
+            let upper = upperBoundNamePrefix(in: snapshot.nameAscending, snapshot: snapshot, prefix: term.token)
+            visitOrderedRows(snapshot.nameAscending[lower..<upper],
+                             ascending: request.sort.column != .name || request.sort.ascending,
+                             column: .name, store: snapshot.store) { row in
+                matches.count < maxResults && visitName(row)
+            }
+        }
+
+        if matches.count < maxResults, !budget.isExhausted {
+            if let posting {
+                for row in posting {
+                    if posting.count > PreviewBudget.maximumSortedCandidates, matches.count >= maxResults { break }
+                    if !visitName(Int(row)) { break }
+                }
+            } else if snapshot.nameGramIndex == nil {
+                for row in 0..<snapshot.count { if !visitName(row) { break } }
+            }
+        }
+
+        if (matches.isEmpty || matches.contains { snapshot.store.isDirectory(at: $0.rowID) }),
+           term.field != .name, !budget.isExhausted,
+           let componentIndex = snapshot.componentGramIndex {
+            let index: MappedIntPostingIndex
+            switch componentIndex {
+            case .combined(let value), .shared(let value): index = value
+            }
+            if let components = rarestLiteralPosting(in: index, token: term.token) {
+                indexes.insert(.componentGrams)
+                for component in components {
+                    guard !shouldCancel(), budget.consumeRow(), matches.count < maxResults else { break }
+                    let row = Int(component)
+                    scanned += 1
+                    guard snapshot.store.normalizedName(at: row).contains(term.token) else { continue }
+                    _ = snapshot.visitSubtreeRows(startingAt: row, shouldCancel: shouldCancel) { descendant in
+                        guard matches.count < maxResults, budget.consumeRow(), !shouldCancel() else { return false }
+                        scanned += 1
+                        guard !selected.contains(descendant), snapshot.store.isResultRow(at: descendant),
+                              request.includeHidden || snapshot.isVisible(at: descendant),
+                              let literal = cheapIndexedPathExplanation(
+                                snapshot: snapshot, rowID: descendant, token: term.token, mode: term.mode
+                              ) else { return true }
+                        let explanation = term.query.positive.count == 1 ? literal : cheapDegradedExplanation(
+                            snapshot: snapshot, rowID: descendant, parsedQuery: term.query,
+                            pathContainsCache: &pathContainsCache
+                        )
+                        guard let match = explanation else { return true }
+                        selected.insert(descendant)
+                        matches.append(SearchMatch(rowID: descendant, score: match.score, match: match))
+                        return true
+                    }
+                }
+            }
+        }
+
+        matches.sort { compare($0, $1, snapshot: snapshot, sort: request.sort, queryIsEmpty: false) }
+        if matches.count > maxResults { matches.removeSubrange(maxResults...) }
+        let elapsed = Date().timeIntervalSince(started)
+        return SearchResponse(
+            results: materialize(matches, from: snapshot, shouldCancel: shouldCancel),
+            totalMatches: matches.count, elapsed: elapsed, snapshotRevision: snapshotRevision,
+            usesIndexedCandidates: !indexes.isEmpty, completeness: .partial,
+            executionProfile: SearchExecutionProfile(
+                executionPath: usedOrder ? .optimizedSortedFastPath : .nameComponentIndex,
+                indexesUsed: indexes,
+                candidateCount: matches.isEmpty ? posting?.count ?? scanned : scanned,
+                scannedRowCount: scanned, elapsed: elapsed
+            )
+        )
+    }
+
     private static func optimizedSortedUnifiedSearch(
         snapshot: SearchSnapshot,
         request: SearchRequest,
@@ -6981,7 +7386,7 @@ public final class FileIndex: @unchecked Sendable {
             }
             if nameCandidates.isEmpty {
                 simpleNameQuery = nil
-                guard let candidates = Self.candidateIndices(
+                guard let candidates = Self.previewCandidateIndices(
                     snapshot: snapshot,
                     parsedQuery: parsedQuery,
                     shouldCancel: shouldCancel
@@ -7278,6 +7683,24 @@ public final class FileIndex: @unchecked Sendable {
         return unionPostingLists(pathCandidates, nameCandidates, shouldCancel: shouldCancel)
     }
 
+    private static func previewCandidateIndices(
+        snapshot: SearchSnapshot,
+        parsedQuery: FuzzyMatcher.ParsedQuery,
+        shouldCancel: @Sendable () -> Bool
+    ) -> [Int32]? {
+        // These preview paths verify literal names and ancestors. Broad fuzzy
+        // byte candidates cannot add results here; refinement handles them.
+        directLiteralCandidates(
+            snapshot: snapshot,
+            parsedQuery: parsedQuery,
+            shouldCancel: shouldCancel
+        ) ?? candidateIndices(
+            snapshot: snapshot,
+            parsedQuery: parsedQuery,
+            shouldCancel: shouldCancel
+        )
+    }
+
     private static func emptyCompositePreviewIndexes(
         snapshot: SearchSnapshot,
         parsedQuery: FuzzyMatcher.ParsedQuery,
@@ -7417,7 +7840,7 @@ public final class FileIndex: @unchecked Sendable {
                 includeHidden: request.includeHidden,
                 optimizedSortColumns: optimizedSortColumns
             ),
-            let candidateIndices = candidateIndices(
+            let candidateIndices = previewCandidateIndices(
                 snapshot: snapshot,
                 parsedQuery: parsedQuery,
                 shouldCancel: shouldCancel
@@ -7508,7 +7931,7 @@ public final class FileIndex: @unchecked Sendable {
         switch request.mode {
         case .interactivePreview:
             return min(snapshotCount, max(Self.previewIndexedCandidateScanLimit, maxResults * 500))
-        case .complete:
+        case .complete, .rankedResults:
             return snapshotCount
         }
     }
@@ -7523,7 +7946,7 @@ public final class FileIndex: @unchecked Sendable {
         shouldCancel: @Sendable () -> Bool
     ) -> SearchResponse? {
         guard request.mode == .interactivePreview else { return nil }
-        guard let candidateIndices = candidateIndices(
+        guard let candidateIndices = previewCandidateIndices(
             snapshot: snapshot,
             parsedQuery: parsedQuery,
             shouldCancel: shouldCancel
@@ -7532,8 +7955,6 @@ public final class FileIndex: @unchecked Sendable {
         }
 
         let indexesUsed = indexUses(for: parsedQuery)
-
-        guard !candidateIndices.isEmpty else { return nil }
 
         let scanLimit = min(candidateIndices.count, max(Self.previewIndexedCandidateScanLimit, maxResults * 500))
 
@@ -7608,6 +8029,7 @@ public final class FileIndex: @unchecked Sendable {
         maxResults: Int,
         started: Date,
         snapshotRevision: UInt64,
+        previewBudget: PreviewBudget?,
         shouldCancel: @Sendable () -> Bool
     ) -> SearchResponse? {
         let scanLimit = min(snapshot.count, Self.degradedSearchMaximumScanLimit)
@@ -7632,6 +8054,7 @@ public final class FileIndex: @unchecked Sendable {
             if rowID.isMultiple(of: 64), shouldCancel() {
                 return nil
             }
+            if let previewBudget, !previewBudget.consumeRow() { break }
 
             scannedRows += 1
             guard snapshot.store.isResultRow(at: rowID) else { continue }
@@ -9088,6 +9511,21 @@ public final class FileIndex: @unchecked Sendable {
         while low < high {
             let middle = low + (high - low) / 2
             if snapshot.store.normalizedName(at: order[middle]) < key {
+                low = middle + 1
+            } else {
+                high = middle
+            }
+        }
+        return low
+    }
+
+    private static func upperBoundNamePrefix(in order: [Int], snapshot: SearchSnapshot, prefix: String) -> Int {
+        var low = 0
+        var high = order.count
+        while low < high {
+            let middle = low + (high - low) / 2
+            let name = snapshot.store.normalizedName(at: order[middle])
+            if name < prefix || name.hasPrefix(prefix) {
                 low = middle + 1
             } else {
                 high = middle
@@ -10607,6 +11045,139 @@ public final class FileIndex: @unchecked Sendable {
         return candidates.map { SearchMatch(rowID: $0.rowID, score: $0.match?.score ?? 0, match: $0.match) }
     }
 
+    private struct RankedLiteralMatches {
+        let matches: [SearchMatch]
+        let rowIDs: Set<Int>
+        let totalMatches: Int
+        let candidateCount: Int
+
+        func response(
+            snapshot: SearchSnapshot,
+            started: Date,
+            snapshotRevision: UInt64,
+            completeness: SearchCompleteness,
+            shouldCancel: @Sendable () -> Bool
+        ) -> SearchResponse {
+            let elapsed = Date().timeIntervalSince(started)
+            return SearchResponse(
+                results: FileIndex.materialize(matches, from: snapshot, shouldCancel: shouldCancel),
+                totalMatches: totalMatches,
+                elapsed: elapsed,
+                snapshotRevision: snapshotRevision,
+                usesIndexedCandidates: true,
+                completeness: completeness,
+                executionProfile: SearchExecutionProfile(
+                    executionPath: .nameComponentIndex,
+                    indexesUsed: [.nameGrams],
+                    candidateCount: candidateCount,
+                    scannedRowCount: candidateCount,
+                    elapsed: elapsed
+                )
+            )
+        }
+    }
+
+    private static func rankedLiteralMatches(
+        snapshot: SearchSnapshot,
+        request: SearchRequest,
+        parsedQuery: FuzzyMatcher.ParsedQuery,
+        maxResults: Int,
+        shouldCancel: @Sendable () -> Bool
+    ) -> RankedLiteralMatches? {
+        // For one fuzzy filename term, all literal name matches outrank every
+        // remaining typo, acronym, and ancestor match. This bound does not hold
+        // for arbitrary clauses or quoted paths, so those retain full evaluation.
+        guard request.mode == .rankedResults, maxResults > 0,
+              parsedQuery.negative.isEmpty, parsedQuery.positive.count == 1,
+              let clause = parsedQuery.positive.first, clause.alternatives.count == 1,
+              case .text(let field, let pattern, .fuzzy) = clause.alternatives[0],
+              field != .path, !pattern.token.isEmpty,
+              !tokenContainsPathSeparator(pattern.token) else { return nil }
+
+        var matches: [SearchMatch] = []
+        var rowIDs = Set<Int>()
+        var candidateCount = 0
+        func sortAndLimit() {
+            matches.sort { compare($0, $1, snapshot: snapshot, sort: request.sort, queryIsEmpty: false) }
+            if matches.count > maxResults { matches.removeSubrange(maxResults...) }
+        }
+        func visit(_ rowID: Int) {
+            guard !rowIDs.contains(rowID) else { return }
+            candidateCount += 1
+            guard snapshot.store.isResultRow(at: rowID),
+                  request.includeHidden || snapshot.isVisible(at: rowID),
+                  snapshot.store.normalizedName(at: rowID).contains(pattern.token),
+                  let match = FuzzyMatcher.explain(record: snapshot.view(at: rowID), parsedQuery: parsedQuery)
+            else { return }
+            rowIDs.insert(rowID)
+            matches.append(SearchMatch(rowID: rowID, score: match.score, match: match))
+            if matches.count > maxResults * 5 { sortAndLimit() }
+        }
+        func result() -> RankedLiteralMatches {
+            sortAndLimit()
+            return RankedLiteralMatches(
+                matches: matches, rowIDs: rowIDs, totalMatches: rowIDs.count, candidateCount: candidateCount
+            )
+        }
+
+        // Prefixes can settle the list before reading even the substring postings.
+        if snapshot.hasSortedOrder {
+            let lower = lowerBoundName(in: snapshot.nameAscending, snapshot: snapshot, key: pattern.token)
+            let upper = upperBoundNamePrefix(in: snapshot.nameAscending, snapshot: snapshot, prefix: pattern.token)
+            // A dense prefix range is cheaper to select in the requested order
+            // than to score and sort every matching filename. Without exact names,
+            // prefix/bin 4 is the maximum remaining quality.
+            if upper - lower >= maxResults,
+               request.sort.column == .name || upper - lower > snapshot.count / 8,
+               lower < upper, snapshot.store.normalizedName(at: snapshot.nameAscending[lower]) != pattern.token,
+               request.sort.column != .relevance,
+               let order = snapshot.persistedSortOrderAscending(for: request.sort.column) {
+                var scanned = 0
+                let prefixOrder = request.sort.column == .name ? order[lower..<upper] : order[...]
+                visitOrderedRows(prefixOrder, ascending: request.sort.ascending,
+                                 column: request.sort.column, store: snapshot.store) { rowID in
+                    if scanned.isMultiple(of: 64), shouldCancel() { return false }
+                    scanned += 1
+                    if snapshot.store.normalizedName(at: rowID).hasPrefix(pattern.token) {
+                        visit(rowID)
+                    } else {
+                        candidateCount += 1
+                    }
+                    return rowIDs.count < maxResults || !matches.allSatisfy { $0.match?.quality.scoreBin == 4 }
+                }
+                guard !shouldCancel() else { return nil }
+                if rowIDs.count >= maxResults { return result() }
+            }
+            var cursor = lower
+            while cursor < snapshot.nameAscending.count {
+                if cursor.isMultiple(of: 256), shouldCancel() { return nil }
+                let rowID = snapshot.nameAscending[cursor]
+                guard snapshot.store.normalizedName(at: rowID).hasPrefix(pattern.token) else { break }
+                visit(rowID)
+                cursor += 1
+                // Prefix/exact filename scores stay in the highest bin after
+                // depth/hidden penalties. This order already supplies their ties.
+                if rowIDs.count >= maxResults,
+                   request.sort.column == .relevance || (request.sort.column == .name && request.sort.ascending),
+                   matches.allSatisfy({ $0.match?.quality.scoreBin == 4 }) {
+                    return result()
+                }
+            }
+            guard !shouldCancel() else { return nil }
+            if rowIDs.count >= maxResults { return result() }
+        }
+
+        guard snapshot.nameGramIndex != nil else { return nil }
+        if let candidates = rarestLiteralPosting(in: snapshot.nameGramIndex, token: pattern.token) {
+            for (offset, candidate) in candidates.enumerated() {
+                if offset.isMultiple(of: 256), shouldCancel() { return nil }
+                visit(Int(candidate))
+            }
+        }
+        guard !shouldCancel() else { return nil }
+        return result()
+    }
+
     private static func indexedCandidateSearch(
         snapshot: SearchSnapshot,
         request: SearchRequest,
@@ -10614,6 +11185,8 @@ public final class FileIndex: @unchecked Sendable {
         maxResults: Int,
         started: Date,
         snapshotRevision: UInt64,
+        literalSeed: RankedLiteralMatches? = nil,
+        onProgress: ((SearchResponse) -> Void)? = nil,
         shouldCancel: @Sendable () -> Bool
     ) -> SearchResponse? {
         guard let candidateIndices = candidateIndices(
@@ -10641,14 +11214,36 @@ public final class FileIndex: @unchecked Sendable {
             )
         }
 
-        guard candidateIndices.count < snapshot.count else {
+        guard candidateIndices.count < snapshot.count || request.mode == .rankedResults else {
             return nil
         }
 
-        var matches: [SearchMatch] = []
+        var matches: [SearchMatch] = literalSeed?.matches ?? []
         matches.reserveCapacity(min(candidateIndices.count, maxResults))
         let trimThreshold = maxResults > 0 ? maxResults * 5 : 0
-        var total = 0
+        var total = literalSeed?.totalMatches ?? 0
+        var lastPublishedTotal = total
+        var lastPublishedAt = Date()
+        var scannedRows = literalSeed?.candidateCount ?? 0
+
+        func response(completeness: SearchCompleteness) -> SearchResponse {
+            let elapsed = Date().timeIntervalSince(started)
+            return SearchResponse(
+                results: materialize(matches, from: snapshot, shouldCancel: shouldCancel),
+                totalMatches: total,
+                elapsed: elapsed,
+                snapshotRevision: snapshotRevision,
+                usesIndexedCandidates: true,
+                completeness: completeness,
+                executionProfile: SearchExecutionProfile(
+                    executionPath: Self.executionPath(forIndexedCandidateQuery: parsedQuery),
+                    indexesUsed: Self.indexUses(for: parsedQuery),
+                    candidateCount: candidateIndices.count,
+                    scannedRowCount: scannedRows,
+                    elapsed: elapsed
+                )
+            )
+        }
 
         func sortAndLimitMatches() {
             guard maxResults > 0 else { return }
@@ -10669,6 +11264,14 @@ public final class FileIndex: @unchecked Sendable {
             if offset.isMultiple(of: 512), shouldCancel() {
                 return nil
             }
+            if request.mode == .rankedResults, let onProgress,
+               offset.isMultiple(of: 256), total != lastPublishedTotal,
+               Date().timeIntervalSince(lastPublishedAt) >= 0.2 {
+                sortAndLimitMatches()
+                onProgress(response(completeness: .partial))
+                lastPublishedTotal = total
+                lastPublishedAt = Date()
+            }
 
             let index = Int(candidate)
             guard index >= 0, index < snapshot.count else {
@@ -10677,6 +11280,8 @@ public final class FileIndex: @unchecked Sendable {
             guard snapshot.store.isResultRow(at: index) else {
                 continue
             }
+            guard literalSeed?.rowIDs.contains(index) != true else { continue }
+            scannedRows += 1
 
             let record = snapshot.view(at: index)
             guard request.includeHidden || snapshot.isVisible(at: index) else {
@@ -10701,20 +11306,7 @@ public final class FileIndex: @unchecked Sendable {
         sortAndLimitMatches()
 
         guard !shouldCancel() else { return nil }
-        let elapsed = Date().timeIntervalSince(started)
-        return SearchResponse(
-            results: materialize(matches, from: snapshot, shouldCancel: shouldCancel),
-            totalMatches: total,
-            elapsed: elapsed,
-            snapshotRevision: snapshotRevision,
-            usesIndexedCandidates: true,
-            executionProfile: SearchExecutionProfile(
-                executionPath: Self.executionPath(forIndexedCandidateQuery: parsedQuery),
-                indexesUsed: Self.indexUses(for: parsedQuery),
-                candidateCount: candidateIndices.count,
-                elapsed: elapsed
-            )
-        )
+        return response(completeness: .complete)
     }
 
     private static func executionPath(forIndexedCandidateQuery parsedQuery: FuzzyMatcher.ParsedQuery) -> SearchExecutionPath {

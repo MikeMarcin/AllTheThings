@@ -114,6 +114,8 @@ enum AppSettings {
     static let searchHistoryKey = "ATTSearchHistory"
     static let searchHistoryTimestampsKey = "ATTSearchHistoryTimestamps"
     static let searchHistoryRetentionKey = "ATTSearchHistoryRetention"
+    static let searchRefinementTimeLimitKey = "ATTSearchRefinementTimeLimit"
+    static let defaultSearchRefinementTimeLimit: TimeInterval = 60
     static let exclusionDefaultsVersionKey = "ATTExclusionDefaultsVersion"
     static let indexedRootDefaultsVersionKey = "ATTIndexedRootDefaultsVersion"
     static let globalSearchHotKeyDidChangeNotification = Notification.Name("com.allthethings.settings.globalSearchHotKeyDidChange")
@@ -210,6 +212,7 @@ enum AppSettings {
             lightMatchColorsKey: defaultMatchColorHexes(isDark: false),
             darkMatchColorsKey: defaultMatchColorHexes(isDark: true),
             searchHistoryRetentionKey: AppSearchHistoryRetention.defaultEntryCount,
+            searchRefinementTimeLimitKey: defaultSearchRefinementTimeLimit,
             exclusionPatternsKey: FileExclusionRules.defaultPatterns,
             optimizedSortColumnsKey: SortColumn.optimizedIndexColumns.map(\.rawValue)
         ])
@@ -364,6 +367,19 @@ enum AppSettings {
             ]
         )
         postSettingsDidChangeNotification(statusFooterModeDidChangeNotification, defaults: defaults)
+    }
+
+    static func searchRefinementTimeLimit(defaults: UserDefaults = .standard) -> TimeInterval {
+        guard let value = defaults.object(forKey: searchRefinementTimeLimitKey) as? NSNumber,
+              value.doubleValue.isFinite, value.doubleValue >= 0 else {
+            return defaultSearchRefinementTimeLimit
+        }
+        return value.doubleValue
+    }
+
+    static func saveSearchRefinementTimeLimit(_ seconds: TimeInterval, defaults: UserDefaults = .standard) {
+        guard seconds.isFinite, seconds >= 0 else { return }
+        defaults.set(seconds, forKey: searchRefinementTimeLimitKey)
     }
 
     static func searchHistoryRetention(defaults: UserDefaults = .standard) -> AppSearchHistoryRetention {
