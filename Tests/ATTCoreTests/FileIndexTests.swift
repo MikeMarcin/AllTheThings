@@ -1168,6 +1168,42 @@ struct FileIndexTests {
         #expect(index.currentStats().activityPresentation == .backgroundCatchUp)
     }
 
+    @Test("structural delta compaction scales with the base index")
+    func structuralDeltaCompactionScalesWithBaseIndex() {
+        #expect(FileIndex.structuralDeltaCompactionThreshold(baseRecordCount: 100) == 10_000)
+        #expect(FileIndex.structuralDeltaCompactionThreshold(baseRecordCount: 1_000_000) == 20_000)
+        // Regression: this catch-up used to rewrite 7.3 million rows for 108,468 changes.
+        let requirements = FileIndex.structuralDeltaCompactionRequirements(
+            baseRecordCount: 7_260_846, changeCount: 108_468, deltaBytes: 53_915_648
+        )
+        #expect(requirements.threshold == 145_216)
+        #expect(!requirements.shouldCompact)
+        #expect(!requirements.immediate)
+    }
+
+    @Test("large indexes still compact oversized deltas before the proportional threshold")
+    func largeIndexesStillCompactOversizedDeltas() {
+        let requirements = FileIndex.structuralDeltaCompactionRequirements(
+            baseRecordCount: 7_260_846, changeCount: 108_468, deltaBytes: 64 * 1_024 * 1_024
+        )
+        #expect(requirements.shouldCompact)
+        #expect(requirements.immediate)
+    }
+
+    @Test("structural delta growth schedules then accelerates compaction")
+    func structuralDeltaGrowthSchedulesThenAcceleratesCompaction() {
+        let scheduled = FileIndex.structuralDeltaCompactionRequirements(
+            baseRecordCount: 7_260_846, changeCount: 150_000, deltaBytes: 60_000_000
+        )
+        #expect(scheduled.shouldCompact)
+        #expect(!scheduled.immediate)
+        let immediate = FileIndex.structuralDeltaCompactionRequirements(
+            baseRecordCount: 7_260_846, changeCount: 600_000, deltaBytes: 60_000_000
+        )
+        #expect(immediate.shouldCompact)
+        #expect(immediate.immediate)
+    }
+
     @Test("large structural overlay updates schedule mapped snapshot compaction")
     func largeStructuralOverlayUpdatesScheduleMappedSnapshotCompaction() async throws {
         let fileManager = FileManager.default
@@ -1637,6 +1673,47 @@ struct FileIndexTests {
         let finalState = index.maintenanceRequestStateForTesting()
         #expect(!finalState.backgroundEnabled)
         #expect(finalState.promotionApplicationCount == initialState.promotionApplicationCount + 1)
+    }
+
+    @Test("background mode interrupts foreground promotion while the index queue is busy")
+    func backgroundModeInterruptsPromotionWhileIndexQueueIsBusy() {
+        let index = FileIndex(
+            applicationName: "AllTheThingsTests-\(UUID().uuidString)",
+            loadsSnapshotImmediately: false
+        )
+        defer { try? FileManager.default.removeItem(at: index.dataDirectoryURL) }
+        index.setBackgroundMaintenanceEnabled(true)
+        let initialPromotions = index.maintenanceRequestStateForTesting().promotionApplicationCount
+        let queueAcquired = DispatchSemaphore(value: 0)
+        let releaseQueue = DispatchSemaphore(value: 0)
+        let modeChangesApplied = DispatchSemaphore(value: 0)
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            index.withIndexQueueHeldForTesting {
+                queueAcquired.signal()
+                _ = releaseQueue.wait(timeout: .now() + 5)
+            }
+        }
+        guard queueAcquired.wait(timeout: .now() + 1) == .success else {
+            releaseQueue.signal()
+            Issue.record("Timed out acquiring the index queue")
+            return
+        }
+
+        index.requestMaintenanceMode(background: false, promotePendingWork: true)
+        index.requestMaintenanceMode(background: true, promotePendingWork: false)
+        DispatchQueue.global(qos: .userInitiated).async {
+            index.waitForMaintenanceRequestsForTesting(includingPromotions: false)
+            modeChangesApplied.signal()
+        }
+
+        #expect(modeChangesApplied.wait(timeout: .now() + 1) == .success)
+        #expect(index.maintenanceRequestStateForTesting().backgroundEnabled)
+        releaseQueue.signal()
+        index.waitForMaintenanceRequestsForTesting()
+        let finalState = index.maintenanceRequestStateForTesting()
+        #expect(finalState.backgroundEnabled)
+        #expect(finalState.promotionApplicationCount == initialPromotions)
     }
 
     @Test("update completion fires after exact refresh persists")
@@ -3676,8 +3753,8 @@ struct FileIndexTests {
         }
     }
 
-    @Test("background structural update defers search optimization until promotion")
-    func backgroundStructuralUpdateDefersSearchOptimizationUntilPromotion() async throws {
+    @Test("searchable background deltas keep their compaction deadline on foreground activation")
+    func searchableBackgroundDeltasKeepCompactionDeadlineOnActivation() async throws {
         let fileManager = FileManager.default
         let root = fileManager.temporaryDirectory
             .appendingPathComponent("AllTheThingsTests-\(UUID().uuidString)", isDirectory: true)
@@ -3721,15 +3798,24 @@ struct FileIndexTests {
                 && diagnostics.pendingRefreshPathCount == 0
         }
         let overlayRevision = index.currentDiagnostics().snapshotRevision
+        let schedule = try #require(index.structuralDeltaCompactionScheduleForTesting())
+        #expect(index.currentDiagnostics().compositeSearchSegmentCount > 0)
 
-        index.promoteBackgroundMaintenance()
+        index.requestMaintenanceMode(background: false, promotePendingWork: true)
+        index.waitForMaintenanceRequestsForTesting()
+        index.prioritizeSearchOptimization(for: .name)
+        try await Task.sleep(for: .milliseconds(300))
 
-        try await waitUntil(timeout: .seconds(10)) {
-            let diagnostics = index.currentDiagnostics()
-            return diagnostics.snapshotRevision > overlayRevision
-                && diagnostics.recordStoreKind == .mapped
-                && diagnostics.optimizedCount == diagnostics.indexedCount
-        }
+        let after = index.currentDiagnostics()
+        #expect(after.snapshotRevision == overlayRevision)
+        #expect(after.recordStoreKind == .overlay)
+        #expect(after.optimizedCount == after.indexedCount)
+        #expect(index.structuralDeltaCompactionScheduleForTesting()?.revision == schedule.revision)
+        #expect(index.structuralDeltaCompactionScheduleForTesting()?.scheduledAt == schedule.scheduledAt)
+        #expect(index.search(SearchRequest(
+            query: "BackgroundAdded",
+            sort: SortSpec(column: .relevance, ascending: false)
+        ), maxResults: 10).results.contains { $0.record.path == addedFile.path })
     }
 
     @Test("queued refreshes continue draining after the maximum batch")

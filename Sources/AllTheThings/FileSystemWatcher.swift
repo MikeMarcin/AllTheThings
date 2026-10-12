@@ -1082,7 +1082,7 @@ protocol FSEventHistoryReplayCancellable: AnyObject, Sendable {
     func cancel()
 }
 
-enum FSEventHistoryReplayCompletion: Sendable, Equatable {
+enum FSEventHistoryReplayCompletion: String, Sendable, Equatable {
     case completed
     case failed
     case timedOut
@@ -1215,6 +1215,7 @@ private final class FSEventHistoryReplayCollector: @unchecked Sendable {
     private var replayBaselineEventID: UInt64
     private var rawEventCount = 0
     private var droppedExcludedEventCount = 0
+    private var recursiveEventCount = 0
 
     init(rootPaths: [String], exclusions: FileExclusionRules, baselineEventID: UInt64) {
         let rootMatcher = FSEventRootMatcher(rootPaths: rootPaths)
@@ -1252,17 +1253,24 @@ private final class FSEventHistoryReplayCollector: @unchecked Sendable {
                 continue
             }
 
-            if event.requiresRecursiveRescan {
+            if event.historyIsUnsafe {
                 fallbackRootPaths.insert(rootPath)
                 continue
             }
 
+            // MustScanSubDirs describes this directory's subtree, even when
+            // historical events omit ItemIsDir. Only unsafe history requires
+            // expanding the repair to the watched root.
+            if event.requiresRecursiveRescan {
+                recursiveEventCount += 1
+            }
+            let isDirectory = event.itemIsDirectory || event.requiresRecursiveRescan
             let decision: FileExclusionRules.Decision
             if usesKnownExclusionFastPath {
                 if FSEventIndexFilter.isKnownExcludedEventPath(
                     event.path,
                     activePatterns: activeExclusionPatterns,
-                    isDirectory: event.itemIsDirectory
+                    isDirectory: isDirectory
                 ) {
                     droppedExcludedEventCount += 1
                     continue
@@ -1306,6 +1314,10 @@ private final class FSEventHistoryReplayCollector: @unchecked Sendable {
         let loggedRawEventCount = rawEventCount
         let loggedDroppedExcludedEventCount = droppedExcludedEventCount
         let loggedRequiresGlobalFallback = requiresGlobalFallback
+        let loggedRecursiveEventCount = recursiveEventCount
+        let loggedFallbackRootCount = fallbackRootPaths.count
+        let loggedInvalidatedEntireStream = invalidatedEntireStream
+        let loggedSawHistoryDone = sawHistoryDone
 
         if completion != .completed || !sawHistoryDone {
             action = .fullReconcile(paths: nil, baselineEventID: currentEventID)
@@ -1336,7 +1348,12 @@ private final class FSEventHistoryReplayCollector: @unchecked Sendable {
                 "droppedExcludedEventCount": .publicInt(loggedDroppedExcludedEventCount),
                 "keptScopeCount": .publicInt(keptScopeCount),
                 "collapsedScopeCount": .publicInt(collapsedScopeCount),
-                "requiresGlobalFallback": .publicBool(loggedRequiresGlobalFallback)
+                "requiresGlobalFallback": .publicBool(loggedRequiresGlobalFallback),
+                "recursiveEventCount": .publicInt(loggedRecursiveEventCount),
+                "fallbackRootCount": .publicInt(loggedFallbackRootCount),
+                "streamInvalidated": .publicBool(loggedInvalidatedEntireStream),
+                "sawHistoryDone": .publicBool(loggedSawHistoryDone),
+                "replayCompletion": .publicString(completion.rawValue)
             ]
         )
 
@@ -1357,8 +1374,9 @@ private final class FSEventHistoryReplayCollector: @unchecked Sendable {
             evaluator = newEvaluator
         }
 
-        let decision = evaluator(event.path, event.itemIsDirectory)
-        guard decision == .prune, !event.itemIsDirectory else { return decision }
+        let isDirectory = event.itemIsDirectory || event.requiresRecursiveRescan
+        let decision = evaluator(event.path, isDirectory)
+        guard decision == .prune, !isDirectory else { return decision }
 
         let directoryDecision = evaluator(event.path, true)
         return directoryDecision == .index ? directoryDecision : decision
@@ -1372,11 +1390,11 @@ private final class FSEventHistoryReplayCollector: @unchecked Sendable {
         let path = URL(fileURLWithPath: event.path).standardizedFileURL.path
         guard path != rootPath else { return rootPath }
 
-        if event.itemIsDirectory || decision == .skipButDescend {
+        if event.itemIsDirectory || event.requiresRecursiveRescan || decision == .skipButDescend {
             return path
         }
 
-        if event.requiresRecursiveRescan || event.itemChangeRequiresDirectoryScope {
+        if event.itemChangeRequiresDirectoryScope {
             return parentScope(for: path, rootPath: rootPath)
         }
 

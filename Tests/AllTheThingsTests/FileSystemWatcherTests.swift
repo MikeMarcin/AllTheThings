@@ -330,6 +330,155 @@ struct FileSystemWatcherTests {
         #expect(Set(filtered.map(\.eventID)) == [41, 42])
     }
 
+    @Test("historical recursive events repair only the affected subtree", arguments: [false, true])
+    func historicalRecursiveEventsStayScoped(hasDirectoryFlag: Bool) async {
+        let root = URL(fileURLWithPath: "/tmp/allthethings/root-a", isDirectory: true)
+        let changedDirectory = root.appendingPathComponent("Project/Sources").path
+        let changedFile = root.appendingPathComponent("Other/Changed.swift").path
+        let store = memoryCursorStore()
+        store.markBaseline(for: [root.path], eventID: 40)
+        let coordinator = FSEventReconciliationCoordinator(
+            cursorStore: store,
+            replaySource: FakeHistoryReplaySource(events: [
+                FileSystemEvent(
+                    path: changedDirectory,
+                    flags: FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs)
+                        | (hasDirectoryFlag ? FSEventStreamEventFlags(kFSEventStreamEventFlagItemIsDir) : 0),
+                    eventID: 41
+                ),
+                FileSystemEvent(path: changedFile, flags: 0, eventID: 42),
+                FileSystemEvent(
+                    path: root.path,
+                    flags: FSEventStreamEventFlags(kFSEventStreamEventFlagHistoryDone),
+                    eventID: 43
+                )
+            ], completion: .completed),
+            currentEventID: { 50 }
+        )
+
+        let action = await actionFromCoordinator(coordinator, roots: [root])
+        #expect(action == .reconcile(paths: [changedFile, changedDirectory].sorted(), baselineEventID: 43))
+    }
+
+    @Test("excluded historical recursive events do not trigger root scans", arguments: [false, true])
+    func excludedHistoricalRecursiveEventsDoNotTriggerRootScans(customExclusions: Bool) async {
+        let root = URL(fileURLWithPath: "/tmp/allthethings/root-a", isDirectory: true)
+        let store = memoryCursorStore()
+        store.markBaseline(for: [root.path], eventID: 40)
+        let patterns = customExclusions ? ["node_modules/"] : FileExclusionRules.defaultPatterns
+        let coordinator = FSEventReconciliationCoordinator(
+            cursorStore: store,
+            replaySource: FakeHistoryReplaySource(events: [
+                FileSystemEvent(
+                    path: root.appendingPathComponent("Project/node_modules").path,
+                    flags: FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs),
+                    eventID: 41
+                ),
+                FileSystemEvent(
+                    path: root.path,
+                    flags: FSEventStreamEventFlags(kFSEventStreamEventFlagHistoryDone),
+                    eventID: 42
+                )
+            ], completion: .completed),
+            currentEventID: { 50 }
+        )
+
+        let action = await actionFromCoordinator(
+            coordinator, roots: [root], exclusions: FileExclusionRules(patterns: patterns)
+        )
+        #expect(action == .upToDate(baselineEventID: 42))
+    }
+
+    @Test("historical recursive events retain scopes with reincluded descendants")
+    func historicalRecursiveEventsRetainReincludedDescendants() async {
+        let root = URL(fileURLWithPath: "/tmp/allthethings/root-a", isDirectory: true)
+        let generated = root.appendingPathComponent("generated").path
+        let store = memoryCursorStore()
+        store.markBaseline(for: [root.path], eventID: 40)
+        let coordinator = FSEventReconciliationCoordinator(
+            cursorStore: store,
+            replaySource: FakeHistoryReplaySource(events: [
+                FileSystemEvent(
+                    path: generated,
+                    flags: FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs),
+                    eventID: 41
+                ),
+                FileSystemEvent(
+                    path: root.path,
+                    flags: FSEventStreamEventFlags(kFSEventStreamEventFlagHistoryDone),
+                    eventID: 42
+                )
+            ], completion: .completed),
+            currentEventID: { 50 }
+        )
+
+        let action = await actionFromCoordinator(
+            coordinator, roots: [root],
+            exclusions: FileExclusionRules(patterns: ["generated/", "!generated/keep/"])
+        )
+        #expect(action == .reconcile(paths: [generated], baselineEventID: 42))
+    }
+
+    @Test("unsafe historical events still repair roots even inside excluded directories", arguments: [
+        kFSEventStreamEventFlagUserDropped,
+        kFSEventStreamEventFlagKernelDropped,
+        kFSEventStreamEventFlagRootChanged
+    ])
+    func unsafeHistoricalEventsStillRepairRoots(flag: Int) async {
+        let roots = ["/tmp/allthethings/root-a", "/tmp/allthethings/root-b"]
+        let store = memoryCursorStore()
+        store.markBaseline(for: roots, eventID: 40)
+        let coordinator = FSEventReconciliationCoordinator(
+            cursorStore: store,
+            replaySource: FakeHistoryReplaySource(events: [
+                FileSystemEvent(
+                    path: roots[0] + "/node_modules",
+                    flags: FSEventStreamEventFlags(flag)
+                        | FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs),
+                    eventID: 41
+                ),
+                FileSystemEvent(
+                    path: roots[0],
+                    flags: FSEventStreamEventFlags(kFSEventStreamEventFlagHistoryDone),
+                    eventID: 42
+                )
+            ], completion: .completed),
+            currentEventID: { 50 }
+        )
+
+        let action = await actionFromCoordinator(
+            coordinator, roots: roots.map { URL(fileURLWithPath: $0, isDirectory: true) }
+        )
+        if flag == kFSEventStreamEventFlagRootChanged {
+            #expect(action == .fullReconcile(paths: [roots[0]], baselineEventID: 42))
+        } else {
+            #expect(action == .fullReconcile(paths: roots, baselineEventID: 50))
+        }
+    }
+
+    @Test("incomplete historical replay still requires a full repair", arguments: [
+        FSEventHistoryReplayCompletion.timedOut, .failed, .completed
+    ])
+    func incompleteHistoricalReplayStillRequiresFullRepair(completion: FSEventHistoryReplayCompletion) async {
+        let root = URL(fileURLWithPath: "/tmp/allthethings/root-a", isDirectory: true)
+        let store = memoryCursorStore()
+        store.markBaseline(for: [root.path], eventID: 40)
+        let coordinator = FSEventReconciliationCoordinator(
+            cursorStore: store,
+            replaySource: FakeHistoryReplaySource(events: [
+                FileSystemEvent(
+                    path: root.appendingPathComponent("node_modules").path,
+                    flags: FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs),
+                    eventID: 41
+                )
+            ], completion: completion),
+            currentEventID: { 50 }
+        )
+
+        let action = await actionFromCoordinator(coordinator, roots: [root])
+        #expect(action == .fullReconcile(paths: nil, baselineEventID: 50))
+    }
+
     @Test("FSEvent reconciliation scopes normal historical file paths exactly")
     func fseventReconciliationScopesNormalHistoricalFilePathsExactly() async {
         let root = URL(fileURLWithPath: "/tmp/allthethings/root-a", isDirectory: true)

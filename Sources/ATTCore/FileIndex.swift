@@ -5413,7 +5413,12 @@ public final class FileIndex: @unchecked Sendable {
             guard let self else { return }
             self.setBackgroundMaintenanceEnabled(background)
             if promotePendingWork, !background {
-                self.promoteBackgroundMaintenanceSynchronously()
+                self.prepareBackgroundMaintenancePromotion()
+                // A scan may own indexQueue for minutes. Keep mode changes free
+                // to demote it as soon as the app returns to the background.
+                self.indexQueue.async { [weak self] in
+                    self?.promoteBackgroundMaintenanceOnIndexQueue(requiresForeground: true)
+                }
             }
         }
     }
@@ -5454,13 +5459,6 @@ public final class FileIndex: @unchecked Sendable {
         }
     }
 
-    private func promoteBackgroundMaintenanceSynchronously() {
-        prepareBackgroundMaintenancePromotion()
-        indexQueue.sync {
-            promoteBackgroundMaintenanceOnIndexQueue()
-        }
-    }
-
     private func prepareBackgroundMaintenancePromotion() {
         // A reconciliation owns indexQueue while its scan workers are parked.
         // Mark it as promoted and wake its workers synchronously; the queued
@@ -5473,12 +5471,13 @@ public final class FileIndex: @unchecked Sendable {
         wakeBackgroundReconciliation()
     }
 
-    private func promoteBackgroundMaintenanceOnIndexQueue() {
+    private func promoteBackgroundMaintenanceOnIndexQueue(requiresForeground: Bool = false) {
         let promoted = lock.withLock { () -> (
             pendingPathCount: Int,
             hasPendingRefreshes: Bool,
             shouldOptimizeSnapshot: Bool
-        ) in
+        )? in
+            guard !requiresForeground || backgroundMaintenanceEnteredAt == nil else { return nil }
             maintenancePromotionApplicationCountForTesting &+= 1
             var promotedCount = 0
             for path in pendingRefreshPaths.keys {
@@ -5491,7 +5490,7 @@ public final class FileIndex: @unchecked Sendable {
             let shouldOptimizeSnapshot = !indexing
                 && searchSnapshot.store.kind == .overlay
                 && !searchSnapshot.isOptimizedForSearch
-                && !hasDurableStructuralDeltaBelowCompactionThresholdWithoutLock()
+                && !canDeferStructuralDeltaOptimizationWithoutLock()
             if shouldOptimizeSnapshot, !pendingRefreshPaths.isEmpty {
                 optimizesSnapshotAfterPromotedRefreshDrain = true
             }
@@ -5503,7 +5502,7 @@ public final class FileIndex: @unchecked Sendable {
             )
         }
 
-        guard promoted.pendingPathCount > 0 || promoted.shouldOptimizeSnapshot else { return }
+        guard let promoted, promoted.pendingPathCount > 0 || promoted.shouldOptimizeSnapshot else { return }
         DiagnosticLogger.shared.log(
             category: "index",
             event: "index.backgroundMaintenancePromoted",
@@ -5530,7 +5529,7 @@ public final class FileIndex: @unchecked Sendable {
                     && activeDeferredOptimizationRevision == nil
                     && searchSnapshot.store.kind != .mapped
                     && !searchSnapshot.isOptimizedForSearch
-                    && !hasDurableStructuralDeltaBelowCompactionThresholdWithoutLock()
+                    && !canDeferStructuralDeltaOptimizationWithoutLock()
                     && searchSnapshot.resultCount > 0,
                 shouldBuildSortOrder: !indexing
                     && !reconciling
@@ -15499,7 +15498,7 @@ public final class FileIndex: @unchecked Sendable {
                 return !indexing
                     && searchSnapshot.store.kind == .overlay
                     && !searchSnapshot.isOptimizedForSearch
-                    && !hasDurableStructuralDeltaBelowCompactionThresholdWithoutLock()
+                    && !canDeferStructuralDeltaOptimizationWithoutLock()
             }
             if shouldOptimize {
                 schedulePersist(delay: 0)
@@ -17076,20 +17075,55 @@ public final class FileIndex: @unchecked Sendable {
 
     private func structuralDeltaCompactionThreshold(for delta: StructuralDelta) -> Int {
         largeOverlayPersistRecordLimitOverride
-            ?? min(max(10_000, delta.baseIdentity.recordCount / 50), 50_000)
+            ?? Self.structuralDeltaCompactionThreshold(baseRecordCount: delta.baseIdentity.recordCount)
     }
 
-    private func hasDurableStructuralDeltaBelowCompactionThresholdWithoutLock() -> Bool {
+    static func structuralDeltaCompactionThreshold(baseRecordCount: Int) -> Int {
+        // Keep the 2% target proportional for large indexes. The independent
+        // byte limit still bounds delta growth without repeatedly rewriting
+        // millions of unchanged rows at a fixed 50,000-change threshold.
+        max(10_000, baseRecordCount / 50)
+    }
+
+    static func structuralDeltaCompactionRequirements(
+        baseRecordCount: Int,
+        changeCount: Int,
+        deltaBytes: UInt64,
+        thresholdOverride: Int? = nil
+    ) -> (threshold: Int, shouldCompact: Bool, immediate: Bool) {
+        let threshold = thresholdOverride ?? structuralDeltaCompactionThreshold(baseRecordCount: baseRecordCount)
+        let exceedsByteLimit = thresholdOverride == nil
+            && deltaBytes >= structuralDeltaCompactionImmediateByteLimit
+        let multipliedThreshold = threshold.multipliedReportingOverflow(
+            by: structuralDeltaCompactionImmediateChangeMultiplier
+        )
+        let immediateChangeThreshold = multipliedThreshold.overflow ? Int.max : multipliedThreshold.partialValue
+        return (
+            threshold,
+            changeCount >= threshold || exceedsByteLimit,
+            thresholdOverride == nil && (changeCount >= immediateChangeThreshold || exceedsByteLimit)
+        )
+    }
+
+    private func canDeferStructuralDeltaOptimizationWithoutLock() -> Bool {
         guard !hasUnpersistedSnapshotChanges, let structuralDelta else { return false }
-        return structuralDelta.changeCount < structuralDeltaCompactionThreshold(for: structuralDelta)
+        return compositeSearchState != nil
+            || structuralDelta.changeCount < structuralDeltaCompactionThreshold(for: structuralDelta)
     }
 
     private func scheduleStructuralDeltaCompactionIfNeeded(_ snapshot: SearchSnapshot) {
         let deltaState = lock.withLock { structuralDelta }
         guard let deltaState else { return }
 
-        let threshold = structuralDeltaCompactionThreshold(for: deltaState)
-        guard deltaState.changeCount >= threshold else {
+        let deltaBytes = Self.allocatedFileSize(of: structuralDeltaStore.url)
+        let requirements = Self.structuralDeltaCompactionRequirements(
+            baseRecordCount: deltaState.baseIdentity.recordCount,
+            changeCount: deltaState.changeCount,
+            deltaBytes: deltaBytes,
+            thresholdOverride: largeOverlayPersistRecordLimitOverride
+        )
+        let threshold = requirements.threshold
+        guard requirements.shouldCompact else {
             DiagnosticLogger.shared.log(
                 category: "index",
                 event: "index.structuralDeltaCompactionDeferred",
@@ -17104,16 +17138,7 @@ public final class FileIndex: @unchecked Sendable {
         let configuredDelay = largeOverlayPersistDelayOverride != nil
             ? largeOverlayPersistDelay(immediateLargeOverlay: true)
             : backgroundOptimizationPersistDelay()
-        let multipliedThreshold = threshold.multipliedReportingOverflow(
-            by: Self.structuralDeltaCompactionImmediateChangeMultiplier
-        )
-        let immediateChangeThreshold = multipliedThreshold.overflow
-            ? Int.max
-            : multipliedThreshold.partialValue
-        let deltaBytes = Self.allocatedFileSize(of: structuralDeltaStore.url)
-        let requiresImmediateCompaction = largeOverlayPersistRecordLimitOverride == nil
-            && (deltaState.changeCount >= immediateChangeThreshold
-                || deltaBytes >= Self.structuralDeltaCompactionImmediateByteLimit)
+        let requiresImmediateCompaction = requirements.immediate
         let delay = requiresImmediateCompaction ? 0 : configuredDelay
         let schedule = lock.withLock { () -> (
             revision: UInt64,
@@ -18756,8 +18781,15 @@ public final class FileIndex: @unchecked Sendable {
         lock.withLock(body)
     }
 
-    func waitForMaintenanceRequestsForTesting() {
+    func withIndexQueueHeldForTesting(_ body: () -> Void) {
+        indexQueue.sync(execute: body)
+    }
+
+    func waitForMaintenanceRequestsForTesting(includingPromotions: Bool = true) {
         maintenanceControlQueue.sync {}
+        if includingPromotions {
+            indexQueue.sync {}
+        }
     }
 
     func maintenanceRequestStateForTesting() -> (
